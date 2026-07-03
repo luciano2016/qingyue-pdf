@@ -138,6 +138,17 @@ namespace
         std::wstring note;
     };
 
+    struct QuietPdfAnnotation
+    {
+        int page{};
+        int kind{};
+        float x0{};
+        float y0{};
+        float x1{};
+        float y1{};
+        const char* contents{};
+    };
+
     struct OutlineLayoutRow
     {
         int top{};
@@ -274,6 +285,7 @@ namespace
         using NewPixmapFromPageNumberFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int);
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
+        using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using PixmapIntFn = int(__cdecl*)(fz_context*, fz_pixmap*);
         using PixmapSamplesFn = unsigned char*(__cdecl*)(fz_context*, fz_pixmap*);
         using DropPixmapFn = void(__cdecl*)(fz_context*, fz_pixmap*);
@@ -301,6 +313,7 @@ namespace
             Get(newPixmapFromPageNumber, "fz_new_pixmap_from_page_number");
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
             Get(searchPageNumber, "fz_search_page_number");
+            Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(pixmapWidth, "fz_pixmap_width");
             Get(pixmapHeight, "fz_pixmap_height");
             Get(pixmapComponents, "fz_pixmap_components");
@@ -328,6 +341,7 @@ namespace
         NewPixmapFromPageNumberFn newPixmapFromPageNumber{};
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
         SearchPageNumberFn searchPageNumber{};
+        SaveAnnotationsFn saveAnnotations{};
         PixmapIntFn pixmapWidth{};
         PixmapIntFn pixmapHeight{};
         PixmapIntFn pixmapComponents{};
@@ -4108,6 +4122,140 @@ namespace
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
+    bool ReloadPdfTab(PdfTab& tab, const std::wstring& path, int page, double zoom)
+    {
+        DropTab(tab);
+        tab.pages.clear();
+        tab.outline.clear();
+        tab.cache.clear();
+        tab.tileCache.clear();
+        tab.thumbCache.clear();
+        tab.annotations.clear();
+        tab.outlineLayout.clear();
+        tab.outlineLayoutWidth = 0;
+        tab.outlineLayoutFont = 0;
+        tab.outlineLayoutRows = 0;
+        tab.outlineLayoutContentHeight = 0;
+        tab.dirty = false;
+
+        try
+        {
+            g_pdf.Load();
+            tab.ctx = g_pdf.newContext(nullptr, nullptr, 64 << 20, "1.28.0");
+            g_pdf.setAaLevel(tab.ctx, 8);
+            g_pdf.registerHandlers(tab.ctx);
+            auto utf8 = ToUtf8(path);
+            tab.doc = g_pdf.openDocument(tab.ctx, utf8.c_str());
+            tab.pageCount = g_pdf.countPages(tab.ctx, tab.doc);
+            tab.path = path;
+            tab.name = std::filesystem::path(path).filename().wstring();
+            tab.currentPage = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
+            tab.zoom = zoom;
+            tab.pages.resize(static_cast<size_t>(tab.pageCount));
+            int probe = std::min(tab.pageCount, 1000);
+            for (int i = 0; i < probe; ++i)
+            {
+                fz_page* pdfPage = g_pdf.loadPage(tab.ctx, tab.doc, i);
+                fz_rect b = g_pdf.boundPage(tab.ctx, pdfPage);
+                tab.pages[static_cast<size_t>(i)] = PageInfo{ std::max(1.0, static_cast<double>(b.x1 - b.x0)), std::max(1.0, static_cast<double>(b.y1 - b.y0)) };
+                g_pdf.dropPage(tab.ctx, pdfPage);
+            }
+            for (int i = probe; i < tab.pageCount; ++i) tab.pages[static_cast<size_t>(i)] = tab.pages[0];
+            fz_outline* outline = g_pdf.loadOutline(tab.ctx, tab.doc);
+            if (outline)
+            {
+                CollectOutline(tab, outline, 0);
+                g_pdf.dropOutline(tab.ctx, outline);
+            }
+            if (g_continuousRead) ScrollToPage(tab, tab.currentPage);
+            else g_scrollY = 0;
+            return true;
+        }
+        catch (...)
+        {
+            DropTab(tab);
+            return false;
+        }
+    }
+
+    void SaveAnnotationsToPdf(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.path.empty() || !tab.dirty || tab.annotations.empty()) return;
+        if (!g_pdf.saveAnnotations)
+        {
+            MessageBoxW(hwnd, L"当前 MuPDF 组件不支持写入 PDF 标注。", L"保存", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        std::filesystem::path source(tab.path);
+        std::filesystem::path temp = source;
+        temp += L".quietpdf-save.tmp.pdf";
+        try { std::filesystem::remove(temp); } catch (...) {}
+
+        std::vector<std::string> notes;
+        std::vector<QuietPdfAnnotation> annotations;
+        notes.reserve(tab.annotations.size());
+        annotations.reserve(tab.annotations.size());
+        for (auto const& item : tab.annotations)
+        {
+            notes.push_back(ToUtf8(item.note));
+            QuietPdfAnnotation out;
+            out.page = item.page;
+            out.kind = static_cast<int>(item.kind);
+            out.x0 = static_cast<float>(item.x0);
+            out.y0 = static_cast<float>(item.y0);
+            out.x1 = static_cast<float>(item.x1);
+            out.y1 = static_cast<float>(item.y1);
+            out.contents = notes.back().empty() ? nullptr : notes.back().c_str();
+            annotations.push_back(out);
+        }
+
+        std::string tempUtf8 = ToUtf8(temp.wstring());
+        int saved = g_pdf.saveAnnotations(tab.ctx, tab.doc, tempUtf8.c_str(), annotations.data(), static_cast<int>(annotations.size()));
+        if (!saved || !std::filesystem::exists(temp))
+        {
+            try { std::filesystem::remove(temp); } catch (...) {}
+            MessageBoxW(hwnd, L"PDF 标注写入失败，原文件未修改。", L"保存", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        int page = tab.currentPage;
+        double zoom = tab.zoom;
+        DropTab(tab);
+        bool replaced = false;
+        try
+        {
+            std::filesystem::rename(temp, source);
+            replaced = true;
+        }
+        catch (...)
+        {
+            try
+            {
+                std::filesystem::copy_file(temp, source, std::filesystem::copy_options::overwrite_existing);
+                std::filesystem::remove(temp);
+                replaced = true;
+            }
+            catch (...) {}
+        }
+
+        if (!replaced)
+        {
+            ReloadPdfTab(tab, tab.path, page, zoom);
+            MessageBoxW(hwnd, L"PDF 已生成临时保存文件，但替换原文件失败。请确认文件没有被其它程序占用。", L"保存", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        if (!ReloadPdfTab(tab, source.wstring(), page, zoom))
+        {
+            MessageBoxW(hwnd, L"PDF 已保存，但重新载入失败。请重新打开文件。", L"保存", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        TouchRecentProgress(tab, true);
+        SetTitle();
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
     void SaveAnnotationSidecar(HWND hwnd, PdfTab& tab)
     {
         if (tab.path.empty()) return;
@@ -5182,7 +5330,7 @@ namespace
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'W') { CloseTab(g_active); return 0; }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'S')
             {
-                if (PdfTab* tab = Active()) SaveAnnotationSidecar(hwnd, *tab);
+                if (PdfTab* tab = Active()) SaveAnnotationsToPdf(hwnd, *tab);
                 return 0;
             }
             if (wParam == VK_ESCAPE && g_pageInputFocused) { CancelPageInput(hwnd); return 0; }

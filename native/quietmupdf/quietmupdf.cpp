@@ -1,4 +1,16 @@
 #include "mupdf/fitz.h"
+#include "mupdf/pdf.h"
+
+struct quiet_pdf_annotation
+{
+    int page;
+    int kind;
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+    const char* contents;
+};
 
 extern "C" int quietmupdf_anchor()
 {
@@ -43,4 +55,105 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
     }
 
     return pix;
+}
+
+extern "C" int quiet_pdf_save_annotations(
+    fz_context* ctx,
+    fz_document* fzdoc,
+    const char* filename,
+    const quiet_pdf_annotation* annotations,
+    int annotation_count)
+{
+    if (!ctx || !fzdoc || !filename || !annotations || annotation_count < 0)
+        return 0;
+
+    pdf_document* doc = nullptr;
+    int ok = 0;
+
+    fz_try(ctx)
+    {
+        doc = pdf_specifics(ctx, fzdoc);
+        if (!doc)
+            fz_throw(ctx, FZ_ERROR_FORMAT, "document is not a PDF");
+
+        int page_count = pdf_count_pages(ctx, doc);
+        for (int i = 0; i < annotation_count; ++i)
+        {
+            const quiet_pdf_annotation& input = annotations[i];
+            if (input.page < 0 || input.page >= page_count)
+                continue;
+
+            enum pdf_annot_type type = PDF_ANNOT_HIGHLIGHT;
+            if (input.kind == 1) type = PDF_ANNOT_UNDERLINE;
+            else if (input.kind == 2) type = PDF_ANNOT_STRIKE_OUT;
+
+            pdf_page* page = nullptr;
+            pdf_annot* annot = nullptr;
+            fz_try(ctx)
+            {
+                page = pdf_load_page(ctx, doc, input.page);
+                fz_rect bounds = pdf_bound_page(ctx, page, FZ_CROP_BOX);
+                float left = bounds.x0 + fz_clamp(input.x0, 0.0f, 1.0f) * (bounds.x1 - bounds.x0);
+                float top = bounds.y0 + fz_clamp(input.y0, 0.0f, 1.0f) * (bounds.y1 - bounds.y0);
+                float right = bounds.x0 + fz_clamp(input.x1, 0.0f, 1.0f) * (bounds.x1 - bounds.x0);
+                float bottom = bounds.y0 + fz_clamp(input.y1, 0.0f, 1.0f) * (bounds.y1 - bounds.y0);
+                if (right < left) { float t = left; left = right; right = t; }
+                if (bottom < top) { float t = top; top = bottom; bottom = t; }
+                if (right - left >= 0.5f && bottom - top >= 0.5f)
+                {
+                    annot = pdf_create_annot(ctx, page, type);
+                    fz_rect rect = fz_make_rect(left, top, right, bottom);
+                    fz_quad quad = fz_make_quad(left, top, right, top, left, bottom, right, bottom);
+                    pdf_set_annot_rect(ctx, annot, rect);
+                    pdf_set_annot_quad_points(ctx, annot, 1, &quad);
+                    if (input.contents && input.contents[0])
+                        pdf_set_annot_contents(ctx, annot, input.contents);
+
+                    if (type == PDF_ANNOT_HIGHLIGHT)
+                    {
+                        float color[3] = { 1.0f, 0.82f, 0.24f };
+                        pdf_set_annot_color(ctx, annot, 3, color);
+                        pdf_set_annot_opacity(ctx, annot, 0.45f);
+                    }
+                    else if (type == PDF_ANNOT_UNDERLINE)
+                    {
+                        float color[3] = { 0.16f, 0.64f, 0.42f };
+                        pdf_set_annot_color(ctx, annot, 3, color);
+                    }
+                    else
+                    {
+                        float color[3] = { 0.84f, 0.28f, 0.28f };
+                        pdf_set_annot_color(ctx, annot, 3, color);
+                    }
+
+                    pdf_update_annot(ctx, annot);
+                }
+            }
+            fz_always(ctx)
+            {
+                if (annot) pdf_drop_annot(ctx, annot);
+                if (page) pdf_drop_page(ctx, page);
+            }
+            fz_catch(ctx)
+            {
+                fz_rethrow(ctx);
+            }
+        }
+
+        pdf_write_options opts = pdf_default_write_options;
+        opts.do_incremental = 0;
+        opts.do_compress = 1;
+        opts.do_compress_images = 1;
+        opts.do_compress_fonts = 1;
+        opts.do_garbage = 0;
+        opts.do_appearance = 1;
+        pdf_save_document(ctx, doc, filename, &opts);
+        ok = 1;
+    }
+    fz_catch(ctx)
+    {
+        ok = 0;
+    }
+
+    return ok;
 }
