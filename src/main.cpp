@@ -4199,6 +4199,20 @@ namespace
         DestroyMenu(menu);
     }
 
+    void ShowSelectionMenuWithShortcuts(HWND hwnd, int x, int y)
+    {
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, 2501, L"复制选中内容\tCtrl + C");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 2502, L"高亮\tCtrl + H");
+        AppendMenuW(menu, MF_STRING, 2503, L"下划线\tCtrl + U");
+        AppendMenuW(menu, MF_STRING, 2504, L"删除线\tCtrl + K");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 2505, L"添加便签");
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
+        DestroyMenu(menu);
+    }
+
     void AddAnnotationFromSelection(HWND hwnd, AnnotationKind kind)
     {
         PdfTab* tab = Active();
@@ -5013,7 +5027,7 @@ namespace
             {
                 POINT pt{ x, y };
                 ClientToScreen(hwnd, &pt);
-                ShowSelectionMenu(hwnd, pt.x, pt.y);
+                ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y);
                 return 0;
             }
             for (size_t i = 0; i < g_tabRects.size(); ++i)
@@ -5447,6 +5461,29 @@ namespace
             return 0;
         }
         case WM_KEYDOWN:
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && g_hasContentSelection && !g_selectionQuads.empty())
+            {
+                if (wParam == 'C')
+                {
+                    CopyTextToClipboard(hwnd, g_selectionText);
+                    return 0;
+                }
+                if (wParam == 'H')
+                {
+                    AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
+                    return 0;
+                }
+                if (wParam == 'U')
+                {
+                    AddAnnotationFromSelection(hwnd, AnnotationKind::Underline);
+                    return 0;
+                }
+                if (wParam == 'K')
+                {
+                    AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout);
+                    return 0;
+                }
+            }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'F')
             {
                 g_sidebarOpen = true;
