@@ -26,3 +26,4 @@ EXPORTS
     quiet_new_pixmap_from_page_number_clip
     quiet_pdf_save_annotations
     quiet_pdf_last_error
+    quiet_pdf_select_text

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -286,6 +287,7 @@ namespace
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
+        using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
         using PixmapIntFn = int(__cdecl*)(fz_context*, fz_pixmap*);
         using PixmapSamplesFn = unsigned char*(__cdecl*)(fz_context*, fz_pixmap*);
         using DropPixmapFn = void(__cdecl*)(fz_context*, fz_pixmap*);
@@ -314,6 +316,7 @@ namespace
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
             Get(searchPageNumber, "fz_search_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
+            Get(selectText, "quiet_pdf_select_text");
             Get(pixmapWidth, "fz_pixmap_width");
             Get(pixmapHeight, "fz_pixmap_height");
             Get(pixmapComponents, "fz_pixmap_components");
@@ -342,6 +345,7 @@ namespace
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
         SearchPageNumberFn searchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
+        SelectTextFn selectText{};
         PixmapIntFn pixmapWidth{};
         PixmapIntFn pixmapHeight{};
         PixmapIntFn pixmapComponents{};
@@ -472,6 +476,8 @@ namespace
     POINT g_selectionEnd{};
     RECT g_selectionPageRect{};
     fz_rect g_selectionNorm{};
+    std::vector<fz_quad> g_selectionQuads;
+    std::wstring g_selectionText;
     bool g_continuousRead{ true };
     constexpr int TileSize = 384;
 
@@ -2265,6 +2271,22 @@ namespace
         };
     }
 
+    RECT QuadToRect(fz_quad const& quad, RECT pageRect)
+    {
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        float minX = std::min({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+        float maxX = std::max({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+        float minY = std::min({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+        float maxY = std::max({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+        return RECT{
+            pageRect.left + static_cast<int>(minX * pageW + 0.5f),
+            pageRect.top + static_cast<int>(minY * pageH + 0.5f),
+            pageRect.left + static_cast<int>(maxX * pageW + 0.5f),
+            pageRect.top + static_cast<int>(maxY * pageH + 0.5f)
+        };
+    }
+
     RECT DenormalizeAnnotationRect(PdfAnnotation const& annotation, RECT pageRect)
     {
         int pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -2286,6 +2308,62 @@ namespace
             std::max(g_selectionStart.x, g_selectionEnd.x),
             std::max(g_selectionStart.y, g_selectionEnd.y)
         };
+    }
+
+    bool RefreshTextSelection(PdfTab& tab)
+    {
+        g_selectionQuads.clear();
+        g_selectionText.clear();
+        if (!g_pdf.selectText || g_selectionPage < 0 || g_selectionPage >= tab.pageCount)
+            return false;
+
+        fz_rect rect = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
+        if (std::abs(rect.x1 - rect.x0) < 0.001f || std::abs(rect.y1 - rect.y0) < 0.001f)
+            return false;
+
+        std::vector<fz_quad> quads(256);
+        std::string text(65536, '\0');
+        int count = g_pdf.selectText(
+            tab.ctx,
+            tab.doc,
+            g_selectionPage,
+            rect.x0,
+            rect.y0,
+            rect.x1,
+            rect.y1,
+            quads.data(),
+            static_cast<int>(quads.size()),
+            text.data(),
+            static_cast<int>(text.size()));
+        if (count <= 0)
+            return false;
+
+        quads.resize(static_cast<size_t>(count));
+        g_selectionQuads = std::move(quads);
+        g_selectionNorm = rect;
+        g_selectionText = FromUtf8(text.c_str());
+        return true;
+    }
+
+    void CopyTextToClipboard(HWND hwnd, std::wstring const& text)
+    {
+        if (text.empty() || !OpenClipboard(hwnd)) return;
+        EmptyClipboard();
+        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (mem)
+        {
+            void* dst = GlobalLock(mem);
+            if (dst)
+            {
+                memcpy(dst, text.c_str(), bytes);
+                GlobalUnlock(mem);
+                SetClipboardData(CF_UNICODETEXT, mem);
+                mem = nullptr;
+            }
+        }
+        if (mem) GlobalFree(mem);
+        CloseClipboard();
     }
 
     RECT SidebarScrollRect();
@@ -3801,18 +3879,27 @@ namespace
                     }
                     if ((g_hasContentSelection || g_selectingContent) && g_selectionPage == i)
                     {
-                        RECT selection = CurrentSelectionRect();
-                        RECT visibleSelection{};
-                        if (IntersectRect(&visibleSelection, &selection, &pageRect))
+                        if (!g_selectionQuads.empty())
                         {
-                            AlphaFill(dc, visibleSelection, RGB(86, 156, 255), IsDarkTheme() || IsAuroraTheme() ? 72 : 62);
-                            HPEN selectionPen = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(63, 128, 232));
-                            HGDIOBJ oldSelectionPen = SelectObject(dc, selectionPen);
-                            HGDIOBJ oldSelectionBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                            Rectangle(dc, visibleSelection.left, visibleSelection.top, visibleSelection.right, visibleSelection.bottom);
-                            SelectObject(dc, oldSelectionBrush);
-                            SelectObject(dc, oldSelectionPen);
-                            DeleteObject(selectionPen);
+                            for (fz_quad const& quad : g_selectionQuads)
+                            {
+                                RECT selection = QuadToRect(quad, pageRect);
+                                RECT visibleSelection{};
+                                if (IntersectRect(&visibleSelection, &selection, &pageRect))
+                                {
+                                    InflateRect(&visibleSelection, S(1), S(1));
+                                    AlphaFill(dc, visibleSelection, RGB(118, 169, 230), IsDarkTheme() || IsAuroraTheme() ? 82 : 70);
+                                }
+                            }
+                        }
+                        else if (g_selectingContent)
+                        {
+                            RECT selection = CurrentSelectionRect();
+                            RECT visibleSelection{};
+                            if (IntersectRect(&visibleSelection, &selection, &pageRect))
+                            {
+                                AlphaFill(dc, visibleSelection, RGB(86, 156, 255), IsDarkTheme() || IsAuroraTheme() ? 32 : 24);
+                            }
                         }
                     }
                     RestoreDC(dc, savedPageDc);
@@ -4106,8 +4193,19 @@ namespace
     void AddAnnotationFromSelection(HWND hwnd, AnnotationKind kind)
     {
         PdfTab* tab = Active();
-        if (!tab || !g_hasContentSelection || g_selectionPage < 0) return;
-        fz_rect r = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
+        if (!tab || !g_hasContentSelection || g_selectionPage < 0 || g_selectionQuads.empty()) return;
+        float minX = 1.0f;
+        float minY = 1.0f;
+        float maxX = 0.0f;
+        float maxY = 0.0f;
+        for (fz_quad const& quad : g_selectionQuads)
+        {
+            minX = std::min({ minX, quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+            minY = std::min({ minY, quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            maxX = std::max({ maxX, quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+            maxY = std::max({ maxY, quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+        }
+        fz_rect r{ minX, minY, maxX, maxY };
         if (std::abs(r.x1 - r.x0) < 0.004f || std::abs(r.y1 - r.y0) < 0.004f) return;
         PdfAnnotation annotation;
         annotation.page = std::clamp(g_selectionPage, 0, tab->pageCount - 1);
@@ -4119,6 +4217,8 @@ namespace
         tab->annotations.push_back(annotation);
         tab->dirty = true;
         g_hasContentSelection = false;
+        g_selectionQuads.clear();
+        g_selectionText.clear();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -4434,6 +4534,11 @@ namespace
                 }
                 CloseClipboard();
             }
+            return;
+        }
+        if (id == 2501 && !g_selectionText.empty())
+        {
+            CopyTextToClipboard(hwnd, g_selectionText);
             return;
         }
         if (id == 2106 && g_contextTab >= 0)
@@ -4834,6 +4939,8 @@ namespace
                 {
                     g_selectingContent = true;
                     g_hasContentSelection = false;
+                    g_selectionQuads.clear();
+                    g_selectionText.clear();
                     g_selectionPage = page;
                     g_selectionStart = POINT{ x, y };
                     g_selectionEnd = POINT{ x, y };
@@ -4943,6 +5050,7 @@ namespace
                     static_cast<LONG>(std::clamp(mx, static_cast<int>(g_selectionPageRect.left), static_cast<int>(g_selectionPageRect.right))),
                     static_cast<LONG>(std::clamp(my, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom)))
                 };
+                if (PdfTab* tab = Active()) RefreshTextSelection(*tab);
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
@@ -5064,8 +5172,16 @@ namespace
                 g_selectingContent = false;
                 ReleaseCapture();
                 RECT selection = CurrentSelectionRect();
-                g_hasContentSelection = (selection.right - selection.left) >= S(8) && (selection.bottom - selection.top) >= S(6);
-                if (g_hasContentSelection) g_selectionNorm = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
+                if (PdfTab* tab = Active()) RefreshTextSelection(*tab);
+                g_hasContentSelection =
+                    !g_selectionQuads.empty() &&
+                    (selection.right - selection.left) >= S(8) &&
+                    (selection.bottom - selection.top) >= S(6);
+                if (!g_hasContentSelection)
+                {
+                    g_selectionQuads.clear();
+                    g_selectionText.clear();
+                }
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
