@@ -3234,12 +3234,12 @@ namespace
         LineTo(dc, client.right, bar.bottom - 1);
         SelectObject(dc, oldPen);
         DeleteObject(pen);
-        HFONT f = Font(10);
+        HFONT f = Font(8);
         auto oldFont = SelectObject(dc, f);
         int x = S(8);
         for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
         {
-            RECT r{ x, S(43), x + S(220), S(73) };
+            RECT r{ x, S(46), x + S(190), S(71) };
             g_tabRects.push_back(r);
             bool active = i == g_active;
             bool hovered = i == g_hoverTab;
@@ -3250,43 +3250,52 @@ namespace
                     if (IsAuroraTheme())
                     {
                         AlphaFill(dc, r, active ? RGB(12, 56, 58) : RGB(9, 40, 44), active ? 196 : 142);
-                        RoundFill(dc, r, S(11), active ? RGB(14, 55, 58) : RGB(9, 42, 46), active ? RGB(38, 132, 107) : RGB(28, 78, 76));
-                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(9) }, RGB(64, 255, 155), 22);
+                        RoundFill(dc, r, S(9), active ? RGB(14, 55, 58) : RGB(9, 42, 46), active ? RGB(38, 132, 107) : RGB(28, 78, 76));
+                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(64, 255, 155), 22);
                     }
                     else
                     {
                         AlphaFill(dc, r, RGB(255, 255, 255), active ? 168 : 112);
-                        RoundFill(dc, r, S(11), active ? RGB(250, 252, 254) : RGB(255, 255, 255), active ? RGB(218, 224, 232) : RGB(230, 235, 241));
-                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(9) }, RGB(255, 255, 255), 36);
+                        RoundFill(dc, r, S(9), active ? RGB(250, 252, 254) : RGB(255, 255, 255), active ? RGB(218, 224, 232) : RGB(230, 235, 241));
+                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), 36);
                     }
                 }
             }
             else
             {
-                RoundFill(dc, r, S(11), (active || hovered) ? T().panel2 : T().panel, (active || hovered) ? T().line : T().panel);
+                RoundFill(dc, r, S(9), (active || hovered) ? T().panel2 : T().panel, (active || hovered) ? T().line : T().panel);
             }
-            RECT text{ r.left + S(12), r.top, r.right - S(42), r.bottom };
-            std::wstring tabTitle = g_tabs[static_cast<size_t>(i)]->name + (g_tabs[static_cast<size_t>(i)]->dirty ? L" *" : L"");
-            Text(dc, tabTitle, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
-            RECT close{ r.right - S(34), r.top + S(3), r.right - S(6), r.bottom - S(3) };
+            bool dirty = g_tabs[static_cast<size_t>(i)]->dirty;
+            RECT text{ r.left + S(10), r.top, r.right - S(dirty ? 50 : 36), r.bottom };
+            Text(dc, g_tabs[static_cast<size_t>(i)]->name, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+            if (dirty)
+            {
+                RECT mark{ r.right - S(49), r.top + S(3), r.right - S(32), r.bottom - S(3) };
+                HFONT markFont = Font(11, FW_SEMIBOLD);
+                HGDIOBJ oldMarkFont = SelectObject(dc, markFont);
+                Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() || IsAuroraTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
+                SelectObject(dc, oldMarkFont);
+                DeleteObject(markFont);
+            }
+            RECT close{ r.right - S(30), r.top + S(2), r.right - S(5), r.bottom - S(2) };
             bool closeHover = g_hoverTabClose == i;
             int closeCx = (close.left + close.right) / 2;
             int closeCy = (close.top + close.bottom) / 2;
             if (closeHover)
             {
-                DrawSoftCircle(dc, closeCx, closeCy, S(9), RGB(255, 92, 92));
-                HPEN xPen = CreatePen(PS_SOLID, std::max(1, S(2)), RGB(255, 255, 255));
+                DrawSoftCircle(dc, closeCx, closeCy, S(8), RGB(255, 92, 92));
+                HPEN xPen = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(255, 255, 255));
                 HGDIOBJ oldXPen = SelectObject(dc, xPen);
-                MoveToEx(dc, closeCx - S(4), closeCy - S(4), nullptr);
-                LineTo(dc, closeCx + S(4), closeCy + S(4));
-                MoveToEx(dc, closeCx + S(4), closeCy - S(4), nullptr);
-                LineTo(dc, closeCx - S(4), closeCy + S(4));
+                MoveToEx(dc, closeCx - S(3), closeCy - S(3), nullptr);
+                LineTo(dc, closeCx + S(3), closeCy + S(3));
+                MoveToEx(dc, closeCx + S(3), closeCy - S(3), nullptr);
+                LineTo(dc, closeCx - S(3), closeCy + S(3));
                 SelectObject(dc, oldXPen);
                 DeleteObject(xPen);
             }
             else if (active)
             {
-                DrawSoftCircle(dc, closeCx, closeCy, S(4), T().accent);
+                DrawSoftCircle(dc, closeCx, closeCy, S(3), T().accent);
             }
             if (false && closeHover)
             {
@@ -3303,11 +3312,11 @@ namespace
                 SelectObject(dc, oldBrush);
                 DeleteObject(dot);
             }
-            x += S(226);
+            x += S(196);
         }
-        RECT plus{ x, S(43), x + S(36), S(73) };
+        RECT plus{ x, S(46), x + S(30), S(71) };
         AddButton(CmdOpen, plus, L"+", L"打开新文档");
-        HFONT plusFont = Font(18);
+        HFONT plusFont = Font(16);
         HGDIOBJ oldPlusFont = SelectObject(dc, plusFont);
         Text(dc, L"+", plus, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         SelectObject(dc, oldPlusFont);
