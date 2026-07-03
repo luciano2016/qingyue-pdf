@@ -9,6 +9,10 @@ struct quiet_pdf_annotation
     float y0;
     float x1;
     float y1;
+    float color_r;
+    float color_g;
+    float color_b;
+    float opacity;
     const char* contents;
 };
 
@@ -129,18 +133,18 @@ extern "C" int quiet_pdf_save_annotations(
 
                     if (type == PDF_ANNOT_HIGHLIGHT)
                     {
-                        float color[3] = { 1.0f, 0.82f, 0.24f };
+                        float color[3] = { input.color_r, input.color_g, input.color_b };
                         pdf_set_annot_color(ctx, annot, 3, color);
-                        pdf_set_annot_opacity(ctx, annot, 0.45f);
+                        pdf_set_annot_opacity(ctx, annot, fz_clamp(input.opacity, 0.12f, 1.0f));
                     }
                     else if (type == PDF_ANNOT_UNDERLINE)
                     {
-                        float color[3] = { 0.16f, 0.64f, 0.42f };
+                        float color[3] = { input.color_r, input.color_g, input.color_b };
                         pdf_set_annot_color(ctx, annot, 3, color);
                     }
                     else
                     {
-                        float color[3] = { 0.84f, 0.28f, 0.28f };
+                        float color[3] = { input.color_r, input.color_g, input.color_b };
                         pdf_set_annot_color(ctx, annot, 3, color);
                     }
 

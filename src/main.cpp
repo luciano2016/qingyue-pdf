@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -136,6 +137,9 @@ namespace
         double x1{};
         double y1{};
         AnnotationKind kind{ AnnotationKind::Highlight };
+        int colorIndex{};
+        long long createdAt{};
+        std::wstring text;
         std::wstring note;
     };
 
@@ -147,6 +151,10 @@ namespace
         float y0{};
         float x1{};
         float y1{};
+        float colorR{ 1.0f };
+        float colorG{ 0.82f };
+        float colorB{ 0.24f };
+        float opacity{ 0.45f };
         const char* contents{};
     };
 
@@ -225,7 +233,13 @@ namespace
         CmdSearchClear,
         CmdZoomMenu,
         CmdStatusPin,
-        CmdPageInput
+        CmdPageInput,
+        CmdNoteExpandAll,
+        CmdNoteCollapseAll,
+        CmdNotePrev,
+        CmdNoteNext,
+        CmdNoteDelete,
+        CmdNoteDeleteAll
     };
 
     std::string ToUtf8(const std::wstring& text)
@@ -478,6 +492,22 @@ namespace
     fz_rect g_selectionNorm{};
     std::vector<fz_quad> g_selectionQuads;
     std::wstring g_selectionText;
+    int g_activeAnnotation{ -1 };
+    bool g_annotationToolbarOpen{};
+    bool g_annotationNoteOpen{};
+    bool g_annotationNoteFocused{};
+    bool g_annotationNoteCaretVisible{ true };
+    RECT g_annotationHitRect{};
+    RECT g_annotationToolbarRect{};
+    RECT g_annotationCopyRect{};
+    RECT g_annotationNoteRect{};
+    RECT g_annotationDeleteRect{};
+    RECT g_annotationFormatRect{};
+    RECT g_annotationNoteCloseRect{};
+    RECT g_annotationNotePanelRect{};
+    RECT g_annotationNoteInputRect{};
+    std::vector<RECT> g_annotationColorRects;
+    std::set<int> g_collapsedAnnotationPages;
     bool g_continuousRead{ true };
     constexpr int TileSize = 384;
 
@@ -580,6 +610,34 @@ namespace
     {
         if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.34);
         return MixColor(T().muted, T().text, IsDarkTheme() ? 0.18 : 0.10);
+    }
+
+    constexpr COLORREF AnnotationPalette[] = {
+        RGB(255, 236, 0), RGB(49, 211, 68), RGB(82, 174, 232), RGB(244, 97, 142),
+        RGB(156, 120, 229), RGB(255, 157, 50), RGB(20, 211, 214), RGB(235, 82, 207)
+    };
+
+    COLORREF AnnotationColor(PdfAnnotation const& annotation)
+    {
+        int index = std::clamp(annotation.colorIndex, 0, static_cast<int>(std::size(AnnotationPalette)) - 1);
+        return AnnotationPalette[index];
+    }
+
+    std::wstring AnnotationKindName(AnnotationKind kind)
+    {
+        if (kind == AnnotationKind::Underline) return L"\u4e0b\u5212\u7ebf";
+        if (kind == AnnotationKind::Strikeout) return L"\u5220\u9664\u7ebf";
+        return L"\u9ad8\u4eae";
+    }
+
+    std::wstring FormatTimeMs(long long ms)
+    {
+        std::time_t seconds = static_cast<std::time_t>(ms / 1000);
+        std::tm local{};
+        localtime_s(&local, &seconds);
+        wchar_t buffer[32]{};
+        wcsftime(buffer, std::size(buffer), L"%Y/%m/%d %H:%M:%S", &local);
+        return buffer;
     }
 
     COLORREF ScrollTrackColor()
@@ -2255,6 +2313,29 @@ namespace
         return false;
     }
 
+    bool PageRectForPage(PdfTab const& tab, int targetPage, RECT& pageRect)
+    {
+        if (tab.pageCount <= 0 || targetPage < 0 || targetPage >= tab.pageCount) return false;
+        int gap = g_continuousRead ? PageGap() : 0;
+        int firstPage = g_continuousRead ? 0 : std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+        int lastPage = g_continuousRead ? tab.pageCount : std::min(tab.pageCount, firstPage + 1);
+        int y = g_stage.top + S(28) - g_scrollY;
+        for (int i = firstPage; i < lastPage; ++i)
+        {
+            int pageW = PageW(tab, i);
+            int pageH = PageH(tab, i);
+            int x = g_stage.left + std::max<int>(S(28), ((g_stage.right - g_stage.left) - pageW) / 2);
+            RECT r{ x, y, x + pageW, y + pageH };
+            if (i == targetPage)
+            {
+                pageRect = r;
+                return true;
+            }
+            y += pageH + gap;
+        }
+        return false;
+    }
+
     fz_rect NormalizeSelectionRect(RECT pageRect, POINT a, POINT b)
     {
         double pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -2373,6 +2454,74 @@ namespace
         g_selectionPage = -1;
         g_selectionQuads.clear();
         g_selectionText.clear();
+    }
+
+    void ScrollToPage(PdfTab& tab, int page);
+
+    void ClearAnnotationFocus()
+    {
+        g_activeAnnotation = -1;
+        g_annotationToolbarOpen = false;
+        g_annotationNoteOpen = false;
+        g_annotationNoteFocused = false;
+        g_annotationHitRect = RECT{};
+        g_annotationToolbarRect = RECT{};
+        g_annotationCopyRect = RECT{};
+        g_annotationNoteRect = RECT{};
+        g_annotationDeleteRect = RECT{};
+        g_annotationFormatRect = RECT{};
+        g_annotationNoteCloseRect = RECT{};
+        g_annotationNotePanelRect = RECT{};
+        g_annotationNoteInputRect = RECT{};
+        g_annotationColorRects.clear();
+    }
+
+    bool ActiveAnnotation(PdfTab& tab, PdfAnnotation*& annotation)
+    {
+        if (g_activeAnnotation < 0 || g_activeAnnotation >= static_cast<int>(tab.annotations.size())) return false;
+        annotation = &tab.annotations[static_cast<size_t>(g_activeAnnotation)];
+        return true;
+    }
+
+    std::wstring ElideText(std::wstring text, size_t maxChars);
+
+    void DeleteAnnotation(HWND hwnd, PdfTab& tab, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(tab.annotations.size())) return;
+        tab.annotations.erase(tab.annotations.begin() + index);
+        tab.dirty = true;
+        ClearAnnotationFocus();
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void SelectAnnotation(HWND hwnd, PdfTab& tab, int index, bool jump)
+    {
+        if (index < 0 || index >= static_cast<int>(tab.annotations.size())) return;
+        g_activeAnnotation = index;
+        g_annotationToolbarOpen = true;
+        g_annotationNoteFocused = false;
+        if (jump) ScrollToPage(tab, tab.annotations[static_cast<size_t>(index)].page);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    int HitTestAnnotation(PdfTab const& tab, int x, int y, RECT* hitRect = nullptr)
+    {
+        int page = -1;
+        RECT pageRect{};
+        if (!PageRectAtPoint(tab, x, y, page, pageRect)) return -1;
+        for (int i = static_cast<int>(tab.annotations.size()) - 1; i >= 0; --i)
+        {
+            PdfAnnotation const& annotation = tab.annotations[static_cast<size_t>(i)];
+            if (annotation.page != page) continue;
+            RECT mark = DenormalizeAnnotationRect(annotation, pageRect);
+            InflateRect(&mark, S(3), S(5));
+            if (Hit(mark, x, y))
+            {
+                if (hitRect) *hitRect = mark;
+                return i;
+            }
+        }
+        return -1;
     }
 
     RECT SidebarScrollRect();
@@ -3554,46 +3703,99 @@ namespace
         }
         else if (g_sideMode == 3)
         {
-            RECT title{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(36) };
-            Text(dc, L"注释", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+            RECT title{ g_sidebar.left + S(14), g_sidebar.top + S(6), g_sidebar.right - S(14), g_sidebar.top + S(30) };
+            Text(dc, L"\u6ce8\u91ca", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+            int buttonTop = g_sidebar.top + S(34);
+            int buttonSize = S(25);
+            int buttonGap = S(5);
+            int buttonLeft = g_sidebar.left + S(14);
+            struct NoteTool { int id; const wchar_t* text; const wchar_t* tip; };
+            NoteTool tools[] = {
+                { CmdNoteExpandAll, L"+", L"\u5c55\u5f00\u6240\u6709\u6ce8\u91ca" },
+                { CmdNoteCollapseAll, L"-", L"\u6536\u8d77\u6240\u6709\u6ce8\u91ca" },
+                { CmdNotePrev, L"<", L"\u4e0a\u4e00\u4e2a\u6ce8\u91ca" },
+                { CmdNoteNext, L">", L"\u4e0b\u4e00\u4e2a\u6ce8\u91ca" },
+                { CmdNoteDelete, L"x", L"\u5220\u9664\u5f53\u524d\u6ce8\u91ca" },
+                { CmdNoteDeleteAll, L"\u6e05", L"\u5220\u9664\u6240\u6709\u6ce8\u91ca" }
+            };
+            for (int i = 0; i < static_cast<int>(std::size(tools)); ++i)
+            {
+                RECT r{ buttonLeft + i * (buttonSize + buttonGap), buttonTop, buttonLeft + i * (buttonSize + buttonGap) + buttonSize, buttonTop + buttonSize };
+                AddButton(tools[i].id, r, tools[i].text, tools[i].tip);
+                DrawStatusHotArea(dc, r, 6);
+                Text(dc, tools[i].text, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+            }
+            RECT summary{ g_sidebar.left + S(14), g_sidebar.top + S(64), g_sidebar.right - S(14), g_sidebar.top + S(88) };
+            Text(dc, L"\u5171 " + std::to_wstring(tab.annotations.size()) + L" \u5904\u6ce8\u91ca", summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+
             int clipDc = SaveDC(dc);
-            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(42), g_sidebar.right, g_sidebar.bottom);
-            int y = g_sidebar.top + S(46) - g_sidebarScrollY;
-            int content = S(46);
+            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(90), g_sidebar.right, g_sidebar.bottom);
+            int y = g_sidebar.top + S(94) - g_sidebarScrollY;
+            int content = S(94);
+            int lastPage = -1;
             for (size_t i = 0; i < tab.annotations.size(); ++i)
             {
                 PdfAnnotation const& annotation = tab.annotations[i];
-                RECT row{ g_sidebar.left + S(10), y, g_sidebar.right - S(10), y + S(52) };
+                if (annotation.page != lastPage)
+                {
+                    lastPage = annotation.page;
+                    RECT pageRow{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(30) };
+                    if (visible(pageRow))
+                    {
+                        g_sidebarRowPages.push_back(annotation.page);
+                        g_sidebarRowRects.push_back(pageRow);
+                        g_sidebarRowIds.push_back(-100000 - annotation.page);
+                        bool collapsed = g_collapsedAnnotationPages.find(annotation.page) != g_collapsedAnnotationPages.end();
+                        bool hovered = Hit(pageRow, g_mousePos.x, g_mousePos.y);
+                        if (hovered) RoundFill(dc, pageRow, S(6), T().panel2, T().line);
+                        RECT twist{ pageRow.left + S(2), pageRow.top + S(7), pageRow.left + S(18), pageRow.bottom - S(7) };
+                        Text(dc, collapsed ? L"+" : L"-", twist, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+                        RECT pageText{ pageRow.left + S(24), pageRow.top, pageRow.right, pageRow.bottom };
+                        Text(dc, L"\u7b2c " + std::to_wstring(annotation.page + 1) + L" \u9875", pageText, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+                    }
+                    y += S(32);
+                    content += S(32);
+                }
+                if (g_collapsedAnnotationPages.find(annotation.page) != g_collapsedAnnotationPages.end()) continue;
+
+                RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(86) };
                 if (visible(row))
                 {
                     g_sidebarRowPages.push_back(annotation.page);
                     g_sidebarRowRects.push_back(row);
                     g_sidebarRowIds.push_back(static_cast<int>(i));
+                    bool selected = static_cast<int>(i) == g_activeAnnotation;
                     bool hovered = Hit(row, g_mousePos.x, g_mousePos.y);
-                    if (hovered) RoundFill(dc, row, S(7), T().panel2, T().line);
-                    COLORREF markColor = annotation.kind == AnnotationKind::Highlight ? RGB(235, 178, 42) :
-                        (annotation.kind == AnnotationKind::Underline ? T().accent : RGB(214, 86, 86));
-                    RECT swatch{ row.left + S(8), row.top + S(16), row.left + S(18), row.top + S(26) };
+                    if (hovered || selected)
+                    {
+                        COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.22 : 0.12) : T().panel2;
+                        COLORREF line = selected ? T().accent : T().line;
+                        RoundFill(dc, row, S(8), fill, line);
+                    }
+                    COLORREF markColor = AnnotationColor(annotation);
+                    RECT swatch{ row.left + S(10), row.top + S(12), row.left + S(22), row.top + S(24) };
                     Gdiplus::Graphics g(dc);
                     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
                     Gdiplus::SolidBrush brush(GdiColor(markColor));
                     g.FillEllipse(&brush, static_cast<float>(swatch.left), static_cast<float>(swatch.top), static_cast<float>(swatch.right - swatch.left), static_cast<float>(swatch.bottom - swatch.top));
-                    RECT text{ row.left + S(28), row.top + S(5), row.right - S(8), row.bottom - S(5) };
-                    std::wstring kind = annotation.kind == AnnotationKind::Highlight ? L"高亮" :
-                        (annotation.kind == AnnotationKind::Underline ? L"下划线" : L"删除线");
-                    std::wstring label = kind + L"  第 " + std::to_wstring(annotation.page + 1) + L" 页";
-                    Text(dc, label, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+                    RECT topText{ row.left + S(30), row.top + S(7), row.right - S(8), row.top + S(28) };
+                    Text(dc, AnnotationKindName(annotation.kind) + L"  10726", topText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+                    RECT timeText{ row.left + S(30), row.top + S(27), row.right - S(8), row.top + S(45) };
+                    Text(dc, FormatTimeMs(annotation.createdAt), timeText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+                    RECT preview{ row.left + S(10), row.top + S(48), row.right - S(10), row.bottom - S(8) };
+                    std::wstring body = !annotation.note.empty() ? annotation.note : annotation.text;
+                    Text(dc, body.empty() ? L"\u65e0\u6587\u672c\u5185\u5bb9" : ElideText(body, 48), preview, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS, T().muted);
                 }
-                y += S(56);
-                content += S(56);
+                y += S(92);
+                content += S(92);
             }
             if (tab.annotations.empty())
             {
-                RECT empty{ g_sidebar.left + S(14), g_sidebar.top + S(56), g_sidebar.right - S(14), g_sidebar.top + S(96) };
-                Text(dc, L"暂无注释", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+                RECT empty{ g_sidebar.left + S(14), g_sidebar.top + S(98), g_sidebar.right - S(14), g_sidebar.top + S(138) };
+                Text(dc, L"\u6682\u65e0\u6ce8\u91ca", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             }
             RestoreDC(dc, clipDc);
-            g_sidebarContentHeight = std::max(0, content - S(46));
+            g_sidebarContentHeight = std::max(0, content - S(94));
         }
         else
         {
@@ -3869,16 +4071,17 @@ namespace
                         RECT mark = DenormalizeAnnotationRect(annotation, pageRect);
                         RECT visibleMark{};
                         if (!IntersectRect(&visibleMark, &mark, &pageRect)) continue;
+                        COLORREF annotationColor = AnnotationColor(annotation);
                         if (annotation.kind == AnnotationKind::Highlight)
                         {
-                            AlphaFill(dc, visibleMark, RGB(255, 216, 84), IsDarkTheme() || IsAuroraTheme() ? 82 : 104);
+                            AlphaFill(dc, visibleMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 82 : 112);
                         }
                         else
                         {
                             int lineY = annotation.kind == AnnotationKind::Underline ?
                                 std::max(visibleMark.top, visibleMark.bottom - S(3)) :
                                 (visibleMark.top + visibleMark.bottom) / 2;
-                            HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(2)), annotation.kind == AnnotationKind::Underline ? T().accent : RGB(218, 84, 84));
+                            HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(2)), annotationColor);
                             HGDIOBJ oldMarkPen = SelectObject(dc, markPen);
                             MoveToEx(dc, visibleMark.left, lineY, nullptr);
                             LineTo(dc, visibleMark.right, lineY);
@@ -3918,6 +4121,136 @@ namespace
         }
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
+    }
+
+    std::wstring ElideText(std::wstring text, size_t maxChars)
+    {
+        if (text.size() <= maxChars) return text;
+        if (maxChars <= 1) return text.substr(0, maxChars);
+        return text.substr(0, maxChars - 1) + L"...";
+    }
+
+    void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client)
+    {
+        g_annotationToolbarRect = {};
+        g_annotationCopyRect = {};
+        g_annotationNoteRect = {};
+        g_annotationDeleteRect = {};
+        g_annotationFormatRect = {};
+        g_annotationNoteCloseRect = {};
+        g_annotationNotePanelRect = {};
+        g_annotationNoteInputRect = {};
+        g_annotationColorRects.clear();
+        if (!g_annotationToolbarOpen) return;
+
+        PdfAnnotation* annotation = nullptr;
+        if (!ActiveAnnotation(tab, annotation)) return;
+
+        RECT pageRect{};
+        if (!PageRectForPage(tab, annotation->page, pageRect)) return;
+        RECT mark = DenormalizeAnnotationRect(*annotation, pageRect);
+        g_annotationHitRect = mark;
+
+        int width = S(316);
+        int height = S(42);
+        int left = std::clamp(mark.left, g_stage.left + S(10), std::max(g_stage.left + S(10), g_stage.right - width - S(10)));
+        int top = mark.top - height - S(10);
+        if (top < g_stage.top + S(8)) top = std::min(mark.bottom + S(10), g_stage.bottom - height - S(8));
+        g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
+
+        DrawRoundedShadow(dc, g_annotationToolbarRect, S(11.0f), S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
+        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() || IsAuroraTheme() ? 214 : 236, S(11.0f));
+
+        HFONT f = Font(9);
+        HGDIOBJ oldFont = SelectObject(dc, f);
+        auto drawTool = [&](RECT r, const wchar_t* label, bool active = false)
+        {
+            bool hover = Hit(r, g_mousePos.x, g_mousePos.y);
+            if (hover || active) RoundFill(dc, r, S(7), hover ? T().panel2 : MixColor(T().panel2, T().accent, 0.10), hover ? T().line : T().panel2);
+            Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+        };
+
+        int x = g_annotationToolbarRect.left + S(8);
+        int y = g_annotationToolbarRect.top + S(7);
+        int h = S(28);
+        g_annotationCopyRect = RECT{ x, y, x + S(42), y + h };
+        drawTool(g_annotationCopyRect, L"复制");
+        x += S(46);
+        g_annotationNoteRect = RECT{ x, y, x + S(42), y + h };
+        drawTool(g_annotationNoteRect, L"便签", g_annotationNoteOpen);
+        x += S(46);
+        g_annotationDeleteRect = RECT{ x, y, x + S(42), y + h };
+        drawTool(g_annotationDeleteRect, L"删除");
+        x += S(49);
+        g_annotationFormatRect = RECT{ x, y, x + S(42), y + h };
+        drawTool(g_annotationFormatRect, L"格式");
+        x += S(50);
+
+        for (int i = 0; i < static_cast<int>(std::size(AnnotationPalette)); ++i)
+        {
+            RECT swatch{ x, y + S(5), x + S(18), y + S(23) };
+            g_annotationColorRects.push_back(swatch);
+            bool selected = i == annotation->colorIndex;
+            bool hover = Hit(swatch, g_mousePos.x, g_mousePos.y);
+            if (selected || hover)
+            {
+                RECT ring{ swatch.left - S(3), swatch.top - S(3), swatch.right + S(3), swatch.bottom + S(3) };
+                RoundFill(dc, ring, S(10), selected ? MixColor(T().panel2, T().accent, 0.18) : T().panel2, selected ? T().accent : T().line);
+            }
+            Gdiplus::Graphics g(dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::SolidBrush brush(GdiColor(AnnotationPalette[i]));
+            g.FillEllipse(&brush, static_cast<float>(swatch.left), static_cast<float>(swatch.top), static_cast<float>(swatch.right - swatch.left), static_cast<float>(swatch.bottom - swatch.top));
+            x += S(25);
+        }
+        SelectObject(dc, oldFont);
+        DeleteObject(f);
+
+        if (!g_annotationNoteOpen) return;
+        int panelW = S(260);
+        int panelH = S(214);
+        int panelLeft = std::min<int>(static_cast<int>(g_annotationToolbarRect.right) - panelW, static_cast<int>(client.right) - panelW - S(14));
+        panelLeft = std::max<int>(static_cast<int>(g_stage.left) + S(14), panelLeft);
+        int panelTop = std::min<int>(static_cast<int>(g_annotationToolbarRect.bottom) + S(8), static_cast<int>(client.bottom) - panelH - S(46));
+        panelTop = std::max<int>(static_cast<int>(g_stage.top) + S(14), panelTop);
+        g_annotationNotePanelRect = RECT{ panelLeft, panelTop, panelLeft + panelW, panelTop + panelH };
+        DrawRoundedShadow(dc, g_annotationNotePanelRect, S(12.0f), S(2), S(3), S(5), IsDarkTheme() ? 42 : 30);
+        GlassRoundedSurface(dc, g_annotationNotePanelRect, IsDarkTheme() || IsAuroraTheme() ? 224 : 242, S(12.0f));
+
+        HFONT titleFont = Font(10, FW_SEMIBOLD);
+        oldFont = SelectObject(dc, titleFont);
+        RECT title{ panelLeft + S(14), panelTop + S(10), panelLeft + S(160), panelTop + S(34) };
+        Text(dc, L"注释", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        g_annotationNoteCloseRect = RECT{ panelLeft + panelW - S(34), panelTop + S(8), panelLeft + panelW - S(10), panelTop + S(32) };
+        drawTool(g_annotationNoteCloseRect, L"x");
+        SelectObject(dc, oldFont);
+        DeleteObject(titleFont);
+
+        HFONT smallFont = Font(8);
+        oldFont = SelectObject(dc, smallFont);
+        RECT meta{ panelLeft + S(14), panelTop + S(36), panelLeft + panelW - S(14), panelTop + S(58) };
+        std::wstring metaText = L"10726  " + FormatTimeMs(annotation->createdAt);
+        Text(dc, metaText, meta, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+        SelectObject(dc, oldFont);
+        DeleteObject(smallFont);
+
+        g_annotationNoteInputRect = RECT{ panelLeft + S(14), panelTop + S(64), panelLeft + panelW - S(14), panelTop + panelH - S(14) };
+        RoundFill(dc, g_annotationNoteInputRect, S(8), T().paper, g_annotationNoteFocused ? T().accent : T().line);
+        RECT noteText{ g_annotationNoteInputRect.left + S(10), g_annotationNoteInputRect.top + S(8), g_annotationNoteInputRect.right - S(10), g_annotationNoteInputRect.bottom - S(8) };
+        std::wstring note = annotation->note.empty() ? L"点击输入注释..." : annotation->note;
+        Text(dc, note, noteText, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, annotation->note.empty() ? T().muted : T().text);
+        if (g_annotationNoteFocused && g_annotationNoteCaretVisible)
+        {
+            SIZE size{};
+            HFONT noteFont = Font(9);
+            oldFont = SelectObject(dc, noteFont);
+            GetTextExtentPoint32W(dc, annotation->note.c_str(), static_cast<int>(annotation->note.size()), &size);
+            SelectObject(dc, oldFont);
+            DeleteObject(noteFont);
+            int caretX = std::min(noteText.right - S(2), noteText.left + size.cx + S(1));
+            RECT caret{ caretX, noteText.top + S(2), caretX + std::max(1, S(1)), noteText.top + S(18) };
+            Fill(dc, caret, T().accent);
+        }
     }
 
     void PaintStatus(HDC dc, RECT client)
@@ -4092,6 +4425,8 @@ namespace
         }
         if (paintedPages) ClampScroll(g_hwnd);
         PaintMainScrollBar(dc, client, paintClip);
+        if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) || Intersects(paintClip, g_annotationNotePanelRect))
+            PaintAnnotationToolbar(dc, *tab, client);
     }
 
     void ShowThemeMenu(HWND hwnd)
@@ -4237,7 +4572,12 @@ namespace
         annotation.x1 = std::max(r.x0, r.x1);
         annotation.y1 = std::max(r.y0, r.y1);
         annotation.kind = kind;
+        annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : (kind == AnnotationKind::Underline ? 1 : 3);
+        annotation.createdAt = NowMs();
+        annotation.text = g_selectionText;
         tab->annotations.push_back(annotation);
+        g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
+        g_annotationToolbarOpen = true;
         tab->dirty = true;
         g_hasContentSelection = false;
         g_selectionQuads.clear();
@@ -4329,6 +4669,11 @@ namespace
             out.y0 = static_cast<float>(item.y0);
             out.x1 = static_cast<float>(item.x1);
             out.y1 = static_cast<float>(item.y1);
+            COLORREF color = AnnotationColor(item);
+            out.colorR = static_cast<float>(GetRValue(color)) / 255.0f;
+            out.colorG = static_cast<float>(GetGValue(color)) / 255.0f;
+            out.colorB = static_cast<float>(GetBValue(color)) / 255.0f;
+            out.opacity = item.kind == AnnotationKind::Highlight ? 0.45f : 1.0f;
             out.contents = notes.back().empty() ? nullptr : notes.back().c_str();
             annotations.push_back(out);
         }
@@ -4646,6 +4991,45 @@ namespace
             SetTimer(hwnd, 12, 500, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
+        case CmdNoteExpandAll:
+            g_collapsedAnnotationPages.clear();
+            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            break;
+        case CmdNoteCollapseAll:
+            if (tab)
+            {
+                g_collapsedAnnotationPages.clear();
+                for (auto const& annotation : tab->annotations) g_collapsedAnnotationPages.insert(annotation.page);
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
+            }
+            break;
+        case CmdNotePrev:
+            if (tab && !tab->annotations.empty())
+            {
+                int index = g_activeAnnotation < 0 ? 0 : (g_activeAnnotation + static_cast<int>(tab->annotations.size()) - 1) % static_cast<int>(tab->annotations.size());
+                SelectAnnotation(hwnd, *tab, index, true);
+            }
+            break;
+        case CmdNoteNext:
+            if (tab && !tab->annotations.empty())
+            {
+                int index = g_activeAnnotation < 0 ? 0 : (g_activeAnnotation + 1) % static_cast<int>(tab->annotations.size());
+                SelectAnnotation(hwnd, *tab, index, true);
+            }
+            break;
+        case CmdNoteDelete:
+            if (tab && g_activeAnnotation >= 0) DeleteAnnotation(hwnd, *tab, g_activeAnnotation);
+            break;
+        case CmdNoteDeleteAll:
+            if (tab && !tab->annotations.empty())
+            {
+                tab->annotations.clear();
+                tab->dirty = true;
+                ClearAnnotationFocus();
+                g_collapsedAnnotationPages.clear();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            break;
         case CmdTheme: ShowThemeMenu(hwnd); break;
         case CmdView: ShowViewMenuModern(hwnd); break;
         case CmdZoomMenu: ShowZoomMenu(hwnd); break;
@@ -4827,7 +5211,83 @@ namespace
         {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            if (PdfTab* tab = Active())
+            {
+                PdfAnnotation* annotation = nullptr;
+                if (ActiveAnnotation(*tab, annotation))
+                {
+                    if (Hit(g_annotationCopyRect, x, y))
+                    {
+                        CopyTextToClipboard(hwnd, annotation->text);
+                        return 0;
+                    }
+                    if (Hit(g_annotationNoteRect, x, y))
+                    {
+                        g_annotationNoteOpen = true;
+                        g_annotationNoteFocused = true;
+                        SetTimer(hwnd, 13, 500, nullptr);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (Hit(g_annotationDeleteRect, x, y))
+                    {
+                        DeleteAnnotation(hwnd, *tab, g_activeAnnotation);
+                        return 0;
+                    }
+                    for (size_t i = 0; i < g_annotationColorRects.size(); ++i)
+                    {
+                        if (Hit(g_annotationColorRects[i], x, y))
+                        {
+                            annotation->colorIndex = static_cast<int>(i);
+                            tab->dirty = true;
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                    }
+                    if (g_annotationNoteOpen)
+                    {
+                        if (Hit(g_annotationNoteCloseRect, x, y))
+                        {
+                            g_annotationNoteOpen = false;
+                            g_annotationNoteFocused = false;
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                        if (Hit(g_annotationNoteInputRect, x, y))
+                        {
+                            g_annotationNoteFocused = true;
+                            SetTimer(hwnd, 13, 500, nullptr);
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                    }
+                    if (Hit(g_annotationToolbarRect, x, y) || Hit(g_annotationNotePanelRect, x, y))
+                        return 0;
+                }
+            }
             bool hadTextSelection = g_hasContentSelection || !g_selectionQuads.empty();
+            bool clickedAnnotation = false;
+            if (PdfTab* tab = Active())
+            {
+                RECT hitRect{};
+                int annotationIndex = HitTestAnnotation(*tab, x, y, &hitRect);
+                if (annotationIndex >= 0)
+                {
+                    ClearTextSelection();
+                    g_activeAnnotation = annotationIndex;
+                    g_annotationHitRect = hitRect;
+                    g_annotationToolbarOpen = true;
+                    g_annotationNoteFocused = false;
+                    clickedAnnotation = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            if (g_annotationToolbarOpen && !clickedAnnotation)
+            {
+                ClearAnnotationFocus();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             if (hadTextSelection)
             {
                 ClearTextSelection();
@@ -5001,6 +5461,23 @@ namespace
                     if (Hit(g_sidebarRowRects[i], x, y))
                     {
                         int page = std::clamp(g_sidebarRowPages[i], 0, tab->pageCount - 1);
+                        if (g_sideMode == 3 && i < g_sidebarRowIds.size())
+                        {
+                            int rowId = g_sidebarRowIds[i];
+                            if (rowId <= -100000)
+                            {
+                                int notePage = -100000 - rowId;
+                                if (g_collapsedAnnotationPages.find(notePage) != g_collapsedAnnotationPages.end()) g_collapsedAnnotationPages.erase(notePage);
+                                else g_collapsedAnnotationPages.insert(notePage);
+                                InvalidateRect(hwnd, &g_sidebar, FALSE);
+                                return 0;
+                            }
+                            if (rowId >= 0 && rowId < static_cast<int>(tab->annotations.size()))
+                            {
+                                SelectAnnotation(hwnd, *tab, rowId, true);
+                                return 0;
+                            }
+                        }
                         if (g_sideMode == 0 && i < g_sidebarRowIds.size())
                         {
                             g_selectedOutlineRow = g_sidebarRowIds[i];
@@ -5382,6 +5859,18 @@ namespace
                 InvalidateRect(hwnd, &g_searchInputRect, FALSE);
                 return 0;
             }
+            if (wParam == 13)
+            {
+                if (!g_annotationNoteFocused)
+                {
+                    g_annotationNoteCaretVisible = true;
+                    KillTimer(hwnd, 13);
+                    return 0;
+                }
+                g_annotationNoteCaretVisible = !g_annotationNoteCaretVisible;
+                InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
+                return 0;
+            }
             break;
         case WM_MOUSEWHEEL:
         {
@@ -5518,6 +6007,46 @@ namespace
             }
             break;
         case WM_CHAR:
+            if (g_annotationNoteFocused)
+            {
+                PdfTab* tab = Active();
+                PdfAnnotation* annotation = nullptr;
+                if (!tab || !ActiveAnnotation(*tab, annotation))
+                {
+                    g_annotationNoteFocused = false;
+                    return 0;
+                }
+                bool changed = false;
+                if (wParam == VK_BACK)
+                {
+                    if (!annotation->note.empty())
+                    {
+                        annotation->note.pop_back();
+                        changed = true;
+                    }
+                }
+                else if (wParam == VK_RETURN)
+                {
+                    if (annotation->note.size() < 1000)
+                    {
+                        annotation->note.push_back(L'\n');
+                        changed = true;
+                    }
+                }
+                else if (wParam >= 32 && annotation->note.size() < 1000)
+                {
+                    annotation->note.push_back(static_cast<wchar_t>(wParam));
+                    changed = true;
+                }
+                if (changed)
+                {
+                    tab->dirty = true;
+                    g_annotationNoteCaretVisible = true;
+                    SetTimer(hwnd, 13, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (g_pageInputFocused)
             {
                 if (wParam == VK_BACK)
