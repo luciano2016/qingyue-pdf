@@ -8,6 +8,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -15,10 +16,12 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <stdexcept>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -395,6 +398,12 @@ namespace
     std::vector<RECT> g_sideTabRects;
     std::vector<RECT> g_searchResultRects;
     std::vector<int> g_searchResultIds;
+    constexpr UINT WM_QUIETPDF_FILE_CHANGED = WM_APP + 41;
+    std::mutex g_fileWatchMutex;
+    std::thread g_fileWatchThread;
+    HANDLE g_fileWatchDirHandle{};
+    HANDLE g_fileWatchStopEvent{};
+    std::atomic<unsigned long> g_fileWatchGeneration{ 0 };
     RECT g_mainScrollTrackRect{};
     RECT g_mainScrollThumbRect{};
     RECT g_stage{};
@@ -1894,6 +1903,150 @@ namespace
         return false;
     }
 
+    bool SameFileName(std::wstring const& a, std::wstring const& b)
+    {
+        return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
+    }
+
+    bool FileNotifyMentionsTarget(BYTE const* buffer, DWORD bytes, std::wstring const& targetFileName)
+    {
+        DWORD offset = 0;
+        while (offset < bytes)
+        {
+            auto const* info = reinterpret_cast<FILE_NOTIFY_INFORMATION const*>(buffer + offset);
+            std::wstring name(info->FileName, info->FileNameLength / sizeof(wchar_t));
+            if (SameFileName(name, targetFileName)) return true;
+            if (info->NextEntryOffset == 0) break;
+            offset += info->NextEntryOffset;
+        }
+        return false;
+    }
+
+    void FileWatchThreadProc(HWND hwnd, HANDLE directoryHandle, HANDLE stopEvent, std::wstring targetFileName, unsigned long generation)
+    {
+        std::vector<BYTE> buffer(64 * 1024);
+        HANDLE events[2] = { stopEvent, nullptr };
+
+        for (;;)
+        {
+            OVERLAPPED overlapped{};
+            events[1] = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!events[1]) break;
+            overlapped.hEvent = events[1];
+
+            DWORD notifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_ATTRIBUTES;
+            BOOL queued = ReadDirectoryChangesW(
+                directoryHandle,
+                buffer.data(),
+                static_cast<DWORD>(buffer.size()),
+                FALSE,
+                notifyFilter,
+                nullptr,
+                &overlapped,
+                nullptr);
+
+            if (!queued)
+            {
+                CloseHandle(events[1]);
+                break;
+            }
+
+            DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+            if (wait == WAIT_OBJECT_0)
+            {
+                CancelIoEx(directoryHandle, &overlapped);
+                DWORD ignored{};
+                GetOverlappedResult(directoryHandle, &overlapped, &ignored, TRUE);
+                CloseHandle(events[1]);
+                break;
+            }
+
+            DWORD bytes = 0;
+            bool changed = wait == WAIT_OBJECT_0 + 1 &&
+                GetOverlappedResult(directoryHandle, &overlapped, &bytes, FALSE) &&
+                bytes > 0 &&
+                FileNotifyMentionsTarget(buffer.data(), bytes, targetFileName);
+            CloseHandle(events[1]);
+
+            if (changed)
+            {
+                Sleep(180);
+                PostMessageW(hwnd, WM_QUIETPDF_FILE_CHANGED, static_cast<WPARAM>(generation), 0);
+            }
+        }
+
+        CloseHandle(directoryHandle);
+        CloseHandle(stopEvent);
+    }
+
+    void StopFileWatcher()
+    {
+        std::thread oldThread;
+        HANDLE stopEvent{};
+        HANDLE directoryHandle{};
+        {
+            std::lock_guard<std::mutex> lock(g_fileWatchMutex);
+            ++g_fileWatchGeneration;
+            stopEvent = g_fileWatchStopEvent;
+            directoryHandle = g_fileWatchDirHandle;
+            if (stopEvent) SetEvent(stopEvent);
+            if (directoryHandle) CancelIoEx(directoryHandle, nullptr);
+            oldThread = std::move(g_fileWatchThread);
+            g_fileWatchStopEvent = nullptr;
+            g_fileWatchDirHandle = nullptr;
+        }
+        if (oldThread.joinable()) oldThread.join();
+    }
+
+    void StartActiveFileWatcher(HWND hwnd)
+    {
+        StopFileWatcher();
+
+        PdfTab* tab = Active();
+        if (!hwnd || !tab || tab->path.empty()) return;
+
+        std::filesystem::path filePath(tab->path);
+        std::filesystem::path directory = filePath.parent_path();
+        std::wstring targetFileName = filePath.filename().wstring();
+        if (directory.empty() || targetFileName.empty()) return;
+
+        HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stopEvent) return;
+
+        HANDLE directoryHandle = CreateFileW(
+            directory.c_str(),
+            FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+            nullptr);
+        if (directoryHandle == INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(stopEvent);
+            return;
+        }
+
+        unsigned long generation = ++g_fileWatchGeneration;
+        std::thread thread;
+        try
+        {
+            thread = std::thread(FileWatchThreadProc, hwnd, directoryHandle, stopEvent, std::move(targetFileName), generation);
+        }
+        catch (...)
+        {
+            CloseHandle(directoryHandle);
+            CloseHandle(stopEvent);
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(g_fileWatchMutex);
+        g_fileWatchDirHandle = directoryHandle;
+        g_fileWatchStopEvent = stopEvent;
+        g_fileWatchThread = std::move(thread);
+    }
+
     void SetTitle()
     {
         auto* tab = Active();
@@ -2867,6 +3020,7 @@ namespace
         g_selectedOutlineRow = -1;
         UpdateRecent(*Active());
         SetTitle();
+        StartActiveFileWatcher(hwnd);
         SchedulePagePrefetch(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -4910,6 +5064,7 @@ namespace
         else g_active = std::clamp(g_active >= index ? g_active - 1 : g_active, 0, static_cast<int>(g_tabs.size()) - 1);
         g_scrollY = 0;
         SetTitle();
+        StartActiveFileWatcher(g_hwnd);
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 
@@ -4981,6 +5136,7 @@ namespace
         {
             for (int i = static_cast<int>(g_tabs.size()) - 1; i >= 0; --i) if (i != g_contextTab) CloseTab(i);
             g_active = 0;
+            StartActiveFileWatcher(hwnd);
             return;
         }
         if (id == 2103 && g_contextTab >= 0) { while (static_cast<int>(g_tabs.size()) > g_contextTab + 1) CloseTab(static_cast<int>(g_tabs.size()) - 1); return; }
@@ -5032,7 +5188,7 @@ namespace
 
         switch (id)
         {
-        case CmdHome: g_active = -1; SetTitle(); InvalidateRect(hwnd, nullptr, FALSE); break;
+        case CmdHome: g_active = -1; SetTitle(); StartActiveFileWatcher(hwnd); InvalidateRect(hwnd, nullptr, FALSE); break;
         case CmdOpen: OpenDialog(hwnd); break;
         case CmdSidebar: StartSidebarPanelAnimation(hwnd, !g_sidebarOpen); break;
         case CmdSearch:
@@ -5261,10 +5417,15 @@ namespace
                 panConfig.dwBlock = 0;
                 SetGestureConfig(hwnd, 0, 1, &panConfig, sizeof(panConfig));
             }
-            SetTimer(hwnd, 14, 1500, nullptr);
             return 0;
         case WM_ACTIVATEAPP:
             if (wParam) RefreshActiveFileIfChanged(hwnd);
+            return 0;
+        case WM_QUIETPDF_FILE_CHANGED:
+            if (static_cast<unsigned long>(wParam) == g_fileWatchGeneration.load())
+            {
+                RefreshActiveFileIfChanged(hwnd);
+            }
             return 0;
         case WM_DPICHANGED:
             g_dpi = HIWORD(wParam);
@@ -5498,6 +5659,7 @@ namespace
                     g_scrollY = 0;
                     g_selectedOutlineRow = -1;
                     SetTitle();
+                    StartActiveFileWatcher(hwnd);
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -5974,11 +6136,6 @@ namespace
                 InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
                 return 0;
             }
-            if (wParam == 14)
-            {
-                RefreshActiveFileIfChanged(hwnd);
-                return 0;
-            }
             break;
         case WM_MOUSEWHEEL:
         {
@@ -6216,6 +6373,7 @@ namespace
             return 0;
         case WM_DESTROY:
             if (g_immersive) ApplyImmersiveWindow(hwnd, false);
+            StopFileWatcher();
             for (auto& tab : g_tabs) TouchRecentProgress(*tab, false);
             for (auto& tab : g_tabs) DropTab(*tab);
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
