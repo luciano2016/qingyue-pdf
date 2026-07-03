@@ -196,6 +196,8 @@ namespace
         int cachedTheme{ -1 };
         int cachedThumbSize{};
         int cachedThumbTheme{ -1 };
+        std::filesystem::file_time_type fileStamp{};
+        bool hasFileStamp{};
         bool dirty{};
     };
 
@@ -1825,6 +1827,73 @@ namespace
         tab.ctx = nullptr;
     }
 
+    bool ReadFileStamp(const std::wstring& path, std::filesystem::file_time_type& stamp)
+    {
+        try
+        {
+            stamp = std::filesystem::last_write_time(path);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void UpdateTabFileStamp(PdfTab& tab)
+    {
+        tab.hasFileStamp = ReadFileStamp(tab.path, tab.fileStamp);
+    }
+
+    std::wstring LastErrorText(DWORD error)
+    {
+        if (!error) return L"未知错误";
+        wchar_t* buffer = nullptr;
+        DWORD length = FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            nullptr,
+            error,
+            0,
+            reinterpret_cast<wchar_t*>(&buffer),
+            0,
+            nullptr);
+        std::wstring text = length && buffer ? std::wstring(buffer, length) : (L"系统错误 " + std::to_wstring(error));
+        if (buffer) LocalFree(buffer);
+        while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ')) text.pop_back();
+        return text;
+    }
+
+    bool ReplacePdfOnDisk(const std::filesystem::path& source, const std::filesystem::path& temp, DWORD& lastError)
+    {
+        lastError = ERROR_SUCCESS;
+        std::filesystem::path backup = source;
+        backup += L".quietpdf-save.bak";
+        DeleteFileW(backup.c_str());
+
+        if (ReplaceFileW(source.c_str(), temp.c_str(), backup.c_str(), REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr))
+        {
+            DeleteFileW(backup.c_str());
+            return true;
+        }
+        lastError = GetLastError();
+
+        if (MoveFileExW(temp.c_str(), source.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            DeleteFileW(backup.c_str());
+            return true;
+        }
+        lastError = GetLastError();
+
+        if (CopyFileW(temp.c_str(), source.c_str(), FALSE))
+        {
+            DeleteFileW(temp.c_str());
+            DeleteFileW(backup.c_str());
+            return true;
+        }
+        lastError = GetLastError();
+        return false;
+    }
+
     void SetTitle()
     {
         auto* tab = Active();
@@ -2767,6 +2836,7 @@ namespace
         tab->pageCount = g_pdf.countPages(tab->ctx, tab->doc);
         tab->path = path;
         tab->name = std::filesystem::path(path).filename().wstring();
+        UpdateTabFileStamp(*tab);
         int restorePage = RecentPageForPath(path);
         tab->pages.resize(static_cast<size_t>(tab->pageCount));
         int probe = std::min(tab->pageCount, 1000);
@@ -4621,6 +4691,7 @@ namespace
             tab.pageCount = g_pdf.countPages(tab.ctx, tab.doc);
             tab.path = path;
             tab.name = std::filesystem::path(path).filename().wstring();
+            UpdateTabFileStamp(tab);
             tab.currentPage = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
             tab.zoom = zoom;
             tab.pages.resize(static_cast<size_t>(tab.pageCount));
@@ -4698,28 +4769,22 @@ namespace
 
         int page = tab.currentPage;
         double zoom = tab.zoom;
+        std::wstring originalPath = tab.path;
+        auto pendingAnnotations = tab.annotations;
+        bool pendingDirty = tab.dirty;
         DropTab(tab);
-        bool replaced = false;
-        try
-        {
-            std::filesystem::rename(temp, source);
-            replaced = true;
-        }
-        catch (...)
-        {
-            try
-            {
-                std::filesystem::copy_file(temp, source, std::filesystem::copy_options::overwrite_existing);
-                std::filesystem::remove(temp);
-                replaced = true;
-            }
-            catch (...) {}
-        }
+        Sleep(80);
+        DWORD replaceError = ERROR_SUCCESS;
+        bool replaced = ReplacePdfOnDisk(source, temp, replaceError);
 
         if (!replaced)
         {
-            ReloadPdfTab(tab, tab.path, page, zoom);
-            MessageBoxW(hwnd, L"PDF 已生成临时保存文件，但替换原文件失败。请确认文件没有被其它程序占用。", L"保存", MB_OK | MB_ICONWARNING);
+            ReloadPdfTab(tab, originalPath, page, zoom);
+            tab.annotations = std::move(pendingAnnotations);
+            tab.dirty = pendingDirty;
+            std::wstring msg = L"PDF 已生成临时保存文件，但替换原文件失败。\n\n原因：" + LastErrorText(replaceError) +
+                L"\n\n请确认这个 PDF 没有被其它程序占用。\n临时文件：\n" + temp.wstring();
+            MessageBoxW(hwnd, msg.c_str(), L"保存", MB_OK | MB_ICONWARNING);
             return;
         }
 
@@ -4731,6 +4796,31 @@ namespace
         TouchRecentProgress(tab, true);
         SetTitle();
         InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void RefreshActiveFileIfChanged(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab || tab->path.empty() || tab->dirty || !tab->hasFileStamp) return;
+        std::filesystem::file_time_type stamp{};
+        if (!ReadFileStamp(tab->path, stamp) || stamp == tab->fileStamp) return;
+
+        int page = tab->currentPage;
+        double zoom = tab->zoom;
+        int oldScroll = g_scrollY;
+        std::wstring path = tab->path;
+        if (ReloadPdfTab(*tab, path, page, zoom))
+        {
+            g_scrollY = oldScroll;
+            g_searchResults.clear();
+            g_searchCurrent = 0;
+            g_searchHasRun = false;
+            g_searchLastQuery.clear();
+            ClearAnnotationFocus();
+            ClearTextSelection();
+            SetTitle();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
     }
 
     void SaveAnnotationSidecar(HWND hwnd, PdfTab& tab)
@@ -5171,6 +5261,10 @@ namespace
                 panConfig.dwBlock = 0;
                 SetGestureConfig(hwnd, 0, 1, &panConfig, sizeof(panConfig));
             }
+            SetTimer(hwnd, 14, 1500, nullptr);
+            return 0;
+        case WM_ACTIVATEAPP:
+            if (wParam) RefreshActiveFileIfChanged(hwnd);
             return 0;
         case WM_DPICHANGED:
             g_dpi = HIWORD(wParam);
@@ -5878,6 +5972,11 @@ namespace
                 }
                 g_annotationNoteCaretVisible = !g_annotationNoteCaretVisible;
                 InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
+                return 0;
+            }
+            if (wParam == 14)
+            {
+                RefreshActiveFileIfChanged(hwnd);
                 return 0;
             }
             break;
