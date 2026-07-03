@@ -1903,26 +1903,7 @@ namespace
         return false;
     }
 
-    bool SameFileName(std::wstring const& a, std::wstring const& b)
-    {
-        return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
-    }
-
-    bool FileNotifyMentionsTarget(BYTE const* buffer, DWORD bytes, std::wstring const& targetFileName)
-    {
-        DWORD offset = 0;
-        while (offset < bytes)
-        {
-            auto const* info = reinterpret_cast<FILE_NOTIFY_INFORMATION const*>(buffer + offset);
-            std::wstring name(info->FileName, info->FileNameLength / sizeof(wchar_t));
-            if (SameFileName(name, targetFileName)) return true;
-            if (info->NextEntryOffset == 0) break;
-            offset += info->NextEntryOffset;
-        }
-        return false;
-    }
-
-    void FileWatchThreadProc(HWND hwnd, HANDLE directoryHandle, HANDLE stopEvent, std::wstring targetFileName, unsigned long generation)
+    void FileWatchThreadProc(HWND hwnd, HANDLE directoryHandle, HANDLE stopEvent, unsigned long generation)
     {
         std::vector<BYTE> buffer(64 * 1024);
         HANDLE events[2] = { stopEvent, nullptr };
@@ -1935,7 +1916,7 @@ namespace
             overlapped.hEvent = events[1];
 
             DWORD notifyFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
-                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_ATTRIBUTES;
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_CREATION;
             BOOL queued = ReadDirectoryChangesW(
                 directoryHandle,
                 buffer.data(),
@@ -1965,8 +1946,7 @@ namespace
             DWORD bytes = 0;
             bool changed = wait == WAIT_OBJECT_0 + 1 &&
                 GetOverlappedResult(directoryHandle, &overlapped, &bytes, FALSE) &&
-                bytes > 0 &&
-                FileNotifyMentionsTarget(buffer.data(), bytes, targetFileName);
+                bytes > 0;
             CloseHandle(events[1]);
 
             if (changed)
@@ -2008,8 +1988,7 @@ namespace
 
         std::filesystem::path filePath(tab->path);
         std::filesystem::path directory = filePath.parent_path();
-        std::wstring targetFileName = filePath.filename().wstring();
-        if (directory.empty() || targetFileName.empty()) return;
+        if (directory.empty() || filePath.filename().wstring().empty()) return;
 
         HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!stopEvent) return;
@@ -2032,7 +2011,7 @@ namespace
         std::thread thread;
         try
         {
-            thread = std::thread(FileWatchThreadProc, hwnd, directoryHandle, stopEvent, std::move(targetFileName), generation);
+            thread = std::thread(FileWatchThreadProc, hwnd, directoryHandle, stopEvent, generation);
         }
         catch (...)
         {
@@ -4955,7 +4934,7 @@ namespace
     void RefreshActiveFileIfChanged(HWND hwnd)
     {
         PdfTab* tab = Active();
-        if (!tab || tab->path.empty() || tab->dirty || !tab->hasFileStamp) return;
+        if (!tab || tab->path.empty() || !tab->hasFileStamp) return;
         std::filesystem::file_time_type stamp{};
         if (!ReadFileStamp(tab->path, stamp) || stamp == tab->fileStamp) return;
 
@@ -4963,8 +4942,15 @@ namespace
         double zoom = tab->zoom;
         int oldScroll = g_scrollY;
         std::wstring path = tab->path;
+        bool hadPendingAnnotations = tab->dirty;
+        auto pendingAnnotations = hadPendingAnnotations ? tab->annotations : std::vector<PdfAnnotation>{};
         if (ReloadPdfTab(*tab, path, page, zoom))
         {
+            if (hadPendingAnnotations)
+            {
+                tab->annotations = std::move(pendingAnnotations);
+                tab->dirty = true;
+            }
             g_scrollY = oldScroll;
             g_searchResults.clear();
             g_searchCurrent = 0;
