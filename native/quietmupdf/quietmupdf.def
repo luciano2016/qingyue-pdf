@@ -1,0 +1,26 @@
+LIBRARY quietmupdf
+EXPORTS
+    fz_new_context_imp
+    fz_drop_context
+    fz_register_document_handlers
+    fz_open_document
+    fz_count_pages
+    fz_drop_document
+    fz_load_outline
+    fz_drop_outline
+    fz_page_number_from_location
+    fz_set_aa_level
+    fz_scale
+    fz_load_page
+    fz_bound_page
+    fz_drop_page
+    fz_device_rgb
+    fz_new_pixmap_from_page_number
+    fz_search_page_number
+    fz_pixmap_width
+    fz_pixmap_height
+    fz_pixmap_components
+    fz_pixmap_stride
+    fz_pixmap_samples
+    fz_drop_pixmap
+    quiet_new_pixmap_from_page_number_clip

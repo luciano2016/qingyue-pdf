@@ -1,0 +1,15 @@
+build/
+dist/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+*.ipch
+*.pdb
+*.ilk
+*.obj
+*.exp
+*.log
+third_party/
+native/quietmupdf/out/*.obj
+native/quietmupdf/out/*.exp
