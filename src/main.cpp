@@ -2366,6 +2366,15 @@ namespace
         CloseClipboard();
     }
 
+    void ClearTextSelection()
+    {
+        g_selectingContent = false;
+        g_hasContentSelection = false;
+        g_selectionPage = -1;
+        g_selectionQuads.clear();
+        g_selectionText.clear();
+    }
+
     RECT SidebarScrollRect();
     int ClampSidebarScrollValue(int value);
     void RequestSidebarRepaint(HWND hwnd);
@@ -4804,6 +4813,12 @@ namespace
         {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            bool hadTextSelection = g_hasContentSelection || !g_selectionQuads.empty();
+            if (hadTextSelection)
+            {
+                ClearTextSelection();
+                InvalidateRect(hwnd, &g_stage, FALSE);
+            }
             g_searchInputFocused = false;
             if (g_pageInputFocused && !Hit(g_pageInputRect, x, y))
             {
@@ -4939,8 +4954,6 @@ namespace
                 {
                     g_selectingContent = true;
                     g_hasContentSelection = false;
-                    g_selectionQuads.clear();
-                    g_selectionText.clear();
                     g_selectionPage = page;
                     g_selectionStart = POINT{ x, y };
                     g_selectionEnd = POINT{ x, y };
@@ -4996,7 +5009,7 @@ namespace
         {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
-            if (g_hasContentSelection && Hit(CurrentSelectionRect(), x, y))
+            if (g_hasContentSelection && !g_selectionQuads.empty())
             {
                 POINT pt{ x, y };
                 ClientToScreen(hwnd, &pt);
@@ -5169,10 +5182,10 @@ namespace
         case WM_LBUTTONUP:
             if (g_selectingContent)
             {
-                g_selectingContent = false;
-                ReleaseCapture();
                 RECT selection = CurrentSelectionRect();
                 if (PdfTab* tab = Active()) RefreshTextSelection(*tab);
+                g_selectingContent = false;
+                ReleaseCapture();
                 g_hasContentSelection =
                     !g_selectionQuads.empty() &&
                     (selection.right - selection.left) >= S(8) &&
