@@ -12,6 +12,22 @@ struct quiet_pdf_annotation
     const char* contents;
 };
 
+static char quiet_last_error[512] = "";
+
+static void quiet_set_last_error(const char* message)
+{
+    if (!message) message = "";
+    size_t i = 0;
+    for (; i + 1 < sizeof(quiet_last_error) && message[i]; ++i)
+        quiet_last_error[i] = message[i];
+    quiet_last_error[i] = 0;
+}
+
+extern "C" const char* quiet_pdf_last_error()
+{
+    return quiet_last_error;
+}
+
 extern "C" int quietmupdf_anchor()
 {
     return 0;
@@ -64,8 +80,12 @@ extern "C" int quiet_pdf_save_annotations(
     const quiet_pdf_annotation* annotations,
     int annotation_count)
 {
+    quiet_set_last_error("");
     if (!ctx || !fzdoc || !filename || !annotations || annotation_count < 0)
+    {
+        quiet_set_last_error("invalid quiet_pdf_save_annotations arguments");
         return 0;
+    }
 
     pdf_document* doc = nullptr;
     int ok = 0;
@@ -102,9 +122,7 @@ extern "C" int quiet_pdf_save_annotations(
                 if (right - left >= 0.5f && bottom - top >= 0.5f)
                 {
                     annot = pdf_create_annot(ctx, page, type);
-                    fz_rect rect = fz_make_rect(left, top, right, bottom);
                     fz_quad quad = fz_make_quad(left, top, right, top, left, bottom, right, bottom);
-                    pdf_set_annot_rect(ctx, annot, rect);
                     pdf_set_annot_quad_points(ctx, annot, 1, &quad);
                     if (input.contents && input.contents[0])
                         pdf_set_annot_contents(ctx, annot, input.contents);
@@ -152,6 +170,7 @@ extern "C" int quiet_pdf_save_annotations(
     }
     fz_catch(ctx)
     {
+        quiet_set_last_error(fz_caught_message(ctx));
         ok = 0;
     }
 
