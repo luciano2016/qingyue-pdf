@@ -3754,14 +3754,11 @@ namespace
             if (closeHover)
             {
                 DrawSoftCircle(dc, closeCx, closeCy, S(8), RGB(255, 92, 92));
-                HPEN xPen = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(255, 255, 255));
-                HGDIOBJ oldXPen = SelectObject(dc, xPen);
-                MoveToEx(dc, closeCx - S(3), closeCy - S(3), nullptr);
-                LineTo(dc, closeCx + S(3), closeCy + S(3));
-                MoveToEx(dc, closeCx + S(3), closeCy - S(3), nullptr);
-                LineTo(dc, closeCx - S(3), closeCy + S(3));
-                SelectObject(dc, oldXPen);
-                DeleteObject(xPen);
+                DrawCloseGlyph(dc, close, RGB(255, 255, 255));
+            }
+            else if (hovered)
+            {
+                DrawCloseGlyph(dc, close, MixColor(T().muted, T().text, 0.12));
             }
             else if (active)
             {
@@ -4007,18 +4004,22 @@ namespace
                 DeleteObject(pdfFont);
             }
 
-            RECT starHot{ cover.right - S(36), cover.top + S(10), cover.right - S(8), cover.top + S(38) };
+            RECT starHot{ cover.right - S(39), cover.top + S(9), cover.right - S(9), cover.top + S(39) };
             AddHomeHit(starHot, recentIndex, HomeAction::Favorite, item.favorite ? L"取消收藏" : L"收藏");
-            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered, 7, false);
+            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered, 5, false);
 
-            RECT dock{ cover.left + S(15), cover.bottom - S(42), cover.right - S(15), cover.bottom - S(10) };
+            RECT dock{ cover.left + S(17), cover.bottom - S(45), cover.left + S(120), cover.bottom - S(13) };
+            if (hovered || item.pinned)
+            {
+                GlassRoundedSurface(dc, dock, IsDarkTheme() || IsAuroraTheme() ? 196 : 208, S(11.0f));
+            }
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
             const wchar_t* tips[] = { item.pinned ? L"取消置顶" : L"置顶", L"打开文件夹", L"删除记录" };
             for (int a = 0; a < 3; ++a)
             {
-                RECT hot{ dock.left + a * S(40), dock.top + S(2), dock.left + a * S(40) + S(28), dock.top + S(30) };
+                RECT hot{ dock.left + S(5) + a * S(32), dock.top + S(3), dock.left + S(5) + a * S(32) + S(26), dock.top + S(29) };
                 AddHomeHit(hot, recentIndex, actions[a], tips[a]);
-                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered, 7, false);
+                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered, 4, false);
             }
 
             RECT name{ tile.left, cover.bottom + S(8), tile.right, tile.bottom };
@@ -6252,7 +6253,7 @@ namespace
             }
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
-                RECT close{ g_tabRects[i].right - S(32), g_tabRects[i].top, g_tabRects[i].right, g_tabRects[i].bottom };
+                RECT close{ g_tabRects[i].right - S(30), g_tabRects[i].top + S(2), g_tabRects[i].right - S(5), g_tabRects[i].bottom - S(2) };
                 if (Hit(close, x, y)) { CloseTab(static_cast<int>(i)); return 0; }
                 if (Hit(g_tabRects[i], x, y))
                 {
@@ -6473,7 +6474,7 @@ namespace
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
                 if (Hit(g_tabRects[i], mx, my)) g_hoverTab = static_cast<int>(i);
-                RECT close{ g_tabRects[i].right - S(34), g_tabRects[i].top + S(3), g_tabRects[i].right - S(6), g_tabRects[i].bottom - S(3) };
+                RECT close{ g_tabRects[i].right - S(30), g_tabRects[i].top + S(2), g_tabRects[i].right - S(5), g_tabRects[i].bottom - S(2) };
                 if (Hit(close, mx, my))
                 {
                     g_hoverTabClose = static_cast<int>(i);
