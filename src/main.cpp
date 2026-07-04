@@ -471,6 +471,7 @@ namespace
     int g_hoverOutlineToggle{ -1 };
     int g_hoverSearchResult{ -1 };
     int g_hoverHomeHit{ -1 };
+    int g_hoverRecentRect{ -1 };
     int g_outlineCollapseVersion{};
     RECT g_pressedButtonRect{};
     RECT g_hoverButtonRect{};
@@ -1431,15 +1432,16 @@ namespace
         {
             Gdiplus::GraphicsPath path;
             Gdiplus::PointF points[] = {
-                { x + w * 0.36f, y + h * 0.10f },
-                { x + w * 0.70f, y + h * 0.10f },
-                { x + w * 0.62f, y + h * 0.36f },
+                { x + w * 0.32f, y + h * 0.12f },
+                { x + w * 0.68f, y + h * 0.12f },
+                { x + w * 0.60f, y + h * 0.36f },
                 { x + w * 0.78f, y + h * 0.56f },
-                { x + w * 0.54f, y + h * 0.58f },
-                { x + w * 0.48f, y + h * 0.90f },
-                { x + w * 0.39f, y + h * 0.58f },
-                { x + w * 0.16f, y + h * 0.56f },
-                { x + w * 0.34f, y + h * 0.36f }
+                { x + w * 0.58f, y + h * 0.56f },
+                { x + w * 0.52f, y + h * 0.88f },
+                { x + w * 0.48f, y + h * 0.88f },
+                { x + w * 0.42f, y + h * 0.56f },
+                { x + w * 0.22f, y + h * 0.56f },
+                { x + w * 0.40f, y + h * 0.36f }
             };
             path.AddLines(points, static_cast<INT>(std::size(points)));
             path.CloseFigure();
@@ -1460,12 +1462,14 @@ namespace
         }
         else if (action == HomeAction::Remove)
         {
-            Gdiplus::SolidBrush red(GdiColor(RGB(250, 78, 82)));
-            Gdiplus::Pen white(GdiColor(RGB(255, 255, 255)), std::max<Gdiplus::REAL>(2.4f, S(2.0f)));
+            float d = std::min(w, h) * 0.78f;
+            Gdiplus::RectF dot(x + (w - d) * 0.5f, y + (h - d) * 0.5f, d, d);
+            Gdiplus::SolidBrush red(GdiColor(color));
+            Gdiplus::Pen white(GdiColor(RGB(255, 255, 255)), std::max<Gdiplus::REAL>(1.7f, S(1.55f)));
             white.SetStartCap(Gdiplus::LineCapRound);
             white.SetEndCap(Gdiplus::LineCapRound);
-            g.FillEllipse(&red, rr);
-            g.DrawLine(&white, x + w * 0.28f, y + h * 0.50f, x + w * 0.72f, y + h * 0.50f);
+            g.FillEllipse(&red, dot);
+            g.DrawLine(&white, dot.X + dot.Width * 0.28f, dot.Y + dot.Height * 0.50f, dot.X + dot.Width * 0.72f, dot.Y + dot.Height * 0.50f);
         }
         else if (action == HomeAction::ClearAll)
         {
@@ -3842,20 +3846,24 @@ namespace
         return g_hoverHomeHit == static_cast<int>(index);
     }
 
-    void DrawHomeIconButton(HDC dc, RECT hot, HomeAction action, bool active, size_t hitIndex, bool visible = false)
+    void DrawHomeIconButton(HDC dc, RECT hot, HomeAction action, bool active, size_t hitIndex, bool visible = false, int iconInset = 6, bool hoverBackground = true)
     {
         bool hover = HomeHitHovered(hitIndex);
-        if (!visible && !hover && !active) return;
-        COLORREF fill = active ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.24 : 0.78) : (hover ? SidebarHoverFill() : T().panel2);
+        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &hot);
+        if (!visible && !hover && !active && !pressed) return;
+        COLORREF fill = pressed ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.34 : 0.70)
+            : (active ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.24 : 0.78) : (hover ? SidebarHoverFill() : T().panel2));
         COLORREF line = fill;
         if (action == HomeAction::Remove)
         {
-            fill = hover ? RGB(255, 238, 238) : T().panel2;
+            fill = pressed ? RGB(255, 224, 224) : (hover ? RGB(255, 238, 238) : T().panel2);
             line = fill;
         }
-        if (hover || active) RoundFill(dc, hot, S(7), fill, line);
-        RECT icon{ hot.left + S(6), hot.top + S(6), hot.right - S(6), hot.bottom - S(6) };
-        COLORREF color = action == HomeAction::Remove ? RGB(225, 92, 92) : (active ? T().accent : SidebarIconColor());
+        if (pressed || active || (hover && hoverBackground)) RoundFill(dc, hot, S(7), fill, line);
+        RECT icon{ hot.left + S(iconInset), hot.top + S(iconInset), hot.right - S(iconInset), hot.bottom - S(iconInset) };
+        COLORREF color = action == HomeAction::Remove
+            ? (hover || pressed ? RGB(238, 73, 78) : RGB(225, 92, 92))
+            : (pressed || hover || active ? T().accent : SidebarIconColor());
         DrawHomeIcon(dc, icon, action, color, active);
     }
 
@@ -3985,7 +3993,7 @@ namespace
             RECT tile{ x, y, x + tileW, y + tileH };
             g_recentRects.push_back(tile);
             RECT cover{ tile.left, tile.top, tile.right, tile.top + coverH };
-            bool hovered = Hit(cover, g_mousePos.x, g_mousePos.y) || Hit(tile, g_mousePos.x, g_mousePos.y);
+            bool hovered = Hit(cover, g_mousePos.x, g_mousePos.y);
             drawCoverFrame(cover, hovered || item.pinned);
             RECT inner{ cover.left + S(7), cover.top + S(7), cover.right - S(7), cover.bottom - S(7) };
             PageImage* thumb = LoadHomeThumb(item, inner.right - inner.left);
@@ -3999,18 +4007,18 @@ namespace
                 DeleteObject(pdfFont);
             }
 
-            RECT starHot{ cover.right - S(42), cover.top + S(10), cover.right - S(10), cover.top + S(42) };
+            RECT starHot{ cover.right - S(36), cover.top + S(10), cover.right - S(8), cover.top + S(38) };
             AddHomeHit(starHot, recentIndex, HomeAction::Favorite, item.favorite ? L"取消收藏" : L"收藏");
-            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered);
+            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered, 7, false);
 
-            RECT dock{ cover.left + S(14), cover.bottom - S(50), cover.right - S(14), cover.bottom - S(10) };
+            RECT dock{ cover.left + S(15), cover.bottom - S(42), cover.right - S(15), cover.bottom - S(10) };
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
             const wchar_t* tips[] = { item.pinned ? L"取消置顶" : L"置顶", L"打开文件夹", L"删除记录" };
             for (int a = 0; a < 3; ++a)
             {
-                RECT hot{ dock.left + a * S(45), dock.top, dock.left + a * S(45) + S(36), dock.bottom };
+                RECT hot{ dock.left + a * S(40), dock.top + S(2), dock.left + a * S(40) + S(28), dock.top + S(30) };
                 AddHomeHit(hot, recentIndex, actions[a], tips[a]);
-                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered);
+                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered, 7, false);
             }
 
             RECT name{ tile.left, cover.bottom + S(8), tile.right, tile.bottom };
@@ -4071,7 +4079,7 @@ namespace
                 RECT hot{ actionX + a * S(38), row.top + S(8), actionX + a * S(38) + S(30), row.top + S(38) };
                 AddHomeHit(hot, recentIndex, actions[a], tips[a]);
                 bool active = (actions[a] == HomeAction::Pin && item.pinned) || (actions[a] == HomeAction::Favorite && item.favorite);
-                DrawHomeIconButton(dc, hot, actions[a], active, g_homeHits.size() - 1, rowHover);
+                DrawHomeIconButton(dc, hot, actions[a], active, g_homeHits.size() - 1, rowHover, 5, true);
             }
             y += rowH;
         }
@@ -6277,6 +6285,10 @@ namespace
                 {
                     if (Hit(g_homeHits[i].rect, x, y))
                     {
+                        g_pressedButtonRect = g_homeHits[i].rect;
+                        g_hasPressedButton = true;
+                        SetTimer(hwnd, 2, 90, nullptr);
+                        InvalidateRect(hwnd, &g_homeHits[i].rect, FALSE);
                         if (HandleHomeAction(hwnd, g_homeHits[i].action, g_homeHits[i].recentIndex)) return 0;
                     }
                 }
@@ -6446,6 +6458,7 @@ namespace
             int oldHoverOutlineToggle = g_hoverOutlineToggle;
             int oldHoverSearchResult = g_hoverSearchResult;
             int oldHoverHomeHit = g_hoverHomeHit;
+            int oldHoverRecentRect = g_hoverRecentRect;
             bool oldHasHoverButton = g_hasHoverButton;
             RECT oldHoverButtonRect = g_hoverButtonRect;
             g_hoverTab = -1;
@@ -6454,6 +6467,7 @@ namespace
             g_hoverOutlineToggle = -1;
             g_hoverSearchResult = -1;
             g_hoverHomeHit = -1;
+            g_hoverRecentRect = -1;
             g_hasHoverButton = false;
             g_hoverButtonRect = RECT{};
             for (size_t i = 0; i < g_tabRects.size(); ++i)
@@ -6502,6 +6516,14 @@ namespace
             g_hoverTip.clear();
             if (!Active())
             {
+                for (size_t i = 0; i < g_recentRects.size(); ++i)
+                {
+                    if (Hit(g_recentRects[i], mx, my))
+                    {
+                        g_hoverRecentRect = static_cast<int>(i);
+                        break;
+                    }
+                }
                 for (size_t i = 0; i < g_homeHits.size(); ++i)
                 {
                     if (Hit(g_homeHits[i].rect, mx, my))
@@ -6532,7 +6554,7 @@ namespace
                     break;
                 }
             }
-            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit)
+            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect)
             {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
