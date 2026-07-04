@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdint>
 #include <ctime>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -418,6 +419,7 @@ namespace
     std::vector<RECT> g_tabRects;
     std::vector<RECT> g_recentRects;
     std::vector<HomeHit> g_homeHits;
+    std::vector<int> g_homeRecentIds;
     std::vector<int> g_sidebarRowPages;
     std::vector<RECT> g_sidebarRowRects;
     std::vector<int> g_sidebarRowIds;
@@ -474,6 +476,8 @@ namespace
     RECT g_hoverButtonRect{};
     RECT g_hoverTipRect{};
     RECT g_pageInputRect{};
+    RECT g_homeSearchRect{};
+    RECT g_homeSearchClearRect{};
     POINT g_mousePos{};
     bool g_sidebarOpen{ true };
     bool g_immersive{};
@@ -520,6 +524,7 @@ namespace
     std::wstring g_searchQuery;
     std::wstring g_searchLastQuery;
     std::wstring g_pageInputText;
+    std::wstring g_homeSearchQuery;
     std::vector<SearchResult> g_searchResults;
     std::set<int> g_collapsedOutlineRows;
     int g_mainScrollDragOffset{};
@@ -550,6 +555,8 @@ namespace
     std::set<int> g_collapsedAnnotationPages;
     bool g_continuousRead{ true };
     bool g_homeListView{};
+    bool g_homeSearchFocused{};
+    bool g_homeSearchCaretVisible{ true };
     bool g_confirmClearRecent{};
     RECT g_clearDialogConfirmRect{};
     RECT g_clearDialogCancelRect{};
@@ -1409,7 +1416,7 @@ namespace
 
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.35f, S(1.15f)));
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.65f, S(1.35f)));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -1451,7 +1458,16 @@ namespace
             g.DrawPath(&pen, &path);
             if (active) g.FillRectangle(&brush, body);
         }
-        else if (action == HomeAction::Remove || action == HomeAction::ClearAll)
+        else if (action == HomeAction::Remove)
+        {
+            Gdiplus::SolidBrush red(GdiColor(RGB(250, 78, 82)));
+            Gdiplus::Pen white(GdiColor(RGB(255, 255, 255)), std::max<Gdiplus::REAL>(2.4f, S(2.0f)));
+            white.SetStartCap(Gdiplus::LineCapRound);
+            white.SetEndCap(Gdiplus::LineCapRound);
+            g.FillEllipse(&red, rr);
+            g.DrawLine(&white, x + w * 0.28f, y + h * 0.50f, x + w * 0.72f, y + h * 0.50f);
+        }
+        else if (action == HomeAction::ClearAll)
         {
             g.DrawLine(&pen, x + w * 0.30f, y + h * 0.28f, x + w * 0.72f, y + h * 0.28f);
             g.DrawLine(&pen, x + w * 0.43f, y + h * 0.20f, x + w * 0.58f, y + h * 0.20f);
@@ -1953,6 +1969,35 @@ namespace
             if (a.pinned && b.pinned && a.pinnedAt != b.pinnedAt) return a.pinnedAt > b.pinnedAt;
             return a.openedAt > b.openedAt;
         });
+    }
+
+    std::wstring LowerCopy(std::wstring text)
+    {
+        std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch)
+        {
+            return static_cast<wchar_t>(std::towlower(ch));
+        });
+        return text;
+    }
+
+    bool HomeRecentMatches(RecentItem const& item)
+    {
+        if (g_homeSearchQuery.empty()) return true;
+        std::wstring query = LowerCopy(g_homeSearchQuery);
+        std::wstring name = LowerCopy(item.name);
+        std::wstring path = LowerCopy(item.path);
+        return name.find(query) != std::wstring::npos || path.find(query) != std::wstring::npos;
+    }
+
+    std::vector<int> FilteredHomeRecentIds()
+    {
+        std::vector<int> ids;
+        ids.reserve(g_recent.size());
+        for (int i = 0; i < static_cast<int>(g_recent.size()); ++i)
+        {
+            if (HomeRecentMatches(g_recent[static_cast<size_t>(i)])) ids.push_back(i);
+        }
+        return ids;
     }
 
     void LoadState()
@@ -3797,18 +3842,19 @@ namespace
         return g_hoverHomeHit == static_cast<int>(index);
     }
 
-    void DrawHomeIconButton(HDC dc, RECT hot, HomeAction action, bool active, size_t hitIndex)
+    void DrawHomeIconButton(HDC dc, RECT hot, HomeAction action, bool active, size_t hitIndex, bool visible = false)
     {
         bool hover = HomeHitHovered(hitIndex);
-        COLORREF fill = hover ? SidebarHoverFill() : MixColor(T().panel2, T().paper, IsDarkTheme() ? 0.08 : 0.22);
-        COLORREF line = active ? T().accent : (hover ? T().line : MixColor(T().line, T().paper, 0.28));
+        if (!visible && !hover && !active) return;
+        COLORREF fill = active ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.24 : 0.78) : (hover ? SidebarHoverFill() : T().panel2);
+        COLORREF line = fill;
         if (action == HomeAction::Remove)
         {
-            fill = hover ? RGB(255, 235, 235) : MixColor(T().panel2, RGB(255, 255, 255), 0.18);
-            line = hover ? RGB(238, 94, 94) : MixColor(T().line, RGB(238, 94, 94), 0.20);
+            fill = hover ? RGB(255, 238, 238) : T().panel2;
+            line = fill;
         }
-        RoundFill(dc, hot, S(8), fill, line);
-        RECT icon{ hot.left + S(7), hot.top + S(7), hot.right - S(7), hot.bottom - S(7) };
+        if (hover || active) RoundFill(dc, hot, S(7), fill, line);
+        RECT icon{ hot.left + S(6), hot.top + S(6), hot.right - S(6), hot.bottom - S(6) };
         COLORREF color = action == HomeAction::Remove ? RGB(225, 92, 92) : (active ? T().accent : SidebarIconColor());
         DrawHomeIcon(dc, icon, action, color, active);
     }
@@ -3834,12 +3880,36 @@ namespace
 
         HFONT f = Font(9);
         oldFont = SelectObject(dc, f);
-        RECT search{ S(42), S(162), std::min<int>(client.right - S(42), S(520)), S(204) };
-        RoundFill(dc, search, S(9), T().paper, T().line);
-        RECT searchIcon{ search.left + S(14), search.top + S(12), search.left + S(28), search.bottom - S(12) };
+        g_homeSearchRect = RECT{ S(42), S(158), std::min<int>(client.right - S(42), S(560)), S(204) };
+        RoundFill(dc, g_homeSearchRect, S(10), T().paper, g_homeSearchFocused ? T().accent : T().line);
+        RECT searchIcon{ g_homeSearchRect.left + S(14), g_homeSearchRect.top + S(13), g_homeSearchRect.left + S(31), g_homeSearchRect.bottom - S(13) };
         DrawSideTabIcon(dc, searchIcon, SideTabIcon::Search, MixColor(T().muted, T().text, 0.06));
-        RECT placeholder{ search.left + S(34), search.top, search.right - S(12), search.bottom };
-        Text(dc, L"搜索文档", placeholder, DT_LEFT | DT_VCENTER | DT_SINGLELINE, MixColor(T().muted, T().paper, 0.16));
+        g_homeSearchClearRect = RECT{ g_homeSearchRect.right - S(36), g_homeSearchRect.top + S(9), g_homeSearchRect.right - S(8), g_homeSearchRect.bottom - S(9) };
+        RECT inputText{ g_homeSearchRect.left + S(40), g_homeSearchRect.top, g_homeSearchRect.right - (g_homeSearchQuery.empty() ? S(14) : S(42)), g_homeSearchRect.bottom };
+        HFONT searchFont = Font(11);
+        HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
+        std::wstring shown = g_homeSearchQuery.empty() ? L"搜索文档" : g_homeSearchQuery;
+        Text(dc, shown, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            g_homeSearchQuery.empty() ? MixColor(T().muted, T().paper, 0.16) : T().text);
+        if (g_homeSearchFocused && g_homeSearchCaretVisible)
+        {
+            SIZE caretSize{};
+            GetTextExtentPoint32W(dc, g_homeSearchQuery.c_str(), static_cast<int>(g_homeSearchQuery.size()), &caretSize);
+            int caretX = std::min(inputText.right - S(2), inputText.left + caretSize.cx + S(2));
+            HPEN caretPen = CreatePen(PS_SOLID, std::max(1, S(1)), T().text);
+            HGDIOBJ oldCaret = SelectObject(dc, caretPen);
+            MoveToEx(dc, caretX, g_homeSearchRect.top + S(11), nullptr);
+            LineTo(dc, caretX, g_homeSearchRect.bottom - S(11));
+            SelectObject(dc, oldCaret);
+            DeleteObject(caretPen);
+        }
+        if (!g_homeSearchQuery.empty())
+        {
+            if (Hit(g_homeSearchClearRect, g_mousePos.x, g_mousePos.y)) RoundFill(dc, g_homeSearchClearRect, S(7), SidebarHoverFill(), SidebarHoverFill());
+            Text(dc, L"×", g_homeSearchClearRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+        }
+        SelectObject(dc, oldSearchFont);
+        DeleteObject(searchFont);
 
         int right = client.right - S(54);
         RECT clear{ right - S(112), S(168), right, S(200) };
@@ -3858,7 +3928,9 @@ namespace
     {
         g_recentRects.clear();
         g_homeHits.clear();
+        g_homeRecentIds.clear();
         PaintHomeHeader(dc, client);
+        g_homeRecentIds = FilteredHomeRecentIds();
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -3906,15 +3978,17 @@ namespace
         Text(dc, L"打开文档", openName, DT_CENTER | DT_TOP | DT_SINGLELINE, T().muted);
         advance();
 
-        for (size_t i = 0; i < g_recent.size() && i < 24; ++i)
+        for (size_t displayIndex = 0; displayIndex < g_homeRecentIds.size() && displayIndex < 24; ++displayIndex)
         {
+            int recentIndex = g_homeRecentIds[displayIndex];
+            RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
             RECT tile{ x, y, x + tileW, y + tileH };
             g_recentRects.push_back(tile);
             RECT cover{ tile.left, tile.top, tile.right, tile.top + coverH };
-            bool hovered = Hit(tile, g_mousePos.x, g_mousePos.y);
-            drawCoverFrame(cover, hovered || g_recent[i].pinned);
+            bool hovered = Hit(cover, g_mousePos.x, g_mousePos.y) || Hit(tile, g_mousePos.x, g_mousePos.y);
+            drawCoverFrame(cover, hovered || item.pinned);
             RECT inner{ cover.left + S(7), cover.top + S(7), cover.right - S(7), cover.bottom - S(7) };
-            PageImage* thumb = LoadHomeThumb(g_recent[i], inner.right - inner.left);
+            PageImage* thumb = LoadHomeThumb(item, inner.right - inner.left);
             if (thumb && !thumb->bgra.empty()) DrawImageFit(dc, *thumb, inner);
             else
             {
@@ -3925,25 +3999,28 @@ namespace
                 DeleteObject(pdfFont);
             }
 
-            RECT starHot{ cover.right - S(31), cover.top + S(7), cover.right - S(7), cover.top + S(31) };
-            AddHomeHit(starHot, static_cast<int>(i), HomeAction::Favorite, g_recent[i].favorite ? L"取消收藏" : L"收藏");
-            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, g_recent[i].favorite, g_homeHits.size() - 1);
+            RECT starHot{ cover.right - S(42), cover.top + S(10), cover.right - S(10), cover.top + S(42) };
+            AddHomeHit(starHot, recentIndex, HomeAction::Favorite, item.favorite ? L"取消收藏" : L"收藏");
+            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered);
 
-            RECT dock{ cover.left, cover.bottom - S(34), cover.right, cover.bottom };
-            Fill(dc, dock, MixColor(T().paper, RGB(255, 255, 255), IsDarkTheme() ? 0.06 : 0.34));
-            int bx = dock.left + S(12);
+            RECT dock{ cover.left + S(14), cover.bottom - S(50), cover.right - S(14), cover.bottom - S(10) };
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
-            const wchar_t* tips[] = { g_recent[i].pinned ? L"取消置顶" : L"置顶", L"打开文件夹", L"删除记录" };
+            const wchar_t* tips[] = { item.pinned ? L"取消置顶" : L"置顶", L"打开文件夹", L"删除记录" };
             for (int a = 0; a < 3; ++a)
             {
-                RECT hot{ bx + a * S(38), dock.top + S(5), bx + a * S(38) + S(24), dock.bottom - S(5) };
-                AddHomeHit(hot, static_cast<int>(i), actions[a], tips[a]);
-                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && g_recent[i].pinned, g_homeHits.size() - 1);
+                RECT hot{ dock.left + a * S(45), dock.top, dock.left + a * S(45) + S(36), dock.bottom };
+                AddHomeHit(hot, recentIndex, actions[a], tips[a]);
+                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered);
             }
 
             RECT name{ tile.left, cover.bottom + S(8), tile.right, tile.bottom };
-            Text(dc, g_recent[i].name, name, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, T().text);
+            Text(dc, item.name, name, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, T().text);
             advance();
+        }
+        if (!g_homeSearchQuery.empty() && g_homeRecentIds.empty())
+        {
+            RECT empty{ S(58), S(252), client.right - S(58), S(310) };
+            Text(dc, L"没有找到匹配的文档", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
         }
 
         SelectObject(dc, oldFont);
@@ -3954,46 +4031,54 @@ namespace
     {
         g_recentRects.clear();
         g_homeHits.clear();
+        g_homeRecentIds.clear();
         PaintHomeHeader(dc, client);
+        g_homeRecentIds = FilteredHomeRecentIds();
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
         int left = S(54);
         int top = S(242);
         int rowH = S(48);
-        int nameW = std::max<int>(S(300), (client.right - left - S(80)) * 36 / 100);
+        int actionX = client.right - S(188);
+        int sizeX = actionX - S(126);
+        int nameW = std::max<int>(S(300), (sizeX - left) * 34 / 100);
         int dateX = left + nameW;
         int dirX = dateX + S(180);
-        int sizeX = client.right - S(150);
         Text(dc, L"文档名称", RECT{ left, top, dateX - S(20), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         Text(dc, L"阅读时间", RECT{ dateX, top, dirX - S(20), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         Text(dc, L"所在目录", RECT{ dirX, top, sizeX - S(20), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        Text(dc, L"大小", RECT{ sizeX, top, client.right - S(54), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"大小", RECT{ sizeX, top, actionX - S(16), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         int y = top + S(48);
         g_recentRects.push_back(RECT{});
-        for (size_t i = 0; i < g_recent.size() && i < 80; ++i)
+        for (size_t displayIndex = 0; displayIndex < g_homeRecentIds.size() && displayIndex < 80; ++displayIndex)
         {
+            int recentIndex = g_homeRecentIds[displayIndex];
+            RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
             RECT row{ left - S(10), y, client.right - S(44), y + rowH };
             g_recentRects.push_back(row);
-            if (Hit(row, g_mousePos.x, g_mousePos.y)) RoundFill(dc, row, S(7), SidebarHoverFill(), SidebarHoverFill());
-            RECT star{ row.left + S(7), row.top + S(13), row.left + S(27), row.top + S(33) };
-            AddHomeHit(star, static_cast<int>(i), HomeAction::Favorite, g_recent[i].favorite ? L"取消收藏" : L"收藏");
-            DrawHomeIcon(dc, star, HomeAction::Favorite, g_recent[i].favorite ? RGB(246, 190, 58) : SidebarIconColor(), g_recent[i].favorite);
-            RECT pin{ row.left + S(32), row.top + S(13), row.left + S(52), row.top + S(33) };
-            AddHomeHit(pin, static_cast<int>(i), HomeAction::Pin, g_recent[i].pinned ? L"取消置顶" : L"置顶");
-            DrawHomeIcon(dc, pin, HomeAction::Pin, g_recent[i].pinned ? T().accent : SidebarIconColor(), g_recent[i].pinned);
-            RECT name{ left + S(48), row.top, dateX - S(20), row.bottom };
-            Text(dc, g_recent[i].name, name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
-            Text(dc, FormatDate(g_recent[i].openedAt), RECT{ dateX, row.top, dirX - S(20), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
-            Text(dc, std::filesystem::path(g_recent[i].path).parent_path().wstring(), RECT{ dirX, row.top, sizeX - S(20), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
-            Text(dc, FormatFileSize(g_recent[i].path), RECT{ sizeX, row.top, client.right - S(54), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
-            RECT folder{ row.right - S(86), row.top + S(12), row.right - S(66), row.top + S(32) };
-            AddHomeHit(folder, static_cast<int>(i), HomeAction::Folder, L"打开文件夹");
-            DrawHomeIcon(dc, folder, HomeAction::Folder, SidebarIconColor());
-            RECT remove{ row.right - S(42), row.top + S(12), row.right - S(22), row.top + S(32) };
-            AddHomeHit(remove, static_cast<int>(i), HomeAction::Remove, L"删除记录");
-            DrawHomeIcon(dc, remove, HomeAction::Remove, RGB(225, 92, 92));
+            bool rowHover = Hit(row, g_mousePos.x, g_mousePos.y);
+            if (rowHover) RoundFill(dc, row, S(7), SidebarHoverFill(), SidebarHoverFill());
+            RECT name{ left, row.top, dateX - S(20), row.bottom };
+            Text(dc, item.name, name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+            Text(dc, FormatDate(item.openedAt), RECT{ dateX, row.top, dirX - S(20), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            Text(dc, std::filesystem::path(item.path).parent_path().wstring(), RECT{ dirX, row.top, sizeX - S(20), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+            Text(dc, FormatFileSize(item.path), RECT{ sizeX, row.top, actionX - S(16), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Favorite, HomeAction::Remove };
+            const wchar_t* tips[] = { item.pinned ? L"取消置顶" : L"置顶", L"打开文件夹", item.favorite ? L"取消收藏" : L"收藏", L"删除记录" };
+            for (int a = 0; a < 4; ++a)
+            {
+                RECT hot{ actionX + a * S(38), row.top + S(8), actionX + a * S(38) + S(30), row.top + S(38) };
+                AddHomeHit(hot, recentIndex, actions[a], tips[a]);
+                bool active = (actions[a] == HomeAction::Pin && item.pinned) || (actions[a] == HomeAction::Favorite && item.favorite);
+                DrawHomeIconButton(dc, hot, actions[a], active, g_homeHits.size() - 1, rowHover);
+            }
             y += rowH;
+        }
+        if (!g_homeSearchQuery.empty() && g_homeRecentIds.empty())
+        {
+            RECT empty{ left, y, client.right - S(54), y + S(56) };
+            Text(dc, L"没有找到匹配的文档", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
         }
         SelectObject(dc, oldFont);
         DeleteObject(f);
@@ -5962,6 +6047,27 @@ namespace
                 }
                 return 0;
             }
+            if (!Active())
+            {
+                if (!g_homeSearchQuery.empty() && Hit(g_homeSearchClearRect, x, y))
+                {
+                    g_homeSearchQuery.clear();
+                    g_homeSearchFocused = true;
+                    g_homeSearchCaretVisible = true;
+                    SetTimer(hwnd, 15, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (Hit(g_homeSearchRect, x, y))
+                {
+                    g_homeSearchFocused = true;
+                    g_homeSearchCaretVisible = true;
+                    SetTimer(hwnd, 15, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                g_homeSearchFocused = false;
+            }
             if (PdfTab* tab = Active())
             {
                 PdfAnnotation* annotation = nullptr;
@@ -6179,7 +6285,15 @@ namespace
             {
                 if (!Hit(g_recentRects[i], x, y)) continue;
                 if (i == 0) OpenDialog(hwnd);
-                else if (i - 1 < g_recent.size() && std::filesystem::exists(g_recent[i - 1].path)) OpenPdf(hwnd, g_recent[i - 1].path);
+                else if (i - 1 < g_homeRecentIds.size())
+                {
+                    int recentIndex = g_homeRecentIds[i - 1];
+                    if (recentIndex >= 0 && recentIndex < static_cast<int>(g_recent.size()) &&
+                        std::filesystem::exists(g_recent[static_cast<size_t>(recentIndex)].path))
+                    {
+                        OpenPdf(hwnd, g_recent[static_cast<size_t>(recentIndex)].path);
+                    }
+                }
                 return 0;
             }
             if (PdfTab* tab = Active())
@@ -6658,6 +6772,18 @@ namespace
                 InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
                 return 0;
             }
+            if (wParam == 15)
+            {
+                if (!g_homeSearchFocused || Active())
+                {
+                    g_homeSearchCaretVisible = true;
+                    KillTimer(hwnd, 15);
+                    return 0;
+                }
+                g_homeSearchCaretVisible = !g_homeSearchCaretVisible;
+                InvalidateRect(hwnd, &g_homeSearchRect, FALSE);
+                return 0;
+            }
             break;
         case WM_MOUSEWHEEL:
         {
@@ -6762,6 +6888,14 @@ namespace
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'F')
             {
+                if (!Active())
+                {
+                    g_homeSearchFocused = true;
+                    g_homeSearchCaretVisible = true;
+                    SetTimer(hwnd, 15, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
                 g_sidebarOpen = true;
                 g_sideMode = 2;
                 g_searchInputFocused = true;
@@ -6776,6 +6910,12 @@ namespace
                 return 0;
             }
             if (wParam == VK_ESCAPE && g_pageInputFocused) { CancelPageInput(hwnd); return 0; }
+            if (wParam == VK_ESCAPE && g_homeSearchFocused)
+            {
+                g_homeSearchFocused = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (wParam == VK_ESCAPE && g_hasContentSelection) { g_hasContentSelection = false; InvalidateRect(hwnd, &g_stage, FALSE); return 0; }
             if (wParam == VK_ESCAPE && g_immersive) { ApplyImmersiveWindow(hwnd, false); return 0; }
             if (wParam == VK_NEXT)
@@ -6855,6 +6995,34 @@ namespace
                 GetClientRect(hwnd, &client);
                 RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
                 InvalidateRect(hwnd, &status, FALSE);
+                return 0;
+            }
+            if (g_homeSearchFocused && !Active())
+            {
+                bool changed = false;
+                if (wParam == VK_BACK)
+                {
+                    if (!g_homeSearchQuery.empty())
+                    {
+                        g_homeSearchQuery.pop_back();
+                        changed = true;
+                    }
+                }
+                else if (wParam == VK_RETURN)
+                {
+                    return 0;
+                }
+                else if (wParam >= 32 && g_homeSearchQuery.size() < 120)
+                {
+                    g_homeSearchQuery.push_back(static_cast<wchar_t>(wParam));
+                    changed = true;
+                }
+                if (changed)
+                {
+                    g_homeSearchCaretVisible = true;
+                    SetTimer(hwnd, 15, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
             }
             if (g_searchInputFocused && g_sideMode == 2)
