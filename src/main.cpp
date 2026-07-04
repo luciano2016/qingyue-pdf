@@ -133,6 +133,14 @@ namespace
         Strikeout = 2
     };
 
+    struct AnnotationSegment
+    {
+        double x0{};
+        double y0{};
+        double x1{};
+        double y1{};
+    };
+
     struct PdfAnnotation
     {
         int page{};
@@ -143,8 +151,11 @@ namespace
         AnnotationKind kind{ AnnotationKind::Highlight };
         int colorIndex{};
         long long createdAt{};
+        bool persisted{};
+        std::vector<AnnotationSegment> segments;
         std::wstring text;
         std::wstring note;
+        std::wstring author{ L"10726" };
     };
 
     struct QuietPdfAnnotation
@@ -159,7 +170,26 @@ namespace
         float colorG{ 0.82f };
         float colorB{ 0.24f };
         float opacity{ 0.45f };
+        long long createdAtMs{};
+        const char* author{};
         const char* contents{};
+    };
+
+    struct QuietPdfAnnotationInfo
+    {
+        int page{};
+        int kind{};
+        float x0{};
+        float y0{};
+        float x1{};
+        float y1{};
+        float colorR{};
+        float colorG{};
+        float colorB{};
+        float opacity{};
+        long long createdAtMs{};
+        char author[128]{};
+        char contents[512]{};
     };
 
     struct OutlineLayoutRow
@@ -334,6 +364,7 @@ namespace
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
+        using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
         using PixmapIntFn = int(__cdecl*)(fz_context*, fz_pixmap*);
         using PixmapSamplesFn = unsigned char*(__cdecl*)(fz_context*, fz_pixmap*);
@@ -363,6 +394,7 @@ namespace
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
             Get(searchPageNumber, "fz_search_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
+            Get(loadAnnotations, "quiet_pdf_load_annotations");
             Get(selectText, "quiet_pdf_select_text");
             Get(pixmapWidth, "fz_pixmap_width");
             Get(pixmapHeight, "fz_pixmap_height");
@@ -392,6 +424,7 @@ namespace
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
         SearchPageNumberFn searchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
+        LoadAnnotationsFn loadAnnotations{};
         SelectTextFn selectText{};
         PixmapIntFn pixmapWidth{};
         PixmapIntFn pixmapHeight{};
@@ -674,6 +707,29 @@ namespace
     {
         int index = std::clamp(annotation.colorIndex, 0, static_cast<int>(std::size(AnnotationPalette)) - 1);
         return AnnotationPalette[index];
+    }
+
+    int AnnotationColorIndexFromRgb(float r, float g, float b)
+    {
+        int rr = std::clamp<int>(static_cast<int>(r * 255.0f + 0.5f), 0, 255);
+        int gg = std::clamp<int>(static_cast<int>(g * 255.0f + 0.5f), 0, 255);
+        int bb = std::clamp<int>(static_cast<int>(b * 255.0f + 0.5f), 0, 255);
+        int best = 0;
+        int bestDistance = INT_MAX;
+        for (int i = 0; i < static_cast<int>(std::size(AnnotationPalette)); ++i)
+        {
+            COLORREF c = AnnotationPalette[i];
+            int dr = rr - GetRValue(c);
+            int dg = gg - GetGValue(c);
+            int db = bb - GetBValue(c);
+            int distance = dr * dr + dg * dg + db * db;
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        return best;
     }
 
     std::wstring AnnotationKindName(AnnotationKind kind)
@@ -2848,6 +2904,18 @@ namespace
         };
     }
 
+    RECT DenormalizeAnnotationSegment(AnnotationSegment const& segment, RECT pageRect)
+    {
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        return RECT{
+            pageRect.left + static_cast<int>(segment.x0 * pageW + 0.5),
+            pageRect.top + static_cast<int>(segment.y0 * pageH + 0.5),
+            pageRect.left + static_cast<int>(segment.x1 * pageW + 0.5),
+            pageRect.top + static_cast<int>(segment.y1 * pageH + 0.5)
+        };
+    }
+
     RECT CurrentSelectionRect()
     {
         if (!g_hasContentSelection && !g_selectingContent) return RECT{};
@@ -2925,6 +2993,7 @@ namespace
     }
 
     void ScrollToPage(PdfTab& tab, int page);
+    void LoadAnnotationsFromPdf(PdfTab& tab);
 
     void ClearAnnotationFocus()
     {
@@ -3253,6 +3322,7 @@ namespace
             CollectOutline(*tab, outline, 0);
             g_pdf.dropOutline(tab->ctx, outline);
         }
+        LoadAnnotationsFromPdf(*tab);
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
         if (auto* active = Active())
@@ -3437,6 +3507,7 @@ namespace
     void ScrollStageTo(HWND hwnd, int newScrollY)
     {
         PdfTab* tab = Active();
+        int oldPage = tab ? tab->currentPage : -1;
         if (tab)
         {
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
@@ -3457,7 +3528,7 @@ namespace
             return;
         }
 
-        RequestStageRepaint(hwnd, false);
+        RequestStageRepaint(hwnd, tab && oldPage != tab->currentPage);
         UpdateVertScrollBar(hwnd);
         SchedulePagePrefetch(hwnd);
     }
@@ -4484,7 +4555,7 @@ namespace
                     Gdiplus::SolidBrush brush(GdiColor(markColor));
                     g.FillEllipse(&brush, static_cast<float>(swatch.left), static_cast<float>(swatch.top), static_cast<float>(swatch.right - swatch.left), static_cast<float>(swatch.bottom - swatch.top));
                     RECT topText{ row.left + S(30), row.top + S(7), row.right - S(8), row.top + S(28) };
-                    Text(dc, AnnotationKindName(annotation.kind) + L"  10726", topText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+                    Text(dc, AnnotationKindName(annotation.kind) + L"  " + (annotation.author.empty() ? L"10726" : annotation.author), topText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
                     RECT timeText{ row.left + S(30), row.top + S(27), row.right - S(8), row.top + S(45) };
                     Text(dc, FormatTimeMs(annotation.createdAt), timeText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
                     RECT preview{ row.left + S(10), row.top + S(48), row.right - S(10), row.bottom - S(8) };
@@ -4773,26 +4844,34 @@ namespace
                     for (PdfAnnotation const& annotation : tab.annotations)
                     {
                         if (annotation.page != i) continue;
-                        RECT mark = DenormalizeAnnotationRect(annotation, pageRect);
-                        RECT visibleMark{};
-                        if (!IntersectRect(&visibleMark, &mark, &pageRect)) continue;
                         COLORREF annotationColor = AnnotationColor(annotation);
-                        if (annotation.kind == AnnotationKind::Highlight)
+                        auto drawSegment = [&](RECT mark)
                         {
-                            AlphaFill(dc, visibleMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 82 : 112);
-                        }
-                        else
+                            RECT visibleMark{};
+                            if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
+                            if (annotation.kind == AnnotationKind::Highlight)
+                            {
+                                AlphaFill(dc, visibleMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 76 : 132);
+                            }
+                            else
+                            {
+                                int lineY = annotation.kind == AnnotationKind::Underline ?
+                                    std::min(pageRect.bottom - 1, visibleMark.bottom + S(1)) :
+                                    (visibleMark.top + visibleMark.bottom) / 2;
+                                HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(annotation.kind == AnnotationKind::Underline ? 1 : 2)), annotationColor);
+                                HGDIOBJ oldMarkPen = SelectObject(dc, markPen);
+                                MoveToEx(dc, visibleMark.left, lineY, nullptr);
+                                LineTo(dc, visibleMark.right, lineY);
+                                SelectObject(dc, oldMarkPen);
+                                DeleteObject(markPen);
+                            }
+                        };
+                        if (!annotation.segments.empty())
                         {
-                            int lineY = annotation.kind == AnnotationKind::Underline ?
-                                std::max(visibleMark.top, visibleMark.bottom - S(3)) :
-                                (visibleMark.top + visibleMark.bottom) / 2;
-                            HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(2)), annotationColor);
-                            HGDIOBJ oldMarkPen = SelectObject(dc, markPen);
-                            MoveToEx(dc, visibleMark.left, lineY, nullptr);
-                            LineTo(dc, visibleMark.right, lineY);
-                            SelectObject(dc, oldMarkPen);
-                            DeleteObject(markPen);
+                            for (auto const& segment : annotation.segments)
+                                drawSegment(DenormalizeAnnotationSegment(segment, pageRect));
                         }
+                        else drawSegment(DenormalizeAnnotationRect(annotation, pageRect));
                     }
                     if ((g_hasContentSelection || g_selectingContent) && g_selectionPage == i)
                     {
@@ -4934,7 +5013,7 @@ namespace
         HFONT smallFont = Font(8);
         oldFont = SelectObject(dc, smallFont);
         RECT meta{ panelLeft + S(14), panelTop + S(36), panelLeft + panelW - S(14), panelTop + S(58) };
-        std::wstring metaText = L"10726  " + FormatTimeMs(annotation->createdAt);
+        std::wstring metaText = (annotation->author.empty() ? L"10726" : annotation->author) + L"  " + FormatTimeMs(annotation->createdAt);
         Text(dc, metaText, meta, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
         SelectObject(dc, oldFont);
         DeleteObject(smallFont);
@@ -4961,6 +5040,7 @@ namespace
     void PaintStatus(HDC dc, RECT client)
     {
         PdfTab* tab = Active();
+        if (!tab && !g_immersive) return;
         if (g_immersive)
         {
             RECT panel{ client.right - S(154), client.bottom - S(48), client.right - S(18), client.bottom - S(21) };
@@ -5280,7 +5360,19 @@ namespace
         annotation.kind = kind;
         annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : (kind == AnnotationKind::Underline ? 1 : 3);
         annotation.createdAt = NowMs();
+        annotation.author = L"10726";
         annotation.text = g_selectionText;
+        for (fz_quad const& quad : g_selectionQuads)
+        {
+            double sx0 = std::min({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+            double sy0 = std::min({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            double sx1 = std::max({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+            double sy1 = std::max({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            if (sx1 - sx0 >= 0.002 && sy1 - sy0 >= 0.002)
+                annotation.segments.push_back(AnnotationSegment{ sx0, sy0, sx1, sy1 });
+        }
+        if (annotation.segments.empty())
+            annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
         tab->annotations.push_back(annotation);
         g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
         g_annotationToolbarOpen = true;
@@ -5289,6 +5381,39 @@ namespace
         g_selectionQuads.clear();
         g_selectionText.clear();
         InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void LoadAnnotationsFromPdf(PdfTab& tab)
+    {
+        tab.annotations.clear();
+        if (!g_pdf.loadAnnotations || !tab.ctx || !tab.doc || tab.pageCount <= 0) return;
+
+        constexpr int MaxPdfAnnotations = 4096;
+        std::vector<QuietPdfAnnotationInfo> items(MaxPdfAnnotations);
+        int count = g_pdf.loadAnnotations(tab.ctx, tab.doc, items.data(), static_cast<int>(items.size()));
+        if (count <= 0) return;
+        count = std::min<int>(count, static_cast<int>(items.size()));
+        tab.annotations.reserve(static_cast<size_t>(count));
+        for (int i = 0; i < count; ++i)
+        {
+            QuietPdfAnnotationInfo const& item = items[static_cast<size_t>(i)];
+            PdfAnnotation annotation;
+            annotation.page = std::clamp(item.page, 0, tab.pageCount - 1);
+            annotation.x0 = std::clamp<double>(item.x0, 0.0, 1.0);
+            annotation.y0 = std::clamp<double>(item.y0, 0.0, 1.0);
+            annotation.x1 = std::clamp<double>(item.x1, 0.0, 1.0);
+            annotation.y1 = std::clamp<double>(item.y1, 0.0, 1.0);
+            annotation.kind = item.kind == 1 ? AnnotationKind::Underline : (item.kind == 2 ? AnnotationKind::Strikeout : AnnotationKind::Highlight);
+            annotation.colorIndex = AnnotationColorIndexFromRgb(item.colorR, item.colorG, item.colorB);
+            annotation.createdAt = item.createdAtMs > 0 ? item.createdAtMs : NowMs();
+            annotation.persisted = true;
+            annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
+            annotation.author = FromUtf8(item.author);
+            if (annotation.author.empty()) annotation.author = L"10726";
+            annotation.note = FromUtf8(item.contents);
+            annotation.text = annotation.note;
+            tab.annotations.push_back(std::move(annotation));
+        }
     }
 
     bool ReloadPdfTab(PdfTab& tab, const std::wstring& path, int page, double zoom)
@@ -5337,6 +5462,7 @@ namespace
                 CollectOutline(tab, outline, 0);
                 g_pdf.dropOutline(tab.ctx, outline);
             }
+            LoadAnnotationsFromPdf(tab);
             if (g_continuousRead) ScrollToPage(tab, tab.currentPage);
             else g_scrollY = 0;
             return true;
@@ -5363,26 +5489,48 @@ namespace
         try { std::filesystem::remove(temp); } catch (...) {}
 
         std::vector<std::string> notes;
+        std::vector<std::string> authors;
         std::vector<QuietPdfAnnotation> annotations;
         notes.reserve(tab.annotations.size());
+        authors.reserve(tab.annotations.size());
         annotations.reserve(tab.annotations.size());
         for (auto const& item : tab.annotations)
         {
+            if (item.persisted) continue;
             notes.push_back(ToUtf8(item.note));
-            QuietPdfAnnotation out;
-            out.page = item.page;
-            out.kind = static_cast<int>(item.kind);
-            out.x0 = static_cast<float>(item.x0);
-            out.y0 = static_cast<float>(item.y0);
-            out.x1 = static_cast<float>(item.x1);
-            out.y1 = static_cast<float>(item.y1);
+            authors.push_back(ToUtf8(item.author.empty() ? L"10726" : item.author));
             COLORREF color = AnnotationColor(item);
-            out.colorR = static_cast<float>(GetRValue(color)) / 255.0f;
-            out.colorG = static_cast<float>(GetGValue(color)) / 255.0f;
-            out.colorB = static_cast<float>(GetBValue(color)) / 255.0f;
-            out.opacity = item.kind == AnnotationKind::Highlight ? 0.45f : 1.0f;
-            out.contents = notes.back().empty() ? nullptr : notes.back().c_str();
-            annotations.push_back(out);
+            auto pushAnnotation = [&](double x0, double y0, double x1, double y1)
+            {
+                QuietPdfAnnotation out;
+                out.page = item.page;
+                out.kind = static_cast<int>(item.kind);
+                out.x0 = static_cast<float>(x0);
+                out.y0 = static_cast<float>(y0);
+                out.x1 = static_cast<float>(x1);
+                out.y1 = static_cast<float>(y1);
+                out.colorR = static_cast<float>(GetRValue(color)) / 255.0f;
+                out.colorG = static_cast<float>(GetGValue(color)) / 255.0f;
+                out.colorB = static_cast<float>(GetBValue(color)) / 255.0f;
+                out.opacity = item.kind == AnnotationKind::Highlight ? 0.45f : 1.0f;
+                out.createdAtMs = item.createdAt > 0 ? item.createdAt : NowMs();
+                out.author = authors.back().empty() ? "10726" : authors.back().c_str();
+                out.contents = notes.back().empty() ? nullptr : notes.back().c_str();
+                annotations.push_back(out);
+            };
+            if (!item.segments.empty())
+            {
+                for (auto const& segment : item.segments)
+                    pushAnnotation(segment.x0, segment.y0, segment.x1, segment.y1);
+            }
+            else pushAnnotation(item.x0, item.y0, item.x1, item.y1);
+        }
+        if (annotations.empty())
+        {
+            tab.dirty = false;
+            SetTitle();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
         }
 
         std::string tempUtf8 = ToUtf8(temp.wstring());

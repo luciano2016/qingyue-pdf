@@ -1,5 +1,8 @@
 #include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+#include <ctime>
+#include <cstring>
+#include <cstdint>
 
 struct quiet_pdf_annotation
 {
@@ -13,7 +16,26 @@ struct quiet_pdf_annotation
     float color_g;
     float color_b;
     float opacity;
+    int64_t created_at_ms;
+    const char* author;
     const char* contents;
+};
+
+struct quiet_pdf_annotation_info
+{
+    int page;
+    int kind;
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+    float color_r;
+    float color_g;
+    float color_b;
+    float opacity;
+    int64_t created_at_ms;
+    char author[128];
+    char contents[512];
 };
 
 static char quiet_last_error[512] = "";
@@ -25,6 +47,18 @@ static void quiet_set_last_error(const char* message)
     for (; i + 1 < sizeof(quiet_last_error) && message[i]; ++i)
         quiet_last_error[i] = message[i];
     quiet_last_error[i] = 0;
+}
+
+static void quiet_copy_text(char* dst, size_t cap, const char* src)
+{
+    if (!dst || cap == 0)
+        return;
+    if (!src)
+        src = "";
+    size_t i = 0;
+    for (; i + 1 < cap && src[i]; ++i)
+        dst[i] = src[i];
+    dst[i] = 0;
 }
 
 extern "C" const char* quiet_pdf_last_error()
@@ -128,6 +162,10 @@ extern "C" int quiet_pdf_save_annotations(
                     annot = pdf_create_annot(ctx, page, type);
                     fz_quad quad = fz_make_quad(left, top, right, top, left, bottom, right, bottom);
                     pdf_set_annot_quad_points(ctx, annot, 1, &quad);
+                    int64_t date = input.created_at_ms > 0 ? input.created_at_ms / 1000 : static_cast<int64_t>(time(nullptr));
+                    pdf_set_annot_creation_date(ctx, annot, date);
+                    pdf_set_annot_modification_date(ctx, annot, date);
+                    pdf_set_annot_author(ctx, annot, (input.author && input.author[0]) ? input.author : "10726");
                     if (input.contents && input.contents[0])
                         pdf_set_annot_contents(ctx, annot, input.contents);
 
@@ -179,6 +217,118 @@ extern "C" int quiet_pdf_save_annotations(
     }
 
     return ok;
+}
+
+extern "C" int quiet_pdf_load_annotations(
+    fz_context* ctx,
+    fz_document* fzdoc,
+    quiet_pdf_annotation_info* out,
+    int max_annotations)
+{
+    quiet_set_last_error("");
+    if (!ctx || !fzdoc || !out || max_annotations <= 0)
+    {
+        quiet_set_last_error("invalid quiet_pdf_load_annotations arguments");
+        return 0;
+    }
+
+    pdf_document* doc = nullptr;
+    int count = 0;
+
+    fz_try(ctx)
+    {
+        doc = pdf_specifics(ctx, fzdoc);
+        if (!doc)
+            fz_throw(ctx, FZ_ERROR_FORMAT, "document is not a PDF");
+
+        int page_count = pdf_count_pages(ctx, doc);
+        for (int page_index = 0; page_index < page_count && count < max_annotations; ++page_index)
+        {
+            pdf_page* page = nullptr;
+            fz_try(ctx)
+            {
+                page = pdf_load_page(ctx, doc, page_index);
+                fz_rect bounds = pdf_bound_page(ctx, page, FZ_CROP_BOX);
+                float page_w = bounds.x1 - bounds.x0;
+                float page_h = bounds.y1 - bounds.y0;
+                if (page_w > 0 && page_h > 0)
+                {
+                    for (pdf_annot* annot = pdf_first_annot(ctx, page); annot && count < max_annotations; annot = pdf_next_annot(ctx, annot))
+                    {
+                        enum pdf_annot_type type = pdf_annot_type(ctx, annot);
+                        int kind = -1;
+                        if (type == PDF_ANNOT_HIGHLIGHT) kind = 0;
+                        else if (type == PDF_ANNOT_UNDERLINE) kind = 1;
+                        else if (type == PDF_ANNOT_STRIKE_OUT) kind = 2;
+                        if (kind < 0)
+                            continue;
+
+                        fz_rect rect = fz_invalid_rect;
+                        int quad_count = pdf_annot_quad_point_count(ctx, annot);
+                        if (quad_count > 0)
+                        {
+                            for (int q = 0; q < quad_count; ++q)
+                            {
+                                fz_rect qr = fz_rect_from_quad(pdf_annot_quad_point(ctx, annot, q));
+                                if (q == 0) rect = qr;
+                                else
+                                {
+                                    if (qr.x0 < rect.x0) rect.x0 = qr.x0;
+                                    if (qr.y0 < rect.y0) rect.y0 = qr.y0;
+                                    if (qr.x1 > rect.x1) rect.x1 = qr.x1;
+                                    if (qr.y1 > rect.y1) rect.y1 = qr.y1;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            rect = pdf_annot_rect(ctx, annot);
+                        }
+
+                        if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                            continue;
+
+                        quiet_pdf_annotation_info& item = out[count];
+                        std::memset(&item, 0, sizeof(item));
+                        item.page = page_index;
+                        item.kind = kind;
+                        item.x0 = fz_clamp((rect.x0 - bounds.x0) / page_w, 0.0f, 1.0f);
+                        item.y0 = fz_clamp((rect.y0 - bounds.y0) / page_h, 0.0f, 1.0f);
+                        item.x1 = fz_clamp((rect.x1 - bounds.x0) / page_w, 0.0f, 1.0f);
+                        item.y1 = fz_clamp((rect.y1 - bounds.y0) / page_h, 0.0f, 1.0f);
+                        float color[4] = { 1.0f, 0.82f, 0.0f, 1.0f };
+                        int n = 0;
+                        pdf_annot_color(ctx, annot, &n, color);
+                        item.color_r = n > 0 ? color[0] : 1.0f;
+                        item.color_g = n > 1 ? color[1] : 0.82f;
+                        item.color_b = n > 2 ? color[2] : 0.0f;
+                        item.opacity = pdf_annot_opacity(ctx, annot);
+                        int64_t date = pdf_annot_creation_date(ctx, annot);
+                        if (date <= 0) date = pdf_annot_modification_date(ctx, annot);
+                        item.created_at_ms = date > 0 ? date * 1000 : 0;
+                        quiet_copy_text(item.author, sizeof(item.author), pdf_annot_author(ctx, annot));
+                        quiet_copy_text(item.contents, sizeof(item.contents), pdf_annot_contents(ctx, annot));
+                        ++count;
+                    }
+                }
+            }
+            fz_always(ctx)
+            {
+                if (page) pdf_drop_page(ctx, page);
+            }
+            fz_catch(ctx)
+            {
+                fz_rethrow(ctx);
+            }
+        }
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        count = 0;
+    }
+
+    return count;
 }
 
 extern "C" int quiet_pdf_select_text(
