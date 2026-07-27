@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <memory>
@@ -1329,7 +1330,7 @@ namespace
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
     constexpr int TileSize = 1024;
-    constexpr double TileRenderZoomThreshold = 1.60;
+    constexpr double TileRenderZoomThreshold = 0.0;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -1669,64 +1670,38 @@ namespace
         RECT client{};
         if (g_hwnd) GetClientRect(g_hwnd, &client);
         int fullH = std::max<int>(1, client.bottom - client.top);
-        int fullW = std::max<int>(1, client.right - client.left);
-        if (!g_glassBackdrop || g_glassBackdropW != fullW || g_glassBackdropH != fullH || g_glassBackdropTheme != g_theme)
+        if (g_glassBackdrop)
         {
-            if (g_glassBackdrop)
-            {
-                DeleteObject(g_glassBackdrop);
-                g_glassBackdrop = nullptr;
-            }
-            HDC mem = CreateCompatibleDC(dc);
-            g_glassBackdrop = CreateCompatibleBitmap(dc, fullW, fullH);
-            if (!g_glassBackdrop)
-            {
-                DeleteDC(mem);
-                Fill(dc, r, T().bg);
-                return;
-            }
-            HGDIOBJ oldBmp = SelectObject(mem, g_glassBackdrop);
-            RECT full{ 0, 0, fullW, fullH };
-            if (IsAuroraTheme())
-            {
-                for (int y = 0; y < fullH; ++y)
-                {
-                    double ty = static_cast<double>(y) / static_cast<double>(fullH);
-                    COLORREF color = RGB(6, 49, 45);
-                    UNREFERENCED_PARAMETER(ty);
-                    RECT line{ 0, y, fullW, y + 1 };
-                    Fill(mem, line, color);
-                }
-                AlphaFill(mem, full, RGB(40, 220, 145), 2);
-            }
-            else for (int y = 0; y < fullH; ++y)
-            {
-                double ty = static_cast<double>(y) / static_cast<double>(fullH);
-                COLORREF color = MixColor(RGB(247, 250, 252), RGB(232, 239, 246), ty);
-                if (ty < 0.44) color = MixColor(color, RGB(255, 248, 241), 0.20);
-                else if (ty > 0.58) color = MixColor(color, RGB(229, 242, 253), 0.24);
-                RECT line{ 0, y, fullW, y + 1 };
-                Fill(mem, line, color);
-            }
-            if (!IsAuroraTheme())
-            {
-                RECT leftWash{ 0, 0, std::max(1, fullW / 3), fullH };
-                RECT topWash{ 0, 0, fullW, std::max(1, fullH / 3) };
-                AlphaFill(mem, leftWash, RGB(226, 244, 239), 30);
-                AlphaFill(mem, topWash, RGB(255, 255, 255), 42);
-            }
-            SelectObject(mem, oldBmp);
-            DeleteDC(mem);
-            g_glassBackdropW = fullW;
-            g_glassBackdropH = fullH;
-            g_glassBackdropTheme = g_theme;
+            DeleteObject(g_glassBackdrop);
+            g_glassBackdrop = nullptr;
+            g_glassBackdropW = 0;
+            g_glassBackdropH = 0;
+            g_glassBackdropTheme = -1;
         }
 
-        HDC src = CreateCompatibleDC(dc);
-        HGDIOBJ old = SelectObject(src, g_glassBackdrop);
-        BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, src, r.left - client.left, r.top - client.top, SRCCOPY);
-        SelectObject(src, old);
-        DeleteDC(src);
+        if (IsAuroraTheme())
+        {
+            Fill(dc, r, RGB(6, 49, 45));
+            AlphaFill(dc, r, RGB(40, 220, 145), 2);
+            return;
+        }
+
+        for (int y = r.top; y < r.bottom; ++y)
+        {
+            double ty = static_cast<double>(y - client.top) / static_cast<double>(fullH);
+            COLORREF color = MixColor(RGB(247, 250, 252), RGB(232, 239, 246), ty);
+            if (ty < 0.44) color = MixColor(color, RGB(255, 248, 241), 0.20);
+            else if (ty > 0.58) color = MixColor(color, RGB(229, 242, 253), 0.24);
+            RECT line{ r.left, y, r.right, y + 1 };
+            Fill(dc, line, color);
+        }
+
+        int clientW = static_cast<int>(client.right - client.left);
+        RECT leftWash{ client.left, client.top, client.left + std::max<int>(1, clientW / 3), client.bottom };
+        RECT topWash{ client.left, client.top, client.right, client.top + std::max(1, fullH / 3) };
+        RECT wash{};
+        if (IntersectRect(&wash, &r, &leftWash)) AlphaFill(dc, wash, RGB(226, 244, 239), 30);
+        if (IntersectRect(&wash, &r, &topWash)) AlphaFill(dc, wash, RGB(255, 255, 255), 42);
     }
 
     void GlassFill(HDC dc, RECT r, COLORREF fallback, BYTE alpha = 205)
@@ -3078,7 +3053,7 @@ namespace
                 case 1: g_theme = 2; break; // legacy dark mica -> night black
                 case 2: g_theme = 4; break; // legacy aurora -> aurora green
                 case 3: g_theme = 3; break; // legacy graphite -> graphite black
-                case 4: g_theme = 1; break; // 护眼纸张 -> 护眼米白
+                case 4: g_theme = 1; break; // legacy eye-care paper -> eye-care beige
                 case 5: g_theme = 0; break; // legacy frosted mica -> mica white
                 default: g_theme = 0; break;
                 }
@@ -3187,7 +3162,7 @@ namespace
 
     std::wstring LastErrorText(DWORD error)
     {
-        if (!error) return L"未知错误";
+        if (!error) return L"\u672a\u77e5\u9519\u8bef";
         wchar_t* buffer = nullptr;
         DWORD length = FormatMessageW(
             FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -3197,7 +3172,7 @@ namespace
             reinterpret_cast<wchar_t*>(&buffer),
             0,
             nullptr);
-        std::wstring text = length && buffer ? std::wstring(buffer, length) : (L"系统错误 " + std::to_wstring(error));
+        std::wstring text = length && buffer ? std::wstring(buffer, length) : (L"\u7cfb\u7edf\u9519\u8bef " + std::to_wstring(error));
         if (buffer) LocalFree(buffer);
         while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ')) text.pop_back();
         return text;
@@ -3835,8 +3810,8 @@ namespace
             for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
             return total;
         };
-        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 84ull * 1024ull * 1024ull;
-        size_t maxPages = tab.zoom > 2.0 ? 2ull : 12ull;
+        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 24ull * 1024ull * 1024ull;
+        size_t maxPages = tab.zoom > 2.0 ? 2ull : 4ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -4067,6 +4042,27 @@ namespace
         };
     }
 
+    bool TileVisibleNearby(PdfTab const& tab, TileKey const& key, double viewportScreens = 1.35)
+    {
+        if (key.page < 0 || key.page >= tab.pageCount) return false;
+        int start = FirstPageInSpread(key.page);
+        if (!g_continuousRead)
+        {
+            int currentStart = FirstPageInSpread(std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1)));
+            if (start != currentStart) return false;
+        }
+
+        int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+        RECT pageRect{};
+        if (!BuildSpreadPageRect(tab, start, y, key.page, pageRect)) return false;
+        RECT tileRect = TileScreenRect(pageRect, key);
+        RECT nearby = g_stage;
+        int extraY = static_cast<int>((nearby.bottom - nearby.top) * viewportScreens);
+        int extraX = static_cast<int>((nearby.right - nearby.left) * 0.35);
+        InflateRect(&nearby, std::max(0, extraX), std::max(0, extraY));
+        return Intersects(tileRect, nearby);
+    }
+
     void TrimTileCache(PdfTab& tab, TileKey const& protectedKey)
     {
         auto cacheBytes = [&]()
@@ -4076,20 +4072,24 @@ namespace
             return total;
         };
 
-        constexpr size_t maxTileBytes = 36ull * 1024ull * 1024ull;
-        constexpr size_t maxTiles = 72;
+        constexpr size_t maxTileBytes = 24ull * 1024ull * 1024ull;
+        constexpr size_t maxTiles = 48;
         while (tab.tileCache.size() > maxTiles || cacheBytes() > maxTileBytes)
         {
             auto victim = tab.tileCache.end();
-            int worstDistance = -1;
+            int worstScore = std::numeric_limits<int>::min();
             for (auto candidate = tab.tileCache.begin(); candidate != tab.tileCache.end(); ++candidate)
             {
                 bool isProtected = !(candidate->first < protectedKey) && !(protectedKey < candidate->first);
                 if (isProtected && tab.tileCache.size() > 1) continue;
+                bool nearby = TileVisibleNearby(tab, candidate->first);
                 int distance = std::abs(candidate->first.page - tab.currentPage);
-                if (distance > worstDistance)
+                int score = (nearby ? 0 : 100000) + distance * 1000 + candidate->first.level * 80;
+                if (candidate->first.zoom != protectedKey.zoom) score += 400;
+                if (candidate->first.theme != protectedKey.theme) score += 400;
+                if (score > worstScore)
                 {
-                    worstDistance = distance;
+                    worstScore = score;
                     victim = candidate;
                 }
             }
@@ -7166,9 +7166,9 @@ namespace
 
         int right = client.right - S(54);
         RECT clear{ right - S(112), S(168), right, S(200) };
-        AddHomeHit(clear, -1, HomeAction::ClearAll, L"清除记录");
+        AddHomeHit(clear, -1, HomeAction::ClearAll, L"\u6e05\u9664\u8bb0\u5f55");
         size_t clearIndex = g_homeHits.size() - 1;
-        DrawHomeTextButton(dc, clear, HomeAction::ClearAll, L"清除记录", clearIndex);
+        DrawHomeTextButton(dc, clear, HomeAction::ClearAll, L"\u6e05\u9664\u8bb0\u5f55", clearIndex);
         RECT view{ clear.left - S(126), S(168), clear.left - S(12), S(200) };
         AddHomeHit(view, -1, HomeAction::ToggleView, g_homeListView ? L"\u5207\u6362\u89c6\u56fe" : L"\u5207\u6362\u5217\u8868");
         size_t viewIndex = g_homeHits.size() - 1;
@@ -7230,9 +7230,9 @@ namespace
         SelectObject(dc, oldPlus);
         DeleteObject(plusFont);
         RECT openMain{ openCover.left + S(10), openCover.top + S(100), openCover.right - S(10), openCover.top + S(128) };
-        Text(dc, L"打开 PDF", openMain, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u6253\u5f00 PDF", openMain, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
         RECT openSub{ openCover.left + S(14), openCover.top + S(132), openCover.right - S(14), openCover.bottom - S(18) };
-        Text(dc, L"拖入文件或点击打开", openSub, DT_CENTER | DT_WORDBREAK, T().muted);
+        Text(dc, L"\u62d6\u5165\u6587\u4ef6\u6216\u70b9\u51fb\u6253\u5f00", openSub, DT_CENTER | DT_WORDBREAK, T().muted);
         RECT openName{ openTile.left, openCover.bottom + S(8), openTile.right, openTile.bottom };
         Text(dc, L"\u6253\u5f00\u6587\u6863", openName, DT_CENTER | DT_TOP | DT_SINGLELINE, T().muted);
         lastBottom = std::max(lastBottom, static_cast<int>(openTile.bottom));
@@ -7260,7 +7260,7 @@ namespace
             }
 
             RECT starHot{ cover.right - S(39), cover.top + S(9), cover.right - S(9), cover.top + S(39) };
-            AddHomeHit(starHot, recentIndex, HomeAction::Favorite, item.favorite ? L"取消收藏" : L"收藏");
+            AddHomeHit(starHot, recentIndex, HomeAction::Favorite, item.favorite ? L"\u53d6\u6d88\u6536\u85cf" : L"\u6536\u85cf");
             DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered, 5, false);
 
             RECT dock{ cover.left + S(17), cover.bottom - S(45), cover.left + S(120), cover.bottom - S(13) };
@@ -10654,12 +10654,14 @@ namespace
         if (IsRectEmpty(&dirty)) dirty = client;
         int dirtyW = std::max<int>(1, dirty.right - dirty.left);
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
-        if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
+        if (!EnsurePaintBuffer(dc, dirtyW, dirtyH))
         {
             EndPaint(hwnd, &ps);
             return;
         }
         HDC mem = g_paintBufferDc;
+        POINT oldViewport{};
+        SetViewportOrgEx(mem, -dirty.left, -dirty.top, &oldViewport);
         if (UsesBackdropTheme() && !StageLightPaintActive()) PaintGlassBackdrop(mem, dirty);
         else Fill(mem, dirty, T().bg);
         RECT toolbarRect{ 0, 0, client.right, S(38) };
@@ -10686,7 +10688,8 @@ namespace
         PaintCustomZoomDialog(mem, client);
         if (!g_customZoomOpen) PaintHoverTip(mem, client);
         PaintTabDragOverlay(mem);
-        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
+        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, 0, 0, SRCCOPY);
+        SetViewportOrgEx(mem, oldViewport.x, oldViewport.y, nullptr);
         EndPaint(hwnd, &ps);
     }
 
