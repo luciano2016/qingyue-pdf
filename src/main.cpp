@@ -5535,29 +5535,9 @@ namespace
 
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
     {
-        if (IsRectEmpty(&g_stage) || (dx == 0 && dy == 0))
-        {
-            RequestStageRepaint(hwnd, includeStatus);
-            return;
-        }
-
-        RECT exposed{};
-        ScrollWindowEx(hwnd, dx, dy, &g_stage, &g_stage, nullptr, &exposed, SW_INVALIDATE);
-        if (!IsRectEmpty(&g_mainScrollTrackRect))
-            InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
-        if (!IsRectEmpty(&g_mainHScrollTrackRect))
-            InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
-        if (includeStatus)
-        {
-            RECT client{};
-            GetClientRect(hwnd, &client);
-            RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
-            InvalidateRect(hwnd, &status, FALSE);
-        }
-        UpdateWindow(hwnd);
-        g_lastStageRepaintMs = GetTickCount64();
-        g_stageRepaintPending = false;
-        KillTimer(hwnd, 6);
+        UNREFERENCED_PARAMETER(dx);
+        UNREFERENCED_PARAMETER(dy);
+        RequestStageRepaint(hwnd, includeStatus);
     }
     void RequestSidebarRepaint(HWND hwnd)
     {
@@ -5707,20 +5687,8 @@ namespace
         int visible = std::max<int>(1, g_sidebar.bottom - SidebarScrollRect().top);
         int maxScroll = std::max<int>(0, g_sidebarContentHeight - visible);
         g_sidebarScrollY = std::clamp(newScrollY, 0, maxScroll);
-        int dy = old - g_sidebarScrollY;
-        if (dy == 0) return;
-
-        RECT area = SidebarScrollRect();
-        if (!IsRectEmpty(&area))
-        {
-            RECT exposed{};
-            ScrollWindowEx(hwnd, 0, dy, &area, &area, nullptr, &exposed, SW_INVALIDATE);
-            UpdateWindow(hwnd);
-            g_lastSidebarRepaintMs = GetTickCount64();
-            g_sidebarRepaintPending = false;
-            KillTimer(hwnd, 7);
-        }
-        else RequestSidebarRepaint(hwnd);
+        if (old == g_sidebarScrollY) return;
+        RequestSidebarRepaint(hwnd);
     }
 
     int WheelPixels(int delta, int pixelsPerNotch, double& remainder)
@@ -7827,11 +7795,13 @@ namespace
         return DrawCachedImagePart(dc, image, dest, 0, 0, image.width, image.height);
     }
 
-    void PaintPages(HDC dc, PdfTab& tab, RECT paintClip)
+    bool PaintPages(HDC dc, PdfTab& tab, RECT paintClip)
     {
         RECT stageDirty{};
-        if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return;
+        if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
         bool lightPaint = StageLightPaintActive();
+        bool hadVisiblePage = false;
+        bool paintedRenderable = false;
         if (lightPaint)
         {
             Fill(dc, stageDirty, T().stage);
@@ -7868,6 +7838,7 @@ namespace
                 RECT pageRect{};
                 if (!BuildSpreadPageRect(tab, start, y, i, pageRect)) continue;
                 if (!Intersects(pageRect, stageDirty)) continue;
+                hadVisiblePage = true;
                 if (!lightPaint)
                 {
                     RECT shadowRight1{ pageRect.right, pageRect.top + S(1), pageRect.right + std::max(1, S(1)), pageRect.bottom + S(1) };
@@ -7900,7 +7871,7 @@ namespace
                             int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), 0, image->height - 1);
                             int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), sx + 1, image->width);
                             int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), sy + 1, image->height);
-                            DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy);
+                            if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy)) paintedRenderable = true;
                         }
                     }
                     else
@@ -7933,7 +7904,7 @@ namespace
                                 else image = &EnsureTile(tab, key);
                                 if (!image || (!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) continue;
                                 RECT tileDest{ pageRect.left + tx, pageRect.top + ty, pageRect.left + tx + w, pageRect.top + ty + h };
-                                DrawCachedImage(dc, *image, tileDest);
+                                if (DrawCachedImage(dc, *image, tileDest)) paintedRenderable = true;
                             }
                         }
                     }
@@ -8025,6 +7996,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
+        return !lightPaint || !hadVisiblePage || paintedRenderable;
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -8342,7 +8314,7 @@ namespace
         DeleteObject(f);
     }
 
-    void PaintReader(HDC dc, RECT client, RECT paintClip)
+    bool PaintReader(HDC dc, RECT client, RECT paintClip)
     {
         PdfTab* tab = Active();
         g_recentRects.clear();
@@ -8362,7 +8334,7 @@ namespace
             if (g_homeListView) PaintHomeList(dc, client);
             else PaintHomeGrid(dc, client);
             PaintHomeScrollBar(dc, client, paintClip);
-            return;
+            return true;
         }
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
@@ -8380,6 +8352,7 @@ namespace
             g_searchResultIds.clear();
         }
         bool paintedPages = false;
+        bool canFlush = true;
         RECT sidebarPaint{ 0, top, side, client.bottom - bottom };
         if (side && Intersects(paintClip, sidebarPaint))
         {
@@ -8393,13 +8366,14 @@ namespace
         }
         if (Intersects(paintClip, g_stage))
         {
-            PaintPages(dc, *tab, paintClip);
+            canFlush = PaintPages(dc, *tab, paintClip);
             paintedPages = true;
         }
         if (paintedPages) ClampScroll(g_hwnd);
         PaintMainScrollBar(dc, client, paintClip);
         if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) || Intersects(paintClip, g_annotationNotePanelRect))
             PaintAnnotationToolbar(dc, *tab, client);
+        return canFlush;
     }
 
     COLORREF MenuPopupFill()
@@ -10298,7 +10272,7 @@ namespace
             PaintToolbar(mem, client);
             PaintTabs(mem, client);
         }
-        PaintReader(mem, client, dirty);
+        bool shouldFlush = PaintReader(mem, client, dirty);
         PaintSidebarPanelToggle(mem, client);
         if (repaintUi) PaintStatus(mem, client);
         PaintTabListOverlay(mem, client);
@@ -10306,7 +10280,7 @@ namespace
         PaintCustomZoomDialog(mem, client);
         if (!g_customZoomOpen) PaintHoverTip(mem, client);
         PaintTabDragOverlay(mem);
-        BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
+        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
         EndPaint(hwnd, &ps);
     }
 
