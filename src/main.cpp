@@ -164,6 +164,7 @@ namespace
         int page{};
         int zoom{};
         int theme{};
+        int level{};
         int x{};
         int y{};
         int w{};
@@ -171,8 +172,8 @@ namespace
 
         bool operator<(TileKey const& other) const
         {
-            return std::tie(page, zoom, theme, x, y, w, h) <
-                std::tie(other.page, other.zoom, other.theme, other.x, other.y, other.w, other.h);
+            return std::tie(page, zoom, theme, level, x, y, w, h) <
+                std::tie(other.page, other.zoom, other.theme, other.level, other.x, other.y, other.w, other.h);
         }
     };
 
@@ -1075,6 +1076,9 @@ namespace
         int w{};
         int h{};
         double zoom{};
+        double renderZoom{};
+        int level{};
+        unsigned long long viewportGeneration{};
         unsigned dpi{};
         int theme{};
         int priority{};
@@ -1218,6 +1222,7 @@ namespace
     bool g_sidebarResizePending{};
     bool g_sidebarAnimating{};
     bool g_stageIdleRefreshPending{};
+    unsigned long long g_viewportGeneration{};
     bool g_sidebarProgressRefreshPending{};
     bool g_gesturePanning{};
     bool g_gestureSidebar{};
@@ -3862,7 +3867,8 @@ namespace
     {
         return a.documentVersion == b.documentVersion &&
             a.page == b.page && a.tile == b.tile && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h &&
-            a.zoom == b.zoom && a.dpi == b.dpi && a.theme == b.theme &&
+            a.zoom == b.zoom && a.renderZoom == b.renderZoom && a.level == b.level &&
+            a.dpi == b.dpi && a.theme == b.theme &&
             _wcsicmp(a.path.c_str(), b.path.c_str()) == 0;
     }
 
@@ -3917,7 +3923,8 @@ namespace
                 renderTab.ctx = workerCtx;
                 renderTab.doc = workerDoc;
                 renderTab.zoom = request.zoom;
-                double renderScale = request.zoom * static_cast<double>(request.dpi) / 72.0;
+                double renderZoom = request.renderZoom > 0.0 ? request.renderZoom : request.zoom;
+                double renderScale = renderZoom * static_cast<double>(request.dpi) / 72.0;
                 if (request.tile)
                 {
                     RECT tile{ request.x, request.y, request.x + request.w, request.y + request.h };
@@ -4024,6 +4031,42 @@ namespace
         return static_cast<int>(zoom * 10000.0 + 0.5);
     }
 
+    int TileLevelScale(int level)
+    {
+        return 1 << std::clamp(level, 0, 6);
+    }
+
+    int TileLevelForPage(PdfTab const& tab, int page, int pageW, int pageH)
+    {
+        UNREFERENCED_PARAMETER(page);
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        int longest = std::max(pageW, pageH);
+        int viewportLongest = std::max(stageW, stageH);
+        int level = 0;
+        while (level < 3 && longest / TileLevelScale(level) > viewportLongest * 2)
+            ++level;
+        if (tab.zoom < 3.0) level = std::min(level, 1);
+        return level;
+    }
+
+    int TileCoordAtLevel(int targetCoord, int level)
+    {
+        int scale = TileLevelScale(level);
+        return targetCoord >= 0 ? targetCoord / scale : 0;
+    }
+
+    RECT TileScreenRect(RECT pageRect, TileKey const& key)
+    {
+        int scale = TileLevelScale(key.level);
+        return RECT{
+            pageRect.left + key.x * scale,
+            pageRect.top + key.y * scale,
+            pageRect.left + (key.x + key.w) * scale,
+            pageRect.top + (key.y + key.h) * scale
+        };
+    }
+
     void TrimTileCache(PdfTab& tab, TileKey const& protectedKey)
     {
         auto cacheBytes = [&]()
@@ -4082,11 +4125,24 @@ namespace
         request.w = key.w;
         request.h = key.h;
         request.zoom = tab.zoom;
+        request.renderZoom = tab.zoom / static_cast<double>(TileLevelScale(key.level));
+        request.level = key.level;
+        request.viewportGeneration = g_viewportGeneration;
         request.dpi = g_dpi;
         request.theme = g_theme;
         request.priority = priority;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            g_pageRenderQueue.erase(
+                std::remove_if(
+                    g_pageRenderQueue.begin(),
+                    g_pageRenderQueue.end(),
+                    [&](PageRenderRequest const& queued)
+                    {
+                        return queued.tile && queued.viewportGeneration + 1 < g_viewportGeneration &&
+                            queued.documentVersion == tab.renderVersion && _wcsicmp(queued.path.c_str(), tab.path.c_str()) == 0;
+                    }),
+                g_pageRenderQueue.end());
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
             for (auto const& queued : g_pageRenderQueue)
             {
@@ -4098,7 +4154,7 @@ namespace
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& queued) { return queued.priority > priority; });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedTileRenders = 12;
+            constexpr size_t maxQueuedTileRenders = 48;
             while (g_pageRenderQueue.size() > maxQueuedTileRenders)
             {
                 auto victim = std::find_if(
@@ -4112,28 +4168,35 @@ namespace
         g_pageRenderCv.notify_one();
     }
 
-    void QueueVisibleTilesForPage(HWND hwnd, PdfTab& tab, int page, RECT pageRect, RECT clip, int priority, int& budget)
+    void QueueVisibleTilesForPageLevel(HWND hwnd, PdfTab& tab, int page, RECT pageRect, RECT clip, int level, int priority, int& budget)
     {
         RECT drawRect{};
         if (budget <= 0 || !IntersectRect(&drawRect, &pageRect, &clip)) return;
 
         int pageW = std::max<int>(1, pageRect.right - pageRect.left);
         int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        int scale = TileLevelScale(level);
+        int levelPageW = std::max<int>(1, (pageW + scale - 1) / scale);
+        int levelPageH = std::max<int>(1, (pageH + scale - 1) / scale);
         int localLeft = std::clamp<int>(drawRect.left - pageRect.left, 0, pageW);
         int localTop = std::clamp<int>(drawRect.top - pageRect.top, 0, pageH);
         int localRight = std::clamp<int>(drawRect.right - pageRect.left, 0, pageW);
         int localBottom = std::clamp<int>(drawRect.bottom - pageRect.top, 0, pageH);
-        int tileLeft = (localLeft / TileSize) * TileSize;
-        int tileTop = (localTop / TileSize) * TileSize;
-        for (int ty = tileTop; ty < localBottom && budget > 0; ty += TileSize)
+        int levelLeft = TileCoordAtLevel(localLeft, level);
+        int levelTop = TileCoordAtLevel(localTop, level);
+        int levelRight = std::clamp<int>((localRight + scale - 1) / scale, levelLeft + 1, levelPageW);
+        int levelBottom = std::clamp<int>((localBottom + scale - 1) / scale, levelTop + 1, levelPageH);
+        int tileLeft = (levelLeft / TileSize) * TileSize;
+        int tileTop = (levelTop / TileSize) * TileSize;
+        for (int ty = tileTop; ty < levelBottom && budget > 0; ty += TileSize)
         {
-            int h = std::min(TileSize, pageH - ty);
+            int h = std::min(TileSize, levelPageH - ty);
             if (h <= 0) continue;
-            for (int tx = tileLeft; tx < localRight && budget > 0; tx += TileSize)
+            for (int tx = tileLeft; tx < levelRight && budget > 0; tx += TileSize)
             {
-                int w = std::min(TileSize, pageW - tx);
+                int w = std::min(TileSize, levelPageW - tx);
                 if (w <= 0) continue;
-                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, tx, ty, w, h };
+                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, level, tx, ty, w, h };
                 if (!FindCachedTile(tab, key))
                 {
                     QueueTileRender(hwnd, tab, key, priority);
@@ -4141,6 +4204,14 @@ namespace
                 }
             }
         }
+    }
+
+    void QueueVisibleTilesForPage(HWND hwnd, PdfTab& tab, int page, RECT pageRect, RECT clip, int priority, int& budget)
+    {
+        int targetLevel = TileLevelForPage(tab, page, std::max<int>(1, pageRect.right - pageRect.left), std::max<int>(1, pageRect.bottom - pageRect.top));
+        if (targetLevel > 0)
+            QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, targetLevel, priority, budget);
+        QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, 0, priority + 1, budget);
     }
 
     void ScheduleVisibleTilePrefetch(HWND hwnd, PdfTab& tab)
@@ -4185,12 +4256,8 @@ namespace
         int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
         RECT pageRect{};
         if (!BuildSpreadPageRect(tab, start, y, request.page, pageRect)) return false;
-        RECT tileRect{
-            pageRect.left + request.x,
-            pageRect.top + request.y,
-            pageRect.left + request.x + request.w,
-            pageRect.top + request.y + request.h
-        };
+        TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level, request.x, request.y, request.w, request.h };
+        RECT tileRect = TileScreenRect(pageRect, key);
         InflateRect(&tileRect, S(1), S(1));
         return IntersectRect(&out, &tileRect, &g_stage) != FALSE;
     }
@@ -5865,6 +5932,8 @@ namespace
             g_stageScrollLastTick = GetTickCount64();
         }
 
+        if (dy != 0) ++g_viewportGeneration;
+
         if (dy == 0)
         {
             UpdateVertScrollBar(hwnd);
@@ -6103,6 +6172,7 @@ namespace
         }
 
         tab.zoom = clampedZoom;
+        ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
 
         if (g_continuousRead)
@@ -8070,6 +8140,56 @@ namespace
     {
         return DrawCachedImagePart(dc, image, dest, 0, 0, image.width, image.height);
     }
+    bool DrawTileLevel(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect, int level, bool renderMissing, bool& missingVisiblePage)
+    {
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        int scale = TileLevelScale(level);
+        int levelPageW = std::max<int>(1, (pageW + scale - 1) / scale);
+        int levelPageH = std::max<int>(1, (pageH + scale - 1) / scale);
+        int localLeft = std::clamp<int>(drawRect.left - pageRect.left, 0, pageW);
+        int localTop = std::clamp<int>(drawRect.top - pageRect.top, 0, pageH);
+        int localRight = std::clamp<int>(drawRect.right - pageRect.left, 0, pageW);
+        int localBottom = std::clamp<int>(drawRect.bottom - pageRect.top, 0, pageH);
+        int levelLeft = TileCoordAtLevel(localLeft, level);
+        int levelTop = TileCoordAtLevel(localTop, level);
+        int levelRight = std::clamp<int>((localRight + scale - 1) / scale, levelLeft + 1, levelPageW);
+        int levelBottom = std::clamp<int>((localBottom + scale - 1) / scale, levelTop + 1, levelPageH);
+        int tileLeft = (levelLeft / TileSize) * TileSize;
+        int tileTop = (levelTop / TileSize) * TileSize;
+        bool painted = false;
+        for (int ty = tileTop; ty < levelBottom; ty += TileSize)
+        {
+            int h = std::min(TileSize, levelPageH - ty);
+            if (h <= 0) continue;
+            for (int tx = tileLeft; tx < levelRight; tx += TileSize)
+            {
+                int w = std::min(TileSize, levelPageW - tx);
+                if (w <= 0) continue;
+                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, level, tx, ty, w, h };
+                PageImage* image = FindCachedTile(tab, key);
+                if (!image)
+                {
+                    if (renderMissing)
+                    {
+                        missingVisiblePage = true;
+                        QueueTileRender(g_hwnd, tab, key, 0);
+                    }
+                    continue;
+                }
+                if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0)
+                {
+                    if (renderMissing) missingVisiblePage = true;
+                    continue;
+                }
+                RECT tileDest = TileScreenRect(pageRect, key);
+                RECT clippedDest{};
+                if (!IntersectRect(&clippedDest, &tileDest, &pageRect)) continue;
+                if (DrawCachedImage(dc, *image, tileDest)) painted = true;
+            }
+        }
+        return painted;
+    }
 
     bool PaintPages(HDC dc, PdfTab& tab, RECT paintClip)
     {
@@ -8167,46 +8287,32 @@ namespace
                     else
                     {
                         Fill(dc, drawRect, RGB(255, 255, 255));
-                        bool pageFallbackPainted = false;
-                        if (PageImage* fallback = FindZoomFallbackPage(tab, i))
+                        bool fallbackPainted = false;
+                        int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
+                        for (int level = targetLevel; level >= 1; --level)
                         {
-                            if ((fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
-                            {
-                                int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
-                                int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
-                                int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
-                                int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
-                                pageFallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
-                                if (pageFallbackPainted) paintedRenderable = true;
-                            }
+                            bool ignoredMissing = false;
+                            if (DrawTileLevel(dc, tab, i, pageRect, drawRect, level, level == targetLevel, ignoredMissing))
+                                fallbackPainted = true;
                         }
-                        int localLeft = drawRect.left - pageRect.left;
-                        int localTop = drawRect.top - pageRect.top;
-                        int localRight = drawRect.right - pageRect.left;
-                        int localBottom = drawRect.bottom - pageRect.top;
-                        int tileLeft = (localLeft / TileSize) * TileSize;
-                        int tileTop = (localTop / TileSize) * TileSize;
-                        for (int ty = tileTop; ty < localBottom; ty += TileSize)
+                        if (!fallbackPainted)
                         {
-                            int h = std::min(TileSize, pageH - ty);
-                            if (h <= 0) continue;
-                            for (int tx = tileLeft; tx < localRight; tx += TileSize)
+                            if (PageImage* fallback = FindZoomFallbackPage(tab, i))
                             {
-                                int w = std::min(TileSize, pageW - tx);
-                                if (w <= 0) continue;
-                                TileKey key{ i, TileZoomKey(tab.zoom), g_theme, tx, ty, w, h };
-                                PageImage* image = FindCachedTile(tab, key);
-                                if (!image)
+                                if ((fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                                 {
-                                    if (!pageFallbackPainted) missingVisiblePage = true;
-                                    QueueTileRender(g_hwnd, tab, key, 0);
-                                    continue;
+                                    int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
+                                    int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
+                                    int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
+                                    int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
+                                    fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
                                 }
-                                if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) { if (!pageFallbackPainted) missingVisiblePage = true; continue; }
-                                RECT tileDest{ pageRect.left + tx, pageRect.top + ty, pageRect.left + tx + w, pageRect.top + ty + h };
-                                if (DrawCachedImage(dc, *image, tileDest)) paintedRenderable = true;
                             }
                         }
+                        bool targetMissing = false;
+                        bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
+                        if (fallbackPainted || targetPainted) paintedRenderable = true;
+                        if (targetMissing && !fallbackPainted && !targetPainted) missingVisiblePage = true;
                     }
                     if (IsDarkTheme())
                     {
@@ -10645,7 +10751,7 @@ namespace
                 RECT tileDirty{};
                 if (request.tile)
                 {
-                    TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.x, request.y, request.w, request.h };
+                    TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level, request.x, request.y, request.w, request.h };
                     if (tab.tileCache.find(key) == tab.tileCache.end())
                     {
                         tab.tileCache.emplace(key, std::move(result->image));
