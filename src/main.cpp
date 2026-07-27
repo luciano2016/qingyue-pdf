@@ -5859,9 +5859,40 @@ namespace
 
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
     {
-        UNREFERENCED_PARAMETER(dx);
-        UNREFERENCED_PARAMETER(dy);
-        RequestStageRepaint(hwnd, includeStatus);
+        RECT exposed{};
+        bool scrolled = (dx != 0 || dy != 0) && !IsRectEmpty(&g_stage);
+        if (scrolled)
+        {
+            ScrollWindowEx(
+                hwnd,
+                dx,
+                dy,
+                &g_stage,
+                &g_stage,
+                nullptr,
+                &exposed,
+                SW_INVALIDATE);
+        }
+        if (!scrolled || IsRectEmpty(&exposed))
+            InvalidateRect(hwnd, &g_stage, FALSE);
+        if (!IsRectEmpty(&g_mainScrollTrackRect))
+        {
+            InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+        }
+        if (!IsRectEmpty(&g_mainHScrollTrackRect))
+        {
+            InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+        }
+        if (includeStatus)
+        {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
+            InvalidateRect(hwnd, &status, FALSE);
+        }
+        g_lastStageRepaintMs = GetTickCount64();
+        g_stageRepaintPending = false;
+        KillTimer(hwnd, 6);
     }
     void RequestSidebarRepaint(HWND hwnd)
     {
@@ -8271,7 +8302,15 @@ namespace
                         }
                         if (!image)
                         {
-                            image = &EnsurePage(tab, i);
+                            if (StageScrollPaintInProgress())
+                            {
+                                missingVisiblePage = true;
+                                QueuePageRender(g_hwnd, tab, i, 0);
+                            }
+                            else
+                            {
+                                image = &EnsurePage(tab, i);
+                            }
                         }
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
@@ -8315,7 +8354,7 @@ namespace
                         bool targetMissing = false;
                         bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
                         if (fallbackPainted || targetPainted) paintedRenderable = true;
-                        if (targetMissing && !fallbackPainted && !targetPainted) missingVisiblePage = true;
+                        if (targetMissing && !fallbackPainted) missingVisiblePage = true;
                     }
                     if (IsDarkTheme())
                     {
