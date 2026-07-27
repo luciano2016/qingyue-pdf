@@ -5794,6 +5794,10 @@ namespace
         if (g_hasContentSelection || g_selectingContent || g_annotationToolbarOpen || g_annotationNoteOpen)
             return false;
         return g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil;
+    }    bool StageScrollPaintInProgress()
+    {
+        return StageLightPaintActive() || g_draggingMainScroll || g_draggingMainHScroll ||
+            g_smoothStageScroll || g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
     }
 
     void MarkStageScrolling(HWND hwnd)
@@ -10596,10 +10600,21 @@ namespace
                 }
                 if (inserted && i == g_active)
                 {
-                    if (request.tile && !IsRectEmpty(&tileDirty))
-                        InvalidateRect(hwnd, &tileDirty, FALSE);
+                    if (request.tile)
+                    {
+                        if (StageScrollPaintInProgress())
+                        {
+                            g_stageIdleRefreshPending = true;
+                        }
+                        else if (!IsRectEmpty(&tileDirty))
+                        {
+                            InvalidateRect(hwnd, &tileDirty, FALSE);
+                        }
+                    }
                     else
+                    {
                         InvalidateRect(hwnd, &g_stage, FALSE);
+                    }
                 }
                 break;
             }
