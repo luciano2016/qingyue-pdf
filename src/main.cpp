@@ -4148,6 +4148,27 @@ namespace
             if (!g_continuousRead) break;
         }
     }
+    bool TileRequestScreenRect(PdfTab const& tab, PageRenderRequest const& request, RECT& out)
+    {
+        if (!request.tile || request.page < 0 || request.page >= tab.pageCount) return false;
+        int start = FirstPageInSpread(request.page);
+        if (!g_continuousRead)
+        {
+            int currentStart = FirstPageInSpread(std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1)));
+            if (start != currentStart) return false;
+        }
+        int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+        RECT pageRect{};
+        if (!BuildSpreadPageRect(tab, start, y, request.page, pageRect)) return false;
+        RECT tileRect{
+            pageRect.left + request.x,
+            pageRect.top + request.y,
+            pageRect.left + request.x + request.w,
+            pageRect.top + request.y + request.h
+        };
+        InflateRect(&tileRect, S(1), S(1));
+        return IntersectRect(&out, &tileRect, &g_stage) != FALSE;
+    }
     PageImage& EnsurePage(PdfTab& tab, int index)
     {
         PreparePageCache(tab);
@@ -10554,6 +10575,8 @@ namespace
                     continue;
 
                 PreparePageCache(tab);
+                bool inserted = false;
+                RECT tileDirty{};
                 if (request.tile)
                 {
                     TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.x, request.y, request.w, request.h };
@@ -10561,16 +10584,22 @@ namespace
                     {
                         tab.tileCache.emplace(key, std::move(result->image));
                         TrimTileCache(tab, key);
+                        inserted = true;
+                        TileRequestScreenRect(tab, request, tileDirty);
                     }
                 }
                 else if (tab.cache.find(request.page) == tab.cache.end())
                 {
                     tab.cache.emplace(request.page, std::move(result->image));
                     TrimPageCache(tab, request.page);
+                    inserted = true;
                 }
-                if (i == g_active)
+                if (inserted && i == g_active)
                 {
-                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    if (request.tile && !IsRectEmpty(&tileDirty))
+                        InvalidateRect(hwnd, &tileDirty, FALSE);
+                    else
+                        InvalidateRect(hwnd, &g_stage, FALSE);
                 }
                 break;
             }
@@ -11748,7 +11777,9 @@ namespace
                 if (g_stageIdleRefreshPending)
                 {
                     g_stageIdleRefreshPending = false;
-                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    PdfTab* activeForIdle = Active();
+                    if (!activeForIdle || activeForIdle->zoom < TileRenderZoomThreshold)
+                        InvalidateRect(hwnd, &g_stage, FALSE);
                     if (!IsRectEmpty(&g_mainScrollTrackRect))
                         InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
                     if (!IsRectEmpty(&g_mainHScrollTrackRect))
