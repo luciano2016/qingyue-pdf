@@ -295,6 +295,7 @@ namespace
         std::vector<PageInfo> pages;
         std::vector<OutlineItem> outline;
         std::map<int, PageImage> cache;
+        std::map<int, PageImage> zoomFallbackCache;
         std::map<TileKey, PageImage> tileCache;
         std::map<int, PageImage> thumbCache;
         std::vector<PdfAnnotation> annotations;
@@ -306,6 +307,10 @@ namespace
         int outlineLayoutContentHeight{};
         int outlineLayoutCollapseVersion{};
         int cachedTheme{ -1 };
+        double zoomFallbackZoom{};
+        unsigned zoomFallbackDpi{};
+        int zoomFallbackTheme{ -1 };
+        ULONGLONG zoomFallbackUntil{};
         int cachedThumbSize{};
         int cachedThumbTheme{ -1 };
         std::filesystem::file_time_type fileStamp{};
@@ -1319,7 +1324,7 @@ namespace
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
     constexpr int TileSize = 384;
-    constexpr double TileRenderZoomThreshold = 1.20;
+    constexpr double TileRenderZoomThreshold = 1.75;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -2186,9 +2191,7 @@ namespace
             int iconLeft = lineX + S(12);
             int pageLeft = g_sidebar.right - S(30);
             int textWidth = std::max(24, pageLeft - (iconLeft + S(10) + S(5)) - S(4));
-            std::wstring label = tab.outline.empty()
-                ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875")
-                : tab.outline[static_cast<size_t>(i)].title;
+                std::wstring label = tab.outline.empty() ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875") : tab.outline[static_cast<size_t>(i)].title;
             int textH = MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
             int rowH = std::max(baseRowH, textH + S(8));
             int page = tab.outline.empty() ? i : tab.outline[static_cast<size_t>(i)].page;
@@ -3067,11 +3070,11 @@ namespace
                 }
                 else switch (savedTheme)
                 {
-                case 1: g_theme = 2; break; // 深色云母 -> 极夜黑
-                case 2: g_theme = 4; break; // 极光 -> 极光绿
-                case 3: g_theme = 3; break; // 石墨 -> 石墨黑
+                case 1: g_theme = 2; break; // legacy dark mica -> night black
+                case 2: g_theme = 4; break; // legacy aurora -> aurora green
+                case 3: g_theme = 3; break; // legacy graphite -> graphite black
                 case 4: g_theme = 1; break; // 护眼纸张 -> 护眼米白
-                case 5: g_theme = 0; break; // 雾面云母 -> 云母白
+                case 5: g_theme = 0; break; // legacy frosted mica -> mica white
                 default: g_theme = 0; break;
                 }
             }
@@ -3785,8 +3788,22 @@ namespace
         return it->second;
     }
 
+    void PruneZoomFallbackCache(PdfTab& tab)
+    {
+        if (tab.zoomFallbackCache.empty()) return;
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme || GetTickCount64() > tab.zoomFallbackUntil)
+        {
+            tab.zoomFallbackCache.clear();
+            tab.zoomFallbackZoom = 0.0;
+            tab.zoomFallbackDpi = 0;
+            tab.zoomFallbackTheme = -1;
+            tab.zoomFallbackUntil = 0;
+        }
+    }
+
     void PreparePageCache(PdfTab& tab)
     {
+        PruneZoomFallbackCache(tab);
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
             tab.cache.clear();
@@ -3795,6 +3812,14 @@ namespace
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
         }
+    }
+
+    PageImage* FindZoomFallbackPage(PdfTab& tab, int index)
+    {
+        PruneZoomFallbackCache(tab);
+        if (tab.zoomFallbackCache.empty() || tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme) return nullptr;
+        auto found = tab.zoomFallbackCache.find(index);
+        return found == tab.zoomFallbackCache.end() ? nullptr : &found->second;
     }
 
     void TrimPageCache(PdfTab& tab, int protectedPage)
@@ -5548,7 +5573,7 @@ namespace
         ofn.hwndOwner = hwnd;
         ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = L"PDF 文件 (*.pdf)\0*.pdf\0所有文件 (*.*)\0*.*\0";
+        ofn.lpstrFilter = L"PDF \u6587\u4ef6 (*.pdf)\0*.pdf\0\u6240\u6709\u6587\u4ef6 (*.*)\0*.*\0";
         ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
         if (GetOpenFileNameW(&ofn)) OpenPdf(hwnd, file);
     }
@@ -6062,6 +6087,19 @@ namespace
             anchorPage = hoveredPage;
             int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
+        }
+        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme &&
+            tab.zoom < TileRenderZoomThreshold && clampedZoom < TileRenderZoomThreshold && !tab.cache.empty())
+        {
+            tab.zoomFallbackCache = std::move(tab.cache);
+            tab.zoomFallbackZoom = tab.cachedZoom;
+            tab.zoomFallbackDpi = tab.cachedDpi;
+            tab.zoomFallbackTheme = tab.cachedTheme;
+            tab.zoomFallbackUntil = GetTickCount64() + 900;
+        }
+        else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
+        {
+            tab.zoomFallbackUntil = GetTickCount64() + 900;
         }
 
         tab.zoom = clampedZoom;
@@ -7442,7 +7480,7 @@ namespace
             g_sidebarRowPages.push_back(page);
             if (page == tab.currentPage) RoundFill(dc, row, S(7), T().panel2, T().line);
             RECT tx{ row.left + S(8 + (tab.outline.empty() ? 0 : tab.outline[static_cast<size_t>(i)].depth * 14)), row.top, row.right - S(8), row.bottom };
-            std::wstring label = tab.outline.empty() ? (L"第" + std::to_wstring(i + 1) + L" 页") : tab.outline[static_cast<size_t>(i)].title;
+                std::wstring label = tab.outline.empty() ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875") : tab.outline[static_cast<size_t>(i)].title;
             Text(dc, label, tx, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
             y += S(32);
             if (y > g_sidebar.bottom - S(20)) break;
@@ -8101,6 +8139,12 @@ namespace
                     if (tab.zoom < TileRenderZoomThreshold)
                     {
                         PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
+                        bool usingZoomFallback = false;
+                        if (!image && lightPaint)
+                        {
+                            image = FindZoomFallbackPage(tab, i);
+                            usingZoomFallback = image != nullptr;
+                        }
                         if (!image && lightPaint)
                         {
                             missingVisiblePage = true;
@@ -8113,7 +8157,11 @@ namespace
                             int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), 0, image->height - 1);
                             int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), sx + 1, image->width);
                             int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), sy + 1, image->height);
-                            if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy)) paintedRenderable = true;
+                            if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy))
+                            {
+                                paintedRenderable = true;
+                                if (usingZoomFallback) QueuePageRender(g_hwnd, tab, i, 0);
+                            }
                         }
                     }
                     else
@@ -8235,7 +8283,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        return !lightPaint || !hadVisiblePage || (paintedRenderable && (!missingVisiblePage || tab.zoom >= TileRenderZoomThreshold));
+        return !hadVisiblePage || (paintedRenderable && !missingVisiblePage);
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -9549,6 +9597,7 @@ namespace
         tab.pages.clear();
         tab.outline.clear();
         tab.cache.clear();
+        tab.zoomFallbackCache.clear();
         tab.tileCache.clear();
         tab.thumbCache.clear();
         tab.annotations.clear();
@@ -11792,9 +11841,7 @@ namespace
                 if (g_stageIdleRefreshPending)
                 {
                     g_stageIdleRefreshPending = false;
-                    PdfTab* activeForIdle = Active();
-                    if (!activeForIdle || activeForIdle->zoom < TileRenderZoomThreshold)
-                        InvalidateRect(hwnd, &g_stage, FALSE);
+                    InvalidateRect(hwnd, &g_stage, FALSE);
                     if (!IsRectEmpty(&g_mainScrollTrackRect))
                         InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
                     if (!IsRectEmpty(&g_mainHScrollTrackRect))
