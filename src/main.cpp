@@ -17,10 +17,12 @@
 #include <condition_variable>
 #include <cstring>
 #include <cstdint>
+#include <deque>
 #include <ctime>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <memory>
@@ -1065,6 +1067,7 @@ namespace
         double zoom{};
         unsigned dpi{};
         int theme{};
+        int priority{};
     };
 
     struct PageRenderResult
@@ -1076,9 +1079,8 @@ namespace
     std::mutex g_pageRenderMutex;
     std::condition_variable g_pageRenderCv;
     std::thread g_pageRenderThread;
-    PageRenderRequest g_pageRenderRequest;
+    std::deque<PageRenderRequest> g_pageRenderQueue;
     PageRenderRequest g_pageRenderActiveRequest;
-    bool g_pageRenderHasRequest{};
     bool g_pageRenderActive{};
     bool g_pageRenderStop{};
     unsigned long long g_pageRenderSerial{};
@@ -3786,8 +3788,8 @@ namespace
             for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
             return total;
         };
-        size_t maxBytes = tab.zoom > 2.0 ? 8ull * 1024ull * 1024ull : 42ull * 1024ull * 1024ull;
-        size_t maxPages = tab.zoom > 2.0 ? 1ull : 5ull;
+        size_t maxBytes = tab.zoom > 2.0 ? 12ull * 1024ull * 1024ull : 84ull * 1024ull * 1024ull;
+        size_t maxPages = tab.zoom > 2.0 ? 2ull : 9ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -3841,16 +3843,10 @@ namespace
             PageRenderRequest request;
             {
                 std::unique_lock<std::mutex> lock(g_pageRenderMutex);
-                g_pageRenderCv.wait(lock, [] { return g_pageRenderStop || g_pageRenderHasRequest; });
+                g_pageRenderCv.wait(lock, [] { return g_pageRenderStop || !g_pageRenderQueue.empty(); });
                 if (g_pageRenderStop) break;
-                request = g_pageRenderRequest;
-                g_pageRenderHasRequest = false;
-                if (g_pageRenderCv.wait_for(lock, std::chrono::milliseconds(4), [] { return g_pageRenderStop || g_pageRenderHasRequest; }))
-                {
-                    if (g_pageRenderStop) break;
-                    request = g_pageRenderRequest;
-                    g_pageRenderHasRequest = false;
-                }
+                request = g_pageRenderQueue.front();
+                g_pageRenderQueue.pop_front();
                 g_pageRenderActiveRequest = request;
                 g_pageRenderActive = true;
             }
@@ -3893,7 +3889,7 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(g_pageRenderMutex);
                 g_pageRenderActive = false;
-                stale = g_pageRenderStop || g_pageRenderSerial != request.serial;
+                stale = g_pageRenderStop;
             }
             if (!stale && !result->image.bgra.empty() && IsWindow(request.target))
             {
@@ -3913,7 +3909,7 @@ namespace
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             g_pageRenderStop = false;
-            g_pageRenderHasRequest = false;
+            g_pageRenderQueue.clear();
             g_pageRenderActive = false;
         }
         g_pageRenderThread = std::thread(PageRenderWorkerMain);
@@ -3924,16 +3920,17 @@ namespace
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             g_pageRenderStop = true;
-            g_pageRenderHasRequest = false;
+            g_pageRenderQueue.clear();
             ++g_pageRenderSerial;
         }
         g_pageRenderCv.notify_all();
         if (g_pageRenderThread.joinable()) g_pageRenderThread.join();
     }
 
-    void QueuePageRender(HWND hwnd, PdfTab const& tab, int page)
+    void QueuePageRender(HWND hwnd, PdfTab const& tab, int page, int priority = 0)
     {
         if (page < 0 || page >= tab.pageCount || tab.zoom > 2.0) return;
+        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme && tab.cache.find(page) != tab.cache.end()) return;
         EnsurePageRenderWorker();
         PageRenderRequest request;
         request.documentVersion = tab.renderVersion;
@@ -3943,13 +3940,30 @@ namespace
         request.zoom = tab.zoom;
         request.dpi = g_dpi;
         request.theme = g_theme;
+        request.priority = priority;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
-            if (g_pageRenderHasRequest && SamePageRenderRequest(g_pageRenderRequest, request)) return;
-            if (!g_pageRenderHasRequest && g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            for (auto const& queued : g_pageRenderQueue)
+            {
+                if (SamePageRenderRequest(queued, request)) return;
+            }
             request.serial = ++g_pageRenderSerial;
-            g_pageRenderRequest = request;
-            g_pageRenderHasRequest = true;
+            auto insertAt = std::find_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& queued) { return queued.priority > priority; });
+            g_pageRenderQueue.insert(insertAt, request);
+            constexpr size_t maxQueuedPageRenders = 12;
+            while (g_pageRenderQueue.size() > maxQueuedPageRenders)
+            {
+                auto victim = std::find_if(
+                    g_pageRenderQueue.rbegin(),
+                    g_pageRenderQueue.rend(),
+                    [](PageRenderRequest const& queued) { return queued.priority > 0; });
+                if (victim == g_pageRenderQueue.rend()) g_pageRenderQueue.pop_back();
+                else g_pageRenderQueue.erase(std::next(victim).base());
+            }
         }
         g_pageRenderCv.notify_one();
     }
@@ -4007,40 +4021,46 @@ namespace
         if (!tab || tab->pageCount <= 0 || tab->zoom > 2.0) return;
         PreparePageCache(*tab);
 
+        auto missing = [&](int page)
+        {
+            return page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end();
+        };
+        auto enqueue = [&](int page, int priority)
+        {
+            if (missing(page)) QueuePageRender(hwnd, *tab, page, priority);
+        };
+
         int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(*tab) : FirstPageInSpread(std::clamp(tab->currentPage, 0, tab->pageCount - 1));
-        int lastVisible = g_continuousRead ? tab->pageCount : NextSpreadStart(*tab, firstVisible);
-        for (int start = firstVisible; start < lastVisible; start = NextSpreadStart(*tab, start))
+        int lastVisible = firstVisible;
+        for (int start = firstVisible; start < tab->pageCount; start = NextSpreadStart(*tab, start))
         {
             int y = g_continuousRead ? SpreadVisualTop(*tab, start) : g_stage.top + S(28) - g_scrollY;
             int spreadH = SpreadHeight(*tab, start);
             RECT spreadRect{ SpreadX(*tab, start), y, SpreadX(*tab, start) + SpreadWidth(*tab, start), y + spreadH };
-            if (g_continuousRead && spreadRect.top > g_stage.bottom + S(64)) break;
-            if (!Intersects(spreadRect, g_stage)) continue;
+            if (g_continuousRead && spreadRect.top > g_stage.bottom + S(96)) break;
+            if (!Intersects(spreadRect, g_stage) && (g_continuousRead || start != firstVisible)) continue;
+
             int count = SpreadPageCount(*tab, start);
             for (int j = 0; j < count; ++j)
-            {
-                int page = start + j;
-                if (page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end())
-                {
-                    QueuePageRender(hwnd, *tab, page);
-                    return;
-                }
-            }
+                enqueue(start + j, 0);
+            lastVisible = start;
+
+            if (!g_continuousRead) break;
         }
 
         int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int candidates[2]{ center + 1, center - 1 };
-        int candidateCount = rapidScroll ? 1 : 2;
-        for (int i = 0; i < candidateCount; ++i)
+        int forward = rapidScroll ? 5 : 3;
+        int backward = rapidScroll ? 3 : 2;
+        int nextStart = NextSpreadStart(*tab, lastVisible);
+        for (int start = nextStart, n = 0; start < tab->pageCount && n < forward; start = NextSpreadStart(*tab, start), ++n)
         {
-            int page = candidates[i];
-            if (page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end())
-            {
-                QueuePageRender(hwnd, *tab, page);
-                return;
-            }
+            int count = SpreadPageCount(*tab, start);
+            for (int j = 0; j < count; ++j)
+                enqueue(start + j, 1 + n);
         }
+        for (int page = center - 1, n = 0; page >= 0 && n < backward; --page, ++n)
+            enqueue(page, 2 + n);
     }
 
     bool PrefetchOnePage()
@@ -7170,7 +7190,7 @@ namespace
     }
 
 #if 0
-    void PaintSidebar(HDC dc, PdfTab& tab)
+    void PaintSidebar(HDC dc, PdfTab& tab, RECT paintClip)
     {
         if (g_immersive || !g_sidebarOpen) return;
         GlassFill(dc, g_sidebar, T().panel, 214);
@@ -7218,7 +7238,7 @@ namespace
 
 #endif
 
-    void PaintSidebar(HDC dc, PdfTab& tab)
+    void PaintSidebar(HDC dc, PdfTab& tab, RECT paintClip)
     {
         if (!SidebarVisible() || g_sidebarWidth <= 0) return;
         RECT sidebarFull{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
@@ -7232,6 +7252,8 @@ namespace
         g_searchResultRects.clear();
         g_searchResultIds.clear();
         g_sidebarContentHeight = 0;
+        RECT sidebarControls{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.top + S(86) };
+        bool registerSidebarButtons = Intersects(paintClip, sidebarControls) || g_buttons.empty();
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -7252,7 +7274,7 @@ namespace
         {
             RECT tabRect{ tabStart, tabBar.top + i * (tabWidth + tabGap), tabStart + tabWidth, tabBar.top + i * (tabWidth + tabGap) + tabWidth };
             g_sideTabRects.push_back(tabRect);
-            AddButton(0, tabRect, L"", i == 0 ? L"\u76ee\u5f55" : (i == 1 ? L"\u7f29\u7565\u56fe" : (i == 2 ? L"\u67e5\u627e" : L"\u6ce8\u91ca")));
+            if (registerSidebarButtons) AddButton(0, tabRect, L"", i == 0 ? L"\u76ee\u5f55" : (i == 1 ? L"\u7f29\u7565\u56fe" : (i == 2 ? L"\u67e5\u627e" : L"\u6ce8\u91ca")));
             bool hovered = g_mousePos.x >= tabRect.left && g_mousePos.x < tabRect.right && g_mousePos.y >= tabRect.top && g_mousePos.y < tabRect.bottom;
             bool active = i == g_sideMode;
             if (hovered || active)
@@ -7555,7 +7577,7 @@ namespace
             Fill(dc, sizeBar, T().panel);
             RECT toggleAll{ sizeBar.left, sizeBar.top, sizeBar.left + S(92), sizeBar.bottom };
             std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"\u6536\u8d77\u6240\u6709" : L"\u5c55\u5f00\u6240\u6709";
-            AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
+            if (registerSidebarButtons) AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
             bool toggleHovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &toggleAll);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &toggleAll);
             if (toggleHovered || togglePressed)
@@ -7580,8 +7602,8 @@ namespace
             Text(dc, toggleText, toggleAll, DT_CENTER | DT_VCENTER | DT_SINGLELINE, toggleColor);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
-            AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
-            AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
+            if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
+            if (registerSidebarButtons) AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
             DrawStatusHotArea(dc, smallBtnNew, 5);
             DrawStatusHotArea(dc, largeBtnNew, 5);
             HFONT sizeFont = Font(10);
@@ -7802,6 +7824,7 @@ namespace
         bool lightPaint = StageLightPaintActive();
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
+        bool missingVisiblePage = false;
         if (lightPaint)
         {
             Fill(dc, stageDirty, T().stage);
@@ -7863,7 +7886,10 @@ namespace
                     {
                         PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
                         if (!image && lightPaint)
-                            QueuePageRender(g_hwnd, tab, i);
+                        {
+                            missingVisiblePage = true;
+                            QueuePageRender(g_hwnd, tab, i, 0);
+                        }
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             Fill(dc, drawRect, RGB(255, 255, 255));
@@ -7902,7 +7928,7 @@ namespace
                                     }
                                 }
                                 else image = &EnsureTile(tab, key);
-                                if (!image || (!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) continue;
+                                if (!image || (!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) { if (lightPaint) missingVisiblePage = true; continue; }
                                 RECT tileDest{ pageRect.left + tx, pageRect.top + ty, pageRect.left + tx + w, pageRect.top + ty + h };
                                 if (DrawCachedImage(dc, *image, tileDest)) paintedRenderable = true;
                             }
@@ -7996,7 +8022,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        return !lightPaint || !hadVisiblePage || paintedRenderable;
+        return !lightPaint || !hadVisiblePage || (paintedRenderable && !missingVisiblePage);
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -8356,7 +8382,7 @@ namespace
         RECT sidebarPaint{ 0, top, side, client.bottom - bottom };
         if (side && Intersects(paintClip, sidebarPaint))
         {
-            PaintSidebar(dc, *tab);
+            PaintSidebar(dc, *tab, paintClip);
         }
         if (side)
         {
@@ -10262,8 +10288,8 @@ namespace
         bool uiDirty = Intersects(dirty, toolbarRect) || Intersects(dirty, tabsRect) || Intersects(dirty, statusRect);
         if (g_sidebarOpen)
         {
-            RECT sidebarUi{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
-            if (Intersects(dirty, sidebarUi)) uiDirty = true;
+            RECT sidebarControls{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.top + S(86) };
+            if (Intersects(dirty, sidebarControls)) uiDirty = true;
         }
         bool repaintUi = uiDirty || g_buttons.empty();
         if (repaintUi)
