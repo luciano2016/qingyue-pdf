@@ -4189,6 +4189,18 @@ namespace
         };
     }
 
+    fz_point NormalizeSelectionPoint(RECT pageRect, POINT p)
+    {
+        double pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        int x = std::clamp(p.x, pageRect.left, pageRect.right);
+        int y = std::clamp(p.y, pageRect.top, pageRect.bottom);
+        return fz_point{
+            static_cast<float>((x - pageRect.left) / pageW),
+            static_cast<float>((y - pageRect.top) / pageH)
+        };
+    }
+
     RECT QuadToRect(fz_quad const& quad, RECT pageRect)
     {
         int pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -4203,6 +4215,84 @@ namespace
             pageRect.left + static_cast<int>(maxX * pageW + 0.5f),
             pageRect.top + static_cast<int>(maxY * pageH + 0.5f)
         };
+    }
+
+    void DrawTextSelectionQuads(HDC dc, RECT pageRect, std::vector<fz_quad> const& quads)
+    {
+        struct SelectionLine
+        {
+            RECT bounds{};
+            int centerY{};
+            int height{};
+        };
+
+        std::vector<RECT> rects;
+        rects.reserve(quads.size());
+        for (fz_quad const& quad : quads)
+        {
+            RECT r = QuadToRect(quad, pageRect);
+            RECT clipped{};
+            if (!IntersectRect(&clipped, &r, &pageRect))
+                continue;
+            if (clipped.right <= clipped.left || clipped.bottom <= clipped.top)
+                continue;
+            rects.push_back(clipped);
+        }
+        if (rects.empty())
+            return;
+
+        std::sort(rects.begin(), rects.end(), [](RECT const& a, RECT const& b)
+        {
+            int ac = (a.top + a.bottom) / 2;
+            int bc = (b.top + b.bottom) / 2;
+            if (std::abs(ac - bc) > 2)
+                return ac < bc;
+            return a.left < b.left;
+        });
+
+        std::vector<SelectionLine> lines;
+        for (RECT const& r : rects)
+        {
+            int center = (r.top + r.bottom) / 2;
+            int height = std::max<int>(1, static_cast<int>(r.bottom - r.top));
+            SelectionLine* best = nullptr;
+            int bestDistance = 0x7fffffff;
+            for (auto& line : lines)
+            {
+                int tolerance = std::max(S(4), std::max(line.height, height) / 2);
+                int distance = std::abs(center - line.centerY);
+                if (distance <= tolerance && distance < bestDistance)
+                {
+                    best = &line;
+                    bestDistance = distance;
+                }
+            }
+
+            if (!best)
+            {
+                lines.push_back(SelectionLine{ r, center, height });
+                continue;
+            }
+
+            best->bounds.left = std::min(best->bounds.left, r.left);
+            best->bounds.top = std::min(best->bounds.top, r.top);
+            best->bounds.right = std::max(best->bounds.right, r.right);
+            best->bounds.bottom = std::max(best->bounds.bottom, r.bottom);
+            best->centerY = (best->bounds.top + best->bounds.bottom) / 2;
+            best->height = std::max<int>(best->height, static_cast<int>(best->bounds.bottom - best->bounds.top));
+        }
+
+        BYTE alpha = IsDarkTheme() || IsAuroraTheme() ? 88 : 78;
+        for (SelectionLine const& line : lines)
+        {
+            RECT r = line.bounds;
+            InflateRect(&r, S(1), S(1));
+            r.left = std::clamp(r.left, pageRect.left, pageRect.right);
+            r.right = std::clamp(r.right, pageRect.left, pageRect.right);
+            r.top = std::clamp(r.top, pageRect.top, pageRect.bottom);
+            r.bottom = std::clamp(r.bottom, pageRect.top, pageRect.bottom);
+            AlphaFill(dc, r, RGB(86, 151, 204), alpha);
+        }
     }
 
     RECT DenormalizeAnnotationRect(PdfAnnotation const& annotation, RECT pageRect)
@@ -4300,8 +4390,9 @@ namespace
         if (!g_pdf.selectText || g_selectionPage < 0 || g_selectionPage >= tab.pageCount)
             return false;
 
-        fz_rect rect = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
-        if (std::abs(rect.x1 - rect.x0) < 0.001f || std::abs(rect.y1 - rect.y0) < 0.001f)
+        fz_point start = NormalizeSelectionPoint(g_selectionPageRect, g_selectionStart);
+        fz_point end = NormalizeSelectionPoint(g_selectionPageRect, g_selectionEnd);
+        if (std::abs(start.x - end.x) < 0.001f && std::abs(start.y - end.y) < 0.001f)
             return false;
 
         std::vector<fz_quad> quads(256);
@@ -4310,10 +4401,10 @@ namespace
             tab.ctx,
             tab.doc,
             g_selectionPage,
-            rect.x0,
-            rect.y0,
-            rect.x1,
-            rect.y1,
+            start.x,
+            start.y,
+            end.x,
+            end.y,
             quads.data(),
             static_cast<int>(quads.size()),
             text.data(),
@@ -4323,7 +4414,7 @@ namespace
 
         quads.resize(static_cast<size_t>(count));
         g_selectionQuads = std::move(quads);
-        g_selectionNorm = rect;
+        g_selectionNorm = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
         g_selectionText = FromUtf8(text.c_str());
         return true;
     }
@@ -7795,16 +7886,7 @@ namespace
                     {
                         if (!g_selectionQuads.empty())
                         {
-                            for (fz_quad const& quad : g_selectionQuads)
-                            {
-                                RECT selection = QuadToRect(quad, pageRect);
-                                RECT visibleSelection{};
-                                if (IntersectRect(&visibleSelection, &selection, &pageRect))
-                                {
-                                    InflateRect(&visibleSelection, S(1), S(1));
-                                    AlphaFill(dc, visibleSelection, RGB(118, 169, 230), IsDarkTheme() || IsAuroraTheme() ? 82 : 70);
-                                }
-                            }
+                            DrawTextSelectionQuads(dc, pageRect, g_selectionQuads);
                         }
                         else if (g_selectingContent || g_selectionIsImage)
                         {
