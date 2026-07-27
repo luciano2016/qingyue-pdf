@@ -3835,8 +3835,8 @@ namespace
             for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
             return total;
         };
-        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 48ull * 1024ull * 1024ull;
-        size_t maxPages = tab.zoom > 2.0 ? 2ull : 6ull;
+        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 84ull * 1024ull * 1024ull;
+        size_t maxPages = tab.zoom > 2.0 ? 2ull : 12ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -4323,7 +4323,7 @@ namespace
         {
             return page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end();
         };
-        int enqueueBudget = (g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil)) ? 6 : 4;
+        int enqueueBudget = (g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil)) ? 10 : 8;
         auto enqueue = [&](int page, int priority)
         {
             if (enqueueBudget <= 0) return;
@@ -4354,8 +4354,8 @@ namespace
 
         int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int forward = rapidScroll ? 2 : 1;
-        int backward = 1;
+        int forward = rapidScroll ? 4 : 2;
+        int backward = rapidScroll ? 2 : 1;
         int nextStart = NextSpreadStart(*tab, lastVisible);
         for (int start = nextStart, n = 0; start < tab->pageCount && n < forward; start = NextSpreadStart(*tab, start), ++n)
         {
@@ -8258,17 +8258,16 @@ namespace
                     IntersectClipRect(dc, pageRect.left, pageRect.top, pageRect.right, pageRect.bottom);
                     if (tab.zoom < TileRenderZoomThreshold)
                     {
-                        PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
+                        PageImage* image = FindCachedPage(tab, i);
                         bool usingZoomFallback = false;
                         if (!image && lightPaint)
                         {
                             image = FindZoomFallbackPage(tab, i);
                             usingZoomFallback = image != nullptr;
                         }
-                        if (!image && lightPaint)
+                        if (!image)
                         {
-                            missingVisiblePage = true;
-                            QueuePageRender(g_hwnd, tab, i, 0);
+                            image = &EnsurePage(tab, i);
                         }
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
