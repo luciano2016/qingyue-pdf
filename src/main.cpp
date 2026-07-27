@@ -3858,6 +3858,16 @@ namespace
         return &found->second;
     }
 
+    size_t DynamicPageCacheByteLimit(PdfTab const& tab)
+    {
+        if (tab.zoom >= TileRenderZoomThreshold) return 10ull * 1024ull * 1024ull;
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
+        size_t target = visibleBytes * 5ull + 18ull * 1024ull * 1024ull;
+        return std::clamp<size_t>(target, 42ull * 1024ull * 1024ull, 96ull * 1024ull * 1024ull);
+    }
+
     void TrimPageCache(PdfTab& tab, int protectedPage)
     {
         auto cacheBytes = [&]()
@@ -3866,19 +3876,22 @@ namespace
             for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
             return total;
         };
-        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 28ull * 1024ull * 1024ull;
-        size_t maxPages = tab.zoom > 2.0 ? 2ull : 3ull;
+        size_t maxBytes = DynamicPageCacheByteLimit(tab);
+        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 2ull : 8ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
-            int worstDistance = -1;
+            int worstScore = std::numeric_limits<int>::min();
             for (auto candidate = tab.cache.begin(); candidate != tab.cache.end(); ++candidate)
             {
                 if (candidate->first == protectedPage && tab.cache.size() > 1) continue;
                 int distance = std::abs(candidate->first - tab.currentPage);
-                if (distance > worstDistance)
+                if (distance <= 1 && tab.cache.size() <= maxPages + 2) continue;
+                int score = distance * 1000 + static_cast<int>(candidate->second.CacheBytes() / (1024ull * 1024ull));
+                if (candidate->first < tab.currentPage) score += 120;
+                if (score > worstScore)
                 {
-                    worstDistance = distance;
+                    worstScore = score;
                     victim = candidate;
                 }
             }
@@ -3886,7 +3899,6 @@ namespace
             tab.cache.erase(victim);
         }
     }
-
     PageImage* FindCachedPage(PdfTab& tab, int index)
     {
         PreparePageCache(tab);
@@ -4457,7 +4469,6 @@ namespace
         bool scrolling = (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil) ||
             g_draggingMainScroll || g_draggingMainHScroll || g_smoothStageScroll ||
             g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
-        if (scrolling) return;
         if (tab->zoom >= TileRenderZoomThreshold)
         {
             ScheduleVisibleTilePrefetch(hwnd, *tab);
@@ -4469,7 +4480,7 @@ namespace
         {
             return page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end();
         };
-        int enqueueBudget = (g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil)) ? 10 : 8;
+        int enqueueBudget = scrolling ? 4 : 8;
         auto enqueue = [&](int page, int priority)
         {
             if (enqueueBudget <= 0) return;
@@ -4500,8 +4511,8 @@ namespace
 
         int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int forward = rapidScroll ? 4 : 2;
-        int backward = rapidScroll ? 2 : 1;
+        int forward = rapidScroll ? 2 : 2;
+        int backward = rapidScroll ? 1 : 1;
         int nextStart = NextSpreadStart(*tab, lastVisible);
         for (int start = nextStart, n = 0; start < tab->pageCount && n < forward; start = NextSpreadStart(*tab, start), ++n)
         {
