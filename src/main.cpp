@@ -10688,8 +10688,8 @@ namespace
         PaintCustomZoomDialog(mem, client);
         if (!g_customZoomOpen) PaintHoverTip(mem, client);
         PaintTabDragOverlay(mem);
-        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, 0, 0, SRCCOPY);
         SetViewportOrgEx(mem, oldViewport.x, oldViewport.y, nullptr);
+        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, 0, 0, SRCCOPY);
         EndPaint(hwnd, &ps);
     }
 
