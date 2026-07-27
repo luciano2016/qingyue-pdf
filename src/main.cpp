@@ -1064,6 +1064,11 @@ namespace
         HWND target{};
         std::wstring path;
         int page{};
+        bool tile{};
+        int x{};
+        int y{};
+        int w{};
+        int h{};
         double zoom{};
         unsigned dpi{};
         int theme{};
@@ -1314,6 +1319,7 @@ namespace
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
     constexpr int TileSize = 384;
+    constexpr double TileRenderZoomThreshold = 1.20;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -3676,7 +3682,7 @@ namespace
         return store(std::move(result));
     }
 
-    PageImage PixmapToImage(PdfTab& tab, fz_pixmap* pixmap)
+    PageImage PixmapToImageFor(PdfTab& tab, fz_pixmap* pixmap, int renderTheme)
     {
         PageImage image;
         if (!pixmap) return image;
@@ -3696,7 +3702,7 @@ namespace
                 std::uint8_t b = components >= 3 ? px[2] : px[0];
                 std::uint8_t g = components >= 3 ? px[1] : px[0];
                 std::uint8_t r = px[0];
-                ApplyPdfTheme(b, g, r);
+                ApplyPdfThemeFor(renderTheme, b, g, r);
                 dst[x * 4 + 0] = b;
                 dst[x * 4 + 1] = g;
                 dst[x * 4 + 2] = r;
@@ -3706,9 +3712,13 @@ namespace
         return image;
     }
 
-    PageImage RenderPageTile(PdfTab& tab, int index, RECT tile)
+    PageImage PixmapToImage(PdfTab& tab, fz_pixmap* pixmap)
     {
-        double renderScale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
+        return PixmapToImageFor(tab, pixmap, g_theme);
+    }
+
+    PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme)
+    {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = g_pdf.newPixmapFromPageNumberClip(
             tab.ctx,
@@ -3721,9 +3731,15 @@ namespace
             tile.top,
             tile.right,
             tile.bottom);
-        PageImage image = PixmapToImage(tab, pixmap);
+        PageImage image = PixmapToImageFor(tab, pixmap, renderTheme);
         if (pixmap) g_pdf.dropPixmap(tab.ctx, pixmap);
         return image;
+    }
+
+    PageImage RenderPageTile(PdfTab& tab, int index, RECT tile)
+    {
+        double renderScale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
+        return RenderPageTileAtScale(tab, index, tile, renderScale, g_theme);
     }
 
     PageImage& EnsureTile(PdfTab& tab, TileKey key)
@@ -3774,6 +3790,7 @@ namespace
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
             tab.cache.clear();
+            tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
@@ -3819,7 +3836,8 @@ namespace
     bool SamePageRenderRequest(PageRenderRequest const& a, PageRenderRequest const& b)
     {
         return a.documentVersion == b.documentVersion &&
-            a.page == b.page && a.zoom == b.zoom && a.dpi == b.dpi && a.theme == b.theme &&
+            a.page == b.page && a.tile == b.tile && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h &&
+            a.zoom == b.zoom && a.dpi == b.dpi && a.theme == b.theme &&
             _wcsicmp(a.path.c_str(), b.path.c_str()) == 0;
     }
 
@@ -3875,7 +3893,15 @@ namespace
                 renderTab.doc = workerDoc;
                 renderTab.zoom = request.zoom;
                 double renderScale = request.zoom * static_cast<double>(request.dpi) / 72.0;
-                result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme);
+                if (request.tile)
+                {
+                    RECT tile{ request.x, request.y, request.x + request.w, request.y + request.h };
+                    result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme);
+                }
+                else
+                {
+                    result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme);
+                }
             }
             catch (...)
             {
@@ -3929,7 +3955,7 @@ namespace
 
     void QueuePageRender(HWND hwnd, PdfTab const& tab, int page, int priority = 0)
     {
-        if (page < 0 || page >= tab.pageCount || tab.zoom > 2.0) return;
+        if (page < 0 || page >= tab.pageCount || tab.zoom >= TileRenderZoomThreshold) return;
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme && tab.cache.find(page) != tab.cache.end()) return;
         EnsurePageRenderWorker();
         PageRenderRequest request;
@@ -3968,6 +3994,160 @@ namespace
         g_pageRenderCv.notify_one();
     }
 
+    int TileZoomKey(double zoom)
+    {
+        return static_cast<int>(zoom * 10000.0 + 0.5);
+    }
+
+    void TrimTileCache(PdfTab& tab, TileKey const& protectedKey)
+    {
+        auto cacheBytes = [&]()
+        {
+            size_t total = 0;
+            for (auto const& entry : tab.tileCache) total += entry.second.CacheBytes();
+            return total;
+        };
+
+        constexpr size_t maxTileBytes = 36ull * 1024ull * 1024ull;
+        constexpr size_t maxTiles = 72;
+        while (tab.tileCache.size() > maxTiles || cacheBytes() > maxTileBytes)
+        {
+            auto victim = tab.tileCache.end();
+            int worstDistance = -1;
+            for (auto candidate = tab.tileCache.begin(); candidate != tab.tileCache.end(); ++candidate)
+            {
+                bool isProtected = !(candidate->first < protectedKey) && !(protectedKey < candidate->first);
+                if (isProtected && tab.tileCache.size() > 1) continue;
+                int distance = std::abs(candidate->first.page - tab.currentPage);
+                if (distance > worstDistance)
+                {
+                    worstDistance = distance;
+                    victim = candidate;
+                }
+            }
+            if (victim == tab.tileCache.end()) break;
+            bool victimProtected = !(victim->first < protectedKey) && !(protectedKey < victim->first);
+            if (victimProtected) break;
+            tab.tileCache.erase(victim);
+        }
+    }
+
+    PageImage* FindCachedTile(PdfTab& tab, TileKey const& key)
+    {
+        PreparePageCache(tab);
+        auto found = tab.tileCache.find(key);
+        return found == tab.tileCache.end() ? nullptr : &found->second;
+    }
+
+    void QueueTileRender(HWND hwnd, PdfTab& tab, TileKey const& key, int priority = 0)
+    {
+        if (key.page < 0 || key.page >= tab.pageCount || key.w <= 0 || key.h <= 0) return;
+        PreparePageCache(tab);
+        if (tab.tileCache.find(key) != tab.tileCache.end()) return;
+        EnsurePageRenderWorker();
+
+        PageRenderRequest request;
+        request.documentVersion = tab.renderVersion;
+        request.target = hwnd;
+        request.path = tab.path;
+        request.page = key.page;
+        request.tile = true;
+        request.x = key.x;
+        request.y = key.y;
+        request.w = key.w;
+        request.h = key.h;
+        request.zoom = tab.zoom;
+        request.dpi = g_dpi;
+        request.theme = g_theme;
+        request.priority = priority;
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            for (auto const& queued : g_pageRenderQueue)
+            {
+                if (SamePageRenderRequest(queued, request)) return;
+            }
+            request.serial = ++g_pageRenderSerial;
+            auto insertAt = std::find_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& queued) { return queued.priority > priority; });
+            g_pageRenderQueue.insert(insertAt, request);
+            constexpr size_t maxQueuedTileRenders = 12;
+            while (g_pageRenderQueue.size() > maxQueuedTileRenders)
+            {
+                auto victim = std::find_if(
+                    g_pageRenderQueue.rbegin(),
+                    g_pageRenderQueue.rend(),
+                    [](PageRenderRequest const& queued) { return queued.priority > 0; });
+                if (victim == g_pageRenderQueue.rend()) g_pageRenderQueue.pop_back();
+                else g_pageRenderQueue.erase(std::next(victim).base());
+            }
+        }
+        g_pageRenderCv.notify_one();
+    }
+
+    void QueueVisibleTilesForPage(HWND hwnd, PdfTab& tab, int page, RECT pageRect, RECT clip, int priority, int& budget)
+    {
+        RECT drawRect{};
+        if (budget <= 0 || !IntersectRect(&drawRect, &pageRect, &clip)) return;
+
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        int localLeft = std::clamp<int>(drawRect.left - pageRect.left, 0, pageW);
+        int localTop = std::clamp<int>(drawRect.top - pageRect.top, 0, pageH);
+        int localRight = std::clamp<int>(drawRect.right - pageRect.left, 0, pageW);
+        int localBottom = std::clamp<int>(drawRect.bottom - pageRect.top, 0, pageH);
+        int tileLeft = (localLeft / TileSize) * TileSize;
+        int tileTop = (localTop / TileSize) * TileSize;
+        for (int ty = tileTop; ty < localBottom && budget > 0; ty += TileSize)
+        {
+            int h = std::min(TileSize, pageH - ty);
+            if (h <= 0) continue;
+            for (int tx = tileLeft; tx < localRight && budget > 0; tx += TileSize)
+            {
+                int w = std::min(TileSize, pageW - tx);
+                if (w <= 0) continue;
+                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, tx, ty, w, h };
+                if (!FindCachedTile(tab, key))
+                {
+                    QueueTileRender(hwnd, tab, key, priority);
+                    --budget;
+                }
+            }
+        }
+    }
+
+    void ScheduleVisibleTilePrefetch(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.pageCount <= 0) return;
+        PreparePageCache(tab);
+        bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
+        int budget = rapidScroll ? 12 : 8;
+        RECT visible = g_stage;
+        visible.top -= S(32);
+        visible.bottom += rapidScroll ? S(260) : S(120);
+
+        int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        for (int start = firstVisible; start < tab.pageCount && budget > 0; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int spreadH = SpreadHeight(tab, start);
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
+            if (g_continuousRead && spreadRect.top > visible.bottom) break;
+            if (!Intersects(spreadRect, visible) && (g_continuousRead || start != firstVisible)) continue;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && budget > 0; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (BuildSpreadPageRect(tab, start, y, page, pageRect))
+                    QueueVisibleTilesForPage(hwnd, tab, page, pageRect, visible, 0, budget);
+            }
+            if (!g_continuousRead) break;
+        }
+    }
     PageImage& EnsurePage(PdfTab& tab, int index)
     {
         PreparePageCache(tab);
@@ -4018,7 +4198,12 @@ namespace
     void SchedulePagePrefetch(HWND hwnd)
     {
         PdfTab* tab = Active();
-        if (!tab || tab->pageCount <= 0 || tab->zoom > 2.0) return;
+        if (!tab || tab->pageCount <= 0) return;
+        if (tab->zoom >= TileRenderZoomThreshold)
+        {
+            ScheduleVisibleTilePrefetch(hwnd, *tab);
+            return;
+        }
         PreparePageCache(*tab);
 
         auto missing = [&](int page)
@@ -7888,7 +8073,7 @@ namespace
                 {
                     int savedPageDc = SaveDC(dc);
                     IntersectClipRect(dc, pageRect.left, pageRect.top, pageRect.right, pageRect.bottom);
-                    if (tab.zoom <= 2.0)
+                    if (tab.zoom < TileRenderZoomThreshold)
                     {
                         PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
                         if (!image && lightPaint)
@@ -7923,18 +8108,15 @@ namespace
                             {
                                 int w = std::min(TileSize, pageW - tx);
                                 if (w <= 0) continue;
-                                TileKey key{ i, static_cast<int>(tab.zoom * 10000.0 + 0.5), g_theme, tx, ty, w, h };
-                                PageImage* image = nullptr;
-                                if (lightPaint)
+                                TileKey key{ i, TileZoomKey(tab.zoom), g_theme, tx, ty, w, h };
+                                PageImage* image = FindCachedTile(tab, key);
+                                if (!image)
                                 {
-                                    if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme)
-                                    {
-                                        auto found = tab.tileCache.find(key);
-                                        if (found != tab.tileCache.end()) image = &found->second;
-                                    }
+                                    missingVisiblePage = true;
+                                    QueueTileRender(g_hwnd, tab, key, 0);
+                                    continue;
                                 }
-                                else image = &EnsureTile(tab, key);
-                                if (!image || (!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) { if (lightPaint) missingVisiblePage = true; continue; }
+                                if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) { missingVisiblePage = true; continue; }
                                 RECT tileDest{ pageRect.left + tx, pageRect.top + ty, pageRect.left + tx + w, pageRect.top + ty + h };
                                 if (DrawCachedImage(dc, *image, tileDest)) paintedRenderable = true;
                             }
@@ -8028,7 +8210,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        return !lightPaint || !hadVisiblePage || (paintedRenderable && !missingVisiblePage);
+        return !lightPaint || !hadVisiblePage || (paintedRenderable && (!missingVisiblePage || tab.zoom >= TileRenderZoomThreshold));
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -10372,7 +10554,16 @@ namespace
                     continue;
 
                 PreparePageCache(tab);
-                if (tab.cache.find(request.page) == tab.cache.end())
+                if (request.tile)
+                {
+                    TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.x, request.y, request.w, request.h };
+                    if (tab.tileCache.find(key) == tab.tileCache.end())
+                    {
+                        tab.tileCache.emplace(key, std::move(result->image));
+                        TrimTileCache(tab, key);
+                    }
+                }
+                else if (tab.cache.find(request.page) == tab.cache.end())
                 {
                     tab.cache.emplace(request.page, std::move(result->image));
                     TrimPageCache(tab, request.page);
