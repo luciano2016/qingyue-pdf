@@ -5533,6 +5533,32 @@ namespace
         KillTimer(hwnd, 6);
     }
 
+    void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
+    {
+        if (IsRectEmpty(&g_stage) || (dx == 0 && dy == 0))
+        {
+            RequestStageRepaint(hwnd, includeStatus);
+            return;
+        }
+
+        RECT exposed{};
+        ScrollWindowEx(hwnd, dx, dy, &g_stage, &g_stage, nullptr, &exposed, SW_INVALIDATE);
+        if (!IsRectEmpty(&g_mainScrollTrackRect))
+            InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+        if (!IsRectEmpty(&g_mainHScrollTrackRect))
+            InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+        if (includeStatus)
+        {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
+            InvalidateRect(hwnd, &status, FALSE);
+        }
+        UpdateWindow(hwnd);
+        g_lastStageRepaintMs = GetTickCount64();
+        g_stageRepaintPending = false;
+        KillTimer(hwnd, 6);
+    }
     void RequestSidebarRepaint(HWND hwnd)
     {
         constexpr ULONGLONG frameMs = 16;
@@ -5645,7 +5671,7 @@ namespace
         }
         else
         {
-            RequestStageRepaint(hwnd, pageChanged);
+            ScrollStagePixels(hwnd, 0, dy, pageChanged);
         }
         UpdateVertScrollBar(hwnd);
         SchedulePagePrefetch(hwnd);
@@ -5671,7 +5697,7 @@ namespace
             return;
         }
         MarkStageScrolling(hwnd);
-        RequestStageRepaint(hwnd, false);
+        ScrollStagePixels(hwnd, old - g_scrollX, 0, false);
         UpdateVertScrollBar(hwnd);
     }
 
@@ -5684,7 +5710,17 @@ namespace
         int dy = old - g_sidebarScrollY;
         if (dy == 0) return;
 
-        RequestSidebarRepaint(hwnd);
+        RECT area = SidebarScrollRect();
+        if (!IsRectEmpty(&area))
+        {
+            RECT exposed{};
+            ScrollWindowEx(hwnd, 0, dy, &area, &area, nullptr, &exposed, SW_INVALIDATE);
+            UpdateWindow(hwnd);
+            g_lastSidebarRepaintMs = GetTickCount64();
+            g_sidebarRepaintPending = false;
+            KillTimer(hwnd, 7);
+        }
+        else RequestSidebarRepaint(hwnd);
     }
 
     int WheelPixels(int delta, int pixelsPerNotch, double& remainder)
@@ -7856,12 +7892,10 @@ namespace
                     {
                         PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
                         if (!image && lightPaint)
-                        {
-                            image = &EnsurePage(tab, i);
-                        }
-                        Fill(dc, drawRect, RGB(255, 255, 255));
+                            QueuePageRender(g_hwnd, tab, i);
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
+                            Fill(dc, drawRect, RGB(255, 255, 255));
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
                             int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), 0, image->height - 1);
                             int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), sx + 1, image->width);
