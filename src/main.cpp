@@ -4291,7 +4291,7 @@ namespace
             r.right = std::clamp(r.right, pageRect.left, pageRect.right);
             r.top = std::clamp(r.top, pageRect.top, pageRect.bottom);
             r.bottom = std::clamp(r.bottom, pageRect.top, pageRect.bottom);
-            AlphaFill(dc, r, RGB(86, 151, 204), alpha);
+            AlphaFill(dc, r, RGB(255, 241, 168), alpha);
         }
     }
 
