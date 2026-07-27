@@ -4007,12 +4007,28 @@ namespace
         if (!tab || tab->pageCount <= 0 || tab->zoom > 2.0) return;
         PreparePageCache(*tab);
 
-        int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
-        if (tab->cache.find(center) == tab->cache.end())
+        int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(*tab) : FirstPageInSpread(std::clamp(tab->currentPage, 0, tab->pageCount - 1));
+        int lastVisible = g_continuousRead ? tab->pageCount : NextSpreadStart(*tab, firstVisible);
+        for (int start = firstVisible; start < lastVisible; start = NextSpreadStart(*tab, start))
         {
-            QueuePageRender(hwnd, *tab, center);
-            return;
+            int y = g_continuousRead ? SpreadVisualTop(*tab, start) : g_stage.top + S(28) - g_scrollY;
+            int spreadH = SpreadHeight(*tab, start);
+            RECT spreadRect{ SpreadX(*tab, start), y, SpreadX(*tab, start) + SpreadWidth(*tab, start), y + spreadH };
+            if (g_continuousRead && spreadRect.top > g_stage.bottom + S(64)) break;
+            if (!Intersects(spreadRect, g_stage)) continue;
+            int count = SpreadPageCount(*tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                if (page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end())
+                {
+                    QueuePageRender(hwnd, *tab, page);
+                    return;
+                }
+            }
         }
+
+        int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
         int candidates[2]{ center + 1, center - 1 };
         int candidateCount = rapidScroll ? 1 : 2;
@@ -4217,6 +4233,64 @@ namespace
         };
     }
 
+    void FillTextSelectionPaperExact(HDC dc, RECT r)
+    {
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w <= 0 || h <= 0) return;
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = nullptr;
+        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bitmap || !bits)
+        {
+            if (bitmap) DeleteObject(bitmap);
+            Fill(dc, r, RGB(255, 241, 168));
+            return;
+        }
+
+        HDC mem = CreateCompatibleDC(dc);
+        if (!mem)
+        {
+            DeleteObject(bitmap);
+            Fill(dc, r, RGB(255, 241, 168));
+            return;
+        }
+
+        HGDIOBJ old = SelectObject(mem, bitmap);
+        BitBlt(mem, 0, 0, w, h, dc, r.left, r.top, SRCCOPY);
+
+        auto* px = static_cast<std::uint8_t*>(bits);
+        for (int y = 0; y < h; ++y)
+        {
+            for (int x = 0; x < w; ++x)
+            {
+                std::uint8_t* p = px + (static_cast<size_t>(y) * w + x) * 4;
+                std::uint8_t b = p[0];
+                std::uint8_t g = p[1];
+                std::uint8_t red = p[2];
+                if (Luma(red, g, b) >= 172)
+                {
+                    p[0] = 168;
+                    p[1] = 241;
+                    p[2] = 255;
+                    p[3] = 255;
+                }
+            }
+        }
+
+        BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bitmap);
+        DeleteDC(mem);
+    }
     void DrawTextSelectionQuads(HDC dc, RECT pageRect, std::vector<fz_quad> const& quads)
     {
         struct SelectionLine
@@ -4282,7 +4356,6 @@ namespace
             best->height = std::max<int>(best->height, static_cast<int>(best->bounds.bottom - best->bounds.top));
         }
 
-        BYTE alpha = IsDarkTheme() || IsAuroraTheme() ? 88 : 78;
         for (SelectionLine const& line : lines)
         {
             RECT r = line.bounds;
@@ -4291,7 +4364,7 @@ namespace
             r.right = std::clamp(r.right, pageRect.left, pageRect.right);
             r.top = std::clamp(r.top, pageRect.top, pageRect.bottom);
             r.bottom = std::clamp(r.bottom, pageRect.top, pageRect.bottom);
-            AlphaFill(dc, r, RGB(255, 241, 168), alpha);
+            FillTextSelectionPaperExact(dc, r);
         }
     }
 
@@ -7779,10 +7852,14 @@ namespace
                 {
                     int savedPageDc = SaveDC(dc);
                     IntersectClipRect(dc, pageRect.left, pageRect.top, pageRect.right, pageRect.bottom);
-                    Fill(dc, drawRect, RGB(255, 255, 255));
                     if (tab.zoom <= 2.0)
                     {
                         PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
+                        if (!image && lightPaint)
+                        {
+                            image = &EnsurePage(tab, i);
+                        }
+                        Fill(dc, drawRect, RGB(255, 255, 255));
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -7794,6 +7871,7 @@ namespace
                     }
                     else
                     {
+                        Fill(dc, drawRect, RGB(255, 255, 255));
                         int localLeft = drawRect.left - pageRect.left;
                         int localTop = drawRect.top - pageRect.top;
                         int localRight = drawRect.right - pageRect.left;
