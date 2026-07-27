@@ -1323,8 +1323,8 @@ namespace
     RECT g_zoomDialogInputRect{};
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
-    constexpr int TileSize = 384;
-    constexpr double TileRenderZoomThreshold = 1.75;
+    constexpr int TileSize = 1024;
+    constexpr double TileRenderZoomThreshold = 1.60;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -6089,17 +6089,17 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme &&
-            tab.zoom < TileRenderZoomThreshold && clampedZoom < TileRenderZoomThreshold && !tab.cache.empty())
+            tab.zoom < TileRenderZoomThreshold && clampedZoom < 3.25 && !tab.cache.empty())
         {
             tab.zoomFallbackCache = std::move(tab.cache);
             tab.zoomFallbackZoom = tab.cachedZoom;
             tab.zoomFallbackDpi = tab.cachedDpi;
             tab.zoomFallbackTheme = tab.cachedTheme;
-            tab.zoomFallbackUntil = GetTickCount64() + 900;
+            tab.zoomFallbackUntil = GetTickCount64() + 1800;
         }
         else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
         {
-            tab.zoomFallbackUntil = GetTickCount64() + 900;
+            tab.zoomFallbackUntil = GetTickCount64() + 1800;
         }
 
         tab.zoom = clampedZoom;
@@ -8167,6 +8167,19 @@ namespace
                     else
                     {
                         Fill(dc, drawRect, RGB(255, 255, 255));
+                        bool pageFallbackPainted = false;
+                        if (PageImage* fallback = FindZoomFallbackPage(tab, i))
+                        {
+                            if ((fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                            {
+                                int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
+                                int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
+                                int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
+                                int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
+                                pageFallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
+                                if (pageFallbackPainted) paintedRenderable = true;
+                            }
+                        }
                         int localLeft = drawRect.left - pageRect.left;
                         int localTop = drawRect.top - pageRect.top;
                         int localRight = drawRect.right - pageRect.left;
@@ -8185,11 +8198,11 @@ namespace
                                 PageImage* image = FindCachedTile(tab, key);
                                 if (!image)
                                 {
-                                    missingVisiblePage = true;
+                                    if (!pageFallbackPainted) missingVisiblePage = true;
                                     QueueTileRender(g_hwnd, tab, key, 0);
                                     continue;
                                 }
-                                if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) { missingVisiblePage = true; continue; }
+                                if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) { if (!pageFallbackPainted) missingVisiblePage = true; continue; }
                                 RECT tileDest{ pageRect.left + tx, pageRect.top + ty, pageRect.left + tx + w, pageRect.top + ty + h };
                                 if (DrawCachedImage(dc, *image, tileDest)) paintedRenderable = true;
                             }
@@ -8283,7 +8296,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        return !hadVisiblePage || (paintedRenderable && !missingVisiblePage);
+        return !hadVisiblePage || paintedRenderable || !missingVisiblePage;
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -10651,14 +10664,10 @@ namespace
                 {
                     if (request.tile)
                     {
-                        if (StageScrollPaintInProgress())
-                        {
-                            g_stageIdleRefreshPending = true;
-                        }
-                        else if (!IsRectEmpty(&tileDirty))
-                        {
+                        if (!IsRectEmpty(&tileDirty))
                             InvalidateRect(hwnd, &tileDirty, FALSE);
-                        }
+                        if (StageScrollPaintInProgress())
+                            g_stageIdleRefreshPending = true;
                     }
                     else
                     {
