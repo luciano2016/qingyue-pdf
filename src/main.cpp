@@ -1330,7 +1330,7 @@ namespace
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
     constexpr int TileSize = 1024;
-    constexpr double TileRenderZoomThreshold = 0.0;
+    constexpr double TileRenderZoomThreshold = 1.75;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -3810,8 +3810,8 @@ namespace
             for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
             return total;
         };
-        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 24ull * 1024ull * 1024ull;
-        size_t maxPages = tab.zoom > 2.0 ? 2ull : 4ull;
+        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 28ull * 1024ull * 1024ull;
+        size_t maxPages = tab.zoom > 2.0 ? 2ull : 3ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -6199,6 +6199,10 @@ namespace
 
         UpdateVertScrollBar(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
+        RedrawWindow(hwnd, &status, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
         SchedulePagePrefetch(hwnd);
     }
 
@@ -10654,14 +10658,12 @@ namespace
         if (IsRectEmpty(&dirty)) dirty = client;
         int dirtyW = std::max<int>(1, dirty.right - dirty.left);
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
-        if (!EnsurePaintBuffer(dc, dirtyW, dirtyH))
+        if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
         {
             EndPaint(hwnd, &ps);
             return;
         }
         HDC mem = g_paintBufferDc;
-        POINT oldViewport{};
-        SetViewportOrgEx(mem, -dirty.left, -dirty.top, &oldViewport);
         if (UsesBackdropTheme() && !StageLightPaintActive()) PaintGlassBackdrop(mem, dirty);
         else Fill(mem, dirty, T().bg);
         RECT toolbarRect{ 0, 0, client.right, S(38) };
@@ -10688,8 +10690,7 @@ namespace
         PaintCustomZoomDialog(mem, client);
         if (!g_customZoomOpen) PaintHoverTip(mem, client);
         PaintTabDragOverlay(mem);
-        SetViewportOrgEx(mem, oldViewport.x, oldViewport.y, nullptr);
-        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, 0, 0, SRCCOPY);
+        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
         EndPaint(hwnd, &ps);
     }
 
