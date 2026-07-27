@@ -1330,7 +1330,7 @@ namespace
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
     constexpr int TileSize = 1024;
-    constexpr double TileRenderZoomThreshold = 2.25;
+    constexpr double TileRenderZoomThreshold = 1.50;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -3800,6 +3800,62 @@ namespace
         if (tab.zoomFallbackCache.empty() || tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme) return nullptr;
         auto found = tab.zoomFallbackCache.find(index);
         return found == tab.zoomFallbackCache.end() ? nullptr : &found->second;
+    }
+
+    void TrimZoomFallbackCache(PdfTab& tab, int protectedPage)
+    {
+        while (tab.zoomFallbackCache.size() > 3)
+        {
+            auto victim = tab.zoomFallbackCache.end();
+            int worstDistance = -1;
+            for (auto candidate = tab.zoomFallbackCache.begin(); candidate != tab.zoomFallbackCache.end(); ++candidate)
+            {
+                if (candidate->first == protectedPage && tab.zoomFallbackCache.size() > 1) continue;
+                int distance = std::abs(candidate->first - tab.currentPage);
+                if (distance > worstDistance)
+                {
+                    worstDistance = distance;
+                    victim = candidate;
+                }
+            }
+            if (victim == tab.zoomFallbackCache.end() || victim->first == protectedPage) break;
+            tab.zoomFallbackCache.erase(victim);
+        }
+    }
+
+    double PreviewZoomForPage(PdfTab const& tab, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(tab.pages.size())) return std::min(tab.zoom, 0.5);
+        PageInfo const& page = tab.pages[static_cast<size_t>(index)];
+        double baseW = page.widthPt * static_cast<double>(g_dpi) / 72.0;
+        double baseH = page.heightPt * static_cast<double>(g_dpi) / 72.0;
+        double maxEdge = std::max(baseW, baseH);
+        if (maxEdge <= 1.0) return std::min(tab.zoom, 0.5);
+        constexpr double previewMaxEdge = 1280.0;
+        return std::clamp(std::min(tab.zoom, previewMaxEdge / maxEdge), 0.06, tab.zoom);
+    }
+
+    PageImage* EnsureZoomPreviewPage(PdfTab& tab, int index)
+    {
+        if (index < 0 || index >= tab.pageCount) return nullptr;
+        PruneZoomFallbackCache(tab);
+        double previewZoom = PreviewZoomForPage(tab, index);
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme ||
+            std::abs(tab.zoomFallbackZoom - previewZoom) > 0.001)
+        {
+            tab.zoomFallbackCache.clear();
+            tab.zoomFallbackZoom = previewZoom;
+            tab.zoomFallbackDpi = g_dpi;
+            tab.zoomFallbackTheme = g_theme;
+        }
+        tab.zoomFallbackUntil = GetTickCount64() + 30000;
+        auto found = tab.zoomFallbackCache.find(index);
+        if (found == tab.zoomFallbackCache.end())
+        {
+            found = tab.zoomFallbackCache.emplace(index, RenderPageAtZoom(tab, index, previewZoom)).first;
+            TrimZoomFallbackCache(tab, index);
+        }
+        return &found->second;
     }
 
     void TrimPageCache(PdfTab& tab, int protectedPage)
@@ -8295,26 +8351,22 @@ namespace
                     {
                         Fill(dc, drawRect, RGB(255, 255, 255));
                         bool fallbackPainted = false;
+                        PageImage* fallback = FindZoomFallbackPage(tab, i);
+                        if (!fallback) fallback = EnsureZoomPreviewPage(tab, i);
+                        if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                        {
+                            int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
+                            int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
+                            int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
+                            int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
+                            fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
+                        }
                         int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
                         for (int level = targetLevel; level >= 1; --level)
                         {
                             bool ignoredMissing = false;
                             if (DrawTileLevel(dc, tab, i, pageRect, drawRect, level, level == targetLevel, ignoredMissing))
                                 fallbackPainted = true;
-                        }
-                        if (!fallbackPainted)
-                        {
-                            if (PageImage* fallback = FindZoomFallbackPage(tab, i))
-                            {
-                                if ((fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
-                                {
-                                    int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
-                                    int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
-                                    int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
-                                    int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
-                                    fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
-                                }
-                            }
                         }
                         bool targetMissing = false;
                         bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
