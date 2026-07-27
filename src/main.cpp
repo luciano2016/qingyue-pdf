@@ -1329,7 +1329,7 @@ namespace
     RECT g_zoomDialogInputRect{};
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
-    constexpr int TileSize = 1024;
+    constexpr int TileSize = 512;
     constexpr double TileRenderZoomThreshold = 1.50;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
@@ -4174,6 +4174,15 @@ namespace
         return Intersects(tileRect, nearby);
     }
 
+    size_t DynamicTileCacheByteLimit()
+    {
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
+        size_t target = visibleBytes * 4ull + 16ull * 1024ull * 1024ull;
+        return std::clamp<size_t>(target, 32ull * 1024ull * 1024ull, 72ull * 1024ull * 1024ull);
+    }
+
     void TrimTileCache(PdfTab& tab, TileKey const& protectedKey)
     {
         auto cacheBytes = [&]()
@@ -4183,8 +4192,11 @@ namespace
             return total;
         };
 
-        constexpr size_t maxTileBytes = 24ull * 1024ull * 1024ull;
-        constexpr size_t maxTiles = 48;
+        size_t maxTileBytes = DynamicTileCacheByteLimit();
+        size_t maxTiles = std::clamp<size_t>((static_cast<size_t>(std::max<int>(1, g_stage.right - g_stage.left)) /
+            static_cast<size_t>(TileSize) + 3ull) *
+            (static_cast<size_t>(std::max<int>(1, g_stage.bottom - g_stage.top)) /
+                static_cast<size_t>(TileSize) + 4ull), 48ull, 128ull);
         while (tab.tileCache.size() > maxTiles || cacheBytes() > maxTileBytes)
         {
             auto victim = tab.tileCache.end();
@@ -4193,11 +4205,14 @@ namespace
             {
                 bool isProtected = !(candidate->first < protectedKey) && !(protectedKey < candidate->first);
                 if (isProtected && tab.tileCache.size() > 1) continue;
-                bool nearby = TileVisibleNearby(tab, candidate->first);
+                bool visible = TileVisibleNearby(tab, candidate->first, 0.0);
+                bool nearby = visible || TileVisibleNearby(tab, candidate->first);
+                bool sameView = candidate->first.zoom == protectedKey.zoom && candidate->first.theme == protectedKey.theme;
+                if (visible && sameView && tab.tileCache.size() > 1) continue;
                 int distance = std::abs(candidate->first.page - tab.currentPage);
                 int score = (nearby ? 0 : 100000) + distance * 1000 + candidate->first.level * 80;
-                if (candidate->first.zoom != protectedKey.zoom) score += 400;
-                if (candidate->first.theme != protectedKey.theme) score += 400;
+                if (!sameView) score += 1200;
+                if (candidate->first.level != protectedKey.level) score += 180;
                 if (score > worstScore)
                 {
                     worstScore = score;
@@ -4210,7 +4225,6 @@ namespace
             tab.tileCache.erase(victim);
         }
     }
-
     PageImage* FindCachedTile(PdfTab& tab, TileKey const& key)
     {
         PreparePageCache(tab);
@@ -4265,7 +4279,7 @@ namespace
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& queued) { return queued.priority > priority; });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedTileRenders = 48;
+            constexpr size_t maxQueuedTileRenders = 96;
             while (g_pageRenderQueue.size() > maxQueuedTileRenders)
             {
                 auto victim = std::find_if(
