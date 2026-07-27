@@ -3,6 +3,9 @@
 #include <ctime>
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 struct quiet_pdf_annotation
 {
@@ -94,7 +97,7 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
         pix = fz_new_pixmap_with_bbox(ctx, cs, bbox, nullptr, alpha);
         fz_clear_pixmap_with_value(ctx, pix, alpha ? 0 : 255);
         dev = fz_new_draw_device(ctx, ctm, pix);
-        fz_run_page(ctx, page, dev, fz_identity, nullptr);
+        fz_run_page_contents(ctx, page, dev, fz_identity, nullptr);
         fz_close_device(ctx, dev);
     }
     fz_always(ctx)
@@ -111,6 +114,40 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
     return pix;
 }
 
+static bool quiet_is_supported_markup(enum pdf_annot_type type)
+{
+    return type == PDF_ANNOT_HIGHLIGHT ||
+        type == PDF_ANNOT_UNDERLINE ||
+        type == PDF_ANNOT_STRIKE_OUT;
+}
+
+static bool quiet_is_user_comment_annot(enum pdf_annot_type type)
+{
+    switch (type)
+    {
+    case PDF_ANNOT_TEXT:
+    case PDF_ANNOT_FREE_TEXT:
+    case PDF_ANNOT_LINE:
+    case PDF_ANNOT_SQUARE:
+    case PDF_ANNOT_CIRCLE:
+    case PDF_ANNOT_POLYGON:
+    case PDF_ANNOT_POLY_LINE:
+    case PDF_ANNOT_HIGHLIGHT:
+    case PDF_ANNOT_UNDERLINE:
+    case PDF_ANNOT_SQUIGGLY:
+    case PDF_ANNOT_STRIKE_OUT:
+    case PDF_ANNOT_REDACT:
+    case PDF_ANNOT_STAMP:
+    case PDF_ANNOT_CARET:
+    case PDF_ANNOT_INK:
+    case PDF_ANNOT_FILE_ATTACHMENT:
+    case PDF_ANNOT_SOUND:
+        return true;
+    default:
+        return false;
+    }
+}
+
 extern "C" int quiet_pdf_save_annotations(
     fz_context* ctx,
     fz_document* fzdoc,
@@ -119,7 +156,7 @@ extern "C" int quiet_pdf_save_annotations(
     int annotation_count)
 {
     quiet_set_last_error("");
-    if (!ctx || !fzdoc || !filename || !annotations || annotation_count < 0)
+    if (!ctx || !fzdoc || !filename || annotation_count < 0 || (!annotations && annotation_count > 0))
     {
         quiet_set_last_error("invalid quiet_pdf_save_annotations arguments");
         return 0;
@@ -135,6 +172,34 @@ extern "C" int quiet_pdf_save_annotations(
             fz_throw(ctx, FZ_ERROR_FORMAT, "document is not a PDF");
 
         int page_count = pdf_count_pages(ctx, doc);
+        for (int page_index = 0; page_index < page_count; ++page_index)
+        {
+            pdf_page* page = nullptr;
+            fz_try(ctx)
+            {
+                page = pdf_load_page(ctx, doc, page_index);
+                for (pdf_annot* annot = pdf_first_annot(ctx, page); annot; )
+                {
+                    pdf_annot* next = pdf_next_annot(ctx, annot);
+                    enum pdf_annot_type type = pdf_annot_type(ctx, annot);
+                    bool should_delete = annotation_count == 0 ?
+                        quiet_is_user_comment_annot(type) :
+                        quiet_is_supported_markup(type);
+                    if (should_delete)
+                        pdf_delete_annot(ctx, page, annot);
+                    annot = next;
+                }
+            }
+            fz_always(ctx)
+            {
+                if (page) pdf_drop_page(ctx, page);
+            }
+            fz_catch(ctx)
+            {
+                fz_rethrow(ctx);
+            }
+        }
+
         for (int i = 0; i < annotation_count; ++i)
         {
             const quiet_pdf_annotation& input = annotations[i];
@@ -331,6 +396,255 @@ extern "C" int quiet_pdf_load_annotations(
     return count;
 }
 
+static bool quiet_is_whitespace(int c)
+{
+    return c <= 0x20 || c == 0x3000;
+}
+
+static bool quiet_is_ascii_word(int c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-';
+}
+
+static bool quiet_is_cjk(int c)
+{
+    return (c >= 0x3400 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x20000 && c <= 0x2EBEF);
+}
+
+static bool quiet_is_cjk_punctuation(int c)
+{
+    switch (c)
+    {
+    case 0x3001: case 0x3002: case 0xFF0C: case 0xFF01: case 0xFF1F: case 0xFF1B: case 0xFF1A:
+    case 0x201C: case 0x201D: case 0x2018: case 0x2019: case 0xFF08: case 0xFF09: case 0x300A:
+    case 0x300B: case 0x3010: case 0x3011: case 0x300C: case 0x300D: case 0x300E: case 0x300F:
+    case 0x2026: case 0x2014: case 0x00B7:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool quiet_is_ascii_punctuation(int c)
+{
+    return (c >= 0x21 && c <= 0x2F) || (c >= 0x3A && c <= 0x40) || (c >= 0x5B && c <= 0x60) || (c >= 0x7B && c <= 0x7E);
+}
+
+static int quiet_token_class(int c)
+{
+    if (quiet_is_whitespace(c) || quiet_is_ascii_punctuation(c) || quiet_is_cjk_punctuation(c))
+        return 0;
+    if (quiet_is_ascii_word(c))
+        return 1;
+    if (quiet_is_cjk(c))
+        return 2;
+    return 3;
+}
+
+static fz_rect quiet_rect_from_quad(fz_quad q)
+{
+    fz_rect r;
+    r.x0 = std::min({ q.ul.x, q.ur.x, q.ll.x, q.lr.x });
+    r.y0 = std::min({ q.ul.y, q.ur.y, q.ll.y, q.lr.y });
+    r.x1 = std::max({ q.ul.x, q.ur.x, q.ll.x, q.lr.x });
+    r.y1 = std::max({ q.ul.y, q.ur.y, q.ll.y, q.lr.y });
+    return r;
+}
+
+static fz_rect quiet_inflate_rect(fz_rect r, float pad)
+{
+    r.x0 -= pad;
+    r.y0 -= pad;
+    r.x1 += pad;
+    r.y1 += pad;
+    return r;
+}
+
+static bool quiet_point_in_rect(fz_point p, fz_rect r)
+{
+    return p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1;
+}
+
+static float quiet_point_rect_distance_sq(fz_point p, fz_rect r)
+{
+    float dx = 0.0f;
+    if (p.x < r.x0) dx = r.x0 - p.x;
+    else if (p.x > r.x1) dx = p.x - r.x1;
+    float dy = 0.0f;
+    if (p.y < r.y0) dy = r.y0 - p.y;
+    else if (p.y > r.y1) dy = p.y - r.y1;
+    return dx * dx + dy * dy;
+}
+
+static void quiet_normalize_quad(fz_quad& q, fz_rect bounds)
+{
+    float width = std::max(0.0001f, bounds.x1 - bounds.x0);
+    float height = std::max(0.0001f, bounds.y1 - bounds.y0);
+    q.ul.x = (q.ul.x - bounds.x0) / width;
+    q.ur.x = (q.ur.x - bounds.x0) / width;
+    q.ll.x = (q.ll.x - bounds.x0) / width;
+    q.lr.x = (q.lr.x - bounds.x0) / width;
+    q.ul.y = (q.ul.y - bounds.y0) / height;
+    q.ur.y = (q.ur.y - bounds.y0) / height;
+    q.ll.y = (q.ll.y - bounds.y0) / height;
+    q.lr.y = (q.lr.y - bounds.y0) / height;
+}
+
+extern "C" int quiet_pdf_select_word_at_point(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    float x,
+    float y,
+    fz_quad* quads,
+    int max_quads,
+    char* text,
+    int text_capacity)
+{
+    quiet_set_last_error("");
+    if (!ctx || !doc || page_number < 0 || !quads || max_quads <= 0)
+    {
+        quiet_set_last_error("invalid quiet_pdf_select_word_at_point arguments");
+        return 0;
+    }
+
+    if (text && text_capacity > 0)
+        text[0] = 0;
+
+    fz_stext_page* stext = nullptr;
+    fz_buffer* text_buffer = nullptr;
+    int count = 0;
+
+    fz_try(ctx)
+    {
+        int page_count = fz_count_pages(ctx, doc);
+        if (page_number >= page_count)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "page out of range");
+
+        fz_page* page = fz_load_page(ctx, doc, page_number);
+        fz_rect bounds = fz_bound_page(ctx, page);
+        fz_drop_page(ctx, page);
+
+        fz_stext_options opts{};
+        opts.flags = FZ_STEXT_DEHYPHENATE;
+        stext = fz_new_stext_page_from_page_number(ctx, doc, page_number, &opts);
+
+        fz_point point{
+            bounds.x0 + fz_clamp(x, 0.0f, 1.0f) * (bounds.x1 - bounds.x0),
+            bounds.y0 + fz_clamp(y, 0.0f, 1.0f) * (bounds.y1 - bounds.y0)
+        };
+
+        fz_stext_line* best_line = nullptr;
+        int best_index = -1;
+        float best_score = 3.402823466e+38F;
+
+        for (fz_stext_block* block = stext ? stext->first_block : nullptr; block; block = block->next)
+        {
+            if (block->type != FZ_STEXT_BLOCK_TEXT)
+                continue;
+            for (fz_stext_line* line = block->u.t.first_line; line; line = line->next)
+            {
+                int index = 0;
+                for (fz_stext_char* ch = line->first_char; ch; ch = ch->next, ++index)
+                {
+                    fz_rect rect = quiet_rect_from_quad(ch->quad);
+                    float pad = std::max(1.5f, ch->size * 0.28f);
+                    if (!quiet_point_in_rect(point, quiet_inflate_rect(rect, pad)))
+                        continue;
+                    float score = quiet_point_rect_distance_sq(point, rect);
+                    if (score < best_score)
+                    {
+                        best_score = score;
+                        best_line = line;
+                        best_index = index;
+                    }
+                }
+            }
+        }
+
+        if (best_line && best_index >= 0)
+        {
+            std::vector<fz_stext_char*> chars;
+            for (fz_stext_char* ch = best_line->first_char; ch; ch = ch->next)
+                chars.push_back(ch);
+
+            if (best_index < static_cast<int>(chars.size()))
+            {
+                int cls = quiet_token_class(chars[static_cast<size_t>(best_index)]->c);
+                if (cls != 0)
+                {
+                    auto compatible = [cls](int c) -> bool
+                    {
+                        int other = quiet_token_class(c);
+                        if (cls == 1) return other == 1;
+                        if (cls == 2) return other == 2;
+                        return other == cls;
+                    };
+
+                    int start = best_index;
+                    int end = best_index;
+                    while (start > 0 && compatible(chars[static_cast<size_t>(start - 1)]->c))
+                        --start;
+                    while (end + 1 < static_cast<int>(chars.size()) && compatible(chars[static_cast<size_t>(end + 1)]->c))
+                        ++end;
+
+                    text_buffer = fz_new_buffer(ctx, 256);
+                    fz_rect merged{};
+                    bool have_merged = false;
+                    for (int i = start; i <= end; ++i)
+                    {
+                        fz_stext_char* ch = chars[static_cast<size_t>(i)];
+                        fz_rect char_rect = quiet_rect_from_quad(ch->quad);
+                        if (!have_merged)
+                        {
+                            merged = char_rect;
+                            have_merged = true;
+                        }
+                        else
+                        {
+                            merged.x0 = std::min(merged.x0, char_rect.x0);
+                            merged.y0 = std::min(merged.y0, char_rect.y0);
+                            merged.x1 = std::max(merged.x1, char_rect.x1);
+                            merged.y1 = std::max(merged.y1, char_rect.y1);
+                        }
+                        if (text_buffer)
+                            fz_append_rune(ctx, text_buffer, ch->c);
+                    }
+                    if (have_merged && count < max_quads)
+                    {
+                        fz_quad quad{};
+                        quad.ul = fz_point{ merged.x0, merged.y0 };
+                        quad.ur = fz_point{ merged.x1, merged.y0 };
+                        quad.ll = fz_point{ merged.x0, merged.y1 };
+                        quad.lr = fz_point{ merged.x1, merged.y1 };
+                        quiet_normalize_quad(quad, bounds);
+                        quads[count++] = quad;
+                    }
+
+                    if (text && text_capacity > 0 && text_buffer)
+                    {
+                        fz_terminate_buffer(ctx, text_buffer);
+                        quiet_copy_text(text, static_cast<size_t>(text_capacity), fz_string_from_buffer(ctx, text_buffer));
+                    }
+                }
+            }
+        }
+    }
+    fz_always(ctx)
+    {
+        if (text_buffer) fz_drop_buffer(ctx, text_buffer);
+        if (stext) fz_drop_stext_page(ctx, stext);
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        count = 0;
+        if (text && text_capacity > 0)
+            text[0] = 0;
+    }
+
+    return count;
+}
 extern "C" int quiet_pdf_select_text(
     fz_context* ctx,
     fz_document* doc,
@@ -415,4 +729,85 @@ extern "C" int quiet_pdf_select_text(
     }
 
     return count;
+}
+
+extern "C" int quiet_pdf_find_image_at_point(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    float x,
+    float y,
+    fz_rect* out_rect)
+{
+    quiet_set_last_error("");
+    if (!ctx || !doc || page_number < 0 || !out_rect)
+    {
+        quiet_set_last_error("invalid quiet_pdf_find_image_at_point arguments");
+        return 0;
+    }
+
+    fz_stext_page* stext = nullptr;
+    int found = 0;
+    out_rect->x0 = out_rect->y0 = out_rect->x1 = out_rect->y1 = 0.0f;
+
+    fz_try(ctx)
+    {
+        int page_count = fz_count_pages(ctx, doc);
+        if (page_number >= page_count)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "page out of range");
+
+        fz_page* page = fz_load_page(ctx, doc, page_number);
+        fz_rect bounds = fz_bound_page(ctx, page);
+        fz_drop_page(ctx, page);
+
+        fz_stext_options opts{};
+        opts.flags = FZ_STEXT_DEHYPHENATE | FZ_STEXT_PRESERVE_IMAGES;
+        stext = fz_new_stext_page_from_page_number(ctx, doc, page_number, &opts);
+
+        fz_point point{
+            bounds.x0 + fz_clamp(x, 0.0f, 1.0f) * (bounds.x1 - bounds.x0),
+            bounds.y0 + fz_clamp(y, 0.0f, 1.0f) * (bounds.y1 - bounds.y0)
+        };
+
+        float best_area = 0.0f;
+        for (fz_stext_block* block = stext ? stext->first_block : nullptr; block; block = block->next)
+        {
+            if (block->type != FZ_STEXT_BLOCK_IMAGE)
+                continue;
+
+            fz_rect bbox = block->bbox;
+            if (point.x < bbox.x0 || point.x > bbox.x1 || point.y < bbox.y0 || point.y > bbox.y1)
+                continue;
+
+            float area = (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0);
+            if (!found || area < best_area)
+            {
+                *out_rect = bbox;
+                best_area = area;
+                found = 1;
+            }
+        }
+
+        if (found)
+        {
+            float width = bounds.x1 - bounds.x0;
+            float height = bounds.y1 - bounds.y0;
+            out_rect->x0 = (out_rect->x0 - bounds.x0) / width;
+            out_rect->x1 = (out_rect->x1 - bounds.x0) / width;
+            out_rect->y0 = (out_rect->y0 - bounds.y0) / height;
+            out_rect->y1 = (out_rect->y1 - bounds.y0) / height;
+        }
+    }
+    fz_always(ctx)
+    {
+        if (stext) fz_drop_stext_page(ctx, stext);
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        found = 0;
+        out_rect->x0 = out_rect->y0 = out_rect->x1 = out_rect->y1 = 0.0f;
+    }
+
+    return found;
 }

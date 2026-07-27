@@ -16,9 +16,14 @@ RequestExecutionLevel user
 !define APP_UNINSTALL_NAME "卸载轻阅PDF.exe"
 !define APP_REG_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\QingYuePDF"
 !define APP_INSTALL_REG_KEY "Software\QingYuePDF"
+!define APP_PROG_ID "QingYuePDF.Document"
+!define APP_OPENWITH_KEY "Software\Classes\Applications\${APP_EXE_NAME}"
+!define APP_CAPABILITIES_KEY "Software\QingYuePDF\Capabilities"
+!define APP_REGISTERED_NAME "QingYuePDF"
 !define ROOT_DIR "E:\dev\New\SuccSystem\quietpdf-win32"
 !define SOURCE_EXE "${ROOT_DIR}\build\x64\Release\QuietPDF.Win32.exe"
 !define SOURCE_DLL "${ROOT_DIR}\build\x64\Release\quietmupdf.dll"
+!define SOURCE_VCRUNTIME140 "E:\dev\Microsoft Visual Studio18\BuildTools\VC\Redist\MSVC\14.51.36231\x64\Microsoft.VC145.CRT\vcruntime140.dll"
 !define APP_ICON "${ROOT_DIR}\assets\xiaoyue.ico"
 !define SETUP_OUT "${ROOT_DIR}\dist\轻阅PDF-Setup-x64.exe"
 
@@ -89,6 +94,7 @@ Function EnsureInstallFilesWritable
     ClearErrors
     Delete "$INSTDIR\${APP_EXE_NAME}"
     Delete "$INSTDIR\quietmupdf.dll"
+    Delete "$INSTDIR\vcruntime140.dll"
     IfErrors locked done
 
   locked:
@@ -100,6 +106,7 @@ Function EnsureInstallFilesWritable
     ClearErrors
     Delete "$INSTDIR\${APP_EXE_NAME}"
     Delete "$INSTDIR\quietmupdf.dll"
+    Delete "$INSTDIR\vcruntime140.dll"
     IfErrors ask done
 
   ask:
@@ -118,6 +125,7 @@ Section "${APP_NAME}" SecMain
   Call EnsureInstallFilesWritable
   File "/oname=${APP_EXE_NAME}" "${SOURCE_EXE}"
   File "${SOURCE_DLL}"
+  File "${SOURCE_VCRUNTIME140}"
 
   WriteUninstaller "$INSTDIR\${APP_UNINSTALL_NAME}"
   WriteRegStr HKCU "${APP_INSTALL_REG_KEY}" "InstallLocation" "$INSTDIR"
@@ -130,6 +138,19 @@ Section "${APP_NAME}" SecMain
   WriteRegDWORD HKCU "${APP_REG_KEY}" "NoModify" 1
   WriteRegDWORD HKCU "${APP_REG_KEY}" "NoRepair" 1
   WriteRegDWORD HKCU "${APP_REG_KEY}" "EstimatedSize" 18000
+  WriteRegStr HKCU "${APP_OPENWITH_KEY}" "FriendlyAppName" "${APP_NAME}"
+  WriteRegStr HKCU "${APP_OPENWITH_KEY}\DefaultIcon" "" "$INSTDIR\${APP_EXE_NAME},0"
+  WriteRegStr HKCU "${APP_OPENWITH_KEY}\shell\open\command" "" '"$INSTDIR\${APP_EXE_NAME}" "%1"'
+  WriteRegStr HKCU "${APP_OPENWITH_KEY}\SupportedTypes" ".pdf" ""
+  WriteRegStr HKCU "Software\Classes\.pdf\OpenWithProgids" "${APP_PROG_ID}" ""
+  WriteRegStr HKCU "Software\Classes\${APP_PROG_ID}" "" "${APP_NAME}"
+  WriteRegStr HKCU "Software\Classes\${APP_PROG_ID}\DefaultIcon" "" "$INSTDIR\${APP_EXE_NAME},0"
+  WriteRegStr HKCU "Software\Classes\${APP_PROG_ID}\shell\open\command" "" '"$INSTDIR\${APP_EXE_NAME}" "%1"'
+  WriteRegStr HKCU "${APP_CAPABILITIES_KEY}" "ApplicationName" "${APP_NAME}"
+  WriteRegStr HKCU "${APP_CAPABILITIES_KEY}" "ApplicationDescription" "${APP_NAME}"
+  WriteRegStr HKCU "${APP_CAPABILITIES_KEY}\FileAssociations" ".pdf" "${APP_PROG_ID}"
+  WriteRegStr HKCU "Software\RegisteredApplications" "${APP_REGISTERED_NAME}" "${APP_CAPABILITIES_KEY}"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE_NAME}" "" "$INSTDIR\${APP_EXE_NAME}" 0
@@ -155,11 +176,18 @@ Section "un.卸载 ${APP_NAME} 程序文件" SecProgramFiles
   Delete "$SMPROGRAMS\${APP_NAME}\卸载 ${APP_NAME}.lnk"
   RMDir "$SMPROGRAMS\${APP_NAME}"
   Delete "$INSTDIR\quietmupdf.dll"
+  Delete "$INSTDIR\vcruntime140.dll"
   Delete "$INSTDIR\${APP_EXE_NAME}"
   Delete "$INSTDIR\${APP_UNINSTALL_NAME}"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "${APP_REG_KEY}"
   DeleteRegKey HKCU "${APP_INSTALL_REG_KEY}"
+  DeleteRegKey HKCU "${APP_OPENWITH_KEY}"
+  DeleteRegKey HKCU "${APP_CAPABILITIES_KEY}"
+  DeleteRegKey HKCU "Software\Classes\${APP_PROG_ID}"
+  DeleteRegValue HKCU "Software\Classes\.pdf\OpenWithProgids" "${APP_PROG_ID}"
+  DeleteRegValue HKCU "Software\RegisteredApplications" "${APP_REGISTERED_NAME}"
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd
 
 Section /o "un.删除应用配置数据（阅读进度、最近文档、主题设置）" un.SecUserData

@@ -6,10 +6,15 @@
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <sddl.h>
+#include <wincrypt.h>
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
 #include <ctime>
@@ -59,7 +64,7 @@ namespace
         unsigned int b : 8;
     };
 
-    constexpr wchar_t const* AppName = L"轻阅PDF";
+    constexpr wchar_t const* AppName = L"\u8f7b\u9605PDF";
 
     struct Theme
     {
@@ -80,6 +85,76 @@ namespace
         int width{};
         int height{};
         std::vector<std::uint8_t> bgra;
+        mutable HBITMAP dib{};
+
+        PageImage() = default;
+        ~PageImage() { ResetDib(); }
+
+        PageImage(PageImage const& other)
+            : width(other.width), height(other.height), bgra(other.bgra)
+        {
+        }
+
+        PageImage& operator=(PageImage const& other)
+        {
+            if (this != &other)
+            {
+                ResetDib();
+                width = other.width;
+                height = other.height;
+                bgra = other.bgra;
+            }
+            return *this;
+        }
+
+        PageImage(PageImage&& other) noexcept
+            : width(other.width), height(other.height), bgra(std::move(other.bgra)), dib(other.dib)
+        {
+            other.width = 0;
+            other.height = 0;
+            other.dib = nullptr;
+        }
+
+        PageImage& operator=(PageImage&& other) noexcept
+        {
+            if (this != &other)
+            {
+                ResetDib();
+                width = other.width;
+                height = other.height;
+                bgra = std::move(other.bgra);
+                dib = other.dib;
+                other.width = 0;
+                other.height = 0;
+                other.dib = nullptr;
+            }
+            return *this;
+        }
+
+        void ResetDib() const
+        {
+            if (dib)
+            {
+                DeleteObject(dib);
+                dib = nullptr;
+            }
+        }
+
+        size_t PixelBytes() const
+        {
+            if (width <= 0 || height <= 0) return 0;
+            return static_cast<size_t>(width) * static_cast<size_t>(height) * 4ull;
+        }
+
+        size_t CacheBytes() const
+        {
+            return dib ? PixelBytes() : bgra.size();
+        }
+
+        void ReleasePixels()
+        {
+            std::vector<std::uint8_t>().swap(bgra);
+        }
     };
 
     struct TileKey
@@ -209,6 +284,7 @@ namespace
         fz_document* doc{};
         int pageCount{};
         int currentPage{};
+        int savedScrollY{};
         double zoom{ 1.0 };
         double cachedZoom{};
         unsigned cachedDpi{};
@@ -233,6 +309,7 @@ namespace
         std::filesystem::file_time_type fileStamp{};
         bool hasFileStamp{};
         bool dirty{};
+        unsigned long renderVersion{};
     };
 
     struct RecentItem
@@ -244,6 +321,14 @@ namespace
         long long pinnedAt{};
         bool pinned{};
         bool favorite{};
+    };
+
+    struct LastSessionItem
+    {
+        std::wstring path;
+        int page{ 1 };
+        int scrollY{};
+        double zoom{ 1.0 };
     };
 
     enum class HomeAction
@@ -302,7 +387,11 @@ namespace
         CmdNoteDelete,
         CmdNoteDeleteAll,
         CmdHomeToggleView,
-        CmdHomeClearRecords
+        CmdHomeClearRecords,
+        CmdTabNavPrev,
+        CmdTabNavNext,
+        CmdTabListToggle,
+        CmdSidebarPanelToggle
     };
 
     std::string ToUtf8(const std::wstring& text)
@@ -330,6 +419,490 @@ namespace
         wchar_t path[MAX_PATH]{};
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         return std::filesystem::path(path).parent_path();
+    }
+
+    constexpr wchar_t const* PdfProgId = L"QingYuePDF.Document";
+    constexpr wchar_t const* PdfRegisteredApp = L"QingYuePDF";
+    constexpr wchar_t const* UserChoiceExperienceFallback = L"User Choice set via Windows User Experience {D18B6DD5-6124-4341-9318-804003BAFA0B}";
+    int g_defaultAssocStatus = 0;
+
+    std::wstring LowerCopy(std::wstring value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+        return value;
+    }
+
+    bool WriteRegSz(HKEY root, std::wstring const& path, wchar_t const* name, std::wstring const& value)
+    {
+        HKEY key{};
+        if (RegCreateKeyExW(root, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+            return false;
+        LSTATUS status = RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<BYTE const*>(value.c_str()), static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(key);
+        return status == ERROR_SUCCESS;
+    }
+
+    bool WriteRegDword(HKEY root, std::wstring const& path, wchar_t const* name, DWORD value)
+    {
+        HKEY key{};
+        if (RegCreateKeyExW(root, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+            return false;
+        LSTATUS status = RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<BYTE const*>(&value), sizeof(value));
+        RegCloseKey(key);
+        return status == ERROR_SUCCESS;
+    }
+
+    std::wstring ReadRegSz(HKEY root, std::wstring const& path, wchar_t const* name)
+    {
+        HKEY key{};
+        if (RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+            return {};
+
+        DWORD type = 0;
+        DWORD bytes = 0;
+        if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes) != ERROR_SUCCESS || type != REG_SZ || bytes < sizeof(wchar_t))
+        {
+            RegCloseKey(key);
+            return {};
+        }
+
+        std::wstring value(bytes / sizeof(wchar_t), L'\0');
+        if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(value.data()), &bytes) != ERROR_SUCCESS)
+        {
+            RegCloseKey(key);
+            return {};
+        }
+
+        RegCloseKey(key);
+        while (!value.empty() && value.back() == L'\0')
+            value.pop_back();
+        return value;
+    }
+
+    std::wstring PowerShellEscapeSingleQuoted(std::wstring value)
+    {
+        size_t pos = 0;
+        while ((pos = value.find(L'\'', pos)) != std::wstring::npos)
+        {
+            value.replace(pos, 1, L"''");
+            pos += 2;
+        }
+        return value;
+    }
+
+    bool RunHiddenProcess(std::wstring const& application, std::wstring commandLine, DWORD& exitCode)
+    {
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi{};
+        std::vector<wchar_t> buffer(commandLine.begin(), commandLine.end());
+        buffer.push_back(L'\0');
+        if (!CreateProcessW(application.c_str(), buffer.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+            return false;
+
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        exitCode = 1;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return true;
+    }
+
+    bool VerifyPdfDefaultAssociation()
+    {
+        for (int i = 0; i < 20; ++i)
+        {
+            std::wstring progId = ReadRegSz(
+                HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.pdf\\UserChoice",
+                L"ProgId");
+            if (_wcsicmp(progId.c_str(), PdfProgId) == 0)
+                return true;
+            Sleep(100);
+        }
+        return false;
+    }
+
+    bool HasUserChoiceProtection()
+    {
+        HKEY key{};
+        LSTATUS status = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"SYSTEM\\CurrentControlSet\\Services\\UCPD",
+            0,
+            KEY_QUERY_VALUE,
+            &key);
+        if (status == ERROR_SUCCESS)
+            RegCloseKey(key);
+        return status == ERROR_SUCCESS;
+    }
+
+    bool DeleteRegTreeIfExists(HKEY root, std::wstring const& path)
+    {
+        LSTATUS status = RegDeleteTreeW(root, path.c_str());
+        return status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND;
+    }
+
+    std::wstring CurrentUserSidString()
+    {
+        HANDLE token{};
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            return {};
+
+        DWORD bytes = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+        std::vector<BYTE> buffer(bytes);
+        if (!GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes))
+        {
+            CloseHandle(token);
+            return {};
+        }
+        CloseHandle(token);
+
+        TOKEN_USER* user = reinterpret_cast<TOKEN_USER*>(buffer.data());
+        LPWSTR sidText = nullptr;
+        if (!ConvertSidToStringSidW(user->User.Sid, &sidText))
+            return {};
+        std::wstring sid = sidText;
+        LocalFree(sidText);
+        return sid;
+    }
+
+    std::wstring CurrentAssocTimestampHex()
+    {
+        SYSTEMTIME local{};
+        GetLocalTime(&local);
+        local.wSecond = 0;
+        local.wMilliseconds = 0;
+        FILETIME localFileTime{};
+        FILETIME utcFileTime{};
+        if (!SystemTimeToFileTime(&local, &localFileTime) || !LocalFileTimeToFileTime(&localFileTime, &utcFileTime))
+            return {};
+
+        wchar_t buffer[17]{};
+        swprintf_s(buffer, L"%08lx%08lx", utcFileTime.dwHighDateTime, utcFileTime.dwLowDateTime);
+        return buffer;
+    }
+
+    std::wstring DetectUserChoiceExperience()
+    {
+        wchar_t sysWow64[MAX_PATH]{};
+        UINT len = GetSystemWow64DirectoryW(sysWow64, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH)
+        {
+            len = GetSystemDirectoryW(sysWow64, MAX_PATH);
+            if (len == 0 || len >= MAX_PATH)
+                return UserChoiceExperienceFallback;
+        }
+
+        std::filesystem::path shell32 = std::filesystem::path(sysWow64) / L"Shell32.dll";
+        std::ifstream in(shell32, std::ios::binary);
+        if (!in)
+            return UserChoiceExperienceFallback;
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (bytes.size() < sizeof(wchar_t) * 8)
+            return UserChoiceExperienceFallback;
+
+        std::wstring text(reinterpret_cast<wchar_t const*>(bytes.data()), bytes.size() / sizeof(wchar_t));
+        std::wstring needle = L"User Choice set via Windows User Experience";
+        size_t start = text.find(needle);
+        if (start == std::wstring::npos)
+            return UserChoiceExperienceFallback;
+        size_t end = text.find(L'}', start);
+        if (end == std::wstring::npos)
+            return UserChoiceExperienceFallback;
+        return text.substr(start, end - start + 1);
+    }
+
+    int32_t ReadInt32LE(std::vector<BYTE> const& bytes, size_t offset)
+    {
+        uint32_t value = static_cast<uint32_t>(bytes[offset]) |
+            (static_cast<uint32_t>(bytes[offset + 1]) << 8) |
+            (static_cast<uint32_t>(bytes[offset + 2]) << 16) |
+            (static_cast<uint32_t>(bytes[offset + 3]) << 24);
+        return static_cast<int32_t>(value);
+    }
+
+    int64_t ShiftRightSigned(int64_t value, int count)
+    {
+        if (value >= 0) return value >> count;
+        return (value >> count) ^ (0xFFFF0000LL);
+    }
+
+    int32_t Wrap32(int64_t value)
+    {
+        return static_cast<int32_t>(static_cast<uint32_t>(value & 0xFFFFFFFFu));
+    }
+
+    bool Md5Wide(std::wstring const& text, BYTE hash[16])
+    {
+        HCRYPTPROV provider{};
+        HCRYPTHASH digest{};
+        if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT))
+            return false;
+        if (!CryptCreateHash(provider, CALG_MD5, 0, 0, &digest))
+        {
+            CryptReleaseContext(provider, 0);
+            return false;
+        }
+        DWORD byteCount = static_cast<DWORD>((text.size() + 1) * sizeof(wchar_t));
+        bool ok = CryptHashData(digest, reinterpret_cast<BYTE const*>(text.c_str()), byteCount, 0) != 0;
+        DWORD hashSize = 16;
+        if (ok) ok = CryptGetHashParam(digest, HP_HASHVAL, hash, &hashSize, 0) != 0 && hashSize == 16;
+        CryptDestroyHash(digest);
+        CryptReleaseContext(provider, 0);
+        return ok;
+    }
+
+    std::string Base64EncodeBytes(BYTE const* data, size_t size)
+    {
+        static char const* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((size + 2) / 3) * 4);
+        for (size_t i = 0; i < size; i += 3)
+        {
+            uint32_t block = static_cast<uint32_t>(data[i]) << 16;
+            if (i + 1 < size) block |= static_cast<uint32_t>(data[i + 1]) << 8;
+            if (i + 2 < size) block |= static_cast<uint32_t>(data[i + 2]);
+            out.push_back(alphabet[(block >> 18) & 63]);
+            out.push_back(alphabet[(block >> 12) & 63]);
+            out.push_back(i + 1 < size ? alphabet[(block >> 6) & 63] : '=');
+            out.push_back(i + 2 < size ? alphabet[block & 63] : '=');
+        }
+        return out;
+    }
+
+    std::wstring ComputeUserChoiceHash(std::wstring const& extension, std::wstring const& sid, std::wstring const& progId, std::wstring const& timestampHex, std::wstring const& experience)
+    {
+        std::wstring baseInfo = LowerCopy(extension + sid + progId + timestampHex + experience);
+        BYTE md5[16]{};
+        if (!Md5Wide(baseInfo, md5))
+            return {};
+
+        std::vector<BYTE> baseBytes(reinterpret_cast<BYTE const*>(baseInfo.data()), reinterpret_cast<BYTE const*>(baseInfo.data()) + baseInfo.size() * sizeof(wchar_t));
+        baseBytes.push_back(0);
+        baseBytes.push_back(0);
+        baseBytes.resize(baseBytes.size() + 16, 0);
+
+        auto shift = [](int64_t value, int count) -> int64_t
+        {
+            if ((value & 0x80000000LL) != 0)
+                return static_cast<int32_t>((static_cast<uint32_t>(value >> count)) ^ 0xFFFF0000u);
+            return value >> count;
+        };
+        std::vector<BYTE> md5Bytes(md5, md5 + 16);
+        int64_t lengthBase = static_cast<int64_t>(baseInfo.size() * sizeof(wchar_t) + sizeof(wchar_t));
+        int64_t length = (((lengthBase & 4) <= 1) ? 1 : 0) + shift(lengthBase, 2) - 1;
+        if (length <= 1)
+            return {};
+
+        BYTE outHash[16]{};
+        int64_t md51 = (static_cast<int64_t>(ReadInt32LE(md5Bytes, 0)) | 1LL) + 0x69FB0000LL;
+        int64_t md52 = (static_cast<int64_t>(ReadInt32LE(md5Bytes, 4)) | 1LL) + 0x13DB0000LL;
+        int64_t counter = shift(length - 2, 1) + 1;
+        size_t p = 0;
+        int32_t cache = 0;
+        int32_t out1 = 0;
+        int32_t out2 = 0;
+        while (counter-- > 0)
+        {
+            int32_t r0 = Wrap32(static_cast<int64_t>(ReadInt32LE(baseBytes, p)) + out1);
+            int32_t r1 = ReadInt32LE(baseBytes, p + 4);
+            p += 8;
+            int32_t r2 = Wrap32((static_cast<int64_t>(r0) * md51) - (0x10FA9605LL * shift(r0, 16)));
+            int32_t r2b = Wrap32((0x79F8A395LL * r2) + (0x689B6B9FLL * shift(r2, 16)));
+            int32_t r3 = Wrap32((0xEA970001LL * r2b) - (0x3C101569LL * shift(r2b, 16)));
+            int32_t r4 = Wrap32(static_cast<int64_t>(r3) + r1);
+            int32_t r5 = Wrap32(static_cast<int64_t>(cache) + r3);
+            int32_t r6 = Wrap32((static_cast<int64_t>(r4) * md52) - (0x3CE8EC25LL * shift(r4, 16)));
+            int32_t r6b = Wrap32((0x59C3AF2DLL * r6) - (0x2232E0F1LL * shift(r6, 16)));
+            out1 = Wrap32((0x1EC90001LL * r6b) + (0x35BD1EC9LL * shift(r6b, 16)));
+            out2 = Wrap32(static_cast<int64_t>(r5) + out1);
+            cache = out2;
+        }
+        *reinterpret_cast<int32_t*>(outHash + 0) = out1;
+        *reinterpret_cast<int32_t*>(outHash + 4) = out2;
+
+        md51 = static_cast<int64_t>(ReadInt32LE(md5Bytes, 0)) | 1LL;
+        md52 = static_cast<int64_t>(ReadInt32LE(md5Bytes, 4)) | 1LL;
+        counter = shift(length - 2, 1) + 1;
+        p = 0;
+        cache = 0;
+        out1 = 0;
+        out2 = 0;
+        while (counter-- > 0)
+        {
+            int32_t r0 = Wrap32(static_cast<int64_t>(ReadInt32LE(baseBytes, p)) + out1);
+            p += 8;
+            int32_t r1 = Wrap32(static_cast<int64_t>(r0) * md51);
+            int32_t r1b = Wrap32((0xB1110000LL * r1) - (0x30674EEFLL * shift(r1, 16)));
+            int32_t r2 = Wrap32((0x5B9F0000LL * r1b) - (0x78F7A461LL * shift(r1b, 16)));
+            int32_t r2b = Wrap32((0x12CEB96DLL * shift(r2, 16)) - (0x46930000LL * r2));
+            int32_t r3 = Wrap32((0x1D830000LL * r2b) + (0x257E1D83LL * shift(r2b, 16)));
+            int32_t r4 = Wrap32(md52 * (static_cast<int64_t>(r3) + ReadInt32LE(baseBytes, p - 4)));
+            int32_t r4b = Wrap32((0x16F50000LL * r4) - (0x5D8BE90BLL * shift(r4, 16)));
+            int32_t r5 = Wrap32((0x96FF0000LL * r4b) - (0x2C7C6901LL * shift(r4b, 16)));
+            int32_t r5b = Wrap32((0x2B890000LL * r5) + (0x7C932B89LL * shift(r5, 16)));
+            out1 = Wrap32((0x9F690000LL * r5b) - (0x405B6097LL * shift(r5b, 16)));
+            out2 = Wrap32(static_cast<int64_t>(out1) + cache + r3);
+            cache = out2;
+        }
+        *reinterpret_cast<int32_t*>(outHash + 8) = out1;
+        *reinterpret_cast<int32_t*>(outHash + 12) = out2;
+
+        uint32_t hash1 = static_cast<uint32_t>(ReadInt32LE(std::vector<BYTE>(outHash, outHash + 16), 8)) ^ static_cast<uint32_t>(ReadInt32LE(std::vector<BYTE>(outHash, outHash + 16), 0));
+        uint32_t hash2 = static_cast<uint32_t>(ReadInt32LE(std::vector<BYTE>(outHash, outHash + 16), 12)) ^ static_cast<uint32_t>(ReadInt32LE(std::vector<BYTE>(outHash, outHash + 16), 4));
+        BYTE out[8]{
+            static_cast<BYTE>(hash1 & 0xFF), static_cast<BYTE>((hash1 >> 8) & 0xFF), static_cast<BYTE>((hash1 >> 16) & 0xFF), static_cast<BYTE>((hash1 >> 24) & 0xFF),
+            static_cast<BYTE>(hash2 & 0xFF), static_cast<BYTE>((hash2 >> 8) & 0xFF), static_cast<BYTE>((hash2 >> 16) & 0xFF), static_cast<BYTE>((hash2 >> 24) & 0xFF)
+        };
+        return FromUtf8(Base64EncodeBytes(out, sizeof(out)));
+    }
+
+    bool RegisterPdfAssociationForCurrentUser()
+    {
+        std::wstring exe = (ExeDir() / AppName).replace_extension(L".exe").wstring();
+        if (!std::filesystem::exists(exe))
+            exe = (ExeDir() / L"\u8f7b\u9605PDF.exe").wstring();
+        if (!std::filesystem::exists(exe))
+        {
+            wchar_t modulePath[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+            exe = modulePath;
+        }
+
+        return
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\Classes\\Applications\\\u8f7b\u9605PDF.exe", L"FriendlyAppName", AppName) &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\Classes\\Applications\\\u8f7b\u9605PDF.exe\\DefaultIcon", nullptr, exe + L",0") &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\Classes\\Applications\\\u8f7b\u9605PDF.exe\\shell\\open\\command", nullptr, L"\"" + exe + L"\" \"%1\"") &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\Classes\\Applications\\\u8f7b\u9605PDF.exe\\SupportedTypes", L".pdf", L"") &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\Classes\\.pdf\\OpenWithProgids", PdfProgId, L"") &&
+            WriteRegSz(HKEY_CURRENT_USER, std::wstring(L"Software\\Classes\\") + PdfProgId, nullptr, AppName) &&
+            WriteRegSz(HKEY_CURRENT_USER, std::wstring(L"Software\\Classes\\") + PdfProgId + L"\\DefaultIcon", nullptr, exe + L",0") &&
+            WriteRegSz(HKEY_CURRENT_USER, std::wstring(L"Software\\Classes\\") + PdfProgId + L"\\shell\\open\\command", nullptr, L"\"" + exe + L"\" \"%1\"") &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\QingYuePDF\\Capabilities", L"ApplicationName", AppName) &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\QingYuePDF\\Capabilities", L"ApplicationDescription", AppName) &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\QingYuePDF\\Capabilities\\FileAssociations", L".pdf", PdfProgId) &&
+            WriteRegSz(HKEY_CURRENT_USER, L"Software\\RegisteredApplications", PdfRegisteredApp, L"Software\\QingYuePDF\\Capabilities");
+    }
+
+    bool TrySetDefaultPdfAssociationViaShell()
+    {
+        HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        bool shouldUninit = SUCCEEDED(init);
+        if (init == RPC_E_CHANGED_MODE)
+            init = S_OK;
+        if (FAILED(init))
+        {
+            g_defaultAssocStatus = 170;
+            return false;
+        }
+
+        IApplicationAssociationRegistration* association = nullptr;
+        HRESULT hr = CoCreateInstance(
+            CLSID_ApplicationAssociationRegistration,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&association));
+        if (SUCCEEDED(hr) && association)
+        {
+            hr = association->SetAppAsDefault(PdfRegisteredApp, L".pdf", AT_FILEEXTENSION);
+            association->Release();
+        }
+        if (shouldUninit)
+            CoUninitialize();
+
+        if (FAILED(hr))
+        {
+            g_defaultAssocStatus = 180;
+            return false;
+        }
+
+        SHChangeNotify(0x08000000, 0, nullptr, nullptr);
+        bool verified = VerifyPdfDefaultAssociation();
+        g_defaultAssocStatus = verified ? 0 : 190;
+        return verified;
+    }
+
+    bool TrySetDefaultPdfAssociationViaLicensedHelper()
+    {
+        std::filesystem::path helper = ExeDir() / L"SetUserFTA.exe";
+        if (!std::filesystem::exists(helper))
+            return false;
+
+        std::wstring commandLine =
+            L"\"" + helper.wstring() + L"\" .pdf " + PdfProgId;
+        DWORD exitCode = 1;
+        if (!RunHiddenProcess(helper.wstring(), commandLine, exitCode) || exitCode != 0)
+        {
+            g_defaultAssocStatus = 200;
+            return false;
+        }
+
+        SHChangeNotify(0x08000000, 0, nullptr, nullptr);
+        bool verified = VerifyPdfDefaultAssociation();
+        g_defaultAssocStatus = verified ? 0 : 210;
+        return verified;
+    }
+
+    bool TrySetDefaultPdfAssociationDirect()
+    {
+        g_defaultAssocStatus = 100;
+        if (!RegisterPdfAssociationForCurrentUser())
+        {
+            g_defaultAssocStatus = 110;
+            return false;
+        }
+        if (TrySetDefaultPdfAssociationViaLicensedHelper())
+            return true;
+        if (TrySetDefaultPdfAssociationViaShell())
+            return true;
+
+        std::wstring sid = CurrentUserSidString();
+        std::wstring timestampHex = CurrentAssocTimestampHex();
+        std::wstring experience = DetectUserChoiceExperience();
+        if (sid.empty() || timestampHex.empty() || experience.empty())
+        {
+            g_defaultAssocStatus = 120;
+            return false;
+        }
+
+        std::wstring hash = ComputeUserChoiceHash(L".pdf", sid, PdfProgId, timestampHex, experience);
+        if (hash.empty())
+        {
+            g_defaultAssocStatus = 130;
+            return false;
+        }
+
+        WriteRegDword(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\ApplicationAssociationToasts",
+            (std::wstring(PdfProgId) + L"_.pdf").c_str(),
+            0);
+        WriteRegDword(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\ApplicationAssociationToasts",
+            L"Applications\\\u8f7b\u9605PDF.exe_.pdf",
+            0);
+
+        DeleteRegTreeIfExists(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.pdf\\UserChoice");
+        if (!WriteRegSz(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.pdf\\UserChoice", L"Hash", hash))
+        {
+            g_defaultAssocStatus = 140;
+            return false;
+        }
+        if (!WriteRegSz(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.pdf\\UserChoice", L"ProgId", PdfProgId))
+        {
+            g_defaultAssocStatus = 150;
+            return false;
+        }
+
+        SHChangeNotify(0x08000000, 0, nullptr, nullptr);
+        bool verified = VerifyPdfDefaultAssociation();
+        g_defaultAssocStatus = verified ? 0 : 160;
+        return verified;
     }
 
     long long NowMs()
@@ -366,6 +939,8 @@ namespace
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
+        using SelectWordAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_quad*, int, char*, int);
+        using FindImageAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_rect*);
         using PixmapIntFn = int(__cdecl*)(fz_context*, fz_pixmap*);
         using PixmapSamplesFn = unsigned char*(__cdecl*)(fz_context*, fz_pixmap*);
         using DropPixmapFn = void(__cdecl*)(fz_context*, fz_pixmap*);
@@ -396,6 +971,8 @@ namespace
             Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(loadAnnotations, "quiet_pdf_load_annotations");
             Get(selectText, "quiet_pdf_select_text");
+            GetOptional(selectWordAtPoint, "quiet_pdf_select_word_at_point");
+            GetOptional(findImageAtPoint, "quiet_pdf_find_image_at_point");
             Get(pixmapWidth, "fz_pixmap_width");
             Get(pixmapHeight, "fz_pixmap_height");
             Get(pixmapComponents, "fz_pixmap_components");
@@ -426,6 +1003,8 @@ namespace
         SaveAnnotationsFn saveAnnotations{};
         LoadAnnotationsFn loadAnnotations{};
         SelectTextFn selectText{};
+        SelectWordAtPointFn selectWordAtPoint{};
+        FindImageAtPointFn findImageAtPoint{};
         PixmapIntFn pixmapWidth{};
         PixmapIntFn pixmapHeight{};
         PixmapIntFn pixmapComponents{};
@@ -440,6 +1019,12 @@ namespace
             target = reinterpret_cast<T>(GetProcAddress(module, name));
             if (!target) throw std::runtime_error(std::string("Missing MuPDF export: ") + name);
         }
+
+        template <typename T>
+        void GetOptional(T& target, const char* name)
+        {
+            target = reinterpret_cast<T>(GetProcAddress(module, name));
+        }
     };
 
     MuPdf g_pdf;
@@ -447,9 +1032,12 @@ namespace
     unsigned g_dpi{ 96 };
     std::vector<std::unique_ptr<PdfTab>> g_tabs;
     std::vector<RecentItem> g_recent;
+    std::vector<LastSessionItem> g_lastSessionTabs;
     std::map<std::wstring, PageImage> g_homeThumbCache;
     std::vector<Button> g_buttons;
     std::vector<RECT> g_tabRects;
+    std::vector<int> g_tabRectIds;
+    std::vector<bool> g_tabTitleTruncated;
     std::vector<RECT> g_recentRects;
     std::vector<HomeHit> g_homeHits;
     std::vector<int> g_homeRecentIds;
@@ -461,7 +1049,40 @@ namespace
     std::vector<RECT> g_sideTabRects;
     std::vector<RECT> g_searchResultRects;
     std::vector<int> g_searchResultIds;
+    std::vector<RECT> g_tabListItemRects;
+    std::vector<int> g_tabListItemIds;
     constexpr UINT WM_QUIETPDF_FILE_CHANGED = WM_APP + 41;
+    constexpr UINT WM_QUIETPDF_DRAG_SCROLL = WM_APP + 42;
+    constexpr UINT WM_QUIETPDF_PAGE_RENDERED = WM_APP + 43;
+
+    struct PageRenderRequest
+    {
+        unsigned long long serial{};
+        unsigned long documentVersion{};
+        HWND target{};
+        std::wstring path;
+        int page{};
+        double zoom{};
+        unsigned dpi{};
+        int theme{};
+    };
+
+    struct PageRenderResult
+    {
+        PageRenderRequest request;
+        PageImage image;
+    };
+
+    std::mutex g_pageRenderMutex;
+    std::condition_variable g_pageRenderCv;
+    std::thread g_pageRenderThread;
+    PageRenderRequest g_pageRenderRequest;
+    PageRenderRequest g_pageRenderActiveRequest;
+    bool g_pageRenderHasRequest{};
+    bool g_pageRenderActive{};
+    bool g_pageRenderStop{};
+    unsigned long long g_pageRenderSerial{};
+    std::atomic<unsigned long> g_nextRenderVersion{ 0 };
     std::mutex g_fileWatchMutex;
     std::thread g_fileWatchThread;
     HANDLE g_fileWatchDirHandle{};
@@ -469,6 +1090,12 @@ namespace
     std::atomic<unsigned long> g_fileWatchGeneration{ 0 };
     RECT g_mainScrollTrackRect{};
     RECT g_mainScrollThumbRect{};
+    RECT g_mainHScrollTrackRect{};
+    RECT g_mainHScrollThumbRect{};
+    RECT g_homeScrollTrackRect{};
+    RECT g_homeScrollThumbRect{};
+    RECT g_sidebarScrollTrackRect{};
+    RECT g_sidebarScrollThumbRect{};
     RECT g_stage{};
     RECT g_sidebar{};
     RECT g_searchInputRect{};
@@ -478,8 +1105,13 @@ namespace
     LONG_PTR g_preImmersiveExStyle{};
     int g_active{ -1 };
     int g_scrollY{};
+    int g_scrollX{};
     int g_stageScrollTarget{};
+    double g_stageScrollPos{};
+    double g_stageScrollVelocity{};
+    ULONGLONG g_stageScrollLastTick{};
     int g_contentHeight{};
+    int g_contentWidth{};
     int g_sidebarScrollY{};
     int g_sidebarScrollTargetY{};
     int g_sidebarContentHeight{};
@@ -491,13 +1123,17 @@ namespace
     int g_sideMode{}; // 0 outline, 1 thumbnails, 2 search
     int g_thumbSize{ 116 };
     constexpr int ThumbSizeMin = 82;
-    constexpr int ThumbSizeMax = 252;
+    constexpr int ThumbSizeMax = 320;
     int g_homeThumbWidth{};
+    int g_homeScrollY{};
+    int g_homeContentHeight{};
     int g_theme{};
     int g_viewMode{};
     int g_contextTab{ -1 };
+    int g_lastSessionActive{ -1 };
     int g_searchCurrent{};
     int g_selectedOutlineRow{ -1 };
+    int g_tabVisibleStart{};
     int g_hoverTab{ -1 };
     int g_hoverTabClose{ -1 };
     int g_hoverOutlineRow{ -1 };
@@ -505,6 +1141,7 @@ namespace
     int g_hoverSearchResult{ -1 };
     int g_hoverHomeHit{ -1 };
     int g_hoverRecentRect{ -1 };
+    int g_hoverTabListItem{ -1 };
     int g_outlineCollapseVersion{};
     RECT g_pressedButtonRect{};
     RECT g_hoverButtonRect{};
@@ -512,12 +1149,35 @@ namespace
     RECT g_pageInputRect{};
     RECT g_homeSearchRect{};
     RECT g_homeSearchClearRect{};
+    RECT g_tabNavPrevRect{};
+    RECT g_tabNavNextRect{};
+    RECT g_tabCountRect{};
+    RECT g_tabListRect{};
+    RECT g_tabListScrollTrackRect{};
+    RECT g_tabListScrollThumbRect{};
+    RECT g_sidebarPanelToggleRect{};
     POINT g_mousePos{};
     bool g_sidebarOpen{ true };
     bool g_immersive{};
+    bool g_immersiveSidebarOpen{};
     bool g_hasPreImmersivePlacement{};
     bool g_resizingSidebar{};
     bool g_draggingThumbSlider{};
+    bool g_draggingTab{};
+    bool g_tabDetachArmed{};
+    int g_draggingTabIndex{ -1 };
+    POINT g_tabDragStart{};
+    POINT g_tabDragOffset{};
+    RECT g_tabDragSourceRect{};
+    RECT g_tabDragCurrentRect{};
+    bool g_tabDragFloating{};
+    int g_tabDragInsertIndex{ -1 };
+    bool g_tabListOpen{};
+    bool g_draggingTabListScroll{};
+    int g_tabListScrollY{};
+    int g_tabListContentHeight{};
+    int g_tabListDragOffset{};
+    int g_dragScrollTarget{};
     bool g_searchInputFocused{};
     bool g_searchHasRun{};
     bool g_searchCaretVisible{ true };
@@ -531,28 +1191,70 @@ namespace
     bool g_statusPinned{ true };
     bool g_statusReveal{};
     bool g_draggingMainScroll{};
+    bool g_draggingMainHScroll{};
+    bool g_draggingHomeScroll{};
+    bool g_draggingSidebarScroll{};
+    bool g_dragScrollPosted{};
+    bool g_mainScrollThumbLive{};
     bool g_mainScrollHover{};
+    bool g_mainHScrollHover{};
+    bool g_homeScrollHover{};
+    bool g_sidebarScrollHover{};
+    bool g_sidebarPanelToggleHover{};
     bool g_stageRepaintPending{};
     bool g_sidebarRepaintPending{};
     bool g_sidebarResizePending{};
     bool g_sidebarAnimating{};
+    bool g_stageIdleRefreshPending{};
+    bool g_sidebarProgressRefreshPending{};
     bool g_gesturePanning{};
     bool g_gestureSidebar{};
+    bool g_touchPanQueued{};
+    bool g_touchMomentum{};
+    bool g_pagePrefetchPending{};
     ULONGLONG g_lastStageRepaintMs{};
     ULONGLONG g_lastSidebarRepaintMs{};
     ULONGLONG g_lastSidebarResizeMs{};
+    ULONGLONG g_lastTouchFollowPaintMs{};
+    ULONGLONG g_stageLightPaintUntil{};
     ULONGLONG g_sidebarAnimationStartMs{};
-    ULONGLONG g_deferPageRenderUntil{};
     HBITMAP g_glassBackdrop{};
+    HDC g_paintBufferDc{};
+    HDC g_imageDrawDc{};
+    HBITMAP g_paintBufferBitmap{};
+    HGDIOBJ g_paintBufferOldBitmap{};
     int g_glassBackdropW{};
     int g_glassBackdropH{};
     int g_glassBackdropTheme{ -1 };
+    int g_paintBufferW{};
+    int g_paintBufferH{};
     int g_statusOffset{};
     int g_statusTargetOffset{};
     int g_pageWheelDeltaAccum{};
+    int g_gestureLastX{};
     int g_gestureLastY{};
+    int g_touchPanPendingX{};
+    int g_touchPanPendingY{};
+    int g_lastTouchFollowSign{};
+    POINT g_touchPanPoint{};
+    POINT g_touchMomentumPoint{};
+    ULONGLONG g_touchMomentumLastInputMs{};
+    ULONGLONG g_touchMomentumLastTickMs{};
+    double g_touchMomentumX{};
+    double g_touchMomentumY{};
+    double g_touchMomentumRemainderX{};
+    double g_touchMomentumRemainderY{};
+    double g_touchMomentumBoost{};
     double g_stageWheelRemainder{};
+    double g_stageHWheelRemainder{};
     double g_sidebarWheelRemainder{};
+    double g_autoScrollXSpeed{};
+    double g_autoScrollYSpeed{};
+    double g_autoScrollXAccum{};
+    double g_autoScrollYAccum{};
+    ULONGLONG g_autoScrollLastTick{};
+    POINT g_autoScrollAnchor{};
+    bool g_autoScrollActive{};
     ULONG_PTR g_gdiplusToken{};
     std::wstring g_hoverTip;
     std::wstring g_searchQuery;
@@ -562,8 +1264,18 @@ namespace
     std::vector<SearchResult> g_searchResults;
     std::set<int> g_collapsedOutlineRows;
     int g_mainScrollDragOffset{};
+    int g_mainHScrollDragOffset{};
+    int g_mainScrollDragStartY{};
+    int g_mainScrollDragStartPos{};
+    int g_mainHScrollDragStartX{};
+    int g_mainHScrollDragStartPos{};
+    int g_mainScrollThumbLiveTop{};
+    int g_mainScrollThumbLiveHeight{};
+    int g_homeScrollDragOffset{};
+    int g_sidebarScrollDragOffset{};
     bool g_selectingContent{};
     bool g_hasContentSelection{};
+    bool g_selectionIsImage{};
     int g_selectionPage{ -1 };
     POINT g_selectionStart{};
     POINT g_selectionEnd{};
@@ -595,14 +1307,35 @@ namespace
     RECT g_clearDialogConfirmRect{};
     RECT g_clearDialogCancelRect{};
     RECT g_clearDialogCloseRect{};
+    RECT g_zoomDialogRect{};
+    RECT g_zoomDialogInputRect{};
+    RECT g_zoomDialogConfirmRect{};
+    RECT g_zoomDialogCancelRect{};
     constexpr int TileSize = 384;
-
+    bool g_customZoomOpen{};
+    bool g_customZoomFocused{};
+    bool g_customZoomCaretVisible{ true };
+    std::wstring g_customZoomText;
+    struct ThemedMenuItem
+    {
+        std::wstring text;
+        UINT id{};
+        bool separator{};
+        bool checked{};
+        bool disabled{};
+    };
+    std::vector<std::unique_ptr<ThemedMenuItem>> g_themedMenuItems;
+    HWND g_themedMenuPopup{};
+    HWND g_themedMenuOwner{};
+    std::vector<RECT> g_themedMenuItemRects;
+    int g_themedMenuHover{ -1 };
+    int g_themedMenuPressed{ -1 };
     Theme g_themes[] = {
-        { L"云母白", RGB(244,247,250), RGB(255,255,255), RGB(250,252,254), RGB(238,243,247), RGB(255,255,255), RGB(31,35,40), RGB(105,113,125), RGB(210,217,226), RGB(59,170,124) },
-        { L"护眼米白", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
-        { L"极夜黑", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
-        { L"石墨黑", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"极光绿", RGB(4,19,24), RGB(10,37,43), RGB(18,58,62), RGB(5,23,27), RGB(7,31,36), RGB(231,255,244), RGB(142,194,184), RGB(31,75,79), RGB(45,245,143) }
+        { L"\u4e91\u6bcd\u767d", RGB(244,247,250), RGB(255,255,255), RGB(250,252,254), RGB(238,243,247), RGB(255,255,255), RGB(31,35,40), RGB(105,113,125), RGB(210,217,226), RGB(59,170,124) },
+        { L"\u62a4\u773c\u7c73\u767d", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
+        { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
+        { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
+        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) }
     };
 
     Theme const& T()
@@ -618,6 +1351,16 @@ namespace
     bool IsAuroraTheme()
     {
         return g_theme == 4;
+    }
+
+    bool IsBeigeTheme()
+    {
+        return g_theme == 1;
+    }
+
+    bool SidebarVisible()
+    {
+        return g_sidebarOpen && (!g_immersive || g_immersiveSidebarOpen);
     }
 
     bool UsesBackdropTheme()
@@ -658,18 +1401,28 @@ namespace
 
     COLORREF SidebarHoverFill()
     {
-        if (IsAuroraTheme()) return MixColor(T().panel2, T().accent, 0.12);
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
         if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.08);
-        if (IsDarkTheme()) return MixColor(T().panel2, T().accent, 0.16);
+        if (IsBeigeTheme()) return MixColor(RGB(246, 241, 231), RGB(0, 0, 0), 0.03);
+        if (IsDarkTheme()) return MixColor(T().panel2, RGB(255, 255, 255), 0.04);
         return MixColor(T().panel2, T().accent, 0.10);
     }
 
     COLORREF SidebarSelectedFill()
     {
-        if (IsAuroraTheme()) return MixColor(T().accent, T().panel2, 0.34);
-        if (IsGlassTheme()) return MixColor(T().accent, RGB(255, 255, 255), 0.24);
-        if (IsDarkTheme()) return MixColor(T().accent, T().panel2, 0.42);
-        return MixColor(T().accent, T().paper, 0.30);
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.075);
+        if (IsGlassTheme()) return MixColor(T().accent, RGB(255, 255, 255), 0.10);
+        if (IsBeigeTheme()) return T().panel2;
+        if (IsDarkTheme()) return MixColor(T().accent, T().panel2, 0.18);
+        return MixColor(T().accent, T().paper, 0.12);
+    }
+
+    COLORREF SidebarSelectedBorder()
+    {
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
+        if (IsDarkTheme() && !IsAuroraTheme()) return MixColor(T().accent, T().panel2, 0.25);
+        if (IsBeigeTheme()) return T().line;
+        return SidebarSelectedFill();
     }
 
     COLORREF SidebarTreeColor()
@@ -682,6 +1435,7 @@ namespace
     COLORREF SidebarToggleFill(bool hovered)
     {
         if (IsAuroraTheme()) return hovered ? MixColor(T().panel2, T().accent, 0.30) : MixColor(T().panel2, T().accent, 0.16);
+        if (IsBeigeTheme()) return hovered ? SidebarSelectedFill() : MixColor(RGB(251, 247, 239), RGB(0, 0, 0), 0.03);
         if (IsDarkTheme()) return hovered ? MixColor(T().panel2, T().text, 0.18) : MixColor(T().panel2, T().line, 0.12);
         return hovered ? MixColor(T().panel2, T().text, 0.12) : MixColor(T().panel2, T().line, 0.08);
     }
@@ -689,12 +1443,14 @@ namespace
     COLORREF SidebarToggleLine(bool hovered)
     {
         if (IsAuroraTheme()) return hovered ? MixColor(T().accent, RGB(255, 255, 255), 0.18) : MixColor(T().accent, T().text, 0.20);
+        if (IsBeigeTheme()) return hovered ? RGB(111, 155, 255) : RGB(111, 106, 99);
         return hovered ? MixColor(T().text, T().muted, 0.22) : MixColor(T().muted, T().text, 0.16);
     }
 
     COLORREF SidebarIconColor()
     {
         if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.34);
+        if (IsBeigeTheme()) return RGB(111, 106, 99);
         return MixColor(T().muted, T().text, IsDarkTheme() ? 0.18 : 0.10);
     }
 
@@ -749,6 +1505,19 @@ namespace
         return buffer;
     }
 
+    COLORREF ChromeBarColor()
+    {
+        if (IsAuroraTheme()) return RGB(6, 49, 45);
+        if (IsGlassTheme()) return RGB(244, 247, 250);
+        if (IsDarkTheme()) return T().panel;
+        return T().panel;
+    }
+
+    COLORREF ChromeDividerColor()
+    {
+        if (IsAuroraTheme()) return RGB(38, 114, 101);
+        return T().line;
+    }
     COLORREF ScrollTrackColor()
     {
         if (IsAuroraTheme()) return MixColor(T().bg, T().panel, 0.58);
@@ -769,25 +1538,14 @@ namespace
     bool Intersects(RECT a, RECT b);
     void RoundFill(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
 
-    void ApplyPdfTheme(std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
+    void ApplyPdfThemeFor(int theme, std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
-        if (g_theme == 0) return;
+        int clampedTheme = std::clamp(theme, 0, static_cast<int>(std::size(g_themes)) - 1);
+        if (clampedTheme == 0) return;
+        if (clampedTheme == 2 || clampedTheme == 3 || clampedTheme == 4) return;
 
         int lum = Luma(r, g, b);
-        COLORREF paper = T().paper;
-        COLORREF text = T().text;
-        int maxc = std::max<int>(r, std::max<int>(g, b));
-        int minc = std::min<int>(r, std::min<int>(g, b));
-        int sat = maxc - minc;
-
-        if ((g_theme == 2 || g_theme == 3 || g_theme == 4) && sat < 28)
-        {
-            double t = static_cast<double>(lum) / 255.0;
-            r = MixByte(static_cast<std::uint8_t>(GetRValue(text)), static_cast<std::uint8_t>(GetRValue(paper)), t);
-            g = MixByte(static_cast<std::uint8_t>(GetGValue(text)), static_cast<std::uint8_t>(GetGValue(paper)), t);
-            b = MixByte(static_cast<std::uint8_t>(GetBValue(text)), static_cast<std::uint8_t>(GetBValue(paper)), t);
-            return;
-        }
+        COLORREF paper = g_themes[clampedTheme].paper;
 
         if (lum > 185)
         {
@@ -796,16 +1554,11 @@ namespace
             g = MixByte(g, static_cast<std::uint8_t>(GetGValue(paper)), t);
             b = MixByte(b, static_cast<std::uint8_t>(GetBValue(paper)), t);
         }
+    }
 
-        if (Luma(static_cast<std::uint8_t>(GetRValue(paper)), static_cast<std::uint8_t>(GetGValue(paper)), static_cast<std::uint8_t>(GetBValue(paper))) < 90 &&
-            Luma(static_cast<std::uint8_t>(GetRValue(text)), static_cast<std::uint8_t>(GetGValue(text)), static_cast<std::uint8_t>(GetBValue(text))) > 150 &&
-            lum < 95)
-        {
-            double t = static_cast<double>(95 - lum) / 95.0 * 0.88;
-            r = MixByte(r, static_cast<std::uint8_t>(GetRValue(text)), t);
-            g = MixByte(g, static_cast<std::uint8_t>(GetGValue(text)), t);
-            b = MixByte(b, static_cast<std::uint8_t>(GetBValue(text)), t);
-        }
+    void ApplyPdfTheme(std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
+    {
+        ApplyPdfThemeFor(g_theme, b, g, r);
     }
 
     int S(int value)
@@ -828,6 +1581,7 @@ namespace
         LOGFONTW lf{};
         lf.lfHeight = -MulDiv(pt, static_cast<int>(g_dpi), 72);
         lf.lfWeight = weight;
+        lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
         wcscpy_s(lf.lfFaceName, L"Segoe UI Variable Text");
         return CreateFontIndirectW(&lf);
     }
@@ -917,43 +1671,15 @@ namespace
             RECT full{ 0, 0, fullW, fullH };
             if (IsAuroraTheme())
             {
-                Gdiplus::Graphics g(mem);
-                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-                g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-                std::filesystem::path auroraPath = ExeDir() / L"aurora-theme.jpg";
-                Gdiplus::Image auroraImage(auroraPath.c_str());
-                if (auroraImage.GetLastStatus() == Gdiplus::Ok)
+                for (int y = 0; y < fullH; ++y)
                 {
-                    double srcW = std::max<UINT>(1, auroraImage.GetWidth());
-                    double srcH = std::max<UINT>(1, auroraImage.GetHeight());
-                    double scale = std::max(static_cast<double>(fullW) / srcW, static_cast<double>(fullH) / srcH);
-                    double cropW = static_cast<double>(fullW) / scale;
-                    double cropH = static_cast<double>(fullH) / scale;
-                    double srcX = std::max(0.0, (srcW - cropW) * 0.54);
-                    double srcY = std::max(0.0, (srcH - cropH) * 0.36);
-                    if (srcX + cropW > srcW) srcX = srcW - cropW;
-                    if (srcY + cropH > srcH) srcY = srcH - cropH;
-                    g.DrawImage(
-                        &auroraImage,
-                        Gdiplus::Rect(0, 0, fullW, fullH),
-                        static_cast<Gdiplus::REAL>(srcX),
-                        static_cast<Gdiplus::REAL>(srcY),
-                        static_cast<Gdiplus::REAL>(cropW),
-                        static_cast<Gdiplus::REAL>(cropH),
-                        Gdiplus::UnitPixel);
+                    double ty = static_cast<double>(y) / static_cast<double>(fullH);
+                    COLORREF color = RGB(6, 49, 45);
+                    UNREFERENCED_PARAMETER(ty);
+                    RECT line{ 0, y, fullW, y + 1 };
+                    Fill(mem, line, color);
                 }
-                else
-                {
-                    for (int y = 0; y < fullH; ++y)
-                    {
-                        double ty = static_cast<double>(y) / static_cast<double>(fullH);
-                        COLORREF color = MixColor(RGB(2, 16, 21), RGB(7, 34, 39), ty);
-                        if (ty > 0.60) color = MixColor(color, RGB(4, 12, 17), 0.48);
-                        RECT line{ 0, y, fullW, y + 1 };
-                        Fill(mem, line, color);
-                    }
-                }
-                AlphaFill(mem, full, RGB(0, 8, 12), 14);
+                AlphaFill(mem, full, RGB(40, 220, 145), 2);
             }
             else for (int y = 0; y < fullH; ++y)
             {
@@ -1005,11 +1731,9 @@ namespace
         }
         else if (IsAuroraTheme())
         {
-            AlphaFill(dc, r, RGB(6, 32, 37), std::min<BYTE>(alpha, 184));
-            int halfH = std::max<int>(1, static_cast<int>(r.bottom - r.top) / 2);
-            RECT topWash{ r.left, r.top, r.right, r.top + halfH };
-            AlphaFill(dc, topWash, RGB(42, 245, 143), 22);
-            HPEN highlight = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(37, 112, 105));
+            Fill(dc, r, T().panel);
+            AlphaFill(dc, r, RGB(42, 245, 143), std::min<BYTE>(alpha / 22, 8));
+            HPEN highlight = CreatePen(PS_SOLID, std::max(1, S(1)), ChromeDividerColor());
             HGDIOBJ oldPen = SelectObject(dc, highlight);
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
             Rectangle(dc, r.left, r.top, r.right, r.bottom);
@@ -1024,9 +1748,7 @@ namespace
     {
         if (IsAuroraTheme())
         {
-            AlphaFill(dc, r, RGB(5, 31, 36), std::max<BYTE>(alpha, 150));
-            RECT top{ r.left, r.top, r.right, r.top + std::max<int>(1, (r.bottom - r.top) / 2) };
-            AlphaFill(dc, top, RGB(36, 240, 141), 18);
+            Fill(dc, r, ChromeBarColor());
             return;
         }
         if (!IsGlassTheme())
@@ -1041,38 +1763,150 @@ namespace
 
     void GlassDivider(HDC dc, RECT r)
     {
-        Fill(dc, r, IsAuroraTheme() ? RGB(29, 93, 88) : (IsGlassTheme() ? RGB(211, 218, 226) : T().line));
+        Fill(dc, r, IsAuroraTheme() ? ChromeDividerColor() : (IsGlassTheme() ? RGB(211, 218, 226) : T().line));
     }
+
+    RECT HomeContentViewportRect(RECT client);
 
     void UpdateMainScrollRects(RECT client)
     {
         g_mainScrollTrackRect = {};
         g_mainScrollThumbRect = {};
+        g_mainHScrollTrackRect = {};
+        g_mainHScrollThumbRect = {};
         if (g_immersive || g_active < 0) return;
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-        if (g_contentHeight <= stageH + 1) return;
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int trackW = S(12);
         int gutter = S(3);
-        g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top + S(8), client.right - gutter, g_stage.bottom - S(8) };
+        if (g_contentHeight > stageH + 1)
+        {
+            g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top + S(8), client.right - gutter, g_stage.bottom - S(8) };
+            int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
+            int thumbH = std::clamp(MulDiv(stageH, trackH, std::max(1, g_contentHeight)), S(28), trackH);
+            if (g_draggingMainScroll && g_mainScrollThumbLive && g_mainScrollThumbLiveHeight > 0)
+                thumbH = std::clamp(g_mainScrollThumbLiveHeight, S(28), trackH);
+            int maxScroll = std::max<int>(1, g_contentHeight - stageH);
+            int thumbTravel = std::max<int>(0, trackH - thumbH);
+            int thumbTop = g_mainScrollTrackRect.top + MulDiv(g_scrollY, thumbTravel, maxScroll);
+            if (g_draggingMainScroll && g_mainScrollThumbLive)
+                thumbTop = std::clamp<int>(g_mainScrollThumbLiveTop, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
+            else if (g_scrollY >= maxScroll)
+                thumbTop = g_mainScrollTrackRect.bottom - thumbH;
+            g_mainScrollThumbRect = RECT{ g_mainScrollTrackRect.left, thumbTop, g_mainScrollTrackRect.right, thumbTop + thumbH };
+        }
+        if (g_contentWidth > stageW + 1)
+        {
+            int trackH = S(12);
+            int rightInset = IsRectEmpty(&g_mainScrollTrackRect) ? S(16) : S(22);
+            g_mainHScrollTrackRect = RECT{ g_stage.left + S(14), g_stage.bottom - gutter - trackH, g_stage.right - rightInset, g_stage.bottom - gutter };
+            int trackLen = std::max<int>(1, g_mainHScrollTrackRect.right - g_mainHScrollTrackRect.left);
+            int thumbW = std::clamp(MulDiv(stageW, trackLen, std::max(1, g_contentWidth)), S(40), trackLen);
+            int maxScroll = std::max<int>(1, g_contentWidth - stageW);
+            int thumbTravel = std::max<int>(0, trackLen - thumbW);
+            int thumbLeft = g_mainHScrollTrackRect.left + MulDiv(g_scrollX, thumbTravel, maxScroll);
+            if (g_scrollX >= maxScroll) thumbLeft = g_mainHScrollTrackRect.right - thumbW;
+            g_mainHScrollThumbRect = RECT{ thumbLeft, g_mainHScrollTrackRect.top, thumbLeft + thumbW, g_mainHScrollTrackRect.bottom };
+        }
+    }
+
+    void RedrawMainScrollBarNow(HWND hwnd)
+    {
+        RECT redraw = g_mainScrollTrackRect;
+        if (!IsRectEmpty(&g_mainHScrollTrackRect))
+        {
+            RECT merged{};
+            UnionRect(&merged, &redraw, &g_mainHScrollTrackRect);
+            redraw = merged;
+        }
+        if (!IsRectEmpty(&redraw))
+            RedrawWindow(hwnd, &redraw, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+
+    void UpdateMainScrollDragStateFromPointer(HWND hwnd, int pointerY, bool redrawNow)
+    {
+        if (!g_draggingMainScroll || g_active < 0) return;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        UpdateMainScrollRects(client);
+        if (IsRectEmpty(&g_mainScrollTrackRect)) return;
+
         int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
-        int thumbH = std::clamp(MulDiv(stageH, trackH, std::max(1, g_contentHeight)), S(28), trackH);
-        int maxScroll = std::max<int>(1, g_contentHeight - stageH);
-        int thumbTravel = std::max<int>(0, trackH - thumbH);
-        int thumbTop = g_mainScrollTrackRect.top + MulDiv(g_scrollY, thumbTravel, maxScroll);
-        if (g_scrollY >= maxScroll) thumbTop = g_mainScrollTrackRect.bottom - thumbH;
-        g_mainScrollThumbRect = RECT{ g_mainScrollTrackRect.left, thumbTop, g_mainScrollTrackRect.right, thumbTop + thumbH };
+        int thumbH = g_mainScrollThumbLiveHeight > 0 ? g_mainScrollThumbLiveHeight : std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
+        thumbH = std::clamp<int>(thumbH, S(28), trackH);
+
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        int maxScroll = std::max<int>(0, g_contentHeight - stageH);
+        int travel = std::max<int>(1, trackH - thumbH);
+        int dragDelta = pointerY - g_mainScrollDragStartY;
+        int newScroll = g_mainScrollDragStartPos;
+        if (travel > 0 && maxScroll > 0)
+            newScroll = g_mainScrollDragStartPos + MulDiv(dragDelta, maxScroll, travel);
+
+        int liveTop = std::clamp<int>(pointerY - g_mainScrollDragOffset, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
+        bool liveChanged = !g_mainScrollThumbLive || g_mainScrollThumbLiveTop != liveTop;
+        g_mainScrollThumbLive = true;
+        g_mainScrollThumbLiveTop = liveTop;
+        g_mainScrollThumbLiveHeight = thumbH;
+        g_dragScrollTarget = std::clamp<int>(newScroll, 0, maxScroll);
+
+        if (redrawNow && liveChanged)
+            RedrawMainScrollBarNow(hwnd);
     }
 
     void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip)
     {
         UpdateMainScrollRects(client);
-        if (IsRectEmpty(&g_mainScrollTrackRect)) return;
-        if (!Intersects(paintClip, g_mainScrollTrackRect) && !Intersects(paintClip, g_mainScrollThumbRect)) return;
-        bool active = g_draggingMainScroll || Hit(g_mainScrollTrackRect, g_mousePos.x, g_mousePos.y);
-        int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
-        int trackW = active ? S(7) : std::max(2, S(3));
-        RECT visualThumb{ centerX - trackW / 2, g_mainScrollThumbRect.top, centerX + (trackW + 1) / 2, g_mainScrollThumbRect.bottom };
-        RoundFill(dc, visualThumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+        if (!IsRectEmpty(&g_mainScrollTrackRect) && (Intersects(paintClip, g_mainScrollTrackRect) || Intersects(paintClip, g_mainScrollThumbRect)))
+        {
+            bool active = g_draggingMainScroll || Hit(g_mainScrollTrackRect, g_mousePos.x, g_mousePos.y);
+            int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
+            int trackW = active ? S(7) : std::max(2, S(3));
+            RECT visualThumb{ centerX - trackW / 2, g_mainScrollThumbRect.top, centerX + (trackW + 1) / 2, g_mainScrollThumbRect.bottom };
+            RoundFill(dc, visualThumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+        }
+        if (!IsRectEmpty(&g_mainHScrollTrackRect) && (Intersects(paintClip, g_mainHScrollTrackRect) || Intersects(paintClip, g_mainHScrollThumbRect)))
+        {
+            bool hActive = g_draggingMainHScroll || Hit(g_mainHScrollTrackRect, g_mousePos.x, g_mousePos.y);
+            int centerY = (g_mainHScrollTrackRect.top + g_mainHScrollTrackRect.bottom) / 2;
+            int h = hActive ? S(7) : std::max(2, S(3));
+            RECT visualH{ g_mainHScrollThumbRect.left, centerY - h / 2, g_mainHScrollThumbRect.right, centerY + (h + 1) / 2 };
+            RoundFill(dc, visualH, S(5), ScrollThumbColor(hActive), ScrollThumbColor(hActive));
+        }
+    }
+
+    void UpdateHomeScrollRects(RECT client)
+    {
+        g_homeScrollTrackRect = {};
+        g_homeScrollThumbRect = {};
+        if (g_immersive || g_active >= 0) return;
+        RECT viewport = HomeContentViewportRect(client);
+        int visible = std::max<int>(1, viewport.bottom - viewport.top);
+        if (g_homeContentHeight <= visible + 1) return;
+        int trackW = S(12);
+        int gutter = S(3);
+        g_homeScrollTrackRect = RECT{ client.right - gutter - trackW, viewport.top + S(8), client.right - gutter, viewport.bottom - S(8) };
+        int trackH = std::max<int>(1, g_homeScrollTrackRect.bottom - g_homeScrollTrackRect.top);
+        int thumbH = std::clamp(MulDiv(visible, trackH, std::max(1, g_homeContentHeight)), S(28), trackH);
+        int maxScroll = std::max<int>(1, g_homeContentHeight - visible);
+        int thumbTravel = std::max<int>(0, trackH - thumbH);
+        int thumbTop = g_homeScrollTrackRect.top + MulDiv(g_homeScrollY, thumbTravel, maxScroll);
+        if (g_homeScrollY >= maxScroll) thumbTop = g_homeScrollTrackRect.bottom - thumbH;
+        g_homeScrollThumbRect = RECT{ g_homeScrollTrackRect.left, thumbTop, g_homeScrollTrackRect.right, thumbTop + thumbH };
+    }
+
+    void PaintHomeScrollBar(HDC dc, RECT client, RECT paintClip)
+    {
+        UpdateHomeScrollRects(client);
+        if (!IsRectEmpty(&g_homeScrollTrackRect) && (Intersects(paintClip, g_homeScrollTrackRect) || Intersects(paintClip, g_homeScrollThumbRect)))
+        {
+            bool active = g_draggingHomeScroll || Hit(g_homeScrollTrackRect, g_mousePos.x, g_mousePos.y);
+            int centerX = (g_homeScrollTrackRect.left + g_homeScrollTrackRect.right) / 2;
+            int trackW = active ? S(7) : std::max(2, S(3));
+            RECT visualThumb{ centerX - trackW / 2, g_homeScrollThumbRect.top, centerX + (trackW + 1) / 2, g_homeScrollThumbRect.bottom };
+            RoundFill(dc, visualThumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+        }
     }
 
     void RoundFill(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line)
@@ -1345,7 +2179,7 @@ namespace
             int pageLeft = g_sidebar.right - S(30);
             int textWidth = std::max(24, pageLeft - (iconLeft + S(10) + S(5)) - S(4));
             std::wstring label = tab.outline.empty()
-                ? (L"第 " + std::to_wstring(i + 1) + L" 页")
+                ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875")
                 : tab.outline[static_cast<size_t>(i)].title;
             int textH = MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
             int rowH = std::max(baseRowH, textH + S(8));
@@ -1571,7 +2405,41 @@ namespace
 
     void DrawFlatMenuItem(HDC dc, const Button& b)
     {
-        Text(dc, b.text, b.rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+        bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &b.rect);
+        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &b.rect);
+        if (IsAuroraTheme())
+        {
+            BYTE alpha = pressed ? 188 : (hovered ? 136 : 0);
+            if (alpha > 0)
+            {
+                AlphaFill(dc, b.rect, RGB(10, 42, 46), alpha);
+                RoundFill(dc, b.rect, S(8),
+                    pressed ? RGB(12, 56, 58) : RGB(9, 42, 46),
+                    pressed ? RGB(38, 132, 107) : RGB(28, 78, 76));
+            }
+        }
+        else if (IsGlassTheme())
+        {
+            BYTE alpha = pressed ? 180 : (hovered ? 128 : 0);
+            if (alpha > 0)
+            {
+                AlphaFill(dc, b.rect, RGB(255, 255, 255), alpha);
+                RoundFill(dc, b.rect, S(8),
+                    pressed ? RGB(248, 251, 254) : RGB(255, 255, 255),
+                    pressed ? RGB(208, 217, 226) : RGB(228, 234, 241));
+            }
+        }
+        else if (pressed || hovered)
+        {
+            COLORREF fill = pressed
+                ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.26 : 0.12)
+                : MixColor(T().panel2, T().paper, IsDarkTheme() ? 0.18 : 0.50);
+            COLORREF line = pressed
+                ? MixColor(T().line, T().accent, 0.36)
+                : MixColor(T().line, T().text, 0.08);
+            RoundFill(dc, b.rect, S(8), fill, line);
+        }
+        Text(dc, b.text, b.rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, pressed ? T().text : MixColor(T().text, T().muted, 0.08));
     }
 
     void DrawStatusHotArea(HDC dc, RECT r, int radius = 6)
@@ -1616,6 +2484,23 @@ namespace
         LineTo(dc, x + S(3), y - S(1));
         SelectObject(dc, oldPen);
         DeleteObject(pen);
+    }
+
+    void DrawTabArrowGlyph(HDC dc, RECT r, bool right, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.4f, S(1.15f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        float cx = (r.left + r.right) * 0.5f;
+        float cy = (r.top + r.bottom) * 0.5f;
+        float dir = right ? 1.0f : -1.0f;
+        float dx = S(3.9f);
+        float dy = S(4.8f);
+        g.DrawLine(&pen, cx - dir * dx, cy - dy, cx + dir * dx, cy);
+        g.DrawLine(&pen, cx + dir * dx, cy, cx - dir * dx, cy + dy);
     }
 
     void DrawStatusIcon(HDC dc, RECT r, StatusIcon icon, COLORREF color)
@@ -1864,6 +2749,93 @@ namespace
         }
     }
 
+    void DrawNoteToolIcon(HDC dc, RECT r, int id, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.15f, S(1.0f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        Gdiplus::SolidBrush brush(GdiColor(color));
+
+        float cx = (r.left + r.right) * 0.5f;
+        float cy = (r.top + r.bottom) * 0.5f;
+        float box = std::min<float>(static_cast<float>(r.right - r.left), static_cast<float>(r.bottom - r.top));
+        float u = box / 28.0f;
+
+        auto drawTree = [&](bool expand)
+        {
+            Gdiplus::RectF mark{ cx - 8.5f * u, cy - 8.5f * u, 17.0f * u, 17.0f * u };
+            DrawGdiRoundRect(g, pen, mark, 3.0f * u);
+
+            float dir = expand ? 1.0f : -1.0f;
+            float topY = cy - 4.5f * u * dir;
+            float midY = cy;
+            float bottomY = cy + 4.5f * u * dir;
+            float wing = 4.2f * u;
+
+            g.DrawLine(&pen, cx - wing, topY, cx, midY);
+            g.DrawLine(&pen, cx + wing, topY, cx, midY);
+            g.DrawLine(&pen, cx - wing, midY, cx, bottomY);
+            g.DrawLine(&pen, cx + wing, midY, cx, bottomY);
+        };
+        auto drawArrowBox = [&](bool next)
+        {
+            Gdiplus::RectF mark{ cx - 8.5f * u, cy - 8.5f * u, 17.0f * u, 17.0f * u };
+            DrawGdiRoundRect(g, pen, mark, 3.0f * u);
+            float dir = next ? 1.0f : -1.0f;
+            float ax = cx + dir * 4.0f * u;
+            float bx = cx - dir * 3.5f * u;
+            g.DrawLine(&pen, ax, cy, bx, cy - 5.0f * u);
+            g.DrawLine(&pen, ax, cy, bx, cy + 5.0f * u);
+            g.DrawLine(&pen, ax, cy, cx - dir * 5.0f * u, cy);
+        };
+
+        auto drawTrash = [&](bool badge)
+        {
+            float x = cx - 6.8f * u;
+            float y = cy - 5.2f * u;
+            Gdiplus::RectF body{ x, y, 13.6f * u, 13.0f * u };
+            DrawGdiRoundRect(g, pen, body, 2.3f * u);
+            g.DrawLine(&pen, x - 1.4f * u, y - 3.0f * u, x + 15.0f * u, y - 3.0f * u);
+            g.DrawLine(&pen, cx - 3.2f * u, y - 5.8f * u, cx + 3.2f * u, y - 5.8f * u);
+            g.DrawLine(&pen, cx - 2.8f * u, y - 5.8f * u, cx - 4.4f * u, y - 3.0f * u);
+            g.DrawLine(&pen, cx + 2.8f * u, y - 5.8f * u, cx + 4.4f * u, y - 3.0f * u);
+            g.DrawLine(&pen, cx - 3.4f * u, y + 2.0f * u, cx - 3.4f * u, y + 9.2f * u);
+            g.DrawLine(&pen, cx, y + 2.0f * u, cx, y + 9.2f * u);
+            g.DrawLine(&pen, cx + 3.4f * u, y + 2.0f * u, cx + 3.4f * u, y + 9.2f * u);
+
+            if (badge)
+            {
+                Gdiplus::SolidBrush red(GdiColor(RGB(220, 77, 77)));
+                Gdiplus::Pen white(GdiColor(RGB(255, 255, 255)), std::max<Gdiplus::REAL>(1.1f, S(0.9f)));
+                white.SetStartCap(Gdiplus::LineCapRound);
+                white.SetEndCap(Gdiplus::LineCapRound);
+                Gdiplus::RectF dot{ cx + 3.3f * u, cy - 10.4f * u, 8.4f * u, 8.4f * u };
+                g.FillEllipse(&red, dot);
+                g.DrawLine(&white, dot.X + 2.5f * u, dot.Y + 2.5f * u, dot.X + 5.9f * u, dot.Y + 5.9f * u);
+                g.DrawLine(&white, dot.X + 5.9f * u, dot.Y + 2.5f * u, dot.X + 2.5f * u, dot.Y + 5.9f * u);
+            }
+        };
+
+        if (id == CmdNoteExpandAll) drawTree(true);
+        else if (id == CmdNoteCollapseAll) drawTree(false);
+        else if (id == CmdNotePrev) drawArrowBox(false);
+        else if (id == CmdNoteNext) drawArrowBox(true);
+        else if (id == CmdNoteDelete) drawTrash(false);
+        else if (id == CmdNoteDeleteAll) drawTrash(true);
+    }
+
+    void DrawFilledCircle(HDC dc, int cx, int cy, float radius, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush brush(GdiColor(color));
+        float d = radius * 2.0f;
+        g.FillEllipse(&brush, static_cast<float>(cx) - radius, static_cast<float>(cy) - radius, d, d);
+    }
     void DrawSearchGlyph(HDC dc, RECT r, COLORREF color)
     {
         Gdiplus::Graphics g(dc);
@@ -1907,14 +2879,28 @@ namespace
     {
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.35f, S(1.05f)));
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.22f, S(0.92f)));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         float cx = (r.left + r.right) * 0.5f;
         float cy = (r.top + r.bottom) * 0.5f;
-        float d = S(4.5f);
+        float d = S(3.45f);
         g.DrawLine(&pen, cx - d, cy - d, cx + d, cy + d);
         g.DrawLine(&pen, cx + d, cy - d, cx - d, cy + d);
+    }
+
+    void DrawPlusGlyph(HDC dc, RECT r, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.6f, S(1.25f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        float cx = (r.left + r.right) * 0.5f;
+        float cy = (r.top + r.bottom) * 0.5f;
+        float d = S(5.4f);
+        g.DrawLine(&pen, cx - d, cy, cx + d, cy);
+        g.DrawLine(&pen, cx, cy - d, cx, cy + d);
     }
 
     void DrawSearchActionButton(HDC dc, int id, RECT r, const std::wstring& label)
@@ -1991,6 +2977,10 @@ namespace
         return g_tabs[static_cast<size_t>(g_active)].get();
     }
 
+    void SaveActiveTabProgress();
+    void RestoreActiveTabPosition(HWND hwnd);
+    void ActivateTab(HWND hwnd, int index);
+
     std::filesystem::path StatePath()
     {
         PWSTR appData = nullptr;
@@ -2029,15 +3019,6 @@ namespace
             if (a.pinned && b.pinned && a.pinnedAt != b.pinnedAt) return a.pinnedAt > b.pinnedAt;
             return a.openedAt > b.openedAt;
         });
-    }
-
-    std::wstring LowerCopy(std::wstring text)
-    {
-        std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch)
-        {
-            return static_cast<wchar_t>(std::towlower(ch));
-        });
-        return text;
     }
 
     bool HomeRecentMatches(RecentItem const& item)
@@ -2079,7 +3060,7 @@ namespace
                 else switch (savedTheme)
                 {
                 case 1: g_theme = 2; break; // 深色云母 -> 极夜黑
-                case 2: g_theme = 4; break; // 极光 -> 极光
+                case 2: g_theme = 4; break; // 极光 -> 极光绿
                 case 3: g_theme = 3; break; // 石墨 -> 石墨黑
                 case 4: g_theme = 1; break; // 护眼纸张 -> 护眼米白
                 case 5: g_theme = 0; break; // 雾面云母 -> 云母白
@@ -2102,6 +3083,20 @@ namespace
             else if (line.rfind("homeList=", 0) == 0) g_homeListView = std::atoi(line.c_str() + 9) != 0;
             else if (line.rfind("continuous=", 0) == 0) g_continuousRead = std::atoi(line.c_str() + 11) != 0;
             else if (line.rfind("statusPinned=", 0) == 0) g_statusPinned = std::atoi(line.c_str() + 13) != 0;
+            else if (line.rfind("lastSessionActive=", 0) == 0) g_lastSessionActive = std::atoi(line.c_str() + 18);
+            else if (line.rfind("lastSessionTab=", 0) == 0)
+            {
+                auto parts = SplitTabLine(line.substr(15));
+                if (parts.size() >= 4)
+                {
+                    LastSessionItem item;
+                    item.page = std::max(1, std::atoi(parts[0].c_str()));
+                    item.scrollY = std::max(0, std::atoi(parts[1].c_str()));
+                    item.zoom = std::clamp(std::atof(parts[2].c_str()), 0.0833, 64.0);
+                    item.path = FromUtf8(parts[3]);
+                    if (!item.path.empty()) g_lastSessionTabs.push_back(item);
+                }
+            }
             else if (line.rfind("recent=", 0) == 0)
             {
                 auto parts = SplitTabLine(line.substr(7));
@@ -2121,6 +3116,8 @@ namespace
         }
         SortRecent();
         if (g_recent.size() > 80) g_recent.resize(80);
+        if (g_lastSessionActive < 0 || g_lastSessionActive >= static_cast<int>(g_lastSessionTabs.size()))
+            g_lastSessionActive = g_lastSessionTabs.empty() ? -1 : 0;
     }
 
     void SaveState()
@@ -2134,6 +3131,11 @@ namespace
         out << "homeList=" << (g_homeListView ? 1 : 0) << "\n";
         out << "continuous=" << (g_continuousRead ? 1 : 0) << "\n";
         out << "statusPinned=" << (g_statusPinned ? 1 : 0) << "\n";
+        out << "lastSessionActive=" << g_lastSessionActive << "\n";
+        for (auto const& item : g_lastSessionTabs)
+        {
+            out << "lastSessionTab=" << item.page << '\t' << item.scrollY << '\t' << item.zoom << '\t' << ToUtf8(item.path) << "\n";
+        }
         for (auto const& item : g_recent)
         {
             out << "recent=" << item.openedAt << '\t' << item.page << '\t' << ToUtf8(item.path) << '\t'
@@ -2354,6 +3356,12 @@ namespace
         DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof(dark));
         int backdrop = IsGlassTheme() ? 4 : 2;
         DwmSetWindowAttribute(g_hwnd, 38, &backdrop, sizeof(backdrop));
+        COLORREF caption = ChromeBarColor();
+        COLORREF captionText = T().text;
+        COLORREF border = ChromeDividerColor();
+        DwmSetWindowAttribute(g_hwnd, 35, &caption, sizeof(caption));
+        DwmSetWindowAttribute(g_hwnd, 36, &captionText, sizeof(captionText));
+        DwmSetWindowAttribute(g_hwnd, 34, &border, sizeof(border));
     }
 
     void UpdateRecent(const PdfTab& tab)
@@ -2413,11 +3421,171 @@ namespace
         return std::max(2, S(2));
     }
 
-    PageImage RenderPageAtZoom(PdfTab& tab, int index, double zoom)
+    int FacingPageGap()
     {
-        double renderScale = zoom * static_cast<double>(g_dpi) / 72.0;
+        return std::max(4, S(8));
+    }
+
+    int FirstPageInSpread(int page)
+    {
+        if (g_viewMode == 1) return (std::max(0, page) / 2) * 2;
+        if (g_viewMode == 2)
+        {
+            if (page <= 0) return 0;
+            return 1 + ((page - 1) / 2) * 2;
+        }
+        return std::max(0, page);
+    }
+
+    int NextSpreadStart(PdfTab const& tab, int start)
+    {
+        if (g_viewMode == 0) return start + 1;
+        if (g_viewMode == 2 && start == 0) return std::min(1, tab.pageCount);
+        return start + 2;
+    }
+
+    int SpreadPageCount(PdfTab const& tab, int start)
+    {
+        if (start < 0 || start >= tab.pageCount) return 0;
+        if (g_viewMode == 0) return 1;
+        if (g_viewMode == 2 && start == 0) return 1;
+        return std::min(2, tab.pageCount - start);
+    }
+
+    int SpreadWidth(PdfTab const& tab, int start)
+    {
+        int count = SpreadPageCount(tab, start);
+        if (count <= 0) return 0;
+        int width = 0;
+        for (int i = 0; i < count; ++i)
+        {
+            if (i) width += FacingPageGap();
+            width += PageW(tab, start + i);
+        }
+        return width;
+    }
+
+    int SpreadHeight(PdfTab const& tab, int start)
+    {
+        int count = SpreadPageCount(tab, start);
+        int height = 0;
+        for (int i = 0; i < count; ++i)
+            height = std::max(height, PageH(tab, start + i));
+        return height;
+    }
+
+    int MaxSpreadWidth(PdfTab const& tab)
+    {
+        int maxWidth = 0;
+        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
+            maxWidth = std::max(maxWidth, SpreadWidth(tab, start));
+        return maxWidth;
+    }
+
+    int ReadingContentWidth(PdfTab const& tab)
+    {
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        return std::max<int>(stageW, MaxSpreadWidth(tab) + S(56));
+    }
+
+    int SpreadX(PdfTab const& tab, int start)
+    {
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int spreadW = SpreadWidth(tab, start);
+        int maxSpreadW = MaxSpreadWidth(tab);
+        if (maxSpreadW + S(56) <= stageW)
+            return g_stage.left + (stageW - spreadW) / 2;
+        return g_stage.left + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
+    }
+
+    int SpreadTopScroll(PdfTab const& tab, int targetPage)
+    {
+        targetPage = std::clamp(targetPage, 0, std::max(0, tab.pageCount - 1));
+        int targetStart = FirstPageInSpread(targetPage);
+        int scroll = S(28);
+        for (int start = 0; start < tab.pageCount && start < targetStart; start = NextSpreadStart(tab, start))
+            scroll += SpreadHeight(tab, start) + PageGap();
+        return scroll;
+    }
+
+    int SpreadVisualTop(PdfTab const& tab, int start)
+    {
+        return g_stage.top + SpreadTopScroll(tab, start) - g_scrollY;
+    }
+
+    int FirstVisibleSpreadStart(PdfTab const& tab)
+    {
+        int first = 0;
+        int threshold = std::max(0, g_scrollY - S(96));
+        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
+        {
+            int nextStart = NextSpreadStart(tab, start);
+            int nextTop = nextStart < tab.pageCount
+                ? SpreadTopScroll(tab, nextStart)
+                : SpreadTopScroll(tab, start) + SpreadHeight(tab, start) + PageGap();
+            if (nextTop >= threshold) break;
+            if (nextStart >= tab.pageCount)
+            {
+                first = start;
+                break;
+            }
+            first = nextStart;
+        }
+        return first;
+    }
+
+    bool BuildSpreadPageRect(PdfTab const& tab, int start, int y, int page, RECT& pageRect)
+    {
+        int count = SpreadPageCount(tab, start);
+        if (count <= 0 || page < start || page >= start + count) return false;
+        int x = SpreadX(tab, start);
+        int spreadH = SpreadHeight(tab, start);
+        for (int i = 0; i < count; ++i)
+        {
+            int p = start + i;
+            int pageW = PageW(tab, p);
+            int pageH = PageH(tab, p);
+            int pageY = y + (spreadH - pageH) / 2;
+            RECT r{ x, pageY, x + pageW, pageY + pageH };
+            if (p == page)
+            {
+                pageRect = r;
+                return true;
+            }
+            x += pageW + FacingPageGap();
+        }
+        return false;
+    }
+
+    int ContinuousContentHeight(PdfTab const& tab);
+    int SinglePageContentHeight(PdfTab const& tab);
+    int SinglePageMaxScroll(PdfTab const& tab);
+
+    PageImage RenderPageAtScale(PdfTab& tab, int index, double renderScale, bool applyTheme, int renderTheme = -1)
+    {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
-        fz_pixmap* pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceRgb(tab.ctx), 0);
+        fz_pixmap* pixmap = nullptr;
+        if (g_pdf.newPixmapFromPageNumberClip)
+        {
+            fz_page* page = g_pdf.loadPage(tab.ctx, tab.doc, index);
+            fz_rect bounds = g_pdf.boundPage(tab.ctx, page);
+            g_pdf.dropPage(tab.ctx, page);
+            int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
+            int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
+            pixmap = g_pdf.newPixmapFromPageNumberClip(
+                tab.ctx,
+                tab.doc,
+                index,
+                matrix,
+                g_pdf.deviceRgb(tab.ctx),
+                0,
+                0,
+                0,
+                widthPx,
+                heightPx);
+        }
+        if (!pixmap)
+            pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceRgb(tab.ctx), 0);
         PageImage image;
         image.width = g_pdf.pixmapWidth(tab.ctx, pixmap);
         image.height = g_pdf.pixmapHeight(tab.ctx, pixmap);
@@ -2435,7 +3603,7 @@ namespace
                 std::uint8_t b = components >= 3 ? px[2] : px[0];
                 std::uint8_t g = components >= 3 ? px[1] : px[0];
                 std::uint8_t r = px[0];
-                ApplyPdfTheme(b, g, r);
+                if (applyTheme) ApplyPdfThemeFor(renderTheme >= 0 ? renderTheme : g_theme, b, g, r);
                 dst[x * 4 + 0] = b;
                 dst[x * 4 + 1] = g;
                 dst[x * 4 + 2] = r;
@@ -2444,6 +3612,11 @@ namespace
         }
         g_pdf.dropPixmap(tab.ctx, pixmap);
         return image;
+    }
+
+    PageImage RenderPageAtZoom(PdfTab& tab, int index, double zoom)
+    {
+        return RenderPageAtScale(tab, index, zoom * static_cast<double>(g_dpi) / 72.0, true);
     }
 
     PageImage* LoadHomeThumb(const RecentItem& item, int targetWidth)
@@ -2570,7 +3743,7 @@ namespace
             auto cacheBytes = [&]()
             {
                 size_t total = 0;
-                for (auto const& entry : tab.tileCache) total += entry.second.bgra.size();
+                for (auto const& entry : tab.tileCache) total += entry.second.CacheBytes();
                 return total;
             };
             while (tab.tileCache.size() > 44 || cacheBytes() > 24ull * 1024ull * 1024ull)
@@ -2594,7 +3767,7 @@ namespace
         return it->second;
     }
 
-    PageImage& EnsurePage(PdfTab& tab, int index)
+    void PreparePageCache(PdfTab& tab)
     {
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
@@ -2603,35 +3776,192 @@ namespace
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
         }
+    }
+
+    void TrimPageCache(PdfTab& tab, int protectedPage)
+    {
+        auto cacheBytes = [&]()
+        {
+            size_t total = 0;
+            for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
+            return total;
+        };
+        size_t maxBytes = tab.zoom > 2.0 ? 8ull * 1024ull * 1024ull : 42ull * 1024ull * 1024ull;
+        size_t maxPages = tab.zoom > 2.0 ? 1ull : 5ull;
+        while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
+        {
+            auto victim = tab.cache.end();
+            int worstDistance = -1;
+            for (auto candidate = tab.cache.begin(); candidate != tab.cache.end(); ++candidate)
+            {
+                if (candidate->first == protectedPage && tab.cache.size() > 1) continue;
+                int distance = std::abs(candidate->first - tab.currentPage);
+                if (distance > worstDistance)
+                {
+                    worstDistance = distance;
+                    victim = candidate;
+                }
+            }
+            if (victim == tab.cache.end() || victim->first == protectedPage) break;
+            tab.cache.erase(victim);
+        }
+    }
+
+    PageImage* FindCachedPage(PdfTab& tab, int index)
+    {
+        PreparePageCache(tab);
+        auto found = tab.cache.find(index);
+        return found == tab.cache.end() ? nullptr : &found->second;
+    }
+
+    bool SamePageRenderRequest(PageRenderRequest const& a, PageRenderRequest const& b)
+    {
+        return a.documentVersion == b.documentVersion &&
+            a.page == b.page && a.zoom == b.zoom && a.dpi == b.dpi && a.theme == b.theme &&
+            _wcsicmp(a.path.c_str(), b.path.c_str()) == 0;
+    }
+
+    void PageRenderWorkerMain()
+    {
+        fz_context* workerCtx = nullptr;
+        fz_document* workerDoc = nullptr;
+        std::wstring workerPath;
+        unsigned long workerVersion = 0;
+
+        auto closeWorkerDocument = [&]()
+        {
+            if (workerDoc) g_pdf.dropDocument(workerCtx, workerDoc);
+            workerDoc = nullptr;
+            workerPath.clear();
+            workerVersion = 0;
+        };
+
+        for (;;)
+        {
+            PageRenderRequest request;
+            {
+                std::unique_lock<std::mutex> lock(g_pageRenderMutex);
+                g_pageRenderCv.wait(lock, [] { return g_pageRenderStop || g_pageRenderHasRequest; });
+                if (g_pageRenderStop) break;
+                request = g_pageRenderRequest;
+                g_pageRenderHasRequest = false;
+                if (g_pageRenderCv.wait_for(lock, std::chrono::milliseconds(4), [] { return g_pageRenderStop || g_pageRenderHasRequest; }))
+                {
+                    if (g_pageRenderStop) break;
+                    request = g_pageRenderRequest;
+                    g_pageRenderHasRequest = false;
+                }
+                g_pageRenderActiveRequest = request;
+                g_pageRenderActive = true;
+            }
+
+            auto result = std::make_unique<PageRenderResult>();
+            result->request = request;
+            try
+            {
+                if (!workerCtx)
+                {
+                    workerCtx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
+                    g_pdf.setAaLevel(workerCtx, 8);
+                    g_pdf.registerHandlers(workerCtx);
+                }
+                if (!workerDoc || workerVersion != request.documentVersion || _wcsicmp(workerPath.c_str(), request.path.c_str()) != 0)
+                {
+                    closeWorkerDocument();
+                    std::string utf8 = ToUtf8(request.path);
+                    workerDoc = g_pdf.openDocument(workerCtx, utf8.c_str());
+                    workerPath = request.path;
+                    workerVersion = request.documentVersion;
+                }
+
+                PdfTab renderTab;
+                renderTab.ctx = workerCtx;
+                renderTab.doc = workerDoc;
+                renderTab.zoom = request.zoom;
+                double renderScale = request.zoom * static_cast<double>(request.dpi) / 72.0;
+                result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme);
+            }
+            catch (...)
+            {
+                closeWorkerDocument();
+                if (workerCtx) g_pdf.dropContext(workerCtx);
+                workerCtx = nullptr;
+                result->image = {};
+            }
+
+            bool stale = false;
+            {
+                std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+                g_pageRenderActive = false;
+                stale = g_pageRenderStop || g_pageRenderSerial != request.serial;
+            }
+            if (!stale && !result->image.bgra.empty() && IsWindow(request.target))
+            {
+                if (!PostMessageW(request.target, WM_QUIETPDF_PAGE_RENDERED, 0, reinterpret_cast<LPARAM>(result.get())))
+                    continue;
+                result.release();
+            }
+        }
+
+        closeWorkerDocument();
+        if (workerCtx) g_pdf.dropContext(workerCtx);
+    }
+
+    void EnsurePageRenderWorker()
+    {
+        if (g_pageRenderThread.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            g_pageRenderStop = false;
+            g_pageRenderHasRequest = false;
+            g_pageRenderActive = false;
+        }
+        g_pageRenderThread = std::thread(PageRenderWorkerMain);
+    }
+
+    void StopPageRenderWorker()
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            g_pageRenderStop = true;
+            g_pageRenderHasRequest = false;
+            ++g_pageRenderSerial;
+        }
+        g_pageRenderCv.notify_all();
+        if (g_pageRenderThread.joinable()) g_pageRenderThread.join();
+    }
+
+    void QueuePageRender(HWND hwnd, PdfTab const& tab, int page)
+    {
+        if (page < 0 || page >= tab.pageCount || tab.zoom > 2.0) return;
+        EnsurePageRenderWorker();
+        PageRenderRequest request;
+        request.documentVersion = tab.renderVersion;
+        request.target = hwnd;
+        request.path = tab.path;
+        request.page = page;
+        request.zoom = tab.zoom;
+        request.dpi = g_dpi;
+        request.theme = g_theme;
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            if (g_pageRenderHasRequest && SamePageRenderRequest(g_pageRenderRequest, request)) return;
+            if (!g_pageRenderHasRequest && g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            request.serial = ++g_pageRenderSerial;
+            g_pageRenderRequest = request;
+            g_pageRenderHasRequest = true;
+        }
+        g_pageRenderCv.notify_one();
+    }
+
+    PageImage& EnsurePage(PdfTab& tab, int index)
+    {
+        PreparePageCache(tab);
         auto it = tab.cache.find(index);
         if (it == tab.cache.end())
         {
             it = tab.cache.emplace(index, RenderPageAtZoom(tab, index, tab.zoom)).first;
-            auto cacheBytes = [&]()
-            {
-                size_t total = 0;
-                for (auto const& entry : tab.cache) total += entry.second.bgra.size();
-                return total;
-            };
-            size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 36ull * 1024ull * 1024ull;
-            size_t maxPages = tab.zoom > 2.0 ? 1ull : 4ull;
-            while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
-            {
-                auto victim = tab.cache.end();
-                int worstDistance = -1;
-                for (auto candidate = tab.cache.begin(); candidate != tab.cache.end(); ++candidate)
-                {
-                    if (candidate->first == index && tab.cache.size() > 1) continue;
-                    int distance = std::abs(candidate->first - tab.currentPage);
-                    if (distance > worstDistance)
-                    {
-                        worstDistance = distance;
-                        victim = candidate;
-                    }
-                }
-                if (victim == tab.cache.end() || victim->first == index) break;
-                tab.cache.erase(victim);
-            }
+            TrimPageCache(tab, index);
         }
         return it->second;
     }
@@ -2650,46 +3980,56 @@ namespace
             double pageWidthPixelsAtZoom1 = tab.pages[static_cast<size_t>(index)].widthPt * static_cast<double>(g_dpi) / 72.0;
             double thumbZoom = std::max(0.04, static_cast<double>(g_thumbSize) / std::max(1.0, pageWidthPixelsAtZoom1));
             it = tab.thumbCache.emplace(index, RenderPageAtZoom(tab, index, thumbZoom)).first;
-            while (tab.thumbCache.size() > 28) tab.thumbCache.erase(tab.thumbCache.begin());
+            while (tab.thumbCache.size() > 28)
+            {
+                auto victim = tab.thumbCache.end();
+                int worstDistance = -1;
+                for (auto candidate = tab.thumbCache.begin(); candidate != tab.thumbCache.end(); ++candidate)
+                {
+                    if (candidate->first == index) continue;
+                    int distance = std::abs(candidate->first - index);
+                    if (distance > worstDistance)
+                    {
+                        worstDistance = distance;
+                        victim = candidate;
+                    }
+                }
+                if (victim == tab.thumbCache.end()) break;
+                tab.thumbCache.erase(victim);
+            }
         }
         return it->second;
     }
 
     void SchedulePagePrefetch(HWND hwnd)
     {
-        UNREFERENCED_PARAMETER(hwnd);
+        PdfTab* tab = Active();
+        if (!tab || tab->pageCount <= 0 || tab->zoom > 2.0) return;
+        PreparePageCache(*tab);
+
+        int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
+        if (tab->cache.find(center) == tab->cache.end())
+        {
+            QueuePageRender(hwnd, *tab, center);
+            return;
+        }
+        bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
+        int candidates[2]{ center + 1, center - 1 };
+        int candidateCount = rapidScroll ? 1 : 2;
+        for (int i = 0; i < candidateCount; ++i)
+        {
+            int page = candidates[i];
+            if (page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end())
+            {
+                QueuePageRender(hwnd, *tab, page);
+                return;
+            }
+        }
     }
 
     bool PrefetchOnePage()
     {
-        PdfTab* tab = Active();
-        if (!tab || tab->pageCount <= 0) return false;
-        if (tab->cachedZoom != tab->zoom || tab->cachedDpi != g_dpi || tab->cachedTheme != g_theme)
-        {
-            tab->cache.clear();
-            tab->cachedZoom = tab->zoom;
-            tab->cachedDpi = g_dpi;
-            tab->cachedTheme = g_theme;
-        }
-
-        if (tab->zoom > 2.5 || tab->cache.size() >= 5) return false;
-
-        int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
-        for (int radius = 0; radius <= 2; ++radius)
-        {
-            int candidates[2]{ center + radius, center - radius };
-            int count = radius == 0 ? 1 : 2;
-            for (int i = 0; i < count; ++i)
-            {
-                int page = candidates[i];
-                if (page < 0 || page >= tab->pageCount) continue;
-                if (tab->cache.find(page) == tab->cache.end())
-                {
-                    EnsurePage(*tab, page);
-                    return true;
-                }
-            }
-        }
+        SchedulePagePrefetch(g_hwnd);
         return false;
     }
 
@@ -2700,7 +4040,7 @@ namespace
             int page = g_pdf.pageNumberFromLocation(tab.ctx, tab.doc, current->page);
             if (page >= 0 && page < tab.pageCount)
             {
-                std::wstring title = current->title ? FromUtf8(current->title) : L"未命名目录";
+                std::wstring title = current->title ? FromUtf8(current->title) : L"\u672a\u547d\u540d\u76ee\u5f55";
                 tab.outline.push_back(OutlineItem{ title, page, current->y, depth });
             }
             if (current->down)
@@ -2713,24 +4053,13 @@ namespace
     void ScrollToPage(PdfTab& tab, int page)
     {
         page = std::clamp(page, 0, tab.pageCount - 1);
-        int scroll = S(28);
-        for (int p = 0; p < page; ++p)
-        {
-            scroll += PageH(tab, p) + PageGap();
-        }
         tab.currentPage = page;
-        g_scrollY = scroll;
+        g_scrollY = g_continuousRead ? SpreadTopScroll(tab, page) : 0;
     }
 
     int PageTopScroll(PdfTab& tab, int page)
     {
-        page = std::clamp(page, 0, tab.pageCount - 1);
-        int scroll = S(28);
-        for (int p = 0; p < page; ++p)
-        {
-            scroll += PageH(tab, p) + PageGap();
-        }
-        return scroll;
+        return SpreadTopScroll(tab, page);
     }
 
     RECT SearchQuadRect(PdfTab const& tab, SearchResult const& result, RECT pageRect)
@@ -2762,21 +4091,16 @@ namespace
             {
                 int target = scroll + static_cast<int>(topPt * scale + 0.5) - S(96);
                 int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-                int content = S(28);
-                for (int p = 0; p < tab.pageCount; ++p)
-                {
-                    content += PageH(tab, p) + PageGap();
-                }
-                content = std::max<int>(content + S(28), stageH);
+                int content = ContinuousContentHeight(tab);
                 int maxScroll = std::max(0, content - stageH);
                 g_scrollY = std::clamp(target, 0, maxScroll);
             }
             else
             {
                 int target = static_cast<int>(topPt * scale + 0.5) - S(96);
-                int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-                int maxScroll = std::max<int>(0, PageH(tab, page) + S(56) - stageH);
-                g_scrollY = std::clamp(target, 0, maxScroll);
+                tab.currentPage = page;
+                g_contentHeight = SinglePageContentHeight(tab);
+                g_scrollY = std::clamp(target, 0, SinglePageMaxScroll(tab));
             }
         }
         else
@@ -2789,9 +4113,9 @@ namespace
     {
         int gap = PageGap();
         int content = S(28);
-        for (int p = 0; p < tab.pageCount; ++p)
+        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
         {
-            content += PageH(tab, p) + gap;
+            content += SpreadHeight(tab, start) + gap;
         }
         return std::max<int>(content + S(28), g_stage.bottom - g_stage.top);
     }
@@ -2800,7 +4124,7 @@ namespace
     {
         if (tab.pageCount <= 0) return std::max<int>(1, g_stage.bottom - g_stage.top);
         int page = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
-        return std::max<int>(PageH(tab, page) + S(56), g_stage.bottom - g_stage.top);
+        return std::max<int>(SpreadHeight(tab, FirstPageInSpread(page)) + S(56), g_stage.bottom - g_stage.top);
     }
 
     int SinglePageMaxScroll(PdfTab const& tab)
@@ -2812,27 +4136,23 @@ namespace
     bool PageRectAtPoint(PdfTab const& tab, int px, int py, int& page, RECT& pageRect)
     {
         if (!Hit(g_stage, px, py) || tab.pageCount <= 0) return false;
-        int gap = g_continuousRead ? PageGap() : 0;
-        int firstPage = g_continuousRead ? 0 : std::clamp(tab.currentPage, 0, tab.pageCount - 1);
-        int lastPage = g_continuousRead ? tab.pageCount : std::min(tab.pageCount, firstPage + 1);
-        int y = g_stage.top + S(28) - g_scrollY;
-        if (g_continuousRead)
+        int firstPage = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
         {
-            for (int p = 0; p < firstPage; ++p) y += PageH(tab, p) + gap;
-        }
-        for (int i = firstPage; i < lastPage; ++i)
-        {
-            int pageW = PageW(tab, i);
-            int pageH = PageH(tab, i);
-            int x = g_stage.left + std::max<int>(S(28), ((g_stage.right - g_stage.left) - pageW) / 2);
-            RECT r{ x, y, x + pageW, y + pageH };
-            if (Hit(r, px, py))
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
             {
-                page = i;
-                pageRect = r;
-                return true;
+                RECT r{};
+                int p = start + j;
+                if (BuildSpreadPageRect(tab, start, y, p, r) && Hit(r, px, py))
+                {
+                    page = p;
+                    pageRect = r;
+                    return true;
+                }
             }
-            y += pageH + gap;
         }
         return false;
     }
@@ -2840,22 +4160,15 @@ namespace
     bool PageRectForPage(PdfTab const& tab, int targetPage, RECT& pageRect)
     {
         if (tab.pageCount <= 0 || targetPage < 0 || targetPage >= tab.pageCount) return false;
-        int gap = g_continuousRead ? PageGap() : 0;
-        int firstPage = g_continuousRead ? 0 : std::clamp(tab.currentPage, 0, tab.pageCount - 1);
-        int lastPage = g_continuousRead ? tab.pageCount : std::min(tab.pageCount, firstPage + 1);
-        int y = g_stage.top + S(28) - g_scrollY;
-        for (int i = firstPage; i < lastPage; ++i)
+        int firstPage = g_continuousRead ? FirstPageInSpread(targetPage) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? NextSpreadStart(tab, firstPage) : NextSpreadStart(tab, firstPage);
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
         {
-            int pageW = PageW(tab, i);
-            int pageH = PageH(tab, i);
-            int x = g_stage.left + std::max<int>(S(28), ((g_stage.right - g_stage.left) - pageW) / 2);
-            RECT r{ x, y, x + pageW, y + pageH };
-            if (i == targetPage)
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (BuildSpreadPageRect(tab, start, y, targetPage, pageRect))
             {
-                pageRect = r;
                 return true;
             }
-            y += pageH + gap;
         }
         return false;
     }
@@ -2916,6 +4229,47 @@ namespace
         };
     }
 
+    bool NearlySameSegment(AnnotationSegment const& a, AnnotationSegment const& b)
+    {
+        constexpr double eps = 0.0015;
+        return std::abs(a.x0 - b.x0) <= eps &&
+            std::abs(a.y0 - b.y0) <= eps &&
+            std::abs(a.x1 - b.x1) <= eps &&
+            std::abs(a.y1 - b.y1) <= eps;
+    }
+
+    bool AppendUniqueSegment(std::vector<AnnotationSegment>& segments, AnnotationSegment segment)
+    {
+        if (segment.x1 - segment.x0 < 0.002 || segment.y1 - segment.y0 < 0.002)
+            return false;
+        for (auto const& existing : segments)
+        {
+            if (NearlySameSegment(existing, segment))
+                return false;
+        }
+        segments.push_back(segment);
+        return true;
+    }
+
+    bool NearlySameAnnotation(PdfAnnotation const& a, PdfAnnotation const& b)
+    {
+        if (a.page != b.page || a.kind != b.kind || a.colorIndex != b.colorIndex)
+            return false;
+        AnnotationSegment as{ a.x0, a.y0, a.x1, a.y1 };
+        AnnotationSegment bs{ b.x0, b.y0, b.x1, b.y1 };
+        return NearlySameSegment(as, bs);
+    }
+
+    bool CanMergeLoadedAnnotation(PdfAnnotation const& existing, PdfAnnotation const& incoming)
+    {
+        return existing.page == incoming.page &&
+            existing.kind == incoming.kind &&
+            existing.colorIndex == incoming.colorIndex &&
+            existing.createdAt == incoming.createdAt &&
+            existing.author == incoming.author &&
+            existing.note == incoming.note;
+    }
+
     RECT CurrentSelectionRect()
     {
         if (!g_hasContentSelection && !g_selectingContent) return RECT{};
@@ -2925,6 +4279,18 @@ namespace
             std::max(g_selectionStart.x, g_selectionEnd.x),
             std::max(g_selectionStart.y, g_selectionEnd.y)
         };
+    }
+
+    bool HasImageSelection()
+    {
+        return g_hasContentSelection && g_selectionIsImage;
+    }
+
+    bool CurrentSelectionPageRect(RECT& out)
+    {
+        RECT selection = CurrentSelectionRect();
+        if (IsRectEmpty(&selection) || IsRectEmpty(&g_selectionPageRect)) return false;
+        return IntersectRect(&out, &selection, &g_selectionPageRect) != FALSE;
     }
 
     bool RefreshTextSelection(PdfTab& tab)
@@ -2962,6 +4328,42 @@ namespace
         return true;
     }
 
+    bool TrySelectImageAtPoint(PdfTab& tab, int page, RECT pageRect, POINT clientPt)
+    {
+        if (!g_pdf.findImageAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
+            return false;
+
+        double pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
+        float y = std::clamp(static_cast<float>((clientPt.y - pageRect.top) / pageH), 0.0f, 1.0f);
+        fz_rect imageRect{};
+        if (g_pdf.findImageAtPoint(tab.ctx, tab.doc, page, x, y, &imageRect) <= 0)
+            return false;
+
+        RECT hitRect{
+            pageRect.left + static_cast<int>(std::floor(imageRect.x0 * pageW)),
+            pageRect.top + static_cast<int>(std::floor(imageRect.y0 * pageH)),
+            pageRect.left + static_cast<int>(std::ceil(imageRect.x1 * pageW)),
+            pageRect.top + static_cast<int>(std::ceil(imageRect.y1 * pageH))
+        };
+        hitRect.left = std::clamp(hitRect.left, pageRect.left, pageRect.right - 1);
+        hitRect.top = std::clamp(hitRect.top, pageRect.top, pageRect.bottom - 1);
+        hitRect.right = std::clamp(hitRect.right, hitRect.left + 1, pageRect.right);
+        hitRect.bottom = std::clamp(hitRect.bottom, hitRect.top + 1, pageRect.bottom);
+
+        g_selectionPage = page;
+        g_selectionPageRect = pageRect;
+        g_selectionNorm = imageRect;
+        g_selectionStart = POINT{ hitRect.left, hitRect.top };
+        g_selectionEnd = POINT{ hitRect.right, hitRect.bottom };
+        g_selectionQuads.clear();
+        g_selectionText.clear();
+        g_selectionIsImage = true;
+        g_hasContentSelection = true;
+        return true;
+    }
+
     void CopyTextToClipboard(HWND hwnd, std::wstring const& text)
     {
         if (text.empty() || !OpenClipboard(hwnd)) return;
@@ -2983,11 +4385,100 @@ namespace
         CloseClipboard();
     }
 
+    bool CopyImageToClipboard(HWND hwnd, PageImage const& image)
+    {
+        if (image.bgra.empty() || image.width <= 0 || image.height <= 0) return false;
+        if (!OpenClipboard(hwnd)) return false;
+        EmptyClipboard();
+
+        int stride = image.width * 4;
+        size_t payloadBytes = static_cast<size_t>(stride) * image.height;
+        size_t totalBytes = sizeof(BITMAPINFOHEADER) + payloadBytes;
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, totalBytes);
+        if (!mem)
+        {
+            CloseClipboard();
+            return false;
+        }
+
+        BYTE* dst = static_cast<BYTE*>(GlobalLock(mem));
+        if (!dst)
+        {
+            GlobalFree(mem);
+            CloseClipboard();
+            return false;
+        }
+
+        BITMAPINFOHEADER bih{};
+        bih.biSize = sizeof(BITMAPINFOHEADER);
+        bih.biWidth = image.width;
+        bih.biHeight = image.height;
+        bih.biPlanes = 1;
+        bih.biBitCount = 32;
+        bih.biCompression = BI_RGB;
+        bih.biSizeImage = static_cast<DWORD>(payloadBytes);
+        memcpy(dst, &bih, sizeof(bih));
+
+        BYTE* bits = dst + sizeof(BITMAPINFOHEADER);
+        for (int y = 0; y < image.height; ++y)
+        {
+            BYTE const* srcRow = image.bgra.data() + static_cast<size_t>(image.height - 1 - y) * stride;
+            memcpy(bits + static_cast<size_t>(y) * stride, srcRow, stride);
+        }
+
+        GlobalUnlock(mem);
+        if (!SetClipboardData(CF_DIB, mem))
+        {
+            GlobalFree(mem);
+            CloseClipboard();
+            return false;
+        }
+
+        CloseClipboard();
+        return true;
+    }
+
+    bool BuildSelectionImage(PdfTab& tab, PageImage& image)
+    {
+        RECT selected{};
+        if (!HasImageSelection() || !CurrentSelectionPageRect(selected) || g_selectionPage < 0 || g_selectionPage >= tab.pageCount)
+            return false;
+
+        int localLeft = std::max<int>(0, selected.left - g_selectionPageRect.left);
+        int localTop = std::max<int>(0, selected.top - g_selectionPageRect.top);
+        int localRight = std::min<int>(g_selectionPageRect.right - g_selectionPageRect.left, selected.right - g_selectionPageRect.left);
+        int localBottom = std::min<int>(g_selectionPageRect.bottom - g_selectionPageRect.top, selected.bottom - g_selectionPageRect.top);
+        if (localRight <= localLeft || localBottom <= localTop)
+            return false;
+
+        RECT tile{ localLeft, localTop, localRight, localBottom };
+        image = RenderPageTile(tab, g_selectionPage, tile);
+        return !image.bgra.empty();
+    }
+
+    bool CopyCurrentSelectionToClipboard(HWND hwnd)
+    {
+        if (!g_hasContentSelection) return false;
+        if (!g_selectionQuads.empty())
+        {
+            CopyTextToClipboard(hwnd, g_selectionText);
+            return !g_selectionText.empty();
+        }
+        PdfTab* tab = Active();
+        if (!tab) return false;
+        PageImage image;
+        if (!BuildSelectionImage(*tab, image)) return false;
+        return CopyImageToClipboard(hwnd, image);
+    }
+
     void ClearTextSelection()
     {
         g_selectingContent = false;
         g_hasContentSelection = false;
+        g_selectionIsImage = false;
         g_selectionPage = -1;
+        g_selectionPageRect = {};
+        g_selectionNorm = {};
         g_selectionQuads.clear();
         g_selectionText.clear();
     }
@@ -3013,6 +4504,78 @@ namespace
         g_annotationColorRects.clear();
     }
 
+    bool TrySelectWordAtPoint(HWND hwnd, PdfTab& tab, int page, RECT pageRect, POINT clientPt)
+    {
+        if (!g_pdf.selectWordAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
+            return false;
+
+        double pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
+        float y = std::clamp(static_cast<float>((clientPt.y - pageRect.top) / pageH), 0.0f, 1.0f);
+
+        std::vector<fz_quad> quads(256);
+        std::string text(65536, '\0');
+        int count = g_pdf.selectWordAtPoint(
+            tab.ctx,
+            tab.doc,
+            page,
+            x,
+            y,
+            quads.data(),
+            static_cast<int>(quads.size()),
+            text.data(),
+            static_cast<int>(text.size()));
+        if (count <= 0)
+            return false;
+
+        quads.resize(static_cast<size_t>(count));
+        bool haveUnion = false;
+        RECT unionRect{};
+        fz_rect norm{};
+        for (fz_quad const& quad : quads)
+        {
+            float minX = std::min({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+            float maxX = std::max({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+            float minY = std::min({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            float maxY = std::max({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            minX = std::clamp(minX, 0.0f, 1.0f);
+            maxX = std::clamp(maxX, 0.0f, 1.0f);
+            minY = std::clamp(minY, 0.0f, 1.0f);
+            maxY = std::clamp(maxY, 0.0f, 1.0f);
+            RECT quadRect = QuadToRect(quad, pageRect);
+            if (!haveUnion)
+            {
+                unionRect = quadRect;
+                norm = fz_rect{ minX, minY, maxX, maxY };
+                haveUnion = true;
+            }
+            else
+            {
+                UnionRect(&unionRect, &unionRect, &quadRect);
+                norm.x0 = std::min(norm.x0, minX);
+                norm.y0 = std::min(norm.y0, minY);
+                norm.x1 = std::max(norm.x1, maxX);
+                norm.y1 = std::max(norm.y1, maxY);
+            }
+        }
+        if (!haveUnion)
+            return false;
+
+        ClearAnnotationFocus();
+        g_selectingContent = false;
+        g_hasContentSelection = true;
+        g_selectionIsImage = false;
+        g_selectionPage = page;
+        g_selectionPageRect = pageRect;
+        g_selectionStart = POINT{ unionRect.left, unionRect.top };
+        g_selectionEnd = POINT{ unionRect.right, unionRect.bottom };
+        g_selectionNorm = norm;
+        g_selectionQuads = std::move(quads);
+        g_selectionText = FromUtf8(text.c_str());
+        InvalidateRect(hwnd, &g_stage, FALSE);
+        return true;
+    }
     bool ActiveAnnotation(PdfTab& tab, PdfAnnotation*& annotation)
     {
         if (g_activeAnnotation < 0 || g_activeAnnotation >= static_cast<int>(tab.annotations.size())) return false;
@@ -3065,6 +4628,92 @@ namespace
     int ClampSidebarScrollValue(int value);
     void RequestSidebarRepaint(HWND hwnd);
 
+    constexpr int MaxVisibleTabs = 10;
+
+    RECT HomeContentViewportRect(RECT client)
+    {
+        return RECT{ 0, S(220), client.right, client.bottom };
+    }
+
+    int ComputeHomeGridContentHeight(RECT client, size_t recentCount)
+    {
+        int tileW = S(152);
+        int coverH = S(198);
+        int nameH = S(38);
+        int tileH = coverH + nameH + S(10);
+        int gapX = S(28);
+        int gapY = S(28);
+        int startX = S(42);
+        int maxRight = std::max<int>(startX + tileW, client.right - S(42));
+        int availableW = std::max<int>(tileW, maxRight - startX);
+        int columns = std::max<int>(1, (availableW + gapX) / (tileW + gapX));
+        size_t tileCount = 1 + recentCount;
+        size_t rows = std::max<size_t>(1, (tileCount + static_cast<size_t>(columns) - 1) / static_cast<size_t>(columns));
+        return S(16) + static_cast<int>(rows) * tileH + std::max<int>(0, static_cast<int>(rows) - 1) * gapY + S(24);
+    }
+
+    int ComputeHomeListContentHeight(size_t recentCount, bool showEmptySearch)
+    {
+        int content = static_cast<int>(recentCount) * S(48) + S(16);
+        if (showEmptySearch && recentCount == 0)
+            content = std::max<int>(content, S(80));
+        return std::max<int>(0, content);
+    }
+
+    int ClampHomeScrollValue(RECT client, int value)
+    {
+        RECT viewport = HomeContentViewportRect(client);
+        int visible = std::max<int>(1, viewport.bottom - viewport.top);
+        int maxScroll = std::max<int>(0, g_homeContentHeight - visible);
+        return std::clamp(value, 0, maxScroll);
+    }
+
+    void ScrollHomeTo(HWND hwnd, int value)
+    {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int clamped = ClampHomeScrollValue(client, value);
+        if (clamped == g_homeScrollY) return;
+        g_homeScrollY = clamped;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void EnsureTabWindowVisible(int index)
+    {
+        int total = static_cast<int>(g_tabs.size());
+        if (total <= MaxVisibleTabs)
+        {
+            g_tabVisibleStart = 0;
+            return;
+        }
+        int maxStart = std::max(0, total - MaxVisibleTabs);
+        if (index >= 0)
+        {
+            if (index < g_tabVisibleStart) g_tabVisibleStart = index;
+            else if (index >= g_tabVisibleStart + MaxVisibleTabs) g_tabVisibleStart = index - MaxVisibleTabs + 1;
+        }
+        g_tabVisibleStart = std::clamp(g_tabVisibleStart, 0, maxStart);
+    }
+
+    int ClampTabListScrollValue(RECT client, int value)
+    {
+        int maxHeight = std::max<int>(S(120), static_cast<int>(client.bottom - g_tabCountRect.bottom - S(18)));
+        int visible = std::min(maxHeight, std::max<int>(0, g_tabListContentHeight));
+        int maxScroll = std::max<int>(0, g_tabListContentHeight - visible);
+        return std::clamp(value, 0, maxScroll);
+    }
+
+    void ScrollTabListTo(HWND hwnd, int value)
+    {
+        if (!g_tabListOpen) return;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int clamped = ClampTabListScrollValue(client, value);
+        if (clamped == g_tabListScrollY) return;
+        g_tabListScrollY = clamped;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
     int PageFromScroll(PdfTab const& tab, int scrollY)
     {
         if (tab.pageCount <= 0) return 0;
@@ -3072,12 +4721,12 @@ namespace
         int y = S(28);
         int probe = scrollY + S(32);
         int best = 0;
-        for (int p = 0; p < tab.pageCount; ++p)
+        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
         {
-            int pageH = PageH(tab, p);
-            if (probe < y + pageH + gap / 2) return p;
-            y += pageH + gap;
-            best = p;
+            int spreadH = SpreadHeight(tab, start);
+            if (probe < y + spreadH + gap / 2) return start;
+            y += spreadH + gap;
+            best = start;
         }
         return best;
     }
@@ -3085,14 +4734,7 @@ namespace
     int OutlineTargetScrollY(PdfTab const& tab, OutlineItem const& item, int knownPage = -1, int knownPageTop = 0)
     {
         int page = std::clamp(item.page, 0, tab.pageCount - 1);
-        int scroll = knownPage == page ? knownPageTop : S(28);
-        if (knownPage != page)
-        {
-            for (int p = 0; p < page; ++p)
-            {
-                scroll += PageH(tab, p) + PageGap();
-            }
-        }
+        int scroll = knownPage == page ? knownPageTop : SpreadTopScroll(tab, page);
         int yOffset = item.yPt > 0 ? static_cast<int>(item.yPt * tab.zoom * static_cast<double>(g_dpi) / 72.0 + 0.5) : 0;
         return std::max(0, scroll + yOffset - S(24));
     }
@@ -3118,23 +4760,11 @@ namespace
         if (tab.outline.empty() || tab.pageCount <= 0) return -1;
         int probe = scrollY + S(48);
         int best = -1;
-        int pageTop = S(28);
-        int page = 0;
         for (int i = 0; i < static_cast<int>(tab.outline.size()); ++i)
         {
             if (!OutlineRowVisible(tab, i)) continue;
             int itemPage = std::clamp(tab.outline[static_cast<size_t>(i)].page, 0, tab.pageCount - 1);
-            if (itemPage < page)
-            {
-                pageTop = S(28);
-                page = 0;
-            }
-            while (page < itemPage)
-            {
-                pageTop += PageH(tab, page) + PageGap();
-                ++page;
-            }
-            int target = OutlineTargetScrollY(tab, tab.outline[static_cast<size_t>(i)], page, pageTop);
+            int target = OutlineTargetScrollY(tab, tab.outline[static_cast<size_t>(i)]);
             if (target <= probe) best = i;
             else if (itemPage > tab.currentPage || target > probe + S(400)) break;
         }
@@ -3143,7 +4773,7 @@ namespace
 
     void KeepOutlineSelectionVisible(HWND hwnd, PdfTab const& tab)
     {
-        if (!g_sidebarOpen || g_immersive || g_sideMode != 0 || g_selectedOutlineRow < 0) return;
+        if (!SidebarVisible() || g_sideMode != 0 || g_selectedOutlineRow < 0) return;
         if (tab.outlineLayout.empty()) return;
         auto rowIt = std::find_if(
             tab.outlineLayout.begin(),
@@ -3173,12 +4803,73 @@ namespace
         RequestSidebarRepaint(hwnd);
     }
 
+    int ThumbnailBoxHeight(PdfTab const& tab, int page)
+    {
+        page = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
+        double ratioH = tab.pages[static_cast<size_t>(page)].heightPt / std::max(1.0, tab.pages[static_cast<size_t>(page)].widthPt);
+        int thumbH = std::max<int>(S(56), static_cast<int>(g_thumbSize * ratioH + 0.5));
+        return thumbH + S(58);
+    }
+
+    void KeepThumbnailSelectionVisible(HWND hwnd, PdfTab const& tab)
+    {
+        if (!SidebarVisible() || g_sideMode != 1 || tab.pageCount <= 0) return;
+        int page = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+        int itemTop = S(80);
+        for (int i = 0; i < page; ++i)
+            itemTop += ThumbnailBoxHeight(tab, i) + S(22);
+        int itemBottom = itemTop + ThumbnailBoxHeight(tab, page);
+
+        int sidebarH = std::max<int>(1, g_sidebar.bottom - g_sidebar.top);
+        int desired = g_sidebarScrollY;
+        if (itemTop - g_sidebarScrollY < S(86))
+            desired = itemTop - S(92);
+        else if (itemBottom - g_sidebarScrollY > sidebarH - S(14))
+            desired = itemBottom - sidebarH + S(14);
+
+        desired = ClampSidebarScrollValue(desired);
+        if (desired != g_sidebarScrollY)
+        {
+            g_sidebarScrollY = desired;
+            RequestSidebarRepaint(hwnd);
+        }
+        else
+        {
+            RECT area = SidebarScrollRect();
+            InvalidateRect(hwnd, &area, FALSE);
+        }
+    }
+
     void SyncOutlineSelectionFromScroll(HWND hwnd, PdfTab& tab)
     {
         int selected = OutlineRowFromScroll(tab, g_scrollY);
         if (selected == g_selectedOutlineRow) return;
         g_selectedOutlineRow = selected;
         KeepOutlineSelectionVisible(hwnd, tab);
+    }
+
+    void SyncSidebarProgressFromScroll(HWND hwnd, PdfTab& tab)
+    {
+        if (g_sideMode == 0) SyncOutlineSelectionFromScroll(hwnd, tab);
+        else if (g_sideMode == 1) KeepThumbnailSelectionVisible(hwnd, tab);
+    }
+
+    void SyncSidebarProgressFromScrollFast(HWND hwnd, PdfTab& tab)
+    {
+        if (!SidebarVisible()) return;
+        if (g_sideMode == 0)
+        {
+            int selected = OutlineRowFromScroll(tab, g_scrollY);
+            if (selected != g_selectedOutlineRow)
+            {
+                g_selectedOutlineRow = selected;
+                RequestSidebarRepaint(hwnd);
+            }
+        }
+        else if (g_sideMode == 1)
+        {
+            RequestSidebarRepaint(hwnd);
+        }
     }
 
     void FocusPageInput(HWND hwnd)
@@ -3228,11 +4919,7 @@ namespace
         }
         auto const& item = tab.outline[static_cast<size_t>(outlineRow)];
         int page = std::clamp(item.page, 0, tab.pageCount - 1);
-        int scroll = S(28);
-        for (int p = 0; p < page; ++p)
-        {
-            scroll += PageH(tab, p) + PageGap();
-        }
+        int scroll = SpreadTopScroll(tab, page);
         int yOffset = item.yPt > 0 ? static_cast<int>(item.yPt * tab.zoom * static_cast<double>(g_dpi) / 72.0 + 0.5) : 0;
         tab.currentPage = page;
         g_scrollY = std::max(0, scroll + yOffset - S(24));
@@ -3262,11 +4949,11 @@ namespace
                 for (int hit = 0; hit < count && totalHits < 500; ++hit)
                 {
                     ++totalHits;
-                    std::wstring snippet = L"第 " + std::to_wstring(page + 1) + L" 页第 " + std::to_wstring(hit + 1) + L" 处“" + g_searchQuery + L"”";
+                    std::wstring snippet = L"\u7b2c" + std::to_wstring(page + 1) + L" \u9875\u7b2c " + std::to_wstring(hit + 1) + L" \u5904\uff1a" + g_searchQuery;
                     int highlightStart = static_cast<int>(snippet.find(g_searchQuery));
                     if (highlightStart < 0) highlightStart = 0;
                     g_searchResults.push_back(SearchResult{
-                        L"第 " + std::to_wstring(page + 1) + L" 页包含 \"" + g_searchQuery + L"\"",
+                        L"\u7b2c" + std::to_wstring(page + 1) + L" \u9875\u5305\u542b \"" + g_searchQuery + L"\"",
                         snippet,
                         page,
                         1,
@@ -3296,6 +4983,7 @@ namespace
     {
         g_pdf.Load();
         auto tab = std::make_unique<PdfTab>();
+        tab->renderVersion = ++g_nextRenderVersion;
         tab->ctx = g_pdf.newContext(nullptr, nullptr, 64 << 20, "1.28.0");
         g_pdf.setAaLevel(tab->ctx, 8);
         g_pdf.registerHandlers(tab->ctx);
@@ -3325,6 +5013,8 @@ namespace
         LoadAnnotationsFromPdf(*tab);
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
+        EnsureTabWindowVisible(g_active);
+        g_tabListOpen = false;
         if (auto* active = Active())
         {
             ScrollToPage(*active, std::clamp(restorePage, 1, active->pageCount) - 1);
@@ -3338,6 +5028,119 @@ namespace
         SetTitle();
         StartActiveFileWatcher(hwnd);
         SchedulePagePrefetch(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    bool SamePath(std::wstring const& a, std::wstring const& b)
+    {
+        return _wcsicmp(a.c_str(), b.c_str()) == 0;
+    }
+
+    int FindOpenTabByPath(std::wstring const& path)
+    {
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            if (SamePath(g_tabs[static_cast<size_t>(i)]->path, path))
+                return i;
+        }
+        return -1;
+    }
+
+    void ApplySessionPosition(PdfTab& tab, LastSessionItem const& item)
+    {
+        tab.zoom = std::clamp(item.zoom, 0.0833, 64.0);
+        ScrollToPage(tab, std::clamp(item.page, 1, tab.pageCount) - 1);
+        tab.savedScrollY = std::max(0, item.scrollY);
+        if (g_continuousRead)
+        {
+            g_contentHeight = ContinuousContentHeight(tab);
+            int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+            g_scrollY = std::clamp(tab.savedScrollY, 0, maxScroll);
+            tab.currentPage = PageFromScroll(tab, g_scrollY);
+        }
+        else
+        {
+            g_contentHeight = SinglePageContentHeight(tab);
+            g_scrollY = std::clamp(tab.savedScrollY, 0, SinglePageMaxScroll(tab));
+        }
+        TouchRecentProgress(tab, false);
+    }
+
+    void CaptureLastSessionFromOpenTabs()
+    {
+        g_lastSessionTabs.clear();
+        g_lastSessionActive = -1;
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            auto const& tab = g_tabs[static_cast<size_t>(i)];
+            if (!tab || tab->path.empty()) continue;
+            LastSessionItem item;
+            item.path = tab->path;
+            item.page = std::max(1, tab->currentPage + 1);
+            item.scrollY = (g_active == i) ? g_scrollY : tab->savedScrollY;
+            item.zoom = tab->zoom;
+            g_lastSessionTabs.push_back(item);
+        }
+        if (!g_lastSessionTabs.empty())
+            g_lastSessionActive = std::clamp(g_active, 0, static_cast<int>(g_lastSessionTabs.size()) - 1);
+    }
+
+    bool HasOtherQingYueWindows(HWND current)
+    {
+        HWND found = nullptr;
+        while ((found = FindWindowExW(nullptr, found, L"XiaoYuePDFWindow", nullptr)) != nullptr)
+        {
+            if (found != current)
+                return true;
+        }
+        return false;
+    }
+
+    void RestoreLastSessionAndOpenLaunchFiles(HWND hwnd, std::vector<std::wstring> const& launchFiles)
+    {
+        std::vector<int> restoredIndices;
+        std::vector<LastSessionItem> savedTabs = g_lastSessionTabs;
+        int savedActive = g_lastSessionActive;
+
+        for (auto const& item : savedTabs)
+        {
+            if (item.path.empty() || !std::filesystem::exists(item.path))
+                continue;
+            if (FindOpenTabByPath(item.path) >= 0)
+                continue;
+            try
+            {
+                OpenPdf(hwnd, item.path);
+                if (PdfTab* tab = Active())
+                {
+                    ApplySessionPosition(*tab, item);
+                    restoredIndices.push_back(g_active);
+                }
+            }
+            catch (std::exception const&) {}
+        }
+
+        if (!restoredIndices.empty())
+        {
+            int restoredActive = std::clamp(savedActive, 0, static_cast<int>(restoredIndices.size()) - 1);
+            g_active = restoredIndices[static_cast<size_t>(restoredActive)];
+            RestoreActiveTabPosition(hwnd);
+        }
+
+        for (auto const& path : launchFiles)
+        {
+            int existing = FindOpenTabByPath(path);
+            if (existing >= 0)
+            {
+                ActivateTab(hwnd, existing);
+                continue;
+            }
+            try { OpenPdf(hwnd, path); }
+            catch (std::exception const& e) { MessageBoxA(hwnd, e.what(), "QingYuePDF", MB_ICONERROR); }
+        }
+
+        SetTitle();
+        StartActiveFileWatcher(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -3360,14 +5163,17 @@ namespace
         if (tab)
         {
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+            g_contentWidth = ReadingContentWidth(*tab);
         }
         int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
+        int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
         g_scrollY = std::clamp(g_scrollY, 0, maxScroll);
+        g_scrollX = std::clamp(g_scrollX, 0, maxScrollX);
         if (tab && g_continuousRead)
         {
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
             TouchRecentProgress(*tab, false);
-            SyncOutlineSelectionFromScroll(hwnd, *tab);
+            SyncSidebarProgressFromScroll(hwnd, *tab);
         }
         SCROLLINFO si{};
         si.cbSize = sizeof(si);
@@ -3385,6 +5191,7 @@ namespace
         if (tab)
         {
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+            g_contentWidth = ReadingContentWidth(*tab);
         }
         SCROLLINFO si{};
         si.cbSize = sizeof(si);
@@ -3405,6 +5212,15 @@ namespace
     {
         RECT out{};
         return IntersectRect(&out, &a, &b) != FALSE;
+    }
+
+    RECT UnionRectSafe(RECT a, RECT b)
+    {
+        if (IsRectEmpty(&a)) return b;
+        if (IsRectEmpty(&b)) return a;
+        RECT out{};
+        UnionRect(&out, &a, &b);
+        return out;
     }
 
     void ResizeSidebarNow(HWND hwnd, int width, bool finalPaint)
@@ -3429,7 +5245,6 @@ namespace
 
         RECT client{};
         GetClientRect(hwnd, &client);
-        int oldWidth = g_sidebarWidth;
         g_sidebarWidth = g_sidebarTargetWidth;
         if (g_sidebarWidth >= S(180)) g_sidebarExpandedWidth = g_sidebarWidth;
         g_sidebarResizePending = false;
@@ -3438,13 +5253,8 @@ namespace
 
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int oldRight = oldWidth + (oldWidth ? std::max(1, S(1)) : 0);
-        int newRight = width + (width ? std::max(1, S(1)) : 0);
-        RECT dirty{ 0, top, std::min<int>(client.right, std::max<int>(oldRight, newRight) + S(18)), client.bottom - bottom };
-        if (finalPaint)
-        {
-            dirty.right = client.right;
-        }
+        RECT dirty{ 0, top, client.right, client.bottom - bottom };
+        InvalidateRect(hwnd, &dirty, FALSE);
         InvalidateRect(hwnd, &dirty, FALSE);
     }
 
@@ -3454,36 +5264,109 @@ namespace
         return RECT{ g_sidebar.left, top, g_sidebar.right, g_sidebar.bottom };
     }
 
+    bool SidebarContentNeedsScroll()
+    {
+        if (!SidebarVisible() || g_sidebarWidth <= 0) return false;
+        if (g_sideMode != 0 && g_sideMode != 1) return false;
+        RECT area = SidebarScrollRect();
+        int visible = std::max<int>(1, area.bottom - area.top);
+        return g_sidebarContentHeight > visible + S(1);
+    }
+
+    void UpdateSidebarScrollRects()
+    {
+        g_sidebarScrollTrackRect = {};
+        g_sidebarScrollThumbRect = {};
+        if (!SidebarContentNeedsScroll()) return;
+
+        RECT area = SidebarScrollRect();
+        int trackW = S(12);
+        int gutter = S(2);
+        g_sidebarScrollTrackRect = RECT{
+            g_sidebar.right - gutter - trackW,
+            area.top + S(6),
+            g_sidebar.right - gutter,
+            area.bottom - S(6)
+        };
+
+        int trackH = std::max<int>(1, g_sidebarScrollTrackRect.bottom - g_sidebarScrollTrackRect.top);
+        int visible = std::max<int>(1, area.bottom - area.top);
+        int thumbH = std::clamp(MulDiv(visible, trackH, std::max(1, g_sidebarContentHeight)), S(28), trackH);
+        int maxScroll = std::max<int>(1, g_sidebarContentHeight - visible);
+        int travel = std::max<int>(0, trackH - thumbH);
+        int scrollY = std::clamp(g_sidebarScrollY, 0, maxScroll);
+        int thumbTop = g_sidebarScrollTrackRect.top + MulDiv(scrollY, travel, maxScroll);
+        if (scrollY >= maxScroll) thumbTop = g_sidebarScrollTrackRect.bottom - thumbH;
+        g_sidebarScrollThumbRect = RECT{
+            g_sidebarScrollTrackRect.left,
+            thumbTop,
+            g_sidebarScrollTrackRect.right,
+            thumbTop + thumbH
+        };
+    }
+
+    void PaintSidebarScrollBar(HDC dc)
+    {
+        UpdateSidebarScrollRects();
+        if (IsRectEmpty(&g_sidebarScrollTrackRect)) return;
+
+        RECT area = SidebarScrollRect();
+        bool visible = g_draggingSidebarScroll || Hit(area, g_mousePos.x, g_mousePos.y);
+        if (!visible) return;
+
+        bool active = g_draggingSidebarScroll || Hit(g_sidebarScrollTrackRect, g_mousePos.x, g_mousePos.y);
+        int centerX = (g_sidebarScrollTrackRect.left + g_sidebarScrollTrackRect.right) / 2;
+        int trackW = active ? S(6) : std::max(2, S(3));
+        RECT visualThumb{
+            centerX - trackW / 2,
+            g_sidebarScrollThumbRect.top,
+            centerX + (trackW + 1) / 2,
+            g_sidebarScrollThumbRect.bottom
+        };
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        BYTE alpha = active ? 136 : 92;
+        Gdiplus::SolidBrush brush(GdiColor(ScrollThumbColor(active), alpha));
+        Gdiplus::RectF thumb = Rf(visualThumb);
+        float cap = std::max(1.0f, thumb.Width * 0.5f);
+        if (thumb.Height <= thumb.Width)
+        {
+            g.FillEllipse(&brush, thumb);
+        }
+        else
+        {
+            Gdiplus::GraphicsPath path;
+            path.AddArc(thumb.X, thumb.Y, thumb.Width, thumb.Width, 180.0f, 180.0f);
+            path.AddLine(thumb.X + thumb.Width, thumb.Y + cap, thumb.X + thumb.Width, thumb.Y + thumb.Height - cap);
+            path.AddArc(thumb.X, thumb.Y + thumb.Height - thumb.Width, thumb.Width, thumb.Width, 0.0f, 180.0f);
+            path.AddLine(thumb.X, thumb.Y + thumb.Height - cap, thumb.X, thumb.Y + cap);
+            path.CloseFigure();
+            g.FillPath(&brush, &path);
+        }
+    }
+
     void RequestStageRepaint(HWND hwnd, bool includeStatus)
     {
-        constexpr ULONGLONG frameMs = 16;
-        ULONGLONG now = GetTickCount64();
-        auto repaint = [&]()
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        InvalidateRect(hwnd, &g_stage, FALSE);
+        if (!IsRectEmpty(&g_mainScrollTrackRect))
         {
-            RECT client{};
-            GetClientRect(hwnd, &client);
-            InvalidateRect(hwnd, &g_stage, FALSE);
-            if (!IsRectEmpty(&g_mainScrollTrackRect))
-            {
-                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
-            }
-            if (includeStatus)
-            {
-                RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
-                InvalidateRect(hwnd, &status, FALSE);
-            }
-            g_lastStageRepaintMs = GetTickCount64();
-            g_stageRepaintPending = false;
-        };
-        if (now - g_lastStageRepaintMs >= frameMs)
-        {
-            repaint();
+            InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
         }
-        else if (!g_stageRepaintPending)
+        if (!IsRectEmpty(&g_mainHScrollTrackRect))
         {
-            g_stageRepaintPending = true;
-            SetTimer(hwnd, 6, static_cast<UINT>(frameMs - (now - g_lastStageRepaintMs)), nullptr);
+            InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
         }
+        if (includeStatus)
+        {
+            RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
+            InvalidateRect(hwnd, &status, FALSE);
+        }
+        g_lastStageRepaintMs = GetTickCount64();
+        g_stageRepaintPending = false;
+        KillTimer(hwnd, 6);
     }
 
     void RequestSidebarRepaint(HWND hwnd)
@@ -3504,33 +5387,128 @@ namespace
         }
     }
 
-    void ScrollStageTo(HWND hwnd, int newScrollY)
+    bool StageLightPaintActive()
+    {
+        if (g_hasContentSelection || g_selectingContent || g_annotationToolbarOpen || g_annotationNoteOpen)
+            return false;
+        return g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil;
+    }
+
+    void MarkStageScrolling(HWND hwnd)
+    {
+        ULONGLONG now = GetTickCount64();
+        g_stageLightPaintUntil = now + 120;
+        g_stageIdleRefreshPending = true;
+        KillTimer(hwnd, 8);
+        SetTimer(hwnd, 8, 140, nullptr);
+    }
+
+    void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
         PdfTab* tab = Active();
         int oldPage = tab ? tab->currentPage : -1;
         if (tab)
         {
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+            g_contentWidth = ReadingContentWidth(*tab);
         }
         int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+        g_scrollX = std::clamp(g_scrollX, 0, std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left)));
         int old = g_scrollY;
         g_scrollY = std::clamp(newScrollY, 0, maxScroll);
         if (tab && g_continuousRead)
         {
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
-            TouchRecentProgress(*tab, false);
-            SyncOutlineSelectionFromScroll(hwnd, *tab);
+            if (oldPage != tab->currentPage)
+            {
+                TouchRecentProgress(*tab, false);
+                SyncSidebarProgressFromScrollFast(hwnd, *tab);
+            }
+            g_sidebarProgressRefreshPending = true;
         }
         int dy = old - g_scrollY;
+        if (!animatedFrame)
+        {
+            g_stageScrollPos = static_cast<double>(g_scrollY);
+            g_stageScrollVelocity = 0.0;
+            g_stageScrollLastTick = GetTickCount64();
+        }
+
         if (dy == 0)
+        {
+            UpdateVertScrollBar(hwnd);
+            if (immediateRepaint)
+            {
+                if (!IsRectEmpty(&g_mainScrollTrackRect))
+                    RedrawWindow(hwnd, &g_mainScrollTrackRect, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+                if (!IsRectEmpty(&g_mainHScrollTrackRect))
+                    RedrawWindow(hwnd, &g_mainHScrollTrackRect, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            }
+            return;
+        }
+
+        if (!immediateRepaint)
+            MarkStageScrolling(hwnd);
+
+        bool pageChanged = tab && oldPage != tab->currentPage;
+        if (immediateRepaint)
+        {
+            InvalidateRect(hwnd, &g_stage, FALSE);
+            if (!IsRectEmpty(&g_mainScrollTrackRect))
+                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+            if (!IsRectEmpty(&g_mainHScrollTrackRect))
+                InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+            if (pageChanged)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
+                InvalidateRect(hwnd, &status, FALSE);
+            }
+            g_lastStageRepaintMs = GetTickCount64();
+            g_stageRepaintPending = false;
+            if (!IsRectEmpty(&g_mainScrollTrackRect))
+                RedrawWindow(hwnd, &g_mainScrollTrackRect, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            if (!IsRectEmpty(&g_mainHScrollTrackRect))
+                RedrawWindow(hwnd, &g_mainHScrollTrackRect, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            if (pageChanged)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
+                RedrawWindow(hwnd, &status, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            }
+        }
+        else
+        {
+            RequestStageRepaint(hwnd, pageChanged);
+        }
+        UpdateVertScrollBar(hwnd);
+        SchedulePagePrefetch(hwnd);
+    }
+
+    void FlushStageForTouch(HWND hwnd, int deltaY)
+    {
+        UNREFERENCED_PARAMETER(hwnd);
+        UNREFERENCED_PARAMETER(deltaY);
+    }
+
+    void ScrollStageXTo(HWND hwnd, int newScrollX)
+    {
+        PdfTab* tab = Active();
+        if (tab) g_contentWidth = ReadingContentWidth(*tab);
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int maxScroll = std::max<int>(0, g_contentWidth - stageW);
+        int old = g_scrollX;
+        g_scrollX = std::clamp(newScrollX, 0, maxScroll);
+        if (old == g_scrollX)
         {
             UpdateVertScrollBar(hwnd);
             return;
         }
-
-        RequestStageRepaint(hwnd, tab && oldPage != tab->currentPage);
+        MarkStageScrolling(hwnd);
+        RequestStageRepaint(hwnd, false);
         UpdateVertScrollBar(hwnd);
-        SchedulePagePrefetch(hwnd);
     }
 
     void ScrollSidebarTo(HWND hwnd, int newScrollY)
@@ -3553,6 +5531,202 @@ namespace
         return pixels;
     }
 
+    void StartSmoothStageScroll(HWND hwnd, int target);
+    bool ScrollByPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX = 0);
+    void StopAutoScroll(HWND hwnd);
+    void QueueTouchPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX = 0);
+    bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
+
+    void StopTouchMomentum(HWND hwnd)
+    {
+        g_touchMomentum = false;
+        g_touchMomentumX = 0.0;
+        g_touchMomentumY = 0.0;
+        g_touchMomentumRemainderX = 0.0;
+        g_touchMomentumRemainderY = 0.0;
+        g_touchMomentumBoost = 0.0;
+        KillTimer(hwnd, 18);
+    }
+
+    void AddTouchMomentumImpulse(HWND hwnd, POINT clientPt, int deltaY, int deltaX)
+    {
+        constexpr bool touchMomentumEnabled = false;
+        if (!touchMomentumEnabled)
+        {
+            UNREFERENCED_PARAMETER(hwnd);
+            UNREFERENCED_PARAMETER(clientPt);
+            UNREFERENCED_PARAMETER(deltaY);
+            UNREFERENCED_PARAMETER(deltaX);
+            return;
+        }
+        if (deltaY == 0 && deltaX == 0) return;
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsedMs = g_touchMomentumLastInputMs ? now - g_touchMomentumLastInputMs : 32;
+        double frames = std::clamp(static_cast<double>(std::max<ULONGLONG>(1, elapsedMs)) / 16.0, 0.45, 4.0);
+        double sampleY = static_cast<double>(deltaY) / frames;
+        double sampleX = static_cast<double>(deltaX) / frames;
+
+        if (elapsedMs > 180)
+            g_touchMomentumBoost = 0.0;
+        g_touchMomentumBoost = std::min(1400.0, g_touchMomentumBoost * 0.72 + static_cast<double>(std::abs(deltaY) + std::abs(deltaX)) * 2.4);
+        double multiplier = 1.35 + std::min(3.15, g_touchMomentumBoost / 500.0);
+
+        g_touchMomentumY = std::clamp(sampleY * multiplier, -420.0, 420.0);
+        g_touchMomentumX = std::clamp(sampleX * multiplier, -420.0, 420.0);
+        g_touchMomentumPoint = clientPt;
+        g_touchMomentumLastInputMs = now;
+        g_touchMomentumLastTickMs = now;
+        g_touchMomentum = std::abs(g_touchMomentumY) >= 0.8 || std::abs(g_touchMomentumX) >= 0.8;
+        if (g_touchMomentum)
+            SetTimer(hwnd, 18, 16, nullptr);
+    }
+
+    void StepTouchMomentum(HWND hwnd)
+    {
+        if (!g_touchMomentum)
+        {
+            StopTouchMomentum(hwnd);
+            return;
+        }
+
+        ULONGLONG now = GetTickCount64();
+        if (g_touchMomentumLastInputMs && now - g_touchMomentumLastInputMs < 42)
+            return;
+        double frames = std::clamp(static_cast<double>(std::max<ULONGLONG>(1, now - g_touchMomentumLastTickMs)) / 16.0, 0.5, 2.5);
+        g_touchMomentumLastTickMs = now;
+
+        double moveY = g_touchMomentumY * frames + g_touchMomentumRemainderY;
+        double moveX = g_touchMomentumX * frames + g_touchMomentumRemainderX;
+        int pixelsY = moveY >= 0.0 ? static_cast<int>(std::floor(moveY)) : static_cast<int>(std::ceil(moveY));
+        int pixelsX = moveX >= 0.0 ? static_cast<int>(std::floor(moveX)) : static_cast<int>(std::ceil(moveX));
+        g_touchMomentumRemainderY = moveY - static_cast<double>(pixelsY);
+        g_touchMomentumRemainderX = moveX - static_cast<double>(pixelsX);
+
+        if (pixelsY != 0 || pixelsX != 0)
+            ScrollByPanPixels(hwnd, g_touchMomentumPoint, pixelsY, pixelsX);
+
+        double decay = std::pow(0.955, frames);
+        g_touchMomentumY *= decay;
+        g_touchMomentumX *= decay;
+        if (std::abs(g_touchMomentumY) < 0.32 && std::abs(g_touchMomentumX) < 0.32 &&
+            std::abs(g_touchMomentumRemainderY) < 0.7 && std::abs(g_touchMomentumRemainderX) < 0.7)
+        {
+            StopTouchMomentum(hwnd);
+        }
+    }
+
+    void CancelStageMotion(HWND hwnd)
+    {
+        g_smoothStageScroll = false;
+        g_stageScrollTarget = g_scrollY;
+        g_stageScrollPos = static_cast<double>(g_scrollY);
+        g_stageScrollVelocity = 0.0;
+        g_stageScrollLastTick = GetTickCount64();
+        KillTimer(hwnd, 4);
+        g_touchPanQueued = false;
+        g_touchPanPendingX = 0;
+        g_touchPanPendingY = 0;
+        KillTimer(hwnd, 16);
+        StopTouchMomentum(hwnd);
+        g_stageWheelRemainder = 0.0;
+        g_lastTouchFollowSign = 0;
+        g_lastTouchFollowPaintMs = 0;
+    }
+
+    POINT CurrentZoomAnchorPoint()
+    {
+        if (Hit(g_stage, g_mousePos.x, g_mousePos.y))
+            return g_mousePos;
+        return POINT{
+            (g_stage.left + g_stage.right) / 2,
+            (g_stage.top + g_stage.bottom) / 2
+        };
+    }
+
+    void ApplyZoomAtPoint(HWND hwnd, PdfTab& tab, POINT clientPt, double newZoom)
+    {
+        double clampedZoom = std::clamp(newZoom, 0.0833, 64.0);
+        if (std::abs(clampedZoom - tab.zoom) < 0.0001) return;
+        CancelStageMotion(hwnd);
+
+        int anchorPage = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
+        double anchorY = 0.5;
+        RECT pageRect{};
+        int hoveredPage = -1;
+        if (PageRectAtPoint(tab, clientPt.x, clientPt.y, hoveredPage, pageRect))
+        {
+            anchorPage = hoveredPage;
+            int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+            anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
+        }
+
+        tab.zoom = clampedZoom;
+        if (!g_continuousRead) tab.currentPage = anchorPage;
+
+        if (g_continuousRead)
+        {
+            int pageTop = PageTopScroll(tab, anchorPage);
+            int pageH = PageH(tab, anchorPage);
+            int desiredScroll = g_stage.top + pageTop + static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
+            g_contentHeight = ContinuousContentHeight(tab);
+            int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
+            g_scrollY = std::clamp(desiredScroll, 0, maxScroll);
+            tab.currentPage = PageFromScroll(tab, g_scrollY);
+            TouchRecentProgress(tab, false);
+            SyncSidebarProgressFromScroll(hwnd, tab);
+        }
+        else
+        {
+            int pageH = PageH(tab, anchorPage);
+            int desiredScroll = g_stage.top + S(28) + static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
+            g_contentHeight = SinglePageContentHeight(tab);
+            g_scrollY = std::clamp(desiredScroll, 0, SinglePageMaxScroll(tab));
+            TouchRecentProgress(tab, false);
+            KeepThumbnailSelectionVisible(hwnd, tab);
+        }
+
+        UpdateVertScrollBar(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        SchedulePagePrefetch(hwnd);
+    }
+
+    void CloseCustomZoomDialog(HWND hwnd)
+    {
+        g_customZoomOpen = false;
+        g_customZoomFocused = false;
+        g_customZoomText.clear();
+        g_customZoomCaretVisible = true;
+        KillTimer(hwnd, 17);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void OpenCustomZoomDialog(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab) return;
+        int pct = static_cast<int>(tab->zoom * 100.0 + 0.5);
+        g_customZoomText = std::to_wstring(std::clamp(pct, 1, 6400));
+        g_customZoomOpen = true;
+        g_customZoomFocused = true;
+        g_customZoomCaretVisible = true;
+        SetTimer(hwnd, 17, 500, nullptr);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    void CommitCustomZoomDialog(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab || g_customZoomText.empty())
+        {
+            CloseCustomZoomDialog(hwnd);
+            return;
+        }
+        double pct = _wtof(g_customZoomText.c_str());
+        pct = std::clamp(pct, 8.33, 6400.0);
+        ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), pct / 100.0);
+        CloseCustomZoomDialog(hwnd);
+    }
+
     bool ScrollSinglePageByPixels(HWND hwnd, PdfTab& tab, int deltaY)
     {
         if (deltaY == 0) return true;
@@ -3566,10 +5740,11 @@ namespace
             }
             if (tab.currentPage < tab.pageCount - 1)
             {
-                ++tab.currentPage;
+                tab.currentPage = std::min(tab.pageCount - 1, NextSpreadStart(tab, FirstPageInSpread(tab.currentPage)));
                 g_scrollY = 0;
                 g_contentHeight = SinglePageContentHeight(tab);
                 TouchRecentProgress(tab, false);
+                KeepThumbnailSelectionVisible(hwnd, tab);
                 UpdateVertScrollBar(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 SchedulePagePrefetch(hwnd);
@@ -3584,10 +5759,14 @@ namespace
         }
         if (tab.currentPage > 0)
         {
-            --tab.currentPage;
+            int previous = 0;
+            for (int start = 0; start < tab.currentPage; start = NextSpreadStart(tab, start))
+                previous = start;
+            tab.currentPage = previous;
             g_contentHeight = SinglePageContentHeight(tab);
             g_scrollY = SinglePageMaxScroll(tab);
             TouchRecentProgress(tab, false);
+            KeepThumbnailSelectionVisible(hwnd, tab);
             UpdateVertScrollBar(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
             SchedulePagePrefetch(hwnd);
@@ -3598,14 +5777,31 @@ namespace
     bool ScrollByWheelDelta(HWND hwnd, POINT clientPt, int delta, bool ctrlDown)
     {
         PdfTab* tab = Active();
+        if (g_tabListOpen && Hit(g_tabListRect, clientPt.x, clientPt.y))
+        {
+            int pixels = WheelPixels(delta, S(52), g_stageWheelRemainder);
+            if (pixels != 0) ScrollTabListTo(hwnd, g_tabListScrollY - pixels);
+            return true;
+        }
         if (ctrlDown && tab)
         {
-            tab->zoom = std::clamp(tab->zoom + (delta > 0 ? 0.08 : -0.08), 0.25, 5.0);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            StopTouchMomentum(hwnd);
+            ApplyZoomAtPoint(hwnd, *tab, clientPt, tab->zoom + (delta > 0 ? 0.08 : -0.08));
             return true;
         }
 
-        if (g_sidebarOpen && !g_immersive && Hit(g_sidebar, clientPt.x, clientPt.y))
+        if (tab && (GetKeyState(VK_SHIFT) & 0x8000))
+        {
+            StopTouchMomentum(hwnd);
+            int pixels = WheelPixels(delta, S(64), g_stageWheelRemainder);
+            if (pixels != 0)
+            {
+                ScrollStageXTo(hwnd, g_scrollX - pixels);
+            }
+            return true;
+        }
+
+        if (SidebarVisible() && Hit(g_sidebar, clientPt.x, clientPt.y))
         {
             int pixels = WheelPixels(delta, S(52), g_sidebarWheelRemainder);
             if (pixels != 0)
@@ -3617,21 +5813,54 @@ namespace
             return true;
         }
 
-        if (tab && !g_continuousRead)
+        if (tab && std::abs(delta) < WHEEL_DELTA)
         {
+            StopTouchMomentum(hwnd);
             int pixels = WheelPixels(delta, S(48), g_stageWheelRemainder);
             if (pixels != 0)
             {
                 g_smoothStageScroll = false;
                 KillTimer(hwnd, 4);
-                ScrollSinglePageByPixels(hwnd, *tab, -pixels);
+                ScrollByPanPixels(hwnd, clientPt, pixels, 0);
             }
+            return true;
+        }
+
+        if (tab && !g_continuousRead)
+        {
+            StopTouchMomentum(hwnd);
+            int pixels = WheelPixels(delta, S(48), g_stageWheelRemainder);
+            if (pixels != 0)
+            {
+                int maxScroll = SinglePageMaxScroll(*tab);
+                int desired = g_scrollY - pixels;
+                if (desired >= 0 && desired <= maxScroll)
+                {
+                    g_smoothStageScroll = false;
+                    KillTimer(hwnd, 4);
+                    ScrollStageTo(hwnd, desired);
+                }
+                else
+                {
+                    g_smoothStageScroll = false;
+                    KillTimer(hwnd, 4);
+                    ScrollSinglePageByPixels(hwnd, *tab, -pixels);
+                }
+            }
+            return true;
+        }
+
+        if (!tab)
+        {
+            int pixels = WheelPixels(delta, S(52), g_stageWheelRemainder);
+            if (pixels != 0) ScrollHomeTo(hwnd, g_homeScrollY - pixels);
             return true;
         }
 
         int pixels = WheelPixels(delta, S(48), g_stageWheelRemainder);
         if (pixels != 0)
         {
+            StopTouchMomentum(hwnd);
             g_smoothStageScroll = false;
             KillTimer(hwnd, 4);
             ScrollStageTo(hwnd, g_scrollY - pixels);
@@ -3639,29 +5868,166 @@ namespace
         return true;
     }
 
-    bool ScrollByPanPixels(HWND hwnd, POINT clientPt, int deltaY)
+    bool ScrollByPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX)
     {
-        if (deltaY == 0) return true;
-        if (g_sidebarOpen && !g_immersive && Hit(g_sidebar, clientPt.x, clientPt.y))
+        if (deltaY == 0 && deltaX == 0) return true;
+        if (g_tabListOpen && Hit(g_tabListRect, clientPt.x, clientPt.y))
+        {
+            if (deltaY != 0) ScrollTabListTo(hwnd, g_tabListScrollY - deltaY);
+            return true;
+        }
+        if (SidebarVisible() && Hit(g_sidebar, clientPt.x, clientPt.y))
         {
             g_smoothSidebarScroll = false;
             KillTimer(hwnd, 5);
-            ScrollSidebarTo(hwnd, g_sidebarScrollY - deltaY);
+            if (deltaY != 0) ScrollSidebarTo(hwnd, g_sidebarScrollY - deltaY);
             return true;
         }
 
         PdfTab* tab = Active();
+        if (!tab)
+        {
+            if (deltaY != 0) ScrollHomeTo(hwnd, g_homeScrollY - deltaY);
+            return true;
+        }
+        if (tab && deltaX != 0)
+        {
+            ScrollStageXTo(hwnd, g_scrollX - deltaX);
+        }
         if (tab && !g_continuousRead)
         {
             g_smoothStageScroll = false;
             KillTimer(hwnd, 4);
-            return ScrollSinglePageByPixels(hwnd, *tab, -deltaY);
+            if (deltaY != 0)
+            {
+                return ScrollSinglePageByPixels(hwnd, *tab, -deltaY);
+            }
+            return true;
         }
 
         g_smoothStageScroll = false;
         KillTimer(hwnd, 4);
-        ScrollStageTo(hwnd, g_scrollY - deltaY);
+        if (deltaY != 0)
+        {
+            ScrollStageTo(hwnd, g_scrollY - deltaY);
+        }
         return true;
+    }
+
+    double AutoScrollAxisSpeed(int delta)
+    {
+        int deadZone = std::max(4, S(7));
+        int distance = std::abs(delta);
+        if (distance <= deadZone) return 0.0;
+        double speed = static_cast<double>(distance - deadZone) / 10.0;
+        speed = std::min(speed, 85.0);
+        return delta < 0 ? -speed : speed;
+    }
+
+    void UpdateAutoScrollSpeed(HWND hwnd)
+    {
+        POINT pt{};
+        if (!GetCursorPos(&pt)) return;
+        ScreenToClient(hwnd, &pt);
+        g_mousePos = pt;
+        g_autoScrollXSpeed = AutoScrollAxisSpeed(pt.x - g_autoScrollAnchor.x);
+        g_autoScrollYSpeed = AutoScrollAxisSpeed(pt.y - g_autoScrollAnchor.y);
+    }
+
+    void StopAutoScroll(HWND hwnd)
+    {
+        if (!g_autoScrollActive) return;
+        g_autoScrollActive = false;
+        g_autoScrollXSpeed = 0.0;
+        g_autoScrollYSpeed = 0.0;
+        g_autoScrollXAccum = 0.0;
+        g_autoScrollYAccum = 0.0;
+        g_autoScrollLastTick = 0;
+        KillTimer(hwnd, 19);
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    }
+
+    void ToggleAutoScroll(HWND hwnd, POINT anchor)
+    {
+        if (g_autoScrollActive)
+        {
+            StopAutoScroll(hwnd);
+            return;
+        }
+        PdfTab* tab = Active();
+        if (!tab || !Hit(g_stage, anchor.x, anchor.y)) return;
+        CancelStageMotion(hwnd);
+        ClearTextSelection();
+        ClearAnnotationFocus();
+        g_autoScrollActive = true;
+        g_autoScrollAnchor = anchor;
+        g_autoScrollXSpeed = 0.0;
+        g_autoScrollYSpeed = 0.0;
+        g_autoScrollXAccum = 0.0;
+        g_autoScrollYAccum = 0.0;
+        g_autoScrollLastTick = GetTickCount64();
+        UpdateAutoScrollSpeed(hwnd);
+        SetTimer(hwnd, 19, 10, nullptr);
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+    }
+
+    void StepAutoScroll(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!g_autoScrollActive || !tab)
+        {
+            StopAutoScroll(hwnd);
+            return;
+        }
+
+        UpdateAutoScrollSpeed(hwnd);
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsedMs = g_autoScrollLastTick ? now - g_autoScrollLastTick : 10;
+        g_autoScrollLastTick = now;
+        double scale = std::clamp(static_cast<double>(std::max<ULONGLONG>(1, elapsedMs)) / 20.0, 0.05, 3.0);
+        g_autoScrollXAccum += g_autoScrollXSpeed * scale;
+        g_autoScrollYAccum += g_autoScrollYSpeed * scale;
+        int dx = g_autoScrollXAccum >= 0.0 ? static_cast<int>(std::floor(g_autoScrollXAccum)) : static_cast<int>(std::ceil(g_autoScrollXAccum));
+        int dy = g_autoScrollYAccum >= 0.0 ? static_cast<int>(std::floor(g_autoScrollYAccum)) : static_cast<int>(std::ceil(g_autoScrollYAccum));
+        g_autoScrollXAccum -= static_cast<double>(dx);
+        g_autoScrollYAccum -= static_cast<double>(dy);
+
+        if (dx != 0)
+            ScrollStageXTo(hwnd, g_scrollX + dx);
+        if (dy != 0)
+        {
+            if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY + dy, true, false);
+            else ScrollSinglePageByPixels(hwnd, *tab, dy);
+        }
+    }
+    void QueueTouchPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX)
+    {
+        if (deltaY == 0 && deltaX == 0) return;
+        g_touchPanPendingY += deltaY;
+        g_touchPanPendingX += deltaX;
+        g_touchPanPoint = clientPt;
+        if (!g_touchPanQueued)
+        {
+            g_touchPanQueued = true;
+            SetTimer(hwnd, 16, 8, nullptr);
+        }
+    }
+
+    void FlushTouchPan(HWND hwnd)
+    {
+        if (!g_touchPanQueued) return;
+        int dx = g_touchPanPendingX;
+        int dy = g_touchPanPendingY;
+        g_touchPanPendingX = 0;
+        g_touchPanPendingY = 0;
+        g_touchPanQueued = false;
+        KillTimer(hwnd, 16);
+        if (dx != 0 || dy != 0)
+        {
+            ScrollByPanPixels(hwnd, g_touchPanPoint, dy, dx);
+            FlushStageForTouch(hwnd, dy);
+            AddTouchMomentumImpulse(hwnd, g_touchPanPoint, dy, dx);
+        }
     }
 
     int ClampStageScrollValue(int value)
@@ -3682,11 +6048,68 @@ namespace
         return std::clamp(value, 0, maxScroll);
     }
 
+    void SaveActiveTabProgress()
+    {
+        PdfTab* tab = Active();
+        if (!tab) return;
+        tab->savedScrollY = g_scrollY;
+        if (g_continuousRead)
+            tab->currentPage = PageFromScroll(*tab, g_scrollY);
+        TouchRecentProgress(*tab, false);
+    }
+
+    void RestoreActiveTabPosition(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab)
+        {
+            g_scrollY = 0;
+            return;
+        }
+
+        if (g_continuousRead)
+        {
+            g_contentHeight = ContinuousContentHeight(*tab);
+            int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+            g_scrollY = std::clamp(tab->savedScrollY, 0, maxScroll);
+            tab->currentPage = PageFromScroll(*tab, g_scrollY);
+        }
+        else
+        {
+            g_contentHeight = SinglePageContentHeight(*tab);
+            g_scrollY = std::clamp(tab->savedScrollY, 0, SinglePageMaxScroll(*tab));
+        }
+        UpdateVertScrollBar(hwnd);
+        SchedulePagePrefetch(hwnd);
+    }
+
+    void ActivateTab(HWND hwnd, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(g_tabs.size()))
+            return;
+        if (g_active != index)
+            SaveActiveTabProgress();
+        g_active = index;
+        EnsureTabWindowVisible(g_active);
+        g_tabListOpen = false;
+        g_selectedOutlineRow = -1;
+        RestoreActiveTabPosition(hwnd);
+        SetTitle();
+        StartActiveFileWatcher(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
     void StartSmoothStageScroll(HWND hwnd, int target)
     {
         g_stageScrollTarget = ClampStageScrollValue(target);
+        if (!g_smoothStageScroll)
+        {
+            g_stageScrollPos = static_cast<double>(g_scrollY);
+            g_stageScrollVelocity = 0.0;
+        }
+        g_stageScrollLastTick = GetTickCount64();
         g_smoothStageScroll = true;
-        SetTimer(hwnd, 4, 12, nullptr);
+        SetTimer(hwnd, 4, 16, nullptr);
     }
 
     void StartSmoothSidebarScroll(HWND hwnd, int target)
@@ -3719,7 +6142,7 @@ namespace
 
     bool HitSidebarSplitter(int x, int y)
     {
-        return g_sidebarOpen && !g_immersive && Active() &&
+        return SidebarVisible() && Active() &&
             std::abs(x - g_sidebarWidth) <= S(5) &&
             y >= g_sidebar.top && y <= g_sidebar.bottom;
     }
@@ -3736,7 +6159,7 @@ namespace
         if (g_immersive) return;
         RECT bar{ 0, 0, client.right, S(38) };
         GlassSurface(dc, bar, g_statusPinned ? 154 : 188);
-        HPEN pen = CreatePen(PS_SOLID, 1, T().line);
+        HPEN pen = CreatePen(PS_SOLID, 1, ChromeDividerColor());
         auto oldPen = SelectObject(dc, pen);
         MoveToEx(dc, 0, bar.bottom - 1, nullptr);
         LineTo(dc, client.right, bar.bottom - 1);
@@ -3752,13 +6175,13 @@ namespace
             DrawFlatMenuItem(dc, { id, r, text, tip });
             x += S(w + 16);
         };
-        add(CmdHome, L"首页", 42, L"");
-        add(CmdOpen, L"打开", 42, L"");
-        add(CmdSearch, L"查找", 42, L"");
-        add(CmdBookmark, L"书签", 42, L"");
-        add(CmdTheme, L"主题", 42, L"");
-        add(CmdView, L"视图", 42, L"");
-        add(CmdSettings, L"帮助", 42, L"");
+        add(CmdHome, L"\u9996\u9875", 42, L"");
+        add(CmdOpen, L"\u6253\u5f00", 42, L"");
+        add(CmdSearch, L"\u67e5\u627e", 42, L"");
+        add(CmdBookmark, L"\u4e66\u7b7e", 42, L"");
+        add(CmdTheme, L"\u4e3b\u9898", 42, L"");
+        add(CmdView, L"\u89c6\u56fe", 42, L"");
+        add(CmdSettings, L"\u5e2e\u52a9", 42, L"");
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -3766,65 +6189,157 @@ namespace
     void PaintTabs(HDC dc, RECT client)
     {
         g_tabRects.clear();
+        g_tabRectIds.clear();
+        g_tabTitleTruncated.clear();
+        g_tabNavPrevRect = {};
+        g_tabNavNextRect = {};
+        g_tabCountRect = {};
         if (g_immersive) return;
         RECT bar{ 0, S(38), client.right, S(76) };
         GlassSurface(dc, bar, 142);
-        HPEN pen = CreatePen(PS_SOLID, 1, T().line);
+        HPEN pen = CreatePen(PS_SOLID, 1, ChromeDividerColor());
         auto oldPen = SelectObject(dc, pen);
         MoveToEx(dc, 0, bar.bottom - 1, nullptr);
         LineTo(dc, client.right, bar.bottom - 1);
         SelectObject(dc, oldPen);
         DeleteObject(pen);
-        HFONT f = Font(8);
+        HFONT f = Font(9);
         auto oldFont = SelectObject(dc, f);
-        int x = S(8);
-        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        int top = S(46);
+        int bottom = S(71);
+        int left = S(8);
+        int gap = S(6);
+        int countW = S(60);
+        int plusW = S(26);
+        int navW = S(24);
+        g_tabCountRect = RECT{ client.right - S(10) - countW, top, client.right - S(10), bottom };
+        bool showNav = static_cast<int>(g_tabs.size()) > MaxVisibleTabs;
+        if (showNav)
         {
-            RECT r{ x, S(46), x + S(190), S(71) };
+            g_tabNavNextRect = RECT{ g_tabCountRect.left - S(8) - navW, top, g_tabCountRect.left - S(8), bottom };
+            g_tabNavPrevRect = RECT{ g_tabNavNextRect.left - S(4) - navW, top, g_tabNavNextRect.left - S(4), bottom };
+        }
+        int controlsLeft = showNav ? g_tabNavPrevRect.left : g_tabCountRect.left;
+        int tabRight = controlsLeft - S(12) - plusW - gap;
+        int totalTabs = static_cast<int>(g_tabs.size());
+        int visibleCount = std::min(totalTabs, MaxVisibleTabs);
+        EnsureTabWindowVisible(g_active);
+        int start = std::clamp(g_tabVisibleStart, 0, std::max(0, totalTabs - visibleCount));
+        int tabW = visibleCount > 0
+            ? std::clamp((tabRight - left - gap * std::max(0, visibleCount - 1)) / visibleCount, S(98), S(170))
+            : S(138);
+        int plusLeft = visibleCount > 0 ? left + visibleCount * (tabW + gap) : left;
+        plusLeft = std::clamp(plusLeft, left, controlsLeft - S(12) - plusW);
+        RECT plusRect{ plusLeft, top, plusLeft + plusW, bottom };
+
+        std::vector<int> tabSlots;
+        bool draggingVisible = g_tabDragFloating &&
+            g_draggingTabIndex >= start &&
+            g_draggingTabIndex < start + visibleCount &&
+            g_draggingTabIndex >= 0 &&
+            g_draggingTabIndex < totalTabs;
+        if (draggingVisible)
+        {
+            int insertAt = std::clamp(g_tabDragInsertIndex, start, start + visibleCount);
+            for (int actual = start; actual < start + visibleCount && actual < totalTabs; ++actual)
+            {
+                if (actual == insertAt) tabSlots.push_back(-1);
+                if (actual != g_draggingTabIndex) tabSlots.push_back(actual);
+            }
+            if (insertAt == start + visibleCount) tabSlots.push_back(-1);
+            while (static_cast<int>(tabSlots.size()) > visibleCount) tabSlots.pop_back();
+        }
+        else
+        {
+            for (int actual = start; actual < start + visibleCount && actual < totalTabs; ++actual)
+                tabSlots.push_back(actual);
+        }
+
+        for (int i = 0; i < visibleCount && i < static_cast<int>(tabSlots.size()); ++i)
+        {
+            int actualIndex = tabSlots[static_cast<size_t>(i)];
+            int x = left + i * (tabW + gap);
+            RECT r{ x, top, x + tabW, bottom };
+            if (actualIndex < 0)
+            {
+                COLORREF gapFill = MixColor(T().panel, T().stage, IsDarkTheme() || IsAuroraTheme() ? 0.34 : 0.58);
+                COLORREF gapLine = MixColor(T().line, T().panel, IsDarkTheme() || IsAuroraTheme() ? 0.30 : 0.42);
+                RoundFill(dc, r, S(9), gapFill, gapLine);
+                continue;
+            }
+            if (actualIndex >= totalTabs) break;
             g_tabRects.push_back(r);
-            bool active = i == g_active;
-            bool hovered = i == g_hoverTab;
+            g_tabRectIds.push_back(actualIndex);
+            bool active = actualIndex == g_active;
+            bool hovered = actualIndex == g_hoverTab;
+            bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
             if (IsGlassTheme() || IsAuroraTheme())
             {
-                if (active || hovered)
+                if (active || hovered || pressed)
                 {
                     if (IsAuroraTheme())
                     {
-                        AlphaFill(dc, r, active ? RGB(12, 56, 58) : RGB(9, 40, 44), active ? 196 : 142);
-                        RoundFill(dc, r, S(9), active ? RGB(14, 55, 58) : RGB(9, 42, 46), active ? RGB(38, 132, 107) : RGB(28, 78, 76));
-                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(64, 255, 155), 22);
+                        COLORREF tabFill = pressed ? MixColor(T().panel2, T().accent, 0.075) : (active ? MixColor(T().panel2, T().accent, 0.055) : SidebarHoverFill());
+                        COLORREF tabLine = pressed ? MixColor(T().line, T().accent, 0.26) : (active ? MixColor(T().line, T().accent, 0.18) : MixColor(T().line, T().panel, 0.22));
+                        RoundFill(dc, r, S(9), tabFill, tabLine);
+                        UNREFERENCED_PARAMETER(pressed);
                     }
                     else
                     {
-                        AlphaFill(dc, r, RGB(255, 255, 255), active ? 168 : 112);
-                        RoundFill(dc, r, S(9), active ? RGB(250, 252, 254) : RGB(255, 255, 255), active ? RGB(218, 224, 232) : RGB(230, 235, 241));
-                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), 36);
+                        AlphaFill(dc, r, RGB(255, 255, 255), pressed ? 196 : (active ? 168 : 112));
+                        RoundFill(dc, r, S(9),
+                            pressed ? RGB(245, 249, 252) : (active ? RGB(250, 252, 254) : RGB(255, 255, 255)),
+                            pressed ? RGB(198, 208, 220) : (active ? RGB(218, 224, 232) : RGB(230, 235, 241)));
+                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), pressed ? 48 : 36);
+                    }
+                }
+                else
+                {
+                    if (IsAuroraTheme())
+                    {
+                        RoundFill(dc, r, S(9), T().panel, MixColor(T().line, T().panel, 0.28));
+                    }
+                    else
+                    {
+                        AlphaFill(dc, r, RGB(255, 255, 255), 82);
+                        RoundFill(dc, r, S(9), RGB(255, 255, 255), RGB(230, 235, 241));
                     }
                 }
             }
             else
             {
-                RoundFill(dc, r, S(9), (active || hovered) ? T().panel2 : T().panel, (active || hovered) ? T().line : T().panel);
+                COLORREF fill = pressed
+                    ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.24 : 0.10)
+                    : ((active || hovered) ? T().panel2 : T().panel);
+                COLORREF line = pressed
+                    ? MixColor(T().line, T().accent, 0.34)
+                    : ((active || hovered) ? T().line : T().panel);
+                RoundFill(dc, r, S(9), fill, line);
             }
-            bool dirty = g_tabs[static_cast<size_t>(i)]->dirty;
-            RECT text{ r.left + S(10), r.top, r.right - S(dirty ? 50 : 36), r.bottom };
-            Text(dc, g_tabs[static_cast<size_t>(i)]->name, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+            PdfTab const& tab = *g_tabs[static_cast<size_t>(actualIndex)];
+            bool dirty = tab.dirty;
+            RECT text{ r.left + S(11), r.top, r.right - S(dirty ? 42 : 28), r.bottom };
+            Text(dc, tab.name, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                pressed ? MixColor(T().text, T().accent, 0.12) : T().text);
+            SIZE nameSize{};
+            GetTextExtentPoint32W(dc, tab.name.c_str(), static_cast<int>(tab.name.size()), &nameSize);
+            g_tabTitleTruncated.push_back(nameSize.cx > std::max<int>(0, static_cast<int>(text.right - text.left)));
             if (dirty)
             {
-                RECT mark{ r.right - S(49), r.top + S(3), r.right - S(32), r.bottom - S(3) };
-                HFONT markFont = Font(11, FW_SEMIBOLD);
+                RECT mark{ r.right - S(42), r.top + S(2), r.right - S(27), r.bottom - S(2) };
+                HFONT markFont = Font(10, FW_SEMIBOLD);
                 HGDIOBJ oldMarkFont = SelectObject(dc, markFont);
                 Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() || IsAuroraTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
                 SelectObject(dc, oldMarkFont);
                 DeleteObject(markFont);
             }
-            RECT close{ r.right - S(30), r.top + S(2), r.right - S(5), r.bottom - S(2) };
-            bool closeHover = g_hoverTabClose == i;
+            RECT close{ r.right - S(24), r.top + S(2), r.right - S(4), r.bottom - S(2) };
+            bool closeHover = g_hoverTabClose == actualIndex;
             int closeCx = (close.left + close.right) / 2;
             int closeCy = (close.top + close.bottom) / 2;
             if (closeHover)
             {
-                DrawSoftCircle(dc, closeCx, closeCy, S(8), RGB(255, 92, 92));
+                DrawFilledCircle(dc, closeCx, closeCy, S(6.7f), RGB(255, 92, 92));
                 DrawCloseGlyph(dc, close, RGB(255, 255, 255));
             }
             else if (hovered)
@@ -3833,12 +6348,12 @@ namespace
             }
             else if (active)
             {
-                DrawSoftCircle(dc, closeCx, closeCy, S(3), T().accent);
+                DrawFilledCircle(dc, closeCx, closeCy, S(3.2f), T().accent);
             }
             if (false && closeHover)
             {
                 RoundFill(dc, close, S(14), RGB(255, 92, 92), RGB(255, 92, 92));
-                Text(dc, L"×", close, DT_CENTER | DT_VCENTER | DT_SINGLELINE, RGB(255, 255, 255));
+                Text(dc, L"\u00d7", close, DT_CENTER | DT_VCENTER | DT_SINGLELINE, RGB(255, 255, 255));
             }
             else if (false && active)
             {
@@ -3850,17 +6365,167 @@ namespace
                 SelectObject(dc, oldBrush);
                 DeleteObject(dot);
             }
-            x += S(196);
         }
-        RECT plus{ x, S(46), x + S(30), S(71) };
-        AddButton(CmdOpen, plus, L"+", L"打开新文档");
-        HFONT plusFont = Font(16);
-        HGDIOBJ oldPlusFont = SelectObject(dc, plusFont);
-        Text(dc, L"+", plus, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
-        SelectObject(dc, oldPlusFont);
-        DeleteObject(plusFont);
+
+        auto drawUtilityButton = [&](RECT r, bool active)
+        {
+            bool hover = Hit(r, g_mousePos.x, g_mousePos.y);
+            bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
+            COLORREF fill = active ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.10) : T().panel;
+            COLORREF line = active ? MixColor(T().line, T().accent, 0.40) : T().line;
+            if (IsGlassTheme() || IsAuroraTheme())
+            {
+                BYTE alpha = active ? 176 : (hover ? 140 : 88);
+                if (IsAuroraTheme())
+                {
+                    COLORREF utilFill = active ? MixColor(T().panel2, T().accent, 0.06) : (hover ? SidebarHoverFill() : T().panel);
+                    COLORREF utilLine = active ? MixColor(T().line, T().accent, 0.20) : MixColor(T().line, T().panel, 0.22);
+                    RoundFill(dc, r, S(9), utilFill, utilLine);
+                }
+                else
+                {
+                    AlphaFill(dc, r, RGB(255, 255, 255), alpha);
+                    RoundFill(dc, r, S(9), active ? RGB(252, 254, 255) : RGB(255, 255, 255), active ? RGB(212, 220, 228) : RGB(228, 233, 239));
+                }
+            }
+            else
+            {
+                RoundFill(dc, r, S(9), pressed ? T().panel2 : (hover ? T().panel2 : fill), hover ? MixColor(line, T().text, 0.08) : line);
+            }
+        };
+
+        AddButton(CmdOpen, plusRect, L"+", L"\u6253\u5f00\u65b0\u6587\u6863");
+        drawUtilityButton(plusRect, false);
+        DrawPlusGlyph(dc, plusRect, T().muted);
+
+        if (showNav)
+        {
+            AddButton(CmdTabNavPrev, g_tabNavPrevRect, L"", L"\u4e0a\u4e00\u4e2a\u6807\u7b7e\u9875");
+            AddButton(CmdTabNavNext, g_tabNavNextRect, L"", L"\u4e0b\u4e00\u4e2a\u6807\u7b7e\u9875");
+            drawUtilityButton(g_tabNavPrevRect, false);
+            drawUtilityButton(g_tabNavNextRect, false);
+            DrawTabArrowGlyph(dc, g_tabNavPrevRect, false, T().muted);
+            DrawTabArrowGlyph(dc, g_tabNavNextRect, true, T().muted);
+        }
+
+        AddButton(CmdTabListToggle, g_tabCountRect, L"", L"\u5168\u90e8\u6807\u7b7e\u9875");
+        drawUtilityButton(g_tabCountRect, g_tabListOpen);
+        RECT countText{ g_tabCountRect.left + S(6), g_tabCountRect.top, g_tabCountRect.right - S(18), g_tabCountRect.bottom };
+        HFONT countFont = Font(9);
+        HGDIOBJ oldCountFont = SelectObject(dc, countFont);
+        Text(dc, std::to_wstring(totalTabs), countText, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
+        SelectObject(dc, oldCountFont);
+        DeleteObject(countFont);
+        DrawDownCaret(dc, g_tabCountRect.right - S(12), (g_tabCountRect.top + g_tabCountRect.bottom) / 2, T().muted);
         SelectObject(dc, oldFont);
         DeleteObject(f);
+    }
+
+
+    void PaintTabDragOverlay(HDC dc)
+    {
+        int totalTabs = static_cast<int>(g_tabs.size());
+        if (!(g_tabDragFloating && g_draggingTabIndex >= 0 && g_draggingTabIndex < totalTabs))
+            return;
+
+        RECT r = g_tabDragCurrentRect;
+        OffsetRect(&r, 0, g_tabDetachArmed ? S(2) : 0);
+        DrawRoundedShadow(dc, r, S(10.0f), S(2), S(5), S(8), IsDarkTheme() || IsAuroraTheme() ? 54 : 32);
+        COLORREF floatFill = IsAuroraTheme() ? MixColor(T().panel2, T().accent, 0.06) : T().panel2;
+        COLORREF floatLine = MixColor(T().line, T().accent, g_tabDetachArmed ? 0.46 : 0.22);
+        RoundFill(dc, r, S(9), floatFill, floatLine);
+        PdfTab const& tab = *g_tabs[static_cast<size_t>(g_draggingTabIndex)];
+        HFONT f = Font(9);
+        HGDIOBJ oldFont = SelectObject(dc, f);
+        RECT textRect{ r.left + S(11), r.top, r.right - S(tab.dirty ? 42 : 28), r.bottom };
+        Text(dc, tab.name, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+        if (tab.dirty)
+        {
+            RECT mark{ r.right - S(42), r.top + S(2), r.right - S(27), r.bottom - S(2) };
+            HFONT markFont = Font(10, FW_SEMIBOLD);
+            HGDIOBJ oldMarkFont = SelectObject(dc, markFont);
+            Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() || IsAuroraTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
+            SelectObject(dc, oldMarkFont);
+            DeleteObject(markFont);
+        }
+        RECT close{ r.right - S(24), r.top + S(2), r.right - S(4), r.bottom - S(2) };
+        DrawSoftCircle(dc, (close.left + close.right) / 2, (close.top + close.bottom) / 2, S(3), T().accent);
+        SelectObject(dc, oldFont);
+        DeleteObject(f);
+    }
+
+    void PaintTabListOverlay(HDC dc, RECT client)
+    {
+        g_tabListItemRects.clear();
+        g_tabListItemIds.clear();
+        g_tabListRect = {};
+        g_tabListScrollTrackRect = {};
+        g_tabListScrollThumbRect = {};
+        g_tabListContentHeight = 0;
+        if (!g_tabListOpen || g_immersive || g_tabs.empty()) return;
+
+        int rowH = S(31);
+        int panelW = std::clamp<int>(client.right / 3, S(240), S(332));
+        int maxHeight = std::max<int>(S(140), static_cast<int>(client.bottom - g_tabCountRect.bottom - S(18)));
+        g_tabListContentHeight = static_cast<int>(g_tabs.size()) * rowH + S(12);
+        int panelH = std::min(maxHeight, std::max<int>(S(56), g_tabListContentHeight));
+        int left = std::max<int>(S(8), static_cast<int>(g_tabCountRect.right - panelW));
+        g_tabListRect = RECT{ left, g_tabCountRect.bottom + S(6), left + panelW, g_tabCountRect.bottom + S(6) + panelH };
+        g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
+
+        DrawRoundedShadow(dc, g_tabListRect, S(10.0f), S(1), S(4), S(5), IsDarkTheme() || IsAuroraTheme() ? 42 : 22);
+        GlassRoundedSurface(dc, g_tabListRect, IsDarkTheme() || IsAuroraTheme() ? 224 : 242, S(11.0f));
+
+        RECT content{ g_tabListRect.left + S(8), g_tabListRect.top + S(6), g_tabListRect.right - S(8), g_tabListRect.bottom - S(6) };
+        bool needsScroll = g_tabListContentHeight > (content.bottom - content.top);
+        if (needsScroll) content.right -= S(10);
+
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, content.left, content.top, content.right, content.bottom);
+        HFONT font = Font(9);
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        int y = content.top - g_tabListScrollY;
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            RECT row{ content.left, y, content.right, y + rowH - S(2) };
+            if (row.bottom >= content.top - rowH && row.top <= content.bottom)
+            {
+                g_tabListItemRects.push_back(row);
+                g_tabListItemIds.push_back(i);
+                bool active = i == g_active;
+                bool hover = i == g_hoverTabListItem;
+                if (active || hover)
+                {
+                    COLORREF fill = active ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.22 : 0.10) : SidebarHoverFill();
+                    COLORREF line = active ? MixColor(T().line, T().accent, 0.36) : fill;
+                    RoundFill(dc, row, S(8), fill, line);
+                }
+                RECT mark{ row.left + S(10), row.top + S(8), row.left + S(20), row.bottom - S(8) };
+                if (active) DrawSoftCircle(dc, (mark.left + mark.right) / 2, (mark.top + mark.bottom) / 2, S(3), T().accent);
+                RECT text{ row.left + S(24), row.top, row.right - S(12), row.bottom };
+                Text(dc, g_tabs[static_cast<size_t>(i)]->name, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+            }
+            y += rowH;
+        }
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        RestoreDC(dc, saved);
+
+        if (needsScroll)
+        {
+            g_tabListScrollTrackRect = RECT{ g_tabListRect.right - S(10), content.top, g_tabListRect.right - S(6), content.bottom };
+            int trackH = std::max<int>(1, g_tabListScrollTrackRect.bottom - g_tabListScrollTrackRect.top);
+            int thumbH = std::clamp(MulDiv(content.bottom - content.top, trackH, std::max(1, g_tabListContentHeight)), S(28), trackH);
+            int maxScroll = std::max<int>(1, g_tabListContentHeight - (content.bottom - content.top));
+            int travel = std::max<int>(0, trackH - thumbH);
+            int thumbTop = g_tabListScrollTrackRect.top + MulDiv(g_tabListScrollY, travel, maxScroll);
+            g_tabListScrollThumbRect = RECT{ g_tabListScrollTrackRect.left, thumbTop, g_tabListScrollTrackRect.right, thumbTop + thumbH };
+            bool active = g_draggingTabListScroll || Hit(g_tabListRect, g_mousePos.x, g_mousePos.y);
+            int centerX = (g_tabListScrollTrackRect.left + g_tabListScrollTrackRect.right) / 2;
+            int visualW = active ? S(4) : std::max(2, S(2));
+            RECT thumb{ centerX - visualW / 2, g_tabListScrollThumbRect.top, centerX + (visualW + 1) / 2, g_tabListScrollThumbRect.bottom };
+            RoundFill(dc, thumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+        }
     }
 
     void PaintHome(HDC dc, RECT client)
@@ -3869,7 +6534,7 @@ namespace
         HFONT titleFont = Font(24, FW_SEMIBOLD);
         auto oldFont = SelectObject(dc, titleFont);
         RECT title{ S(42), S(118), client.right - S(42), S(164) };
-        Text(dc, L"最近阅读", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u6700\u8fd1\u9605\u8bfb", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
         HFONT f = Font(10);
@@ -3878,7 +6543,7 @@ namespace
         g_recentRects.push_back(openCard);
         RoundFill(dc, openCard, S(8), T().panel2, T().line);
         RECT openText{ openCard.left + S(16), openCard.top + S(72), openCard.right - S(16), openCard.bottom - S(20) };
-        Text(dc, L"打开 PDF\n\n拖入文件或点击这里开始阅读", openText, DT_CENTER | DT_WORDBREAK, T().text);
+        Text(dc, L"\u6253\u5f00 PDF\n\n\u62d6\u5165\u6587\u4ef6\u6216\u70b9\u51fb\u8fd9\u91cc\u5f00\u59cb\u9605\u8bfb", openText, DT_CENTER | DT_WORDBREAK, T().text);
         int x = S(238);
         int y = S(188);
         for (size_t i = 0; i < g_recent.size() && i < 12; ++i)
@@ -3892,7 +6557,7 @@ namespace
             RECT name{ card.left + S(12), card.top + S(146), card.right - S(12), card.top + S(174) };
             Text(dc, g_recent[i].name, name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
             RECT meta{ card.left + S(12), card.top + S(174), card.right - S(12), card.bottom - S(10) };
-            Text(dc, L"第 " + std::to_wstring(g_recent[i].page) + L" 页", meta, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            Text(dc, L"\u7b2c" + std::to_wstring(g_recent[i].page) + L" \u9875", meta, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             x += S(196);
             if (x + S(170) > client.right - S(36))
             {
@@ -3950,7 +6615,7 @@ namespace
         HFONT titleFont = Font(22, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
         RECT title{ S(42), S(112), client.right - S(42), S(154) };
-        Text(dc, L"最近阅读", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u6700\u8fd1\u9605\u8bfb", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
 
@@ -3964,7 +6629,7 @@ namespace
         RECT inputText{ g_homeSearchRect.left + S(40), g_homeSearchRect.top, g_homeSearchRect.right - (g_homeSearchQuery.empty() ? S(14) : S(42)), g_homeSearchRect.bottom };
         HFONT searchFont = Font(11);
         HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
-        std::wstring shown = g_homeSearchQuery.empty() ? L"搜索文档" : g_homeSearchQuery;
+        std::wstring shown = g_homeSearchQuery.empty() ? L"\u641c\u7d22\u6587\u6863" : g_homeSearchQuery;
         Text(dc, shown, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             g_homeSearchQuery.empty() ? MixColor(T().muted, T().paper, 0.16) : T().text);
         if (g_homeSearchFocused && g_homeSearchCaretVisible)
@@ -3982,7 +6647,7 @@ namespace
         if (!g_homeSearchQuery.empty())
         {
             if (Hit(g_homeSearchClearRect, g_mousePos.x, g_mousePos.y)) RoundFill(dc, g_homeSearchClearRect, S(7), SidebarHoverFill(), SidebarHoverFill());
-            Text(dc, L"×", g_homeSearchClearRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+            Text(dc, L"\u00d7", g_homeSearchClearRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         }
         SelectObject(dc, oldSearchFont);
         DeleteObject(searchFont);
@@ -3993,9 +6658,9 @@ namespace
         size_t clearIndex = g_homeHits.size() - 1;
         DrawHomeTextButton(dc, clear, HomeAction::ClearAll, L"清除记录", clearIndex);
         RECT view{ clear.left - S(126), S(168), clear.left - S(12), S(200) };
-        AddHomeHit(view, -1, HomeAction::ToggleView, g_homeListView ? L"切换视图" : L"切换列表");
+        AddHomeHit(view, -1, HomeAction::ToggleView, g_homeListView ? L"\u5207\u6362\u89c6\u56fe" : L"\u5207\u6362\u5217\u8868");
         size_t viewIndex = g_homeHits.size() - 1;
-        DrawHomeTextButton(dc, view, HomeAction::ToggleView, g_homeListView ? L"切换视图" : L"切换列表", viewIndex);
+        DrawHomeTextButton(dc, view, HomeAction::ToggleView, g_homeListView ? L"\u5207\u6362\u89c6\u56fe" : L"\u5207\u6362\u5217\u8868", viewIndex);
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -4004,9 +6669,11 @@ namespace
     {
         g_recentRects.clear();
         g_homeHits.clear();
-        g_homeRecentIds.clear();
-        PaintHomeHeader(dc, client);
         g_homeRecentIds = FilteredHomeRecentIds();
+        g_homeContentHeight = ComputeHomeGridContentHeight(client, g_homeRecentIds.size());
+        g_homeScrollY = ClampHomeScrollValue(client, g_homeScrollY);
+        PaintHomeHeader(dc, client);
+        RECT viewport = HomeContentViewportRect(client);
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -4018,7 +6685,8 @@ namespace
         int gapY = S(28);
         int startX = S(42);
         int x = startX;
-        int y = S(236);
+        int y = viewport.top + S(16) - g_homeScrollY;
+        int lastBottom = y;
         int maxRight = std::max<int>(startX + tileW, client.right - S(42));
         auto advance = [&]()
         {
@@ -4036,6 +6704,9 @@ namespace
             RoundFill(dc, cover, S(5), T().paper, active ? T().accent : T().line);
         };
 
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, viewport.left, viewport.top, viewport.right, viewport.bottom);
+
         RECT openTile{ x, y, x + tileW, y + tileH };
         g_recentRects.push_back(openTile);
         RECT openCover{ openTile.left, openTile.top, openTile.right, openTile.top + coverH };
@@ -4051,10 +6722,11 @@ namespace
         RECT openSub{ openCover.left + S(14), openCover.top + S(132), openCover.right - S(14), openCover.bottom - S(18) };
         Text(dc, L"拖入文件或点击打开", openSub, DT_CENTER | DT_WORDBREAK, T().muted);
         RECT openName{ openTile.left, openCover.bottom + S(8), openTile.right, openTile.bottom };
-        Text(dc, L"打开文档", openName, DT_CENTER | DT_TOP | DT_SINGLELINE, T().muted);
+        Text(dc, L"\u6253\u5f00\u6587\u6863", openName, DT_CENTER | DT_TOP | DT_SINGLELINE, T().muted);
+        lastBottom = std::max(lastBottom, static_cast<int>(openTile.bottom));
         advance();
 
-        for (size_t displayIndex = 0; displayIndex < g_homeRecentIds.size() && displayIndex < 24; ++displayIndex)
+        for (size_t displayIndex = 0; displayIndex < g_homeRecentIds.size(); ++displayIndex)
         {
             int recentIndex = g_homeRecentIds[displayIndex];
             RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
@@ -4085,7 +6757,7 @@ namespace
                 GlassRoundedSurface(dc, dock, IsDarkTheme() || IsAuroraTheme() ? 196 : 208, S(11.0f));
             }
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
-            const wchar_t* tips[] = { item.pinned ? L"取消置顶" : L"置顶", L"打开文件夹", L"删除记录" };
+            const wchar_t* tips[] = { item.pinned ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u7f6e\u9876", L"\u6253\u5f00\u6587\u4ef6\u5939", L"\u5220\u9664\u8bb0\u5f55" };
             for (int a = 0; a < 3; ++a)
             {
                 RECT hot{ dock.left + S(5) + a * S(32), dock.top + S(3), dock.left + S(5) + a * S(32) + S(26), dock.top + S(29) };
@@ -4095,14 +6767,16 @@ namespace
 
             RECT name{ tile.left, cover.bottom + S(8), tile.right, tile.bottom };
             Text(dc, item.name, name, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, T().text);
+            lastBottom = std::max(lastBottom, static_cast<int>(tile.bottom));
             advance();
         }
         if (!g_homeSearchQuery.empty() && g_homeRecentIds.empty())
         {
-            RECT empty{ S(58), S(252), client.right - S(58), S(310) };
-            Text(dc, L"没有找到匹配的文档", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            RECT empty{ S(58), viewport.top + S(32) - g_homeScrollY, client.right - S(58), viewport.top + S(90) - g_homeScrollY };
+            Text(dc, L"\u6ca1\u6709\u627e\u5230\u5339\u914d\u7684\u6587\u6863", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            lastBottom = std::max(lastBottom, static_cast<int>(empty.bottom));
         }
-
+        RestoreDC(dc, saved);
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -4111,27 +6785,33 @@ namespace
     {
         g_recentRects.clear();
         g_homeHits.clear();
-        g_homeRecentIds.clear();
-        PaintHomeHeader(dc, client);
         g_homeRecentIds = FilteredHomeRecentIds();
+        g_homeContentHeight = ComputeHomeListContentHeight(g_homeRecentIds.size(), !g_homeSearchQuery.empty() && g_homeRecentIds.empty());
+        g_homeScrollY = ClampHomeScrollValue(client, g_homeScrollY);
+        PaintHomeHeader(dc, client);
+        RECT viewport = HomeContentViewportRect(client);
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
         int left = S(54);
-        int top = S(242);
+        int headerTop = viewport.top + S(8);
         int rowH = S(48);
         int actionX = client.right - S(188);
         int sizeX = actionX - S(126);
         int nameW = std::max<int>(S(300), (sizeX - left) * 34 / 100);
         int dateX = left + nameW;
         int dirX = dateX + S(180);
-        Text(dc, L"文档名称", RECT{ left, top, dateX - S(20), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        Text(dc, L"阅读时间", RECT{ dateX, top, dirX - S(20), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        Text(dc, L"所在目录", RECT{ dirX, top, sizeX - S(20), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        Text(dc, L"大小", RECT{ sizeX, top, actionX - S(16), top + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        int y = top + S(48);
+        Text(dc, L"\u6587\u6863\u540d\u79f0", RECT{ left, headerTop, dateX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u9605\u8bfb\u65f6\u95f4", RECT{ dateX, headerTop, dirX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u6240\u5728\u76ee\u5f55", RECT{ dirX, headerTop, sizeX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u5927\u5c0f", RECT{ sizeX, headerTop, actionX - S(16), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        RECT rowsViewport{ viewport.left, headerTop + S(34), viewport.right, viewport.bottom };
+        int y = rowsViewport.top - g_homeScrollY;
+        int lastBottom = y;
         g_recentRects.push_back(RECT{});
-        for (size_t displayIndex = 0; displayIndex < g_homeRecentIds.size() && displayIndex < 80; ++displayIndex)
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, rowsViewport.left, rowsViewport.top, rowsViewport.right, rowsViewport.bottom);
+        for (size_t displayIndex = 0; displayIndex < g_homeRecentIds.size(); ++displayIndex)
         {
             int recentIndex = g_homeRecentIds[displayIndex];
             RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
@@ -4145,7 +6825,7 @@ namespace
             Text(dc, std::filesystem::path(item.path).parent_path().wstring(), RECT{ dirX, row.top, sizeX - S(20), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
             Text(dc, FormatFileSize(item.path), RECT{ sizeX, row.top, actionX - S(16), row.bottom }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Favorite, HomeAction::Remove };
-            const wchar_t* tips[] = { item.pinned ? L"取消置顶" : L"置顶", L"打开文件夹", item.favorite ? L"取消收藏" : L"收藏", L"删除记录" };
+            const wchar_t* tips[] = { item.pinned ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u7f6e\u9876", L"\u6253\u5f00\u6587\u4ef6\u5939", item.favorite ? L"\u53d6\u6d88\u6536\u85cf" : L"\u6536\u85cf", L"\u5220\u9664\u8bb0\u5f55" };
             for (int a = 0; a < 4; ++a)
             {
                 RECT hot{ actionX + a * S(38), row.top + S(8), actionX + a * S(38) + S(30), row.top + S(38) };
@@ -4153,13 +6833,16 @@ namespace
                 bool active = (actions[a] == HomeAction::Pin && item.pinned) || (actions[a] == HomeAction::Favorite && item.favorite);
                 DrawHomeIconButton(dc, hot, actions[a], active, g_homeHits.size() - 1, rowHover, 5, true);
             }
+            lastBottom = std::max(lastBottom, static_cast<int>(row.bottom));
             y += rowH;
         }
         if (!g_homeSearchQuery.empty() && g_homeRecentIds.empty())
         {
-            RECT empty{ left, y, client.right - S(54), y + S(56) };
-            Text(dc, L"没有找到匹配的文档", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            RECT empty{ left, rowsViewport.top + S(8) - g_homeScrollY, client.right - S(54), rowsViewport.top + S(64) - g_homeScrollY };
+            Text(dc, L"\u6ca1\u6709\u627e\u5230\u5339\u914d\u7684\u6587\u6863", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            lastBottom = std::max(lastBottom, static_cast<int>(empty.bottom));
         }
+        RestoreDC(dc, saved);
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -4182,7 +6865,7 @@ namespace
         if (Hit(g_clearDialogCloseRect, g_mousePos.x, g_mousePos.y)) RoundFill(dc, g_clearDialogCloseRect, S(7), SidebarHoverFill(), SidebarHoverFill());
         HFONT closeFont = Font(18, FW_LIGHT);
         HGDIOBJ oldClose = SelectObject(dc, closeFont);
-        Text(dc, L"×", g_clearDialogCloseRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+        Text(dc, L"\u00d7", g_clearDialogCloseRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         SelectObject(dc, oldClose);
         DeleteObject(closeFont);
 
@@ -4195,27 +6878,127 @@ namespace
         SelectObject(dc, oldBang);
         DeleteObject(bangFont);
 
-        HFONT titleFont = Font(13, FW_SEMIBOLD);
+        HFONT titleFont = Font(8, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
         RECT title{ panel.left + S(112), panel.top + S(60), panel.right - S(34), panel.top + S(92) };
-        Text(dc, L"确定要清空最近使用记录吗？", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u786e\u5b9a\u8981\u6e05\u7a7a\u6700\u8fd1\u4f7f\u7528\u8bb0\u5f55\u5417\uff1f", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
         HFONT bodyFont = Font(9);
         oldFont = SelectObject(dc, bodyFont);
         RECT body{ panel.left + S(112), panel.top + S(92), panel.right - S(34), panel.top + S(130) };
-        Text(dc, L"这会删除首页记录、阅读进度和封面缓存，不会删除 PDF 文件。", body, DT_LEFT | DT_WORDBREAK, T().muted);
+        Text(dc, L"\u8fd9\u4f1a\u5220\u9664\u9996\u9875\u8bb0\u5f55\u3001\u9605\u8bfb\u8fdb\u5ea6\u548c\u5c01\u9762\u7f13\u5b58\uff0c\u4e0d\u4f1a\u5220\u9664 PDF \u6587\u4ef6\u3002", body, DT_LEFT | DT_WORDBREAK, T().muted);
 
         g_clearDialogConfirmRect = RECT{ panel.right - S(198), panel.bottom - S(58), panel.right - S(106), panel.bottom - S(24) };
         g_clearDialogCancelRect = RECT{ panel.right - S(94), panel.bottom - S(58), panel.right - S(24), panel.bottom - S(24) };
         bool confirmHover = Hit(g_clearDialogConfirmRect, g_mousePos.x, g_mousePos.y);
         bool cancelHover = Hit(g_clearDialogCancelRect, g_mousePos.x, g_mousePos.y);
         RoundFill(dc, g_clearDialogConfirmRect, S(8), confirmHover ? MixColor(T().accent, RGB(255, 255, 255), 0.16) : T().accent, T().accent);
-        Text(dc, L"确定", g_clearDialogConfirmRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, ForegroundOn(T().accent));
+        Text(dc, L"\u786e\u5b9a", g_clearDialogConfirmRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, ForegroundOn(T().accent));
         RoundFill(dc, g_clearDialogCancelRect, S(8), cancelHover ? SidebarHoverFill() : T().panel2, T().line);
-        Text(dc, L"取消", g_clearDialogCancelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+        Text(dc, L"\u53d6\u6d88", g_clearDialogCancelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         SelectObject(dc, oldFont);
         DeleteObject(bodyFont);
+    }
+
+    void PaintCustomZoomDialog(HDC dc, RECT client)
+    {
+        g_zoomDialogRect = {};
+        g_zoomDialogInputRect = {};
+        g_zoomDialogConfirmRect = {};
+        g_zoomDialogCancelRect = {};
+        if (!g_customZoomOpen) return;
+
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush scrim(GdiColor(RGB(18, 22, 28), IsDarkTheme() ? 116 : 72));
+        g.FillRectangle(&scrim, Rf(client));
+
+        int panelW = S(202);
+        int panelH = S(114);
+        int left = client.left + (client.right - client.left - panelW) / 2;
+        int top = client.top + (client.bottom - client.top - panelH) / 2;
+        g_zoomDialogRect = RECT{ left, top, left + panelW, top + panelH };
+
+        DrawRoundedShadow(dc, g_zoomDialogRect, S(14.0f), S(1), S(3), S(5), IsDarkTheme() ? 52 : 28);
+        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() || IsAuroraTheme() ? 226 : 238, S(14.0f));
+
+        RECT shine{ g_zoomDialogRect.left + S(16), g_zoomDialogRect.top + S(7), g_zoomDialogRect.right - S(48), g_zoomDialogRect.top + S(12) };
+        Gdiplus::SolidBrush shineBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 24 : 82));
+        FillGdiRoundRect(g, shineBrush, Rf(shine), S(4.0f));
+
+        HFONT titleFont = Font(13, FW_SEMIBOLD);
+        HGDIOBJ oldFont = SelectObject(dc, titleFont);
+        RECT title{ g_zoomDialogRect.left + S(14), g_zoomDialogRect.top + S(10), g_zoomDialogRect.right - S(14), g_zoomDialogRect.top + S(30) };
+        Text(dc, L"\u81ea\u5b9a\u4e49\u7f29\u653e", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        SelectObject(dc, oldFont);
+        DeleteObject(titleFont);
+
+        HFONT hintFont = Font(6);
+        oldFont = SelectObject(dc, hintFont);
+        RECT hint{ g_zoomDialogRect.left + S(14), g_zoomDialogRect.top + S(30), g_zoomDialogRect.right - S(14), g_zoomDialogRect.top + S(44) };
+        Text(dc, L"\u8f93\u5165\u9875\u9762\u7f29\u653e\u767e\u5206\u6bd4", hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        SelectObject(dc, oldFont);
+        DeleteObject(hintFont);
+
+        g_zoomDialogInputRect = RECT{ g_zoomDialogRect.left + S(14), g_zoomDialogRect.top + S(47), g_zoomDialogRect.right - S(14), g_zoomDialogRect.top + S(74) };
+        PaintLiquidGlassPill(dc, g_zoomDialogInputRect);
+        RECT inputTextRect{ g_zoomDialogInputRect.left + S(13), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(38), g_zoomDialogInputRect.bottom };
+        HFONT inputFont = Font(8, FW_SEMIBOLD);
+        oldFont = SelectObject(dc, inputFont);
+        std::wstring inputText = g_customZoomText.empty() ? L"" : g_customZoomText;
+        Text(dc, inputText, inputTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        SIZE textSize{};
+        GetTextExtentPoint32W(dc, inputText.c_str(), static_cast<int>(inputText.size()), &textSize);
+        if (g_customZoomFocused && g_customZoomCaretVisible)
+        {
+            int caretX = std::clamp(inputTextRect.left + textSize.cx + S(2), inputTextRect.left, inputTextRect.right);
+            HPEN pen = CreatePen(PS_SOLID, std::max(1, S(1)), T().accent);
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            MoveToEx(dc, caretX, g_zoomDialogInputRect.top + S(6), nullptr);
+            LineTo(dc, caretX, g_zoomDialogInputRect.bottom - S(6));
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+        }
+        SelectObject(dc, oldFont);
+        DeleteObject(inputFont);
+
+        HFONT pctFont = Font(7);
+        oldFont = SelectObject(dc, pctFont);
+        RECT pctRect{ g_zoomDialogInputRect.right - S(34), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(13), g_zoomDialogInputRect.bottom };
+        Text(dc, L"%", pctRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        SelectObject(dc, oldFont);
+        DeleteObject(pctFont);
+
+        g_zoomDialogCancelRect = RECT{ g_zoomDialogRect.right - S(112), g_zoomDialogRect.bottom - S(31), g_zoomDialogRect.right - S(62), g_zoomDialogRect.bottom - S(10) };
+        g_zoomDialogConfirmRect = RECT{ g_zoomDialogRect.right - S(54), g_zoomDialogRect.bottom - S(31), g_zoomDialogRect.right - S(14), g_zoomDialogRect.bottom - S(10) };
+        auto drawDialogButton = [&](RECT r, const wchar_t* label, bool primary)
+        {
+            bool hover = Hit(r, g_mousePos.x, g_mousePos.y);
+            bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
+            COLORREF fill = primary
+                ? (pressed ? MixColor(T().accent, RGB(0, 0, 0), 0.18) : (hover ? MixColor(T().accent, RGB(255, 255, 255), 0.20) : T().accent))
+                : (pressed ? MixColor(T().panel2, T().accent, 0.22) : (hover ? MixColor(T().panel2, T().accent, 0.10) : T().panel2));
+            COLORREF line = primary ? T().accent : T().line;
+            Gdiplus::SolidBrush fillBrush(GdiColor(fill, 246));
+            Gdiplus::Pen borderPen(GdiColor(line, hover || pressed ? 190 : 145), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+            FillGdiRoundRect(g, fillBrush, Rf(r), S(5.0f));
+            if (hover)
+            {
+                Gdiplus::SolidBrush wash(GdiColor(RGB(255, 255, 255), primary ? 36 : 28));
+                RECT topWash{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + (r.bottom - r.top) / 2 };
+                FillGdiRoundRect(g, wash, Rf(topWash), S(4.0f));
+            }
+            DrawGdiRoundRect(g, borderPen, Rf(r), S(5.0f));
+            g.Flush();
+            HFONT buttonFont = Font(7, FW_SEMIBOLD);
+            HGDIOBJ oldButtonFont = SelectObject(dc, buttonFont);
+            Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, primary ? ForegroundOn(T().accent) : T().muted);
+            SelectObject(dc, oldButtonFont);
+            DeleteObject(buttonFont);
+        };
+        drawDialogButton(g_zoomDialogCancelRect, L"\u53d6\u6d88", false);
+        drawDialogButton(g_zoomDialogConfirmRect, L"\u786e\u5b9a", true);
     }
 
 #if 0
@@ -4229,7 +7012,7 @@ namespace
         auto oldFont = SelectObject(dc, f);
         RECT tabBar{ g_sidebar.left + S(10), g_sidebar.top + S(10), g_sidebar.right - S(10), g_sidebar.top + S(42) };
         int tabWidth = (tabBar.right - tabBar.left - S(12)) / 3;
-        const wchar_t* sideTabs[] = { L"目录", L"缩略图", L"书签" };
+        const wchar_t* sideTabs[] = { L"\u76ee\u5f55", L"\u7f29\u7565\u56fe", L"\u4e66\u7b7e" };
         for (int i = 0; i < 3; ++i)
         {
             RECT tabRect{ tabBar.left + i * (tabWidth + S(6)), tabBar.top, tabBar.left + i * (tabWidth + S(6)) + tabWidth, tabBar.bottom };
@@ -4237,7 +7020,7 @@ namespace
             Text(dc, sideTabs[i], tabRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
         }
         RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(50), g_sidebar.right - S(12), g_sidebar.top + S(80) };
-        Text(dc, L"文字大小", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
         RECT smallBtn{ sizeBar.right - S(78), sizeBar.top, sizeBar.right - S(42), sizeBar.bottom };
         RECT largeBtn{ sizeBar.right - S(36), sizeBar.top, sizeBar.right, sizeBar.bottom };
         AddButton(CmdOutlineSmall, smallBtn, L"A-");
@@ -4255,7 +7038,7 @@ namespace
             g_sidebarRowPages.push_back(page);
             if (page == tab.currentPage) RoundFill(dc, row, S(7), T().panel2, T().line);
             RECT tx{ row.left + S(8 + (tab.outline.empty() ? 0 : tab.outline[static_cast<size_t>(i)].depth * 14)), row.top, row.right - S(8), row.bottom };
-            std::wstring label = tab.outline.empty() ? (L"第 " + std::to_wstring(i + 1) + L" 页") : tab.outline[static_cast<size_t>(i)].title;
+            std::wstring label = tab.outline.empty() ? (L"第" + std::to_wstring(i + 1) + L" 页") : tab.outline[static_cast<size_t>(i)].title;
             Text(dc, label, tx, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
             y += S(32);
             if (y > g_sidebar.bottom - S(20)) break;
@@ -4269,7 +7052,7 @@ namespace
 
     void PaintSidebar(HDC dc, PdfTab& tab)
     {
-        if (g_immersive || !g_sidebarOpen || g_sidebarWidth <= 0) return;
+        if (!SidebarVisible() || g_sidebarWidth <= 0) return;
         RECT sidebarFull{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
         GlassSurface(dc, sidebarFull, 128);
         g_sidebarRowPages.clear();
@@ -4286,7 +7069,7 @@ namespace
         HGDIOBJ oldFont = SelectObject(dc, f);
         int railW = S(44);
         RECT rail{ 0, g_sidebar.top, std::min<int>(railW, sidebarFull.right), g_sidebar.bottom };
-        if (IsAuroraTheme()) AlphaFill(dc, rail, RGB(4, 26, 31), 174);
+        if (IsAuroraTheme()) Fill(dc, rail, T().panel);
         else if (IsGlassTheme()) AlphaFill(dc, rail, RGB(247, 250, 253), 116);
         else Fill(dc, rail, T().panel);
         RECT railLine{ rail.right - std::max(1, S(1)), rail.top, rail.right, rail.bottom };
@@ -4296,17 +7079,19 @@ namespace
         int tabGap = S(5);
         int tabStart = tabBar.left + std::max<int>(0, (tabBar.right - tabBar.left - tabWidth) / 2);
         SideTabIcon sideIcons[] = { SideTabIcon::Outline, SideTabIcon::Thumbnails, SideTabIcon::Search, SideTabIcon::Notes };
-        const wchar_t* sideTips[] = { L"目录", L"缩略图", L"查找" };
+        const wchar_t* sideTips[] = { L"\u76ee\u5f55", L"\u7f29\u7565\u56fe", L"\u67e5\u627e" };
         for (int i = 0; i < 4; ++i)
         {
             RECT tabRect{ tabStart, tabBar.top + i * (tabWidth + tabGap), tabStart + tabWidth, tabBar.top + i * (tabWidth + tabGap) + tabWidth };
             g_sideTabRects.push_back(tabRect);
-            AddButton(0, tabRect, L"", i == 0 ? L"目录" : (i == 1 ? L"缩略图" : (i == 2 ? L"查找" : L"注释")));
+            AddButton(0, tabRect, L"", i == 0 ? L"\u76ee\u5f55" : (i == 1 ? L"\u7f29\u7565\u56fe" : (i == 2 ? L"\u67e5\u627e" : L"\u6ce8\u91ca")));
             bool hovered = g_mousePos.x >= tabRect.left && g_mousePos.x < tabRect.right && g_mousePos.y >= tabRect.top && g_mousePos.y < tabRect.bottom;
             bool active = i == g_sideMode;
             if (hovered || active)
             {
-                if (IsAuroraTheme()) RoundFill(dc, tabRect, S(7), active ? RGB(16, 73, 64) : RGB(10, 48, 51), active ? RGB(16, 73, 64) : RGB(28, 79, 76));
+                if (IsAuroraTheme()) RoundFill(dc, tabRect, S(7), active ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill(), active ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill());
+                else if (IsBeigeTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
+                else if (IsDarkTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
                 else RoundFill(dc, tabRect, S(7), active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
             }
             DrawSideTabIcon(dc, tabRect, sideIcons[i], active ? T().accent : SidebarIconColor());
@@ -4320,7 +7105,7 @@ namespace
         if (g_sideMode == 1)
         {
             RECT title{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(34) };
-            Text(dc, L"缩略图", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+            Text(dc, L"\u7f29\u7565\u56fe", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
             g_thumbSliderRect = RECT{ g_sidebar.left + S(58), g_sidebar.top + S(42), g_sidebar.right - S(58), g_sidebar.top + S(62) };
             HPEN track = CreatePen(PS_SOLID, S(3), T().line);
             HGDIOBJ oldPen = SelectObject(dc, track);
@@ -4339,8 +7124,6 @@ namespace
                 g.FillEllipse(&glow, knobX - radius - S(2.0f), cy - radius - S(1.0f), (radius + S(2.0f)) * 2.0f, (radius + S(2.0f)) * 2.0f);
                 Gdiplus::SolidBrush knob(GdiColor(T().accent));
                 g.FillEllipse(&knob, knobX - radius, cy - radius, radius * 2.0f, radius * 2.0f);
-                Gdiplus::SolidBrush wash(GdiColor(RGB(255, 255, 255), IsDarkTheme() || IsAuroraTheme() ? 34 : 74));
-                g.FillEllipse(&wash, knobX - radius * 0.48f, cy - radius * 0.58f, radius * 0.72f, radius * 0.52f);
             }
 
             int clipDc = SaveDC(dc);
@@ -4372,14 +7155,7 @@ namespace
                     RECT imageRect{ item.left + (boxW - thumbW) / 2, item.top + S(14), item.left + (boxW + thumbW) / 2, item.top + S(14) + thumbH };
                     DrawContactShadow(dc, imageRect, 16);
                     DrawRoundedShadow(dc, imageRect, S(3.0f), S(1), S(2), S(2), 12);
-                    BITMAPINFO info{};
-                    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                    info.bmiHeader.biWidth = thumb.width;
-                    info.bmiHeader.biHeight = -thumb.height;
-                    info.bmiHeader.biPlanes = 1;
-                    info.bmiHeader.biBitCount = 32;
-                    info.bmiHeader.biCompression = BI_RGB;
-                    StretchDIBits(dc, imageRect.left, imageRect.top, thumbW, thumbH, 0, 0, thumb.width, thumb.height, thumb.bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+                    DrawCachedImage(dc, thumb, imageRect);
                     RECT pageLabel{ item.left, imageRect.bottom + S(8), item.right, item.bottom };
                     Text(dc, std::to_wstring(i + 1), pageLabel, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
                 }
@@ -4396,7 +7172,7 @@ namespace
             RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
             RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
-            Text(dc, g_searchQuery.empty() ? L"输入关键词" : g_searchQuery, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, g_searchQuery.empty() ? T().muted : T().text);
+            Text(dc, g_searchQuery.empty() ? L"\u8f93\u5165\u5173\u952e\u8bcd" : g_searchQuery, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, g_searchQuery.empty() ? T().muted : T().text);
             if (g_searchInputFocused && g_searchCaretVisible)
             {
                 SIZE sz{};
@@ -4415,7 +7191,7 @@ namespace
             {
                 RoundFill(dc, clearRect, S(6), T().panel2, T().line);
             }
-            AddButton(CmdSearchClear, clearRect, L"×");
+            AddButton(CmdSearchClear, clearRect, L"\u00d7");
             DrawCloseGlyph(dc, clearRect, T().muted);
             RECT gearRect{ g_searchInputRect.right - S(38), g_searchInputRect.top + S(8), g_searchInputRect.right - S(14), g_searchInputRect.bottom - S(8) };
             RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
@@ -4433,15 +7209,15 @@ namespace
             RECT prev{ rowLeft, g_sidebar.top + S(60), rowLeft + btnW, g_sidebar.top + S(94) };
             RECT next{ prev.right + gap, prev.top, prev.right + gap + btnW, prev.bottom };
             RECT run{ next.right + gap, prev.top, rowRight, prev.bottom };
-            AddButton(CmdSearchPrev, prev, L"上一处");
-            AddButton(CmdSearchNext, next, L"下一处");
-            AddButton(CmdSearchRun, run, L"查找");
-            DrawSearchActionButton(dc, CmdSearchPrev, prev, L"上一处");
-            DrawSearchActionButton(dc, CmdSearchNext, next, L"下一处");
-            DrawSearchActionButton(dc, CmdSearchRun, run, L"查找");
+            AddButton(CmdSearchPrev, prev, L"\u4e0a\u4e00\u9875");
+            AddButton(CmdSearchNext, next, L"\u4e0b\u4e00\u9875");
+            AddButton(CmdSearchRun, run, L"\u67e5\u627e");
+            DrawSearchActionButton(dc, CmdSearchPrev, prev, L"\u4e0a\u4e00\u9875");
+            DrawSearchActionButton(dc, CmdSearchNext, next, L"\u4e0b\u4e00\u9875");
+            DrawSearchActionButton(dc, CmdSearchRun, run, L"\u67e5\u627e");
 
             RECT summary{ g_sidebar.left + S(14), g_sidebar.top + S(108), g_sidebar.right - S(14), g_sidebar.top + S(138) };
-            std::wstring summaryText = g_searchHasRun ? (L"精确查找 (" + std::to_wstring(SearchHitTotal()) + L")") : L"输入关键词后点击查找";
+            std::wstring summaryText = g_searchHasRun ? (L"\u7cbe\u786e\u67e5\u627e (" + std::to_wstring(SearchHitTotal()) + L")") : L"\u8f93\u5165\u5173\u952e\u8bcd\u540e\u70b9\u51fb\u67e5\u627e";
             Text(dc, summaryText, summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
 
             int clipDc = SaveDC(dc);
@@ -4481,33 +7257,58 @@ namespace
         {
             RECT title{ g_sidebar.left + S(14), g_sidebar.top + S(6), g_sidebar.right - S(14), g_sidebar.top + S(30) };
             Text(dc, L"\u6ce8\u91ca", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-            int buttonTop = g_sidebar.top + S(34);
-            int buttonSize = S(25);
-            int buttonGap = S(5);
-            int buttonLeft = g_sidebar.left + S(14);
-            struct NoteTool { int id; const wchar_t* text; const wchar_t* tip; };
+            int buttonTop = g_sidebar.top + S(33);
+            int buttonSize = S(30);
+            int buttonGap = S(3);
+            int groupGap = S(11);
+            int buttonLeft = g_sidebar.left + S(10);
+            int available = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left) - S(20));
+            int desired = buttonSize * 6 + buttonGap * 3 + groupGap * 2 + S(2);
+            if (desired > available)
+            {
+                buttonSize = std::max(S(24), (available - buttonGap * 3 - groupGap * 2 - S(2)) / 6);
+            }
+            struct NoteTool { int id; const wchar_t* tip; };
             NoteTool tools[] = {
-                { CmdNoteExpandAll, L"+", L"\u5c55\u5f00\u6240\u6709\u6ce8\u91ca" },
-                { CmdNoteCollapseAll, L"-", L"\u6536\u8d77\u6240\u6709\u6ce8\u91ca" },
-                { CmdNotePrev, L"<", L"\u4e0a\u4e00\u4e2a\u6ce8\u91ca" },
-                { CmdNoteNext, L">", L"\u4e0b\u4e00\u4e2a\u6ce8\u91ca" },
-                { CmdNoteDelete, L"x", L"\u5220\u9664\u5f53\u524d\u6ce8\u91ca" },
-                { CmdNoteDeleteAll, L"\u6e05", L"\u5220\u9664\u6240\u6709\u6ce8\u91ca" }
+                { CmdNoteExpandAll, L"\u5c55\u5f00\u6240\u6709\u6ce8\u91ca" },
+                { CmdNoteCollapseAll, L"\u6536\u8d77\u6240\u6709\u6ce8\u91ca" },
+                { CmdNotePrev, L"\u4e0a\u4e00\u4e2a\u6ce8\u91ca" },
+                { CmdNoteNext, L"\u4e0b\u4e00\u4e2a\u6ce8\u91ca" },
+                { CmdNoteDelete, L"\u5220\u9664\u5f53\u524d\u6ce8\u91ca" },
+                { CmdNoteDeleteAll, L"\u5220\u9664\u6240\u6709\u6ce8\u91ca" }
             };
+            COLORREF noteIcon = MixColor(T().muted, T().text, IsDarkTheme() || IsAuroraTheme() ? 0.14 : 0.08);
+            HPEN sepPen = CreatePen(PS_SOLID, std::max(1, S(1)), MixColor(T().line, T().panel, 0.25));
+            HGDIOBJ oldPen = SelectObject(dc, sepPen);
+            int x = buttonLeft;
             for (int i = 0; i < static_cast<int>(std::size(tools)); ++i)
             {
-                RECT r{ buttonLeft + i * (buttonSize + buttonGap), buttonTop, buttonLeft + i * (buttonSize + buttonGap) + buttonSize, buttonTop + buttonSize };
-                AddButton(tools[i].id, r, tools[i].text, tools[i].tip);
-                DrawStatusHotArea(dc, r, 6);
-                Text(dc, tools[i].text, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+                RECT r{ x, buttonTop, x + buttonSize, buttonTop + buttonSize };
+                AddButton(tools[i].id, r, L"", tools[i].tip);
+                if (Hit(r, g_mousePos.x, g_mousePos.y))
+                    RoundFill(dc, r, S(6), SidebarHoverFill(), SidebarHoverFill());
+                RECT icon{ r.left + S(3), r.top + S(3), r.right - S(3), r.bottom - S(3) };
+                DrawNoteToolIcon(dc, icon, tools[i].id, noteIcon);
+                x += buttonSize;
+                if (i == 1 || i == 3)
+                {
+                    x += buttonGap;
+                    int sepX = x + groupGap / 2;
+                    MoveToEx(dc, sepX, buttonTop + S(6), nullptr);
+                    LineTo(dc, sepX, buttonTop + buttonSize - S(6));
+                    x += groupGap;
+                }
+                else x += buttonGap;
             }
-            RECT summary{ g_sidebar.left + S(14), g_sidebar.top + S(64), g_sidebar.right - S(14), g_sidebar.top + S(88) };
+            SelectObject(dc, oldPen);
+            DeleteObject(sepPen);
+            RECT summary{ g_sidebar.left + S(14), g_sidebar.top + S(70), g_sidebar.right - S(14), g_sidebar.top + S(92) };
             Text(dc, L"\u5171 " + std::to_wstring(tab.annotations.size()) + L" \u5904\u6ce8\u91ca", summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
 
             int clipDc = SaveDC(dc);
-            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(90), g_sidebar.right, g_sidebar.bottom);
-            int y = g_sidebar.top + S(94) - g_sidebarScrollY;
-            int content = S(94);
+            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(96), g_sidebar.right, g_sidebar.bottom);
+            int y = g_sidebar.top + S(100) - g_sidebarScrollY;
+            int content = S(100);
             int lastPage = -1;
             for (size_t i = 0; i < tab.annotations.size(); ++i)
             {
@@ -4576,22 +7377,43 @@ namespace
         else
         {
             RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(8), g_sidebar.right - S(12), g_sidebar.top + S(36) };
-            Text(dc, L"文字大小", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             RECT smallBtn{ sizeBar.right - S(78), sizeBar.top, sizeBar.right - S(42), sizeBar.bottom };
             RECT largeBtn{ sizeBar.right - S(36), sizeBar.top, sizeBar.right, sizeBar.bottom };
-            AddButton(CmdOutlineSmall, smallBtn, L"A-", L"缩小目录字体");
-            AddButton(CmdOutlineLarge, largeBtn, L"A+", L"放大目录字体");
-            DrawButton(dc, Button{ CmdOutlineSmall, smallBtn, L"A-", L"缩小目录字体" });
-            DrawButton(dc, Button{ CmdOutlineLarge, largeBtn, L"A+", L"放大目录字体" });
+            AddButton(CmdOutlineSmall, smallBtn, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
+            AddButton(CmdOutlineLarge, largeBtn, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
+            DrawButton(dc, Button{ CmdOutlineSmall, smallBtn, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7" });
+            DrawButton(dc, Button{ CmdOutlineLarge, largeBtn, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7" });
             Fill(dc, sizeBar, T().panel);
             RECT toggleAll{ sizeBar.left, sizeBar.top, sizeBar.left + S(92), sizeBar.bottom };
-            std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"收起所有" : L"展开所有";
+            std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"\u6536\u8d77\u6240\u6709" : L"\u5c55\u5f00\u6240\u6709";
             AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
-            Text(dc, toggleText, toggleAll, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
-            RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
+            bool toggleHovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &toggleAll);
+            bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &toggleAll);
+            if (toggleHovered || togglePressed)
+            {
+                COLORREF fill{};
+                COLORREF line{};
+                if (IsGlassTheme())
+                {
+                    fill = togglePressed ? RGB(232, 236, 241) : RGB(255, 255, 255);
+                    line = togglePressed ? RGB(202, 210, 220) : RGB(228, 234, 241);
+                }
+                else
+                {
+                    fill = togglePressed
+                        ? MixColor(T().panel2, T().line, IsDarkTheme() || IsAuroraTheme() ? 0.34 : 0.48)
+                        : MixColor(T().panel2, T().paper, IsDarkTheme() || IsAuroraTheme() ? 0.18 : 0.50);
+                    line = togglePressed ? T().line : MixColor(T().line, T().text, 0.08);
+                }
+                RoundFill(dc, toggleAll, S(5), fill, line);
+            }
+            COLORREF toggleColor = togglePressed ? T().text : (toggleHovered ? MixColor(T().text, T().muted, 0.08) : T().muted);
+            Text(dc, toggleText, toggleAll, DT_CENTER | DT_VCENTER | DT_SINGLELINE, toggleColor);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
-            AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"缩小目录字体");
-            AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"放大目录字体");
+            RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
+            AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
+            AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
             DrawStatusHotArea(dc, smallBtnNew, 5);
             DrawStatusHotArea(dc, largeBtnNew, 5);
             HFONT sizeFont = Font(10);
@@ -4633,7 +7455,7 @@ namespace
                 int pageLeft = g_sidebar.right - S(30);
                 int textLeft = iconLeft + iconW + S(5);
                 int textWidth = std::max(24, pageLeft - textLeft - S(4));
-                std::wstring label = tab.outline.empty() ? (L"第 " + std::to_wstring(i + 1) + L" 页") : tab.outline[static_cast<size_t>(i)].title;
+                std::wstring label = tab.outline.empty() ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875") : tab.outline[static_cast<size_t>(i)].title;
                 int textH = textWidth == sampleTextWidth ? it->textHeight : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
                 int rowH = it->height;
                 int y = scrollArea.top + it->top - g_sidebarScrollY;
@@ -4655,7 +7477,7 @@ namespace
                     bool selected = tab.outline.empty() ? page == tab.currentPage : (g_selectedOutlineRow == i);
                     bool hovered = Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered && !selected) RoundFill(dc, row, S(5), SidebarHoverFill(), SidebarHoverFill());
-                    if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(), SidebarSelectedFill());
+                    if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(), SidebarSelectedBorder());
 
                     if (it->hasChildren)
                     {
@@ -4681,15 +7503,16 @@ namespace
                         DeleteObject(togglePen);
                     }
 
-                    RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
-                    DrawBookmarkIcon(dc, mark, selected ? ForegroundOn(SidebarSelectedFill()) : SidebarIconColor(), false);
-
                     RECT pageRect{ pageLeft, row.top, row.right - S(3), row.bottom };
                     RECT tx{ textLeft, textTop, pageRect.left - S(4), textTop + textH };
-                    COLORREF rowText = selected ? ForegroundOn(SidebarSelectedFill()) : T().text;
-                    COLORREF rowMuted = selected ? MixColor(ForegroundOn(SidebarSelectedFill()), T().paper, 0.18) : T().muted;
+                    COLORREF rowText = (selected && IsGlassTheme()) ? RGB(255, 255, 255) : T().text;
+                    COLORREF rowAux = selected ? rowText : T().muted;
+                    COLORREF markColor = selected ? rowText : SidebarIconColor();
+
+                    RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
+                    DrawBookmarkIcon(dc, mark, markColor, false);
                     Text(dc, label, tx, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, rowText);
-                    Text(dc, std::to_wstring(page + 1), pageRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, rowMuted);
+                    Text(dc, std::to_wstring(page + 1), pageRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, rowAux);
                 }
             }
             RestoreDC(dc, clipDc);
@@ -4699,18 +7522,123 @@ namespace
             DeleteObject(outlineFont);
         }
         ClampSidebarScroll();
+        PaintSidebarScrollBar(dc);
         SelectObject(dc, oldFont);
         DeleteObject(f);
+    }
+
+    COLORREF PdfOverlayColor()
+    {
+        if (IsAuroraTheme()) return RGB(0, 42, 30);
+        if (g_theme == 3) return RGB(28, 25, 22);
+        return RGB(7, 10, 20);
+    }
+
+    BYTE PdfOverlayAlpha()
+    {
+        if (IsAuroraTheme()) return 42;
+        if (g_theme == 3) return 40;
+        return 46;
+    }
+
+    bool EnsureImageDib(PageImage& image)
+    {
+        if (image.dib) return true;
+        if (image.bgra.empty() || image.width <= 0 || image.height <= 0) return false;
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = image.width;
+        info.bmiHeader.biHeight = -image.height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = nullptr;
+        HBITMAP dib = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!dib || !bits)
+        {
+            if (dib) DeleteObject(dib);
+            return false;
+        }
+
+        memcpy(bits, image.bgra.data(), image.bgra.size());
+        image.dib = dib;
+        image.ReleasePixels();
+        return true;
+    }
+
+    bool DrawCachedImagePart(HDC dc, PageImage& image, RECT dest, int sx, int sy, int sw, int sh)
+    {
+        if (dest.right <= dest.left || dest.bottom <= dest.top) return false;
+        if (sw <= 0 || sh <= 0) return false;
+        if (!EnsureImageDib(image))
+        {
+            if (image.bgra.empty() || image.width <= 0 || image.height <= 0) return false;
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = image.width;
+            info.bmiHeader.biHeight = -image.height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            StretchDIBits(
+                dc,
+                dest.left,
+                dest.top,
+                dest.right - dest.left,
+                dest.bottom - dest.top,
+                sx,
+                sy,
+                sw,
+                sh,
+                image.bgra.data(),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY);
+            return true;
+        }
+
+        if (!g_imageDrawDc)
+            g_imageDrawDc = CreateCompatibleDC(dc);
+        HDC src = g_imageDrawDc;
+        if (!src) return false;
+        HGDIOBJ old = SelectObject(src, image.dib);
+        int oldMode = SetStretchBltMode(dc, COLORONCOLOR);
+        bool ok = StretchBlt(
+            dc,
+            dest.left,
+            dest.top,
+            dest.right - dest.left,
+            dest.bottom - dest.top,
+            src,
+            sx,
+            sy,
+            sw,
+            sh,
+            SRCCOPY) != 0;
+        SetStretchBltMode(dc, oldMode);
+        SelectObject(src, old);
+        return ok;
+    }
+
+    bool DrawCachedImage(HDC dc, PageImage& image, RECT dest)
+    {
+        return DrawCachedImagePart(dc, image, dest, 0, 0, image.width, image.height);
     }
 
     void PaintPages(HDC dc, PdfTab& tab, RECT paintClip)
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return;
-        if (IsAuroraTheme())
+        bool lightPaint = StageLightPaintActive();
+        if (lightPaint)
         {
-            PaintGlassBackdrop(dc, stageDirty);
-            AlphaFill(dc, stageDirty, RGB(0, 8, 10), 36);
+            Fill(dc, stageDirty, T().stage);
+        }
+        else if (IsAuroraTheme())
+        {
+            Fill(dc, stageDirty, T().stage);
         }
         else if (IsGlassTheme())
         {
@@ -4721,72 +7649,56 @@ namespace
         else Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
-        int gap = g_continuousRead ? PageGap() : 0;
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
-        int firstVisiblePage = 0;
-        if (g_continuousRead)
+        int firstVisibleSpread = g_continuousRead ? FirstVisibleSpreadStart(tab) : 0;
+        int firstPage = g_continuousRead ? std::max(0, firstVisibleSpread) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
         {
-            int scan = S(28);
-            int threshold = std::max(0, g_scrollY - S(96));
-            for (int p = 0; p < tab.pageCount; ++p)
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int spreadH = SpreadHeight(tab, start);
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
+            if (g_continuousRead && spreadRect.top > stageDirty.bottom + S(64)) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
             {
-                int next = scan + PageH(tab, p) + gap;
-                if (next >= threshold) break;
-                scan = next;
-                firstVisiblePage = p + 1;
-            }
-        }
-        int firstPage = g_continuousRead ? std::max(0, firstVisiblePage - 1) : std::clamp(tab.currentPage, 0, tab.pageCount - 1);
-        int y = g_continuousRead ? (g_stage.top + S(28) - g_scrollY) : (g_stage.top + S(28) - g_scrollY);
-        for (int p = 0; g_continuousRead && p < firstPage; ++p)
-        {
-            y += PageH(tab, p) + gap;
-        }
-        int lastPage = g_continuousRead ? tab.pageCount : std::min(tab.pageCount, firstPage + 1);
-        for (int i = firstPage; i < lastPage; ++i)
-        {
-            int pageW = PageW(tab, i);
-            int pageH = PageH(tab, i);
-            int x = g_stage.left + std::max<int>(S(28), ((g_stage.right - g_stage.left) - pageW) / 2);
-            RECT pageRect{ x, y, x + pageW, y + pageH };
-            if (g_continuousRead && pageRect.top > stageDirty.bottom + S(64)) break;
-            if (Intersects(pageRect, stageDirty))
-            {
-                RECT shadowRight1{ pageRect.right, pageRect.top + S(1), pageRect.right + std::max(1, S(1)), pageRect.bottom + S(1) };
-                RECT shadowRight2{ pageRect.right + std::max(1, S(1)), pageRect.top + S(2), pageRect.right + std::max(2, S(2)), pageRect.bottom + S(2) };
-                RECT shadowBottom1{ pageRect.left + S(1), pageRect.bottom, pageRect.right + S(1), pageRect.bottom + std::max(1, S(1)) };
-                RECT shadowBottom2{ pageRect.left + S(2), pageRect.bottom + std::max(1, S(1)), pageRect.right + S(2), pageRect.bottom + std::max(2, S(2)) };
-                RECT innerTopWash{ pageRect.left, pageRect.top, pageRect.right, pageRect.top + std::max(1, S(1)) };
-                RECT innerLeftWash{ pageRect.left, pageRect.top, pageRect.left + std::max(1, S(1)), pageRect.bottom };
-                if (Intersects(shadowRight1, stageDirty)) AlphaFill(dc, shadowRight1, RGB(114, 126, 138), 13);
-                if (Intersects(shadowRight2, stageDirty)) AlphaFill(dc, shadowRight2, RGB(114, 126, 138), 5);
-                if (Intersects(shadowBottom1, stageDirty)) AlphaFill(dc, shadowBottom1, RGB(114, 126, 138), 13);
-                if (Intersects(shadowBottom2, stageDirty)) AlphaFill(dc, shadowBottom2, RGB(114, 126, 138), 5);
-                if (Intersects(innerTopWash, stageDirty)) AlphaFill(dc, innerTopWash, RGB(255, 255, 255), 20);
-                if (Intersects(innerLeftWash, stageDirty)) AlphaFill(dc, innerLeftWash, RGB(255, 255, 255), 16);
+                int i = start + j;
+                int pageW = PageW(tab, i);
+                int pageH = PageH(tab, i);
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, i, pageRect)) continue;
+                if (!Intersects(pageRect, stageDirty)) continue;
+                if (!lightPaint)
+                {
+                    RECT shadowRight1{ pageRect.right, pageRect.top + S(1), pageRect.right + std::max(1, S(1)), pageRect.bottom + S(1) };
+                    RECT shadowRight2{ pageRect.right + std::max(1, S(1)), pageRect.top + S(2), pageRect.right + std::max(2, S(2)), pageRect.bottom + S(2) };
+                    RECT shadowBottom1{ pageRect.left + S(1), pageRect.bottom, pageRect.right + S(1), pageRect.bottom + std::max(1, S(1)) };
+                    RECT shadowBottom2{ pageRect.left + S(2), pageRect.bottom + std::max(1, S(1)), pageRect.right + S(2), pageRect.bottom + std::max(2, S(2)) };
+                    RECT innerTopWash{ pageRect.left, pageRect.top, pageRect.right, pageRect.top + std::max(1, S(1)) };
+                    RECT innerLeftWash{ pageRect.left, pageRect.top, pageRect.left + std::max(1, S(1)), pageRect.bottom };
+                    if (Intersects(shadowRight1, stageDirty)) AlphaFill(dc, shadowRight1, RGB(114, 126, 138), 13);
+                    if (Intersects(shadowRight2, stageDirty)) AlphaFill(dc, shadowRight2, RGB(114, 126, 138), 5);
+                    if (Intersects(shadowBottom1, stageDirty)) AlphaFill(dc, shadowBottom1, RGB(114, 126, 138), 13);
+                    if (Intersects(shadowBottom2, stageDirty)) AlphaFill(dc, shadowBottom2, RGB(114, 126, 138), 5);
+                    if (Intersects(innerTopWash, stageDirty)) AlphaFill(dc, innerTopWash, RGB(255, 255, 255), 20);
+                    if (Intersects(innerLeftWash, stageDirty)) AlphaFill(dc, innerLeftWash, RGB(255, 255, 255), 16);
+                }
                 RECT drawRect{};
                 if (IntersectRect(&drawRect, &pageRect, &stageDirty))
                 {
                     int savedPageDc = SaveDC(dc);
                     IntersectClipRect(dc, pageRect.left, pageRect.top, pageRect.right, pageRect.bottom);
+                    Fill(dc, drawRect, RGB(255, 255, 255));
                     if (tab.zoom <= 2.0)
                     {
-                        PageImage& image = EnsurePage(tab, i);
-                        if (!image.bgra.empty())
+                        PageImage* image = lightPaint ? FindCachedPage(tab, i) : &EnsurePage(tab, i);
+                        if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
-                            BITMAPINFO info{};
-                            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                            info.bmiHeader.biWidth = image.width;
-                            info.bmiHeader.biHeight = -image.height;
-                            info.bmiHeader.biPlanes = 1;
-                            info.bmiHeader.biBitCount = 32;
-                            info.bmiHeader.biCompression = BI_RGB;
-                            int sx = std::clamp<int>(static_cast<int>((drawRect.left - pageRect.left) * image.width / std::max(1, pageW)), 0, image.width - 1);
-                            int sy = std::clamp<int>(static_cast<int>((drawRect.top - pageRect.top) * image.height / std::max(1, pageH)), 0, image.height - 1);
-                            int sw = std::max<int>(1, std::min<int>(image.width - sx, static_cast<int>((drawRect.right - drawRect.left) * image.width / std::max(1, pageW))));
-                            int sh = std::max<int>(1, std::min<int>(image.height - sy, static_cast<int>((drawRect.bottom - drawRect.top) * image.height / std::max(1, pageH))));
-                            int srcY = std::max<int>(0, image.height - sy - sh);
-                            StretchDIBits(dc, drawRect.left, drawRect.top, drawRect.right - drawRect.left, drawRect.bottom - drawRect.top, sx, srcY, sw, sh, image.bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+                            int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
+                            int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), 0, image->height - 1);
+                            int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), sx + 1, image->width);
+                            int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), sy + 1, image->height);
+                            DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy);
                         }
                     }
                     else
@@ -4806,19 +7718,25 @@ namespace
                                 int w = std::min(TileSize, pageW - tx);
                                 if (w <= 0) continue;
                                 TileKey key{ i, static_cast<int>(tab.zoom * 10000.0 + 0.5), g_theme, tx, ty, w, h };
-                                PageImage& image = EnsureTile(tab, key);
-                                if (image.bgra.empty()) continue;
-                                BITMAPINFO info{};
-                                info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                                info.bmiHeader.biWidth = image.width;
-                                info.bmiHeader.biHeight = -image.height;
-                                info.bmiHeader.biPlanes = 1;
-                                info.bmiHeader.biBitCount = 32;
-                                info.bmiHeader.biCompression = BI_RGB;
+                                PageImage* image = nullptr;
+                                if (lightPaint)
+                                {
+                                    if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme)
+                                    {
+                                        auto found = tab.tileCache.find(key);
+                                        if (found != tab.tileCache.end()) image = &found->second;
+                                    }
+                                }
+                                else image = &EnsureTile(tab, key);
+                                if (!image || (!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0) continue;
                                 RECT tileDest{ pageRect.left + tx, pageRect.top + ty, pageRect.left + tx + w, pageRect.top + ty + h };
-                                StretchDIBits(dc, tileDest.left, tileDest.top, image.width, image.height, 0, 0, image.width, image.height, image.bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+                                DrawCachedImage(dc, *image, tileDest);
                             }
                         }
+                    }
+                    if (IsDarkTheme())
+                    {
+                        AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
                     }
                     if (g_searchCurrent >= 0 && g_searchCurrent < static_cast<int>(g_searchResults.size()))
                     {
@@ -4888,23 +7806,31 @@ namespace
                                 }
                             }
                         }
-                        else if (g_selectingContent)
+                        else if (g_selectingContent || g_selectionIsImage)
                         {
                             RECT selection = CurrentSelectionRect();
                             RECT visibleSelection{};
                             if (IntersectRect(&visibleSelection, &selection, &pageRect))
                             {
-                                AlphaFill(dc, visibleSelection, RGB(86, 156, 255), IsDarkTheme() || IsAuroraTheme() ? 32 : 24);
+                                AlphaFill(dc, visibleSelection, RGB(86, 156, 255), IsDarkTheme() || IsAuroraTheme() ? 42 : 32);
+                                RECT top{ visibleSelection.left, visibleSelection.top, visibleSelection.right, visibleSelection.top + std::max(1, S(1)) };
+                                RECT bottom{ visibleSelection.left, visibleSelection.bottom - std::max(1, S(1)), visibleSelection.right, visibleSelection.bottom };
+                                RECT left{ visibleSelection.left, visibleSelection.top, visibleSelection.left + std::max(1, S(1)), visibleSelection.bottom };
+                                RECT right{ visibleSelection.right - std::max(1, S(1)), visibleSelection.top, visibleSelection.right, visibleSelection.bottom };
+                                Fill(dc, top, MixColor(T().accent, RGB(255, 255, 255), 0.10));
+                                Fill(dc, bottom, MixColor(T().accent, RGB(255, 255, 255), 0.10));
+                                Fill(dc, left, MixColor(T().accent, RGB(255, 255, 255), 0.10));
+                                Fill(dc, right, MixColor(T().accent, RGB(255, 255, 255), 0.10));
                             }
                         }
                     }
                     RestoreDC(dc, savedPageDc);
                 }
             }
-            y += pageH + gap;
         }
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
+        g_contentWidth = ReadingContentWidth(tab);
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -4935,7 +7861,7 @@ namespace
         RECT mark = DenormalizeAnnotationRect(*annotation, pageRect);
         g_annotationHitRect = mark;
 
-        int width = S(316);
+        int width = S(360);
         int height = S(42);
         int left = std::clamp(mark.left, g_stage.left + S(10), std::max(g_stage.left + S(10), g_stage.right - width - S(10)));
         int top = mark.top - height - S(10);
@@ -4954,38 +7880,35 @@ namespace
             Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         };
 
-        int x = g_annotationToolbarRect.left + S(8);
+        int x = g_annotationToolbarRect.left + S(9);
         int y = g_annotationToolbarRect.top + S(7);
         int h = S(28);
-        g_annotationCopyRect = RECT{ x, y, x + S(42), y + h };
-        drawTool(g_annotationCopyRect, L"复制");
-        x += S(46);
-        g_annotationNoteRect = RECT{ x, y, x + S(42), y + h };
-        drawTool(g_annotationNoteRect, L"便签", g_annotationNoteOpen);
-        x += S(46);
-        g_annotationDeleteRect = RECT{ x, y, x + S(42), y + h };
-        drawTool(g_annotationDeleteRect, L"删除");
-        x += S(49);
-        g_annotationFormatRect = RECT{ x, y, x + S(42), y + h };
-        drawTool(g_annotationFormatRect, L"格式");
+        g_annotationCopyRect = RECT{ x, y, x + S(40), y + h };
+        drawTool(g_annotationCopyRect, L"\u590d\u5236");
+        x += S(45);
+        g_annotationNoteRect = RECT{ x, y, x + S(40), y + h };
+        drawTool(g_annotationNoteRect, L"\u4fbf\u7b7e", g_annotationNoteOpen);
+        x += S(45);
+        g_annotationDeleteRect = RECT{ x, y, x + S(40), y + h };
+        drawTool(g_annotationDeleteRect, L"\u5220\u9664");
         x += S(50);
 
         for (int i = 0; i < static_cast<int>(std::size(AnnotationPalette)); ++i)
         {
-            RECT swatch{ x, y + S(5), x + S(18), y + S(23) };
+            RECT swatch{ x, y + S(6), x + S(16), y + S(22) };
             g_annotationColorRects.push_back(swatch);
             bool selected = i == annotation->colorIndex;
             bool hover = Hit(swatch, g_mousePos.x, g_mousePos.y);
             if (selected || hover)
             {
-                RECT ring{ swatch.left - S(3), swatch.top - S(3), swatch.right + S(3), swatch.bottom + S(3) };
+                RECT ring{ swatch.left - S(4), swatch.top - S(4), swatch.right + S(4), swatch.bottom + S(4) };
                 RoundFill(dc, ring, S(10), selected ? MixColor(T().panel2, T().accent, 0.18) : T().panel2, selected ? T().accent : T().line);
             }
             Gdiplus::Graphics g(dc);
             g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
             Gdiplus::SolidBrush brush(GdiColor(AnnotationPalette[i]));
             g.FillEllipse(&brush, static_cast<float>(swatch.left), static_cast<float>(swatch.top), static_cast<float>(swatch.right - swatch.left), static_cast<float>(swatch.bottom - swatch.top));
-            x += S(25);
+            x += S(22);
         }
         SelectObject(dc, oldFont);
         DeleteObject(f);
@@ -5004,7 +7927,7 @@ namespace
         HFONT titleFont = Font(10, FW_SEMIBOLD);
         oldFont = SelectObject(dc, titleFont);
         RECT title{ panelLeft + S(14), panelTop + S(10), panelLeft + S(160), panelTop + S(34) };
-        Text(dc, L"注释", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u4fbf\u7b7e", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         g_annotationNoteCloseRect = RECT{ panelLeft + panelW - S(34), panelTop + S(8), panelLeft + panelW - S(10), panelTop + S(32) };
         drawTool(g_annotationNoteCloseRect, L"x");
         SelectObject(dc, oldFont);
@@ -5021,7 +7944,7 @@ namespace
         g_annotationNoteInputRect = RECT{ panelLeft + S(14), panelTop + S(64), panelLeft + panelW - S(14), panelTop + panelH - S(14) };
         RoundFill(dc, g_annotationNoteInputRect, S(8), T().paper, g_annotationNoteFocused ? T().accent : T().line);
         RECT noteText{ g_annotationNoteInputRect.left + S(10), g_annotationNoteInputRect.top + S(8), g_annotationNoteInputRect.right - S(10), g_annotationNoteInputRect.bottom - S(8) };
-        std::wstring note = annotation->note.empty() ? L"点击输入注释..." : annotation->note;
+        std::wstring note = annotation->note.empty() ? L"\u70b9\u51fb\u8f93\u5165\u6ce8\u91ca..." : annotation->note;
         Text(dc, note, noteText, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, annotation->note.empty() ? T().muted : T().text);
         if (g_annotationNoteFocused && g_annotationNoteCaretVisible)
         {
@@ -5037,6 +7960,64 @@ namespace
         }
     }
 
+    void DrawSidebarPanelToggleGlyph(HDC dc, RECT r, bool open, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.2f, S(1.15f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        float cx = (static_cast<float>(r.left + r.right)) * 0.5f;
+        float cy = (static_cast<float>(r.top + r.bottom)) * 0.5f;
+        float dx = S(3.4f);
+        float dy = S(5.0f);
+        if (open)
+        {
+            Gdiplus::PointF pts[3] = { { cx + dx, cy - dy }, { cx - dx, cy }, { cx + dx, cy + dy } };
+            g.DrawLines(&pen, pts, 3);
+        }
+        else
+        {
+            Gdiplus::PointF pts[3] = { { cx - dx, cy - dy }, { cx + dx, cy }, { cx - dx, cy + dy } };
+            g.DrawLines(&pen, pts, 3);
+        }
+    }
+
+    void PaintSidebarPanelToggle(HDC dc, RECT client)
+    {
+        g_sidebarPanelToggleRect = {};
+        if (!Active()) return;
+        int bottomInset = (!g_immersive && g_statusPinned) ? S(34) : 0;
+        int size = S(24);
+        int bottom = g_immersive ? client.bottom - S(21) : client.bottom - bottomInset - S(8);
+        int railRight = S(44);
+        int left = std::max<int>(S(7), (railRight - size) / 2);
+        RECT r{ left, bottom - size, left + size, bottom };
+        g_sidebarPanelToggleRect = r;
+
+        bool open = SidebarVisible();
+        bool hovered = Hit(r, g_mousePos.x, g_mousePos.y);
+        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
+        COLORREF base = IsAuroraTheme() ? T().panel : T().panel2;
+        COLORREF fill = base;
+        COLORREF line = T().line;
+        COLORREF glyph = T().muted;
+        if (hovered)
+        {
+            fill = SidebarHoverFill();
+            line = MixColor(T().line, T().accent, IsAuroraTheme() ? 0.12 : 0.22);
+            glyph = MixColor(T().muted, T().text, 0.20);
+        }
+        if (pressed)
+        {
+            fill = MixColor(fill, T().accent, 0.10);
+            line = MixColor(line, T().accent, 0.30);
+        }
+        DrawRoundedShadow(dc, r, S(8.0f), S(1), S(3), S(3), IsDarkTheme() || IsAuroraTheme() ? 20 : 12);
+        RoundFill(dc, r, S(8), fill, line);
+        DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
+    }
     void PaintStatus(HDC dc, RECT client)
     {
         PdfTab* tab = Active();
@@ -5045,7 +8026,7 @@ namespace
         {
             RECT panel{ client.right - S(154), client.bottom - S(48), client.right - S(18), client.bottom - S(21) };
             PaintLiquidGlassPill(dc, panel);
-            std::wstring text = tab ? std::to_wstring(tab->currentPage + 1) + L" / " + std::to_wstring(tab->pageCount) + L"    退出沉浸" : L"退出沉浸";
+            std::wstring text = tab ? std::to_wstring(tab->currentPage + 1) + L" / " + std::to_wstring(tab->pageCount) + L"    \u9000\u51fa\u6c89\u6d78" : L"\u9000\u51fa\u6c89\u6d78";
             AddButton(CmdImmersive, panel, text);
             HFONT immersiveFont = Font(9);
             HGDIOBJ oldImmersiveFont = SelectObject(dc, immersiveFont);
@@ -5063,12 +8044,12 @@ namespace
         GlassDivider(dc, topLine);
         HFONT f = Font(10);
         HGDIOBJ oldFont = SelectObject(dc, f);
-        std::wstring pageSize = L"-- x -- 厘米";
+        std::wstring pageSize = L"-- x -- \u5398\u7c73";
         if (tab && !tab->pages.empty())
         {
             auto const& p = tab->pages[static_cast<size_t>(tab->currentPage)];
             wchar_t buf[80]{};
-            swprintf_s(buf, L"%.1f x %.1f 厘米", p.widthPt * 2.54 / 72.0, p.heightPt * 2.54 / 72.0);
+            swprintf_s(buf, L"%.1f x %.1f \u5398\u7c73", p.widthPt * 2.54 / 72.0, p.heightPt * 2.54 / 72.0);
             pageSize = buf;
         }
         RECT left{ S(10), bar.top, S(184), bar.bottom };
@@ -5083,8 +8064,8 @@ namespace
             DrawStatusIcon(dc, r, icon, color);
             x += S(24);
         };
-        addIcon(CmdFirst, StatusIcon::First, L"第一页", iconColor);
-        addIcon(CmdPrev, StatusIcon::Prev, L"上一页", iconColor);
+        addIcon(CmdFirst, StatusIcon::First, L"\u7b2c\u4e00\u9875", iconColor);
+        addIcon(CmdPrev, StatusIcon::Prev, L"\u4e0a\u4e00\u9875", iconColor);
 
         std::wstring currentPageText = tab ? std::to_wstring(tab->currentPage + 1) : L"0";
         std::wstring totalPageText = tab ? (L"/" + std::to_wstring(tab->pageCount)) : L"/0";
@@ -5120,8 +8101,8 @@ namespace
         SelectObject(dc, oldPageFont);
         DeleteObject(pageFont);
         x += S(50);
-        addIcon(CmdNext, StatusIcon::Next, L"下一页", iconColor);
-        addIcon(CmdLast, StatusIcon::Last, L"最后一页", iconColor);
+        addIcon(CmdNext, StatusIcon::Next, L"\u4e0b\u4e00\u9875", iconColor);
+        addIcon(CmdLast, StatusIcon::Last, L"\u6700\u540e\u4e00\u9875", iconColor);
 
         int rx = std::max<int>(x + S(36), client.right - S(384));
         auto separator = [&]()
@@ -5141,15 +8122,15 @@ namespace
             rx += S(w + 3);
             if (id == CmdTheme || id == CmdView) rx += S(5);
         };
-        addStatusIcon(CmdTheme, StatusIcon::Theme, L"主题：" + std::wstring(T().name), 34, iconColor);
-        addStatusIcon(CmdView, StatusIcon::View, L"阅读视图", 34, iconColor);
-        addStatusIcon(CmdZoomMenu, StatusIcon::Actual, L"页面缩放", 34, iconColor);
+        addStatusIcon(CmdTheme, StatusIcon::Theme, L"\u4e3b\u9898\uff1a" + std::wstring(T().name), 34, iconColor);
+        addStatusIcon(CmdView, StatusIcon::View, L"\u9605\u8bfb\u89c6\u56fe", 34, iconColor);
+        addStatusIcon(CmdZoomMenu, StatusIcon::Actual, L"\u9875\u9762\u7f29\u653e", 34, iconColor);
         separator();
-        addStatusIcon(CmdZoomOut, StatusIcon::ZoomOut, L"缩小", 34, iconColor);
+        addStatusIcon(CmdZoomOut, StatusIcon::ZoomOut, L"\u7f29\u5c0f", 34, iconColor);
         std::wstring zoom = tab ? std::to_wstring(static_cast<int>(tab->zoom * 100.0 + 0.5)) + L"%" : L"100%";
-        std::wstring zoomText = zoom == L"100%" ? L"实际大小" : zoom;
+        std::wstring zoomText = zoom == L"100%" ? L"\u5b9e\u9645\u5927\u5c0f" : zoom;
         RECT zr{ rx + S(3), bar.top + S(7), rx + S(108), bar.bottom - S(7) };
-        AddButton(CmdZoomMenu, zr, zoomText, L"当前缩放比例");
+        AddButton(CmdZoomMenu, zr, zoomText, L"\u5f53\u524d\u7f29\u653e\u6bd4\u4f8b");
         DrawStatusHotArea(dc, zr, 8);
         RoundFill(dc, zr, S(9), T().paper, T().line);
         RECT zoomLabel{ zr.left + S(14), zr.top, zr.right - S(24), zr.bottom };
@@ -5160,9 +8141,9 @@ namespace
         DeleteObject(zoomFont);
         DrawDownCaret(dc, zr.right - S(18), (zr.top + zr.bottom) / 2, iconColor);
         rx += S(112);
-        addStatusIcon(CmdZoomIn, StatusIcon::ZoomIn, L"放大", 34, iconColor);
-        addStatusIcon(CmdImmersive, StatusIcon::Fullscreen, L"沉浸模式", 34, iconColor);
-        addStatusIcon(CmdStatusPin, StatusIcon::Pin, g_statusPinned ? L"取消固定工具栏" : L"固定工具栏", 34, g_statusPinned ? T().accent : iconColor);
+        addStatusIcon(CmdZoomIn, StatusIcon::ZoomIn, L"\u653e\u5927", 34, iconColor);
+        addStatusIcon(CmdImmersive, StatusIcon::Fullscreen, L"\u6c89\u6d78\u6a21\u5f0f", 34, iconColor);
+        addStatusIcon(CmdStatusPin, StatusIcon::Pin, g_statusPinned ? L"\u53d6\u6d88\u56fa\u5b9a\u5de5\u5177\u680f" : L"\u56fa\u5b9a\u5de5\u5177\u680f", 34, g_statusPinned ? T().accent : iconColor);
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -5173,13 +8154,25 @@ namespace
         g_recentRects.clear();
         if (!tab)
         {
+            g_sidebar = {};
+            g_stage = RECT{ 0, S(76), client.right, client.bottom };
+            g_mainScrollTrackRect = {};
+            g_mainScrollThumbRect = {};
+            g_mainHScrollTrackRect = {};
+            g_mainHScrollThumbRect = {};
+            g_sidebarRowPages.clear();
+            g_sidebarRowRects.clear();
+            g_sideTabRects.clear();
+            g_searchResultRects.clear();
+            g_searchResultIds.clear();
             if (g_homeListView) PaintHomeList(dc, client);
             else PaintHomeGrid(dc, client);
+            PaintHomeScrollBar(dc, client, paintClip);
             return;
         }
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int side = (g_sidebarOpen && !g_immersive) ? g_sidebarWidth : 0;
+        int side = (SidebarVisible()) ? g_sidebarWidth : 0;
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         int splitW = side ? std::max(1, S(1)) : 0;
@@ -5215,15 +8208,554 @@ namespace
             PaintAnnotationToolbar(dc, *tab, client);
     }
 
+    COLORREF MenuPopupFill()
+    {
+        if (IsAuroraTheme()) return T().panel;
+        if (IsBeigeTheme()) return RGB(251, 247, 239);
+        if (IsGlassTheme()) return MixColor(T().panel2, T().bg, 0.20);
+        if (IsDarkTheme()) return T().panel;
+        return T().panel;
+    }
+
+    COLORREF MenuPopupLine()
+    {
+        if (IsAuroraTheme()) return MixColor(T().line, T().accent, 0.12);
+        if (IsBeigeTheme()) return RGB(222, 217, 208);
+        if (IsDarkTheme()) return MixColor(T().line, T().muted, 0.12);
+        return T().line;
+    }
+
+    COLORREF MenuPopupBorder()
+    {
+        COLORREF fill = MenuPopupFill();
+        if (IsAuroraTheme()) return MixColor(fill, T().accent, 0.26);
+        if (IsBeigeTheme()) return RGB(211, 206, 198);
+        if (IsDarkTheme()) return MixColor(fill, RGB(255, 255, 255), 0.20);
+        return MixColor(fill, RGB(86, 96, 108), 0.24);
+    }
+
+    COLORREF MenuPopupHoverFill()
+    {
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.085);
+        if (IsBeigeTheme()) return MixColor(RGB(251, 247, 239), RGB(0, 0, 0), 0.035);
+        if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.085);
+        if (IsDarkTheme()) return MixColor(T().panel2, RGB(255, 255, 255), 0.045);
+        return SidebarHoverFill();
+    }
+
+    COLORREF MenuPopupPressedFill()
+    {
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.13);
+        if (IsBeigeTheme()) return MixColor(RGB(251, 247, 239), RGB(111, 155, 255), 0.16);
+        if (IsDarkTheme()) return MixColor(T().panel2, T().accent, 0.12);
+        return MixColor(T().panel2, T().accent, 0.13);
+    }
+
+    COLORREF MenuPopupText(bool disabled)
+    {
+        if (disabled) return MixColor(T().muted, MenuPopupFill(), IsDarkTheme() || IsAuroraTheme() ? 0.38 : 0.28);
+        return T().text;
+    }
+
+    COLORREF MenuPopupShortcutText(bool disabled)
+    {
+        if (disabled) return MixColor(T().muted, MenuPopupFill(), IsDarkTheme() || IsAuroraTheme() ? 0.46 : 0.36);
+        if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.20);
+        return T().muted;
+    }
+
+    ThemedMenuItem* AddThemedMenuStorage(std::wstring text, bool separator)
+    {
+        auto item = std::make_unique<ThemedMenuItem>();
+        item->text = std::move(text);
+        item->separator = separator;
+        ThemedMenuItem* raw = item.get();
+        g_themedMenuItems.push_back(std::move(item));
+        return raw;
+    }
+
+    void AppendThemedMenuItem(HMENU menu, UINT id, const wchar_t* text, bool checked = false, bool disabled = false)
+    {
+        ThemedMenuItem* item = AddThemedMenuStorage(text ? text : L"", false);
+        item->id = id;
+        item->checked = checked;
+        item->disabled = disabled;
+        UINT flags = MF_OWNERDRAW | (checked ? MF_CHECKED : 0) | (disabled ? (MF_GRAYED | MF_DISABLED) : 0);
+        AppendMenuW(menu, flags, id, reinterpret_cast<LPCWSTR>(item));
+    }
+
+    void AppendThemedMenuSeparator(HMENU menu)
+    {
+        ThemedMenuItem* item = AddThemedMenuStorage(L"", true);
+        AppendMenuW(menu, MF_OWNERDRAW | MF_SEPARATOR, 0, reinterpret_cast<LPCWSTR>(item));
+    }
+
+    void ShowCustomThemedPopupMenu(HWND hwnd, HMENU menu, int x, int y);
+
+    void ShowThemedPopupMenu(HWND hwnd, HMENU menu, int x, int y)
+    {
+        ShowCustomThemedPopupMenu(hwnd, menu, x, y);
+    }
+
+
+    int ThemedMenuFontPt(ThemedMenuItem const* item)
+    {
+        if (item && item->id >= 2410 && item->id <= 2422) return 10;
+        return 9;
+    }
+    bool MeasureThemedMenuItem(MEASUREITEMSTRUCT* measure)
+    {
+        if (!measure || measure->CtlType != ODT_MENU) return false;
+        auto* item = reinterpret_cast<ThemedMenuItem*>(measure->itemData);
+        if (!item || item->separator)
+        {
+            measure->itemWidth = S(112);
+            measure->itemHeight = S(6);
+            return true;
+        }
+
+        HDC dc = GetDC(g_hwnd);
+        HFONT font = Font(ThemedMenuFontPt(item));
+        HGDIOBJ old = SelectObject(dc, font);
+        SIZE mainSize{};
+        SIZE shortcutSize{};
+        std::wstring mainText = item->text;
+        std::wstring shortcut;
+        size_t tab = mainText.find(L'\t');
+        if (tab != std::wstring::npos)
+        {
+            shortcut = mainText.substr(tab + 1);
+            mainText = mainText.substr(0, tab);
+        }
+        GetTextExtentPoint32W(dc, mainText.c_str(), static_cast<int>(mainText.size()), &mainSize);
+        if (!shortcut.empty()) GetTextExtentPoint32W(dc, shortcut.c_str(), static_cast<int>(shortcut.size()), &shortcutSize);
+        SelectObject(dc, old);
+        DeleteObject(font);
+        ReleaseDC(g_hwnd, dc);
+
+        int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
+        measure->itemWidth = std::max(S(112), textW + (shortcut.empty() ? S(54) : S(62)));
+        measure->itemHeight = S(25);
+        return true;
+    }
+
+    void DrawThemedMenuCheck(HDC dc, RECT r, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(GdiColor(color, 240), std::max<Gdiplus::REAL>(1.65f, S(1.15f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        float w = static_cast<float>(std::max<int>(1, static_cast<int>(r.right - r.left)));
+        float h = static_cast<float>(std::max<int>(1, static_cast<int>(r.bottom - r.top)));
+        float x1 = static_cast<float>(r.left) + w * 0.16f;
+        float y1 = static_cast<float>(r.top) + h * 0.53f;
+        float x2 = static_cast<float>(r.left) + w * 0.42f;
+        float y2 = static_cast<float>(r.top) + h * 0.76f;
+        float x3 = static_cast<float>(r.left) + w * 0.86f;
+        float y3 = static_cast<float>(r.top) + h * 0.24f;
+        g.DrawLine(&pen, x1, y1, x2, y2);
+        g.DrawLine(&pen, x2, y2, x3, y3);
+    }
+
+    bool DrawThemedMenuItem(DRAWITEMSTRUCT* draw)
+    {
+        if (!draw || draw->CtlType != ODT_MENU) return false;
+        auto* item = reinterpret_cast<ThemedMenuItem*>(draw->itemData);
+        RECT r = draw->rcItem;
+        Fill(draw->hDC, r, MenuPopupFill());
+        if (!item) return true;
+
+        if (item->separator)
+        {
+            int y = (r.top + r.bottom) / 2;
+            RECT line{ r.left + S(13), y, r.right - S(13), y + std::max(1, S(1)) };
+            Fill(draw->hDC, line, MenuPopupLine());
+            return true;
+        }
+
+        bool selected = (draw->itemState & ODS_SELECTED) != 0;
+        bool disabled = (draw->itemState & ODS_DISABLED) != 0;
+        bool checked = (draw->itemState & ODS_CHECKED) != 0;
+        if (selected && !disabled)
+        {
+            RECT hot{ r.left + S(3), r.top + S(2), r.right - S(3), r.bottom - S(2) };
+            COLORREF fill = (draw->itemState & ODS_HOTLIGHT) ? MenuPopupPressedFill() : MenuPopupHoverFill();
+            RoundFill(draw->hDC, hot, S(6), fill, fill);
+        }
+
+        if (checked)
+        {
+            RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
+            DrawThemedMenuCheck(draw->hDC, check, disabled ? MenuPopupShortcutText(true) : T().accent);
+        }
+
+        std::wstring mainText = item->text;
+        std::wstring shortcut;
+        size_t tab = mainText.find(L'\t');
+        if (tab != std::wstring::npos)
+        {
+            shortcut = mainText.substr(tab + 1);
+            mainText = mainText.substr(0, tab);
+        }
+
+        HFONT font = Font(ThemedMenuFontPt(item));
+        HGDIOBJ old = SelectObject(draw->hDC, font);
+        RECT textRect{ r.left + S(28), r.top, r.right - S(10), r.bottom };
+        if (!shortcut.empty()) textRect.right -= S(76);
+        Text(draw->hDC, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(disabled));
+        if (!shortcut.empty())
+        {
+            RECT shortcutRect{ std::max(textRect.right + S(6), r.right - S(70)), r.top, r.right - S(10), r.bottom };
+            Text(draw->hDC, shortcut, shortcutRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupShortcutText(disabled));
+        }
+        SelectObject(draw->hDC, old);
+        DeleteObject(font);
+        return true;
+    }
+    int ThemedMenuHitTest(POINT pt)
+    {
+        for (int i = 0; i < static_cast<int>(g_themedMenuItemRects.size()); ++i)
+        {
+            if (Hit(g_themedMenuItemRects[static_cast<size_t>(i)], pt.x, pt.y))
+                return i;
+        }
+        return -1;
+    }
+
+    void DrawThemedMenuEntry(HDC dc, ThemedMenuItem const& item, RECT r, bool hover, bool pressed)
+    {
+        if (item.separator)
+        {
+            int y = (r.top + r.bottom) / 2;
+            RECT line{ r.left + S(13), y, r.right - S(13), y + std::max(1, S(1)) };
+            Fill(dc, line, MenuPopupLine());
+            return;
+        }
+
+        if (hover && !item.disabled)
+        {
+            RECT hot{ r.left + S(3), r.top + S(2), r.right - S(3), r.bottom - S(2) };
+            COLORREF fill = pressed ? MenuPopupPressedFill() : MenuPopupHoverFill();
+            RoundFill(dc, hot, S(6), fill, fill);
+        }
+
+        if (item.checked)
+        {
+            RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
+            DrawThemedMenuCheck(dc, check, item.disabled ? MenuPopupShortcutText(true) : T().accent);
+        }
+
+        std::wstring mainText = item.text;
+        std::wstring shortcut;
+        size_t tab = mainText.find(L'\t');
+        if (tab != std::wstring::npos)
+        {
+            shortcut = mainText.substr(tab + 1);
+            mainText = mainText.substr(0, tab);
+        }
+
+        HFONT font = Font(ThemedMenuFontPt(&item));
+        HGDIOBJ old = SelectObject(dc, font);
+        RECT textRect{ r.left + S(28), r.top, r.right - S(10), r.bottom };
+        if (!shortcut.empty()) textRect.right -= S(76);
+        Text(dc, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(item.disabled));
+        if (!shortcut.empty())
+        {
+            RECT shortcutRect{ std::max(textRect.right + S(6), r.right - S(70)), r.top, r.right - S(10), r.bottom };
+            Text(dc, shortcut, shortcutRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupShortcutText(item.disabled));
+        }
+        SelectObject(dc, old);
+        DeleteObject(font);
+    }
+
+    void PaintThemedPopupMenu(HWND hwnd)
+    {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int w = std::max<int>(1, client.right - client.left);
+        int h = std::max<int>(1, client.bottom - client.top);
+
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bitmap = CreateCompatibleBitmap(dc, w, h);
+        HGDIOBJ oldBitmap = SelectObject(mem, bitmap);
+
+        RECT local{ 0, 0, w, h };
+        Fill(mem, local, MenuPopupFill());
+        Gdiplus::Graphics g(mem);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        Gdiplus::SolidBrush fill(GdiColor(MenuPopupFill()));
+        FillGdiRoundRect(g, fill, Rf(local), S(6.0f));
+        Gdiplus::Pen border(GdiColor(MenuPopupBorder()), std::max<Gdiplus::REAL>(0.85f, S(1.0f)));
+        float borderInset = S(0.75f);
+        Gdiplus::RectF borderRect{
+            borderInset,
+            borderInset,
+            std::max(1.0f, static_cast<float>(w) - borderInset * 2.0f),
+            std::max(1.0f, static_cast<float>(h) - borderInset * 2.0f) };
+        DrawGdiRoundRect(g, border, borderRect, S(5.25f));
+
+        for (int i = 0; i < static_cast<int>(g_themedMenuItems.size()) && i < static_cast<int>(g_themedMenuItemRects.size()); ++i)
+        {
+            DrawThemedMenuEntry(mem, *g_themedMenuItems[static_cast<size_t>(i)], g_themedMenuItemRects[static_cast<size_t>(i)], i == g_themedMenuHover, i == g_themedMenuPressed);
+        }
+
+        BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+    }
+    void DestroyThemedPopupWindowOnly()
+    {
+        HWND popup = g_themedMenuPopup;
+        if (popup)
+        {
+            g_themedMenuPopup = nullptr;
+            if (GetCapture() == popup) ReleaseCapture();
+            DestroyWindow(popup);
+        }
+        g_themedMenuOwner = nullptr;
+        g_themedMenuHover = -1;
+        g_themedMenuPressed = -1;
+    }
+
+    void CloseThemedPopupMenu()
+    {
+        HWND popup = g_themedMenuPopup;
+        if (popup)
+        {
+            g_themedMenuPopup = nullptr;
+            if (GetCapture() == popup) ReleaseCapture();
+            DestroyWindow(popup);
+        }
+        g_themedMenuOwner = nullptr;
+        g_themedMenuItemRects.clear();
+        g_themedMenuItems.clear();
+        g_themedMenuHover = -1;
+        g_themedMenuPressed = -1;
+    }
+
+    LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        switch (msg)
+        {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+            PaintThemedPopupMenu(hwnd);
+            return 0;
+        case WM_MOUSEMOVE:
+        {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int hover = ThemedMenuHitTest(pt);
+            if (hover >= 0 && g_themedMenuItems[static_cast<size_t>(hover)]->separator) hover = -1;
+            if (hover != g_themedMenuHover)
+            {
+                g_themedMenuHover = hover;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+        {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int hitIndex = ThemedMenuHitTest(pt);
+            if (hitIndex < 0)
+            {
+                HWND owner = g_themedMenuOwner;
+                POINT screenPt{};
+                GetCursorPos(&screenPt);
+                CloseThemedPopupMenu();
+                if (msg == WM_RBUTTONDOWN && owner && IsWindow(owner))
+                {
+                    POINT clientPt = screenPt;
+                    ScreenToClient(owner, &clientPt);
+                    PostMessageW(owner, WM_RBUTTONDOWN, 0, MAKELPARAM(clientPt.x, clientPt.y));
+                }
+                return 0;
+            }
+            ThemedMenuItem const& item = *g_themedMenuItems[static_cast<size_t>(hitIndex)];
+            g_themedMenuPressed = (!item.separator && !item.disabled) ? hitIndex : -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+        {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            int hitIndex = ThemedMenuHitTest(pt);
+            int pressed = g_themedMenuPressed;
+            g_themedMenuPressed = -1;
+            if (pressed >= 0 && pressed == hitIndex && pressed < static_cast<int>(g_themedMenuItems.size()))
+            {
+                UINT id = g_themedMenuItems[static_cast<size_t>(pressed)]->id;
+                HWND owner = g_themedMenuOwner;
+                CloseThemedPopupMenu();
+                if (owner && id) SendMessageW(owner, WM_COMMAND, id, 0);
+                return 0;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_CAPTURECHANGED:
+            if (reinterpret_cast<HWND>(lParam) != hwnd && g_themedMenuPopup == hwnd)
+                CloseThemedPopupMenu();
+            return 0;
+        case WM_NCDESTROY:
+        {
+            bool wasActivePopup = g_themedMenuPopup == hwnd;
+            if (wasActivePopup) g_themedMenuPopup = nullptr;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            if (wasActivePopup)
+            {
+                g_themedMenuOwner = nullptr;
+                g_themedMenuItemRects.clear();
+                g_themedMenuItems.clear();
+                g_themedMenuHover = -1;
+                g_themedMenuPressed = -1;
+            }
+            return 0;
+        }
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    ATOM EnsureThemedMenuPopupClass()
+    {
+        static ATOM atom{};
+        if (atom) return atom;
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.style = 0;
+        wc.lpfnWndProc = ThemedMenuPopupProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = L"QuietPDF.ThemedPopupMenu";
+        atom = RegisterClassExW(&wc);
+        return atom;
+    }
+
+    void ShowCustomThemedPopupMenu(HWND hwnd, HMENU menu, int x, int y)
+    {
+        DestroyMenu(menu);
+        DestroyThemedPopupWindowOnly();
+        if (g_themedMenuItems.empty()) return;
+        if (!EnsureThemedMenuPopupClass())
+        {
+            g_themedMenuItems.clear();
+            return;
+        }
+
+        HDC dc = GetDC(hwnd);
+        HFONT font = Font(8);
+        HGDIOBJ old = SelectObject(dc, font);
+        int width = S(112);
+        int height = S(6);
+        std::vector<int> heights;
+        heights.reserve(g_themedMenuItems.size());
+        for (auto const& item : g_themedMenuItems)
+        {
+            int rowH = item->separator ? S(6) : S(25);
+            heights.push_back(rowH);
+            if (!item->separator)
+            {
+                std::wstring mainText = item->text;
+                std::wstring shortcut;
+                size_t tab = mainText.find(L'\t');
+                if (tab != std::wstring::npos)
+                {
+                    shortcut = mainText.substr(tab + 1);
+                    mainText = mainText.substr(0, tab);
+                }
+                HFONT rowFont = Font(ThemedMenuFontPt(item.get()));
+                HGDIOBJ oldRowFont = SelectObject(dc, rowFont);
+                SIZE mainSize{};
+                SIZE shortcutSize{};
+                GetTextExtentPoint32W(dc, mainText.c_str(), static_cast<int>(mainText.size()), &mainSize);
+                if (!shortcut.empty()) GetTextExtentPoint32W(dc, shortcut.c_str(), static_cast<int>(shortcut.size()), &shortcutSize);
+                SelectObject(dc, oldRowFont);
+                DeleteObject(rowFont);
+                int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
+                width = std::max(width, textW + (shortcut.empty() ? S(54) : S(62)));
+            }
+            height += rowH;
+        }
+        height += S(6);
+        SelectObject(dc, old);
+        DeleteObject(font);
+        ReleaseDC(hwnd, dc);
+
+        int popupWidth = width;
+        int popupHeight = height;
+
+        g_themedMenuItemRects.clear();
+        int rowTop = S(3);
+        for (int h : heights)
+        {
+            g_themedMenuItemRects.push_back(RECT{ S(3), rowTop, width - S(3), rowTop + h });
+            rowTop += h;
+        }
+
+        POINT pt{ x, y };
+        HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(mon, &mi);
+        if (x + popupWidth > mi.rcWork.right - S(4)) x = mi.rcWork.right - popupWidth - S(4);
+        if (y + popupHeight > mi.rcWork.bottom - S(4)) y = mi.rcWork.bottom - popupHeight - S(4);
+        x = std::max<int>(static_cast<int>(mi.rcWork.left) + S(4), x);
+        y = std::max<int>(static_cast<int>(mi.rcWork.top) + S(4), y);
+
+        g_themedMenuOwner = hwnd;
+        g_themedMenuHover = -1;
+        g_themedMenuPressed = -1;
+        HWND popup = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            L"QuietPDF.ThemedPopupMenu",
+            L"",
+            WS_POPUP,
+            x,
+            y,
+            popupWidth,
+            popupHeight,
+            hwnd,
+            nullptr,
+            GetModuleHandleW(nullptr),
+            nullptr);
+        if (!popup)
+        {
+            CloseThemedPopupMenu();
+            return;
+        }
+        g_themedMenuPopup = popup;
+        int cornerPreference = 3;
+        DwmSetWindowAttribute(popup, 33, &cornerPreference, sizeof(cornerPreference));
+        DWORD borderColor = 0xFFFFFFFE;
+        DwmSetWindowAttribute(popup, 34, &borderColor, sizeof(borderColor));
+        int ncRenderingPolicy = 1;
+        DwmSetWindowAttribute(popup, 2, &ncRenderingPolicy, sizeof(ncRenderingPolicy));
+        HRGN popupRegion = CreateRoundRectRgn(0, 0, popupWidth + 1, popupHeight + 1, S(12), S(12));
+        SetWindowRgn(popup, popupRegion, FALSE);
+        ShowWindow(popup, SW_SHOWNOACTIVATE);
+        UpdateWindow(popup);
+        SetCapture(popup);
+    }
     void ShowThemeMenu(HWND hwnd)
     {
         POINT pt{};
         GetCursorPos(&pt);
         HMENU menu = CreatePopupMenu();
         for (int i = 0; i < static_cast<int>(std::size(g_themes)); ++i)
-            AppendMenuW(menu, MF_STRING | (i == g_theme ? MF_CHECKED : 0), 2200 + i, g_themes[i].name);
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+            AppendThemedMenuItem(menu, 2200 + i, g_themes[i].name, i == g_theme);
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
     }
 
     void ShowViewMenuModern(HWND hwnd)
@@ -5231,27 +8763,23 @@ namespace
         POINT pt{};
         GetCursorPos(&pt);
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING | (g_viewMode == 0 ? MF_CHECKED : 0), 2300, L"单页视图");
-        AppendMenuW(menu, MF_STRING | (g_viewMode == 1 ? MF_CHECKED : 0), 2301, L"双页视图");
-        AppendMenuW(menu, MF_STRING | (g_viewMode == 2 ? MF_CHECKED : 0), 2302, L"书本视图");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (g_continuousRead ? MF_CHECKED : 0), 2303, L"连续阅读");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        AppendThemedMenuItem(menu, 2300, L"\u5355\u9875\u89c6\u56fe", g_viewMode == 0);
+        AppendThemedMenuItem(menu, 2301, L"\u53cc\u9875\u89c6\u56fe", g_viewMode == 1);
+        AppendThemedMenuItem(menu, 2302, L"\u4e66\u672c\u89c6\u56fe", g_viewMode == 2);
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2303, L"\u8fde\u7eed\u9605\u8bfb", g_continuousRead);
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
     }
-
     void ShowViewMenu(HWND hwnd)
     {
         POINT pt{};
         GetCursorPos(&pt);
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING | (g_viewMode == 0 ? MF_CHECKED : 0), 2300, L"连续滚动");
-        AppendMenuW(menu, MF_STRING | (g_viewMode == 1 ? MF_CHECKED : 0), 2301, L"单页阅读");
-        AppendMenuW(menu, MF_STRING | (g_viewMode == 2 ? MF_CHECKED : 0), 2302, L"双页阅读");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        AppendThemedMenuItem(menu, 2300, L"\u8fde\u7eed\u6eda\u52a8", g_viewMode == 0);
+        AppendThemedMenuItem(menu, 2301, L"\u5355\u9875\u9605\u8bfb", g_viewMode == 1);
+        AppendThemedMenuItem(menu, 2302, L"\u53cc\u9875\u9605\u8bfb", g_viewMode == 2);
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
     }
-
     void ShowZoomMenu(HWND hwnd)
     {
         POINT pt{};
@@ -5259,11 +8787,11 @@ namespace
         HMENU menu = CreatePopupMenu();
         PdfTab* tab = Active();
         int current = tab ? static_cast<int>(tab->zoom * 100.0 + 0.5) : 100;
-        AppendMenuW(menu, MF_STRING | (current == 100 ? MF_CHECKED : 0), 2400, L"实际大小");
-        AppendMenuW(menu, MF_STRING, 2401, L"适合页面");
-        AppendMenuW(menu, MF_STRING, 2402, L"适合宽度");
-        AppendMenuW(menu, MF_STRING, 2403, L"适合内容");
-        AppendMenuW(menu, MF_STRING, 2404, L"自定义缩放");
+        AppendThemedMenuItem(menu, 2400, L"\u5b9e\u9645\u5927\u5c0f", current == 100);
+        AppendThemedMenuItem(menu, 2401, L"\u9002\u5408\u9875\u9762");
+        AppendThemedMenuItem(menu, 2402, L"\u9002\u5408\u5bbd\u5ea6");
+        AppendThemedMenuItem(menu, 2403, L"\u9002\u5408\u5185\u5bb9");
+        AppendThemedMenuItem(menu, 2404, L"\u81ea\u5b9a\u4e49\u7f29\u653e");
         struct ZoomItem { int id; double zoom; const wchar_t* label; };
         ZoomItem items[] = {
             { 2410, 64.0, L"6400%" },
@@ -5283,57 +8811,235 @@ namespace
         for (auto const& item : items)
         {
             int pct = static_cast<int>(item.zoom * 100.0 + 0.5);
-            AppendMenuW(menu, MF_STRING | (current == pct ? MF_CHECKED : 0), item.id, item.label);
+            AppendThemedMenuItem(menu, item.id, item.label, current == pct);
         }
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 2430, L"设置默认缩放比例");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2430, L"\u8bbe\u7f6e\u9ed8\u8ba4\u7f29\u653e\u6bd4\u4f8b");
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
+    }
+
+    void ShowHelpMenu(HWND hwnd)
+    {
+        RECT anchor{};
+        for (auto const& button : g_buttons) if (button.id == CmdSettings) anchor = button.rect;
+        POINT pt{ anchor.left, anchor.bottom };
+        ClientToScreen(hwnd, &pt);
+        HMENU menu = CreatePopupMenu();
+        AppendThemedMenuItem(menu, 2601, L"\u6253\u5370", false, !Active());
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2600, L"\u8bbe\u7f6e\u4e3a\u9ed8\u8ba4 PDF \u9605\u8bfb\u5668");
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
+    }
+
+    bool LaunchOpenWithForDefaultPdf(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab || tab->path.empty() || !std::filesystem::exists(tab->path))
+            return false;
+
+        MessageBoxW(
+            hwnd,
+            L"\u5c06\u6253\u5f00 Windows \u9ed8\u8ba4\u5e94\u7528\u8bbe\u7f6e\u9875\uff0c\u8bf7\u5728 PDF \u6587\u4ef6\u7c7b\u578b\u4e2d\u9009\u62e9\u8f7b\u9605PDF\u3002",
+            AppName,
+            MB_OK | MB_ICONINFORMATION);
+
+        std::wstring args = L"shell32.dll,OpenAs_RunDLL \"" + tab->path + L"\"";
+        auto result = reinterpret_cast<INT_PTR>(
+            ShellExecuteW(hwnd, L"open", L"rundll32.exe", args.c_str(), nullptr, SW_SHOWNORMAL));
+        return result > 32;
+    }
+
+    void OpenDefaultPdfReaderSettings(HWND hwnd)
+    {
+        auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+            hwnd,
+            L"open",
+            L"ms-settings:defaultapps?registeredAppUser=QingYuePDF",
+            nullptr,
+            nullptr,
+            SW_SHOWNORMAL));
+        if (result <= 32)
+        {
+            result = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", L"ms-settings:defaultapps", nullptr, nullptr, SW_SHOWNORMAL));
+        }
+        if (result <= 32)
+        {
+            result = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", L"control.exe", L"/name Microsoft.DefaultPrograms", nullptr, SW_SHOWNORMAL));
+        }
+    }
+
+    bool PrintPageImage(HDC printerDc, PdfTab& tab, int pageIndex)
+    {
+        if (pageIndex < 0 || pageIndex >= static_cast<int>(tab.pages.size())) return false;
+        int printableW = GetDeviceCaps(printerDc, HORZRES);
+        int printableH = GetDeviceCaps(printerDc, VERTRES);
+        int offsetX = GetDeviceCaps(printerDc, PHYSICALOFFSETX);
+        int offsetY = GetDeviceCaps(printerDc, PHYSICALOFFSETY);
+        int physicalW = GetDeviceCaps(printerDc, PHYSICALWIDTH);
+        int physicalH = GetDeviceCaps(printerDc, PHYSICALHEIGHT);
+        if (printableW <= 0 || printableH <= 0) return false;
+
+        PageInfo const& page = tab.pages[static_cast<size_t>(pageIndex)];
+        double pageWPt = std::max(1.0, page.widthPt);
+        double pageHPt = std::max(1.0, page.heightPt);
+        double renderScale = std::min(
+            static_cast<double>(printableW) / pageWPt,
+            static_cast<double>(printableH) / pageHPt);
+        int destW = std::max(1, static_cast<int>(pageWPt * renderScale + 0.5));
+        int destH = std::max(1, static_cast<int>(pageHPt * renderScale + 0.5));
+        int destX = (physicalW - destW) / 2 - offsetX;
+        int destY = (physicalH - destH) / 2 - offsetY;
+
+        PageImage image = RenderPageAtScale(tab, pageIndex, renderScale, false);
+        if (image.bgra.empty()) return false;
+
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = image.width;
+        info.bmiHeader.biHeight = -image.height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        int oldMode = SetStretchBltMode(printerDc, HALFTONE);
+        POINT oldBrush{};
+        SetBrushOrgEx(printerDc, 0, 0, &oldBrush);
+        int ok = StretchDIBits(
+            printerDc,
+            destX,
+            destY,
+            destW,
+            destH,
+            0,
+            0,
+            image.width,
+            image.height,
+            image.bgra.data(),
+            &info,
+            DIB_RGB_COLORS,
+            SRCCOPY);
+        SetBrushOrgEx(printerDc, oldBrush.x, oldBrush.y, nullptr);
+        SetStretchBltMode(printerDc, oldMode);
+        return ok != GDI_ERROR;
+    }
+
+    void PrintActiveDocument(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab || tab->pageCount <= 0)
+        {
+            MessageBoxW(hwnd, L"\u5f53\u524d\u6ca1\u6709\u6253\u5f00\u4efb\u4f55 PDF \u6587\u6863\u3002", AppName, MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        PRINTDLGW pd{};
+        pd.lStructSize = sizeof(pd);
+        pd.hwndOwner = hwnd;
+        pd.Flags = PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION;
+        pd.nMinPage = 1;
+        pd.nMaxPage = static_cast<WORD>(std::min(tab->pageCount, 65535));
+        pd.nFromPage = 1;
+        pd.nToPage = pd.nMaxPage;
+        if (!PrintDlgW(&pd)) return;
+        if (!pd.hDC) return;
+
+        int fromPage = 1;
+        int toPage = tab->pageCount;
+        if ((pd.Flags & PD_PAGENUMS) != 0)
+        {
+            fromPage = std::clamp<int>(pd.nFromPage, 1, tab->pageCount);
+            toPage = std::clamp<int>(pd.nToPage, fromPage, tab->pageCount);
+        }
+        int copies = (pd.Flags & PD_USEDEVMODECOPIESANDCOLLATE) ? std::max<int>(1, pd.nCopies) : 1;
+
+        DOCINFOW doc{};
+        doc.cbSize = sizeof(doc);
+        std::wstring docName = tab->name.empty() ? std::filesystem::path(tab->path).filename().wstring() : tab->name;
+        doc.lpszDocName = docName.empty() ? AppName : docName.c_str();
+
+        bool failed = false;
+        if (StartDocW(pd.hDC, &doc) <= 0)
+        {
+            failed = true;
+        }
+        else
+        {
+            for (int copy = 0; copy < copies && !failed; ++copy)
+            {
+                for (int pageNo = fromPage; pageNo <= toPage; ++pageNo)
+                {
+                    int pageIndex = pageNo - 1;
+                    if (StartPage(pd.hDC) <= 0)
+                    {
+                        failed = true;
+                        break;
+                    }
+                    if (!PrintPageImage(pd.hDC, *tab, pageIndex))
+                    {
+                        failed = true;
+                    }
+                    if (EndPage(pd.hDC) <= 0)
+                    {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if (failed) AbortDoc(pd.hDC);
+            else EndDoc(pd.hDC);
+        }
+
+        DeleteDC(pd.hDC);
+        if (pd.hDevMode) GlobalFree(pd.hDevMode);
+        if (pd.hDevNames) GlobalFree(pd.hDevNames);
+        if (failed)
+            MessageBoxW(hwnd, L"\u6253\u5370\u5931\u8d25\u3002", AppName, MB_OK | MB_ICONERROR);
     }
 
     void ShowTabMenu(HWND hwnd, int x, int y)
     {
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, 2101, L"关闭");
-        AppendMenuW(menu, MF_STRING, 2102, L"关闭其他标签");
-        AppendMenuW(menu, MF_STRING, 2103, L"关闭右侧标签");
-        AppendMenuW(menu, MF_STRING, 2104, L"关闭左侧标签");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 2105, L"复制文件路径");
-        AppendMenuW(menu, MF_STRING, 2106, L"打开所在文件夹");
-        AppendMenuW(menu, MF_STRING, 2107, L"属性");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        AppendThemedMenuItem(menu, 2101, L"\u5173\u95ed");
+        AppendThemedMenuItem(menu, 2102, L"\u5173\u95ed\u5176\u4ed6\u6807\u7b7e");
+        AppendThemedMenuItem(menu, 2103, L"\u5173\u95ed\u53f3\u4fa7\u6807\u7b7e");
+        AppendThemedMenuItem(menu, 2104, L"\u5173\u95ed\u5de6\u4fa7\u6807\u7b7e");
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2105, L"\u590d\u5236\u6587\u4ef6\u8def\u5f84");
+        AppendThemedMenuItem(menu, 2106, L"\u6253\u5f00\u6240\u5728\u6587\u4ef6\u5939");
+        AppendThemedMenuItem(menu, 2107, L"\u5c5e\u6027");
+        ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
-    void ShowSelectionMenu(HWND hwnd, int x, int y)
+    void ShowSelectionMenu(HWND hwnd, int x, int y, bool imageOnly)
     {
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, 2501, L"复制所选内容");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 2502, L"高亮");
-        AppendMenuW(menu, MF_STRING, 2503, L"下划线");
-        AppendMenuW(menu, MF_STRING, 2504, L"删除线");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 2505, L"添加便签");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        AppendThemedMenuItem(menu, 2501, imageOnly ? L"\u590d\u5236\u56fe\u7247" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9");
+        if (!imageOnly)
+        {
+            AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae");
+            AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf");
+            AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf");
+            AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
+        }
+        ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
-    void ShowSelectionMenuWithShortcuts(HWND hwnd, int x, int y)
+    void ShowSelectionMenuWithShortcuts(HWND hwnd, int x, int y, bool imageOnly)
     {
         HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, 2501, L"复制选中内容\tCtrl + C");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 2502, L"高亮\tCtrl + H");
-        AppendMenuW(menu, MF_STRING, 2503, L"下划线\tCtrl + U");
-        AppendMenuW(menu, MF_STRING, 2504, L"删除线\tCtrl + K");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, 2505, L"添加便签");
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, x, y, 0, hwnd, nullptr);
-        DestroyMenu(menu);
+        AppendThemedMenuItem(menu, 2501, imageOnly ? L"\u590d\u5236\u56fe\u7247\tCtrl + C" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9\tCtrl + C");
+        if (!imageOnly)
+        {
+            AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae\tCtrl + H");
+            AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf\tCtrl + U");
+            AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf\tCtrl + K");
+            AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
+        }
+        ShowThemedPopupMenu(hwnd, menu, x, y);
     }
-
     void AddAnnotationFromSelection(HWND hwnd, AnnotationKind kind)
     {
         PdfTab* tab = Active();
@@ -5368,8 +9074,7 @@ namespace
             double sy0 = std::min({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
             double sx1 = std::max({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
             double sy1 = std::max({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
-            if (sx1 - sx0 >= 0.002 && sy1 - sy0 >= 0.002)
-                annotation.segments.push_back(AnnotationSegment{ sx0, sy0, sx1, sy1 });
+            AppendUniqueSegment(annotation.segments, AnnotationSegment{ sx0, sy0, sx1, sy1 });
         }
         if (annotation.segments.empty())
             annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
@@ -5377,9 +9082,7 @@ namespace
         g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
         g_annotationToolbarOpen = true;
         tab->dirty = true;
-        g_hasContentSelection = false;
-        g_selectionQuads.clear();
-        g_selectionText.clear();
+        ClearTextSelection();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -5407,17 +9110,34 @@ namespace
             annotation.colorIndex = AnnotationColorIndexFromRgb(item.colorR, item.colorG, item.colorB);
             annotation.createdAt = item.createdAtMs > 0 ? item.createdAtMs : NowMs();
             annotation.persisted = true;
-            annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
+            AppendUniqueSegment(annotation.segments, AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
             annotation.author = FromUtf8(item.author);
             if (annotation.author.empty()) annotation.author = L"10726";
             annotation.note = FromUtf8(item.contents);
             annotation.text = annotation.note;
+            bool merged = false;
+            for (auto& existing : tab.annotations)
+            {
+                if (CanMergeLoadedAnnotation(existing, annotation))
+                {
+                    AppendUniqueSegment(existing.segments, AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
+                    existing.x0 = std::min(existing.x0, annotation.x0);
+                    existing.y0 = std::min(existing.y0, annotation.y0);
+                    existing.x1 = std::max(existing.x1, annotation.x1);
+                    existing.y1 = std::max(existing.y1, annotation.y1);
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged)
+                continue;
             tab.annotations.push_back(std::move(annotation));
         }
     }
 
     bool ReloadPdfTab(PdfTab& tab, const std::wstring& path, int page, double zoom)
     {
+        tab.renderVersion = ++g_nextRenderVersion;
         DropTab(tab);
         tab.pages.clear();
         tab.outline.clear();
@@ -5474,12 +9194,26 @@ namespace
         }
     }
 
+    void RestoreScrollAfterReload(HWND hwnd, PdfTab& tab, int oldScroll)
+    {
+        g_contentHeight = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
+        int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
+        g_scrollY = std::clamp(oldScroll, 0, maxScroll);
+        if (g_continuousRead)
+        {
+            tab.currentPage = PageFromScroll(tab, g_scrollY);
+            SyncSidebarProgressFromScroll(hwnd, tab);
+        }
+        else KeepThumbnailSelectionVisible(hwnd, tab);
+        UpdateVertScrollBar(hwnd);
+    }
+
     void SaveAnnotationsToPdf(HWND hwnd, PdfTab& tab)
     {
-        if (tab.path.empty() || !tab.dirty || tab.annotations.empty()) return;
+        if (tab.path.empty() || !tab.dirty) return;
         if (!g_pdf.saveAnnotations)
         {
-            MessageBoxW(hwnd, L"当前 MuPDF 组件不支持写入 PDF 标注。", L"保存", MB_OK | MB_ICONWARNING);
+            MessageBoxW(hwnd, L"\u5f53\u524d MuPDF \u7ec4\u4ef6\u4e0d\u652f\u6301\u5199\u5165 PDF \u6807\u6ce8\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
 
@@ -5496,7 +9230,6 @@ namespace
         annotations.reserve(tab.annotations.size());
         for (auto const& item : tab.annotations)
         {
-            if (item.persisted) continue;
             notes.push_back(ToUtf8(item.note));
             authors.push_back(ToUtf8(item.author.empty() ? L"10726" : item.author));
             COLORREF color = AnnotationColor(item);
@@ -5520,30 +9253,28 @@ namespace
             };
             if (!item.segments.empty())
             {
+                std::vector<AnnotationSegment> uniqueSegments;
+                uniqueSegments.reserve(item.segments.size());
                 for (auto const& segment : item.segments)
+                    AppendUniqueSegment(uniqueSegments, segment);
+                for (auto const& segment : uniqueSegments)
                     pushAnnotation(segment.x0, segment.y0, segment.x1, segment.y1);
             }
             else pushAnnotation(item.x0, item.y0, item.x1, item.y1);
         }
-        if (annotations.empty())
-        {
-            tab.dirty = false;
-            SetTitle();
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return;
-        }
 
         std::string tempUtf8 = ToUtf8(temp.wstring());
-        int saved = g_pdf.saveAnnotations(tab.ctx, tab.doc, tempUtf8.c_str(), annotations.data(), static_cast<int>(annotations.size()));
+        int saved = g_pdf.saveAnnotations(tab.ctx, tab.doc, tempUtf8.c_str(), annotations.empty() ? nullptr : annotations.data(), static_cast<int>(annotations.size()));
         if (!saved || !std::filesystem::exists(temp))
         {
             try { std::filesystem::remove(temp); } catch (...) {}
-            MessageBoxW(hwnd, L"PDF 标注写入失败，原文件未修改。", L"保存", MB_OK | MB_ICONWARNING);
+            MessageBoxW(hwnd, L"PDF \u6807\u6ce8\u5199\u5165\u5931\u8d25\uff0c\u539f\u6587\u4ef6\u672a\u4fee\u6539\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
 
         int page = tab.currentPage;
         double zoom = tab.zoom;
+        int oldScroll = g_scrollY;
         std::wstring originalPath = tab.path;
         auto pendingAnnotations = tab.annotations;
         bool pendingDirty = tab.dirty;
@@ -5557,17 +9288,19 @@ namespace
             ReloadPdfTab(tab, originalPath, page, zoom);
             tab.annotations = std::move(pendingAnnotations);
             tab.dirty = pendingDirty;
-            std::wstring msg = L"PDF 已生成临时保存文件，但替换原文件失败。\n\n原因：" + LastErrorText(replaceError) +
-                L"\n\n请确认这个 PDF 没有被其它程序占用。\n临时文件：\n" + temp.wstring();
-            MessageBoxW(hwnd, msg.c_str(), L"保存", MB_OK | MB_ICONWARNING);
+            RestoreScrollAfterReload(hwnd, tab, oldScroll);
+            std::wstring msg = L"PDF \u5df2\u751f\u6210\u4e34\u65f6\u4fdd\u5b58\u6587\u4ef6\uff0c\u4f46\u66ff\u6362\u539f\u6587\u4ef6\u5931\u8d25\u3002\n\n\u539f\u56e0\uff1a" + LastErrorText(replaceError) +
+                L"\n\n\u8bf7\u786e\u8ba4\u8fd9\u4e2a PDF \u6ca1\u6709\u88ab\u5176\u5b83\u7a0b\u5e8f\u5360\u7528\u3002\n\u4e34\u65f6\u6587\u4ef6\uff1a\n" + temp.wstring();
+            MessageBoxW(hwnd, msg.c_str(), L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
 
         if (!ReloadPdfTab(tab, source.wstring(), page, zoom))
         {
-            MessageBoxW(hwnd, L"PDF 已保存，但重新载入失败。请重新打开文件。", L"保存", MB_OK | MB_ICONWARNING);
+            MessageBoxW(hwnd, L"PDF \u5df2\u4fdd\u5b58\uff0c\u4f46\u91cd\u65b0\u8f7d\u5165\u5931\u8d25\u3002\u8bf7\u91cd\u65b0\u6253\u5f00\u6587\u4ef6\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
+        RestoreScrollAfterReload(hwnd, tab, oldScroll);
         TouchRecentProgress(tab, true);
         SetTitle();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -5612,7 +9345,7 @@ namespace
         std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
         if (!out)
         {
-            MessageBoxW(hwnd, L"标注旁路文件保存失败。", L"保存", MB_OK | MB_ICONWARNING);
+            MessageBoxW(hwnd, L"\u6807\u6ce8\u65c1\u8def\u6587\u4ef6\u4fdd\u5b58\u5931\u8d25\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
         out << "QuietPDFAnnotations\t1\n";
@@ -5632,12 +9365,12 @@ namespace
     {
         std::uintmax_t size = 0;
         try { size = std::filesystem::file_size(tab.path); } catch (...) {}
-        std::wstring msg = L"文件: " + tab.path +
-            L"\n页数: " + std::to_wstring(tab.pageCount) +
-            L"\n当前页: " + std::to_wstring(tab.currentPage + 1) +
-            L"\n缩放: " + std::to_wstring(static_cast<int>(tab.zoom * 100.0 + 0.5)) + L"%" +
-            L"\n文件大小: " + std::to_wstring(size / 1024) + L" KB";
-        MessageBoxW(hwnd, msg.c_str(), L"属性", MB_OK | MB_ICONINFORMATION);
+        std::wstring msg = L"\u6587\u4ef6: " + tab.path +
+            L"\n\u9875\u6570: " + std::to_wstring(tab.pageCount) +
+            L"\n\u5f53\u524d\u9875\uff1a " + std::to_wstring(tab.currentPage + 1) +
+            L"\n\u7f29\u653e: " + std::to_wstring(static_cast<int>(tab.zoom * 100.0 + 0.5)) + L"%" +
+            L"\n\u6587\u4ef6\u5927\u5c0f: " + std::to_wstring(size / 1024) + L" KB";
+        MessageBoxW(hwnd, msg.c_str(), L"\u5c5e\u6027", MB_OK | MB_ICONINFORMATION);
     }
 
     void ApplyImmersiveWindow(HWND hwnd, bool immersive)
@@ -5659,6 +9392,7 @@ namespace
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_preImmersiveExStyle & ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
             g_immersive = true;
+            g_immersiveSidebarOpen = false;
             SetWindowPos(hwnd, HWND_TOP,
                 monitorInfo.rcMonitor.left,
                 monitorInfo.rcMonitor.top,
@@ -5668,7 +9402,7 @@ namespace
         }
         else
         {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, g_preImmersiveStyle ? g_preImmersiveStyle : (WS_OVERLAPPEDWINDOW | WS_VSCROLL));
+            SetWindowLongPtrW(hwnd, GWL_STYLE, g_preImmersiveStyle ? g_preImmersiveStyle : WS_OVERLAPPEDWINDOW);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_preImmersiveExStyle);
             g_immersive = false;
             if (g_hasPreImmersivePlacement)
@@ -5679,21 +9413,160 @@ namespace
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
         ShowScrollBar(hwnd, SB_VERT, FALSE);
+        ShowScrollBar(hwnd, SB_HORZ, FALSE);
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 
-    void CloseTab(int index)
+    bool ConfirmCloseDirtyTab(HWND hwnd, PdfTab& tab)
     {
-        if (index < 0 || index >= static_cast<int>(g_tabs.size())) return;
-        TouchRecentProgress(*g_tabs[static_cast<size_t>(index)], true);
-        DropTab(*g_tabs[static_cast<size_t>(index)]);
+        if (!tab.dirty) return true;
+        std::wstring name = tab.name.empty() ? L"\u5f53\u524d\u6587\u6863" : tab.name;
+        std::wstring message = L"\u5173\u95ed\u524d\u662f\u5426\u4fdd\u5b58\u5bf9\u201c" + name + L"\u201d\u7684\u4fee\u6539\uff1f";
+        int choice = MessageBoxW(hwnd, message.c_str(), AppName, MB_ICONWARNING | MB_YESNOCANCEL | MB_DEFBUTTON1);
+        if (choice == IDCANCEL || choice == 0) return false;
+        if (choice == IDYES)
+        {
+            SaveAnnotationsToPdf(hwnd, tab);
+            return !tab.dirty;
+        }
+        tab.dirty = false;
+        return true;
+    }
+
+    bool CloseTab(int index)
+    {
+        if (index < 0 || index >= static_cast<int>(g_tabs.size())) return false;
+        PdfTab& tab = *g_tabs[static_cast<size_t>(index)];
+        if (!ConfirmCloseDirtyTab(g_hwnd, tab)) return false;
+        TouchRecentProgress(tab, true);
+        DropTab(tab);
         g_tabs.erase(g_tabs.begin() + index);
         if (g_tabs.empty()) g_active = -1;
         else g_active = std::clamp(g_active >= index ? g_active - 1 : g_active, 0, static_cast<int>(g_tabs.size()) - 1);
-        g_scrollY = 0;
+        EnsureTabWindowVisible(g_active);
+        if (g_tabs.empty()) g_tabListOpen = false;
+        RestoreActiveTabPosition(g_hwnd);
         SetTitle();
         StartActiveFileWatcher(g_hwnd);
         InvalidateRect(g_hwnd, nullptr, FALSE);
+        return true;
+    }
+
+    std::wstring JoinCopyDataPaths(std::vector<std::wstring> const& paths)
+    {
+        std::wstring payload;
+        for (auto const& path : paths)
+        {
+            if (payload.empty()) payload = path;
+            else payload += L"\n" + path;
+        }
+        return payload;
+    }
+
+    bool SendOpenFilesToExistingWindow(HWND target, std::vector<std::wstring> const& paths)
+    {
+        if (!target || paths.empty()) return false;
+        std::wstring payload = JoinCopyDataPaths(paths);
+        COPYDATASTRUCT cds{};
+        cds.dwData = 0x51595044;
+        cds.cbData = static_cast<DWORD>((payload.size() + 1) * sizeof(wchar_t));
+        cds.lpData = payload.data();
+        return SendMessageW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds)) != 0;
+    }
+
+    void OpenFilesFromCopyData(HWND hwnd, COPYDATASTRUCT const* cds)
+    {
+        if (!cds || cds->dwData != 0x51595044 || !cds->lpData || cds->cbData < sizeof(wchar_t))
+            return;
+
+        std::wstring payload(static_cast<wchar_t const*>(cds->lpData), cds->cbData / sizeof(wchar_t));
+        while (!payload.empty() && payload.back() == L'\0') payload.pop_back();
+        size_t start = 0;
+        while (start < payload.size())
+        {
+            size_t end = payload.find(L'\n', start);
+            std::wstring path = payload.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+            if (!path.empty() && std::filesystem::exists(path))
+            {
+                int existing = FindOpenTabByPath(path);
+                if (existing >= 0)
+                {
+                    ActivateTab(hwnd, existing);
+                }
+                else
+                {
+                    try { OpenPdf(hwnd, path); }
+                    catch (std::exception const& e) { MessageBoxA(hwnd, e.what(), "QingYuePDF", MB_ICONERROR); }
+                }
+            }
+            if (end == std::wstring::npos) break;
+            start = end + 1;
+        }
+        ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+        SetForegroundWindow(hwnd);
+    }
+
+    int ComputeTabInsertIndexFromPoint(int x)
+    {
+        int total = static_cast<int>(g_tabs.size());
+        if (total <= 0) return 0;
+        int insert = total;
+        for (size_t i = 0; i < g_tabRects.size() && i < g_tabRectIds.size(); ++i)
+        {
+            int id = g_tabRectIds[i];
+            if (id == g_draggingTabIndex) continue;
+            RECT r = g_tabRects[i];
+            int mid = (r.left + r.right) / 2;
+            if (x < mid)
+            {
+                insert = id;
+                break;
+            }
+            insert = id + 1;
+        }
+        return std::clamp(insert, 0, total);
+    }
+
+    void MoveTabToInsertIndex(HWND hwnd, int from, int insertIndex)
+    {
+        int total = static_cast<int>(g_tabs.size());
+        if (from < 0 || from >= total) return;
+        int to = std::clamp(insertIndex, 0, total);
+        if (to > from) --to;
+        to = std::clamp(to, 0, total - 1);
+        if (to == from)
+        {
+            EnsureTabWindowVisible(g_active);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+
+        auto moving = std::move(g_tabs[static_cast<size_t>(from)]);
+        g_tabs.erase(g_tabs.begin() + from);
+        g_tabs.insert(g_tabs.begin() + to, std::move(moving));
+        g_active = to;
+        EnsureTabWindowVisible(g_active);
+        g_tabListOpen = false;
+        SetTitle();
+        StartActiveFileWatcher(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+    bool DetachTabToNewWindow(HWND hwnd, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(g_tabs.size()))
+            return false;
+        std::wstring path = g_tabs[static_cast<size_t>(index)]->path;
+        if (path.empty() || !std::filesystem::exists(path))
+            return false;
+
+        wchar_t modulePath[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+        std::wstring args = L"--new-window \"" + path + L"\"";
+        auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", modulePath, args.c_str(), nullptr, SW_SHOWNORMAL));
+        if (result <= 32)
+            return false;
+        CloseTab(index);
+        return true;
     }
 
     void DropHomeThumbsForPath(std::wstring const& path)
@@ -5786,14 +9659,28 @@ namespace
         if (id >= 2200 && id < 2200 + static_cast<int>(std::size(g_themes)))
         {
             g_theme = id - 2200;
-            ApplyWindowChrome();
             SaveState();
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
+            ApplyWindowChrome();
+            DwmFlush();
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
         }
         if (id >= 2300 && id <= 2302)
         {
+            int oldPage = tab ? tab->currentPage : 0;
             g_viewMode = id - 2300;
+            if (tab)
+            {
+                tab->currentPage = std::clamp(oldPage, 0, tab->pageCount - 1);
+                g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+                g_contentWidth = ReadingContentWidth(*tab);
+                int maxY = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+                int maxX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
+                g_scrollY = std::clamp(g_continuousRead ? SpreadTopScroll(*tab, oldPage) : g_scrollY, 0, maxY);
+                g_scrollX = std::clamp(g_scrollX, 0, maxX);
+                UpdateVertScrollBar(hwnd);
+            }
             SaveState();
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
@@ -5815,8 +9702,7 @@ namespace
             if (!tab) return;
             auto applyZoom = [&](double zoom)
             {
-                tab->zoom = std::clamp(zoom, 0.0833, 64.0);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), zoom);
             };
             if (id == 2400) applyZoom(1.0);
             else if (id == 2401 && !tab->pages.empty())
@@ -5836,6 +9722,10 @@ namespace
                 auto const& p = tab->pages[static_cast<size_t>(tab->currentPage)];
                 applyZoom(static_cast<double>(std::max<int>(1, g_stage.right - g_stage.left - S(96))) * 72.0 / (p.widthPt * g_dpi));
             }
+            else if (id == 2404)
+            {
+                OpenCustomZoomDialog(hwnd);
+            }
             else if (id >= 2410 && id <= 2422)
             {
                 double values[] = { 64.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.5, 1.25, 1.0, 0.5, 0.25, 0.125, 0.0833 };
@@ -5846,13 +9736,15 @@ namespace
         if (id == 2101) { CloseTab(g_contextTab); return; }
         if (id == 2102 && g_contextTab >= 0)
         {
-            for (int i = static_cast<int>(g_tabs.size()) - 1; i >= 0; --i) if (i != g_contextTab) CloseTab(i);
-            g_active = 0;
-            StartActiveFileWatcher(hwnd);
+            for (int i = static_cast<int>(g_tabs.size()) - 1; i >= 0; --i)
+            {
+                if (i != g_contextTab && !CloseTab(i)) return;
+            }
+            ActivateTab(hwnd, std::clamp(g_contextTab, 0, static_cast<int>(g_tabs.size()) - 1));
             return;
         }
-        if (id == 2103 && g_contextTab >= 0) { while (static_cast<int>(g_tabs.size()) > g_contextTab + 1) CloseTab(static_cast<int>(g_tabs.size()) - 1); return; }
-        if (id == 2104 && g_contextTab >= 0) { while (g_contextTab > 0) { CloseTab(0); --g_contextTab; } return; }
+        if (id == 2103 && g_contextTab >= 0) { while (static_cast<int>(g_tabs.size()) > g_contextTab + 1) { if (!CloseTab(static_cast<int>(g_tabs.size()) - 1)) return; } return; }
+        if (id == 2104 && g_contextTab >= 0) { while (g_contextTab > 0) { if (!CloseTab(0)) return; --g_contextTab; } return; }
         if (id == 2105 && g_contextTab >= 0)
         {
             const auto& path = g_tabs[static_cast<size_t>(g_contextTab)]->path;
@@ -5871,9 +9763,9 @@ namespace
             }
             return;
         }
-        if (id == 2501 && !g_selectionText.empty())
+        if (id == 2501)
         {
-            CopyTextToClipboard(hwnd, g_selectionText);
+            CopyCurrentSelectionToClipboard(hwnd);
             return;
         }
         if (id == 2106 && g_contextTab >= 0)
@@ -5883,11 +9775,8 @@ namespace
             return;
         }
         if (id == 2107 && g_contextTab >= 0) { ShowProperties(hwnd, *g_tabs[static_cast<size_t>(g_contextTab)]); return; }
-        if (id == 2501)
-        {
-            MessageBoxW(hwnd, L"当前版本还没有接入 MuPDF 文字提取接口，暂时不能复制选区文字。", L"复制", MB_OK | MB_ICONINFORMATION);
-            return;
-        }
+        if (id == 2600) { OpenDefaultPdfReaderSettings(hwnd); return; }
+        if (id == 2601) { PrintActiveDocument(hwnd); return; }
         if (id == 2502) { AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight); return; }
         if (id == 2503) { AddAnnotationFromSelection(hwnd, AnnotationKind::Underline); return; }
         if (id == 2504) { AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout); return; }
@@ -5900,11 +9789,59 @@ namespace
 
         switch (id)
         {
-        case CmdHome: g_active = -1; SetTitle(); StartActiveFileWatcher(hwnd); InvalidateRect(hwnd, nullptr, FALSE); break;
+        case CmdHome: g_active = -1; g_tabListOpen = false; SetTitle(); StartActiveFileWatcher(hwnd); InvalidateRect(hwnd, nullptr, FALSE); break;
         case CmdOpen: OpenDialog(hwnd); break;
-        case CmdSidebar: StartSidebarPanelAnimation(hwnd, !g_sidebarOpen); break;
+        case CmdTabNavPrev:
+            if (g_active > 0) ActivateTab(hwnd, g_active - 1);
+            else
+            {
+                g_tabVisibleStart = std::max(0, g_tabVisibleStart - 1);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            g_tabListOpen = false;
+            break;
+        case CmdTabNavNext:
+            if (g_active >= 0 && g_active + 1 < static_cast<int>(g_tabs.size())) ActivateTab(hwnd, g_active + 1);
+            else
+            {
+                g_tabVisibleStart = std::min(std::max(0, static_cast<int>(g_tabs.size()) - MaxVisibleTabs), g_tabVisibleStart + 1);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            g_tabListOpen = false;
+            break;
+        case CmdSidebarPanelToggle:
+            if (g_immersive)
+            {
+                g_immersiveSidebarOpen = !g_immersiveSidebarOpen;
+                if (g_immersiveSidebarOpen)
+                {
+                    g_sidebarOpen = true;
+                    if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else StartSidebarPanelAnimation(hwnd, !g_sidebarOpen);
+            break;
+        case CmdTabListToggle:
+            g_tabListOpen = !g_tabListOpen;
+            if (g_tabListOpen)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                g_tabListContentHeight = static_cast<int>(g_tabs.size()) * S(31) + S(12);
+                if (g_active >= 0)
+                {
+                    int desired = g_active * S(31) - S(20);
+                    g_tabListScrollY = std::max(0, desired);
+                }
+                g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            break;
+        case CmdSidebar: Command(hwnd, CmdSidebarPanelToggle); break;
         case CmdSearch:
             g_sidebarOpen = true;
+            if (g_immersive) g_immersiveSidebarOpen = true;
             g_sideMode = 2;
             g_searchInputFocused = true;
             g_searchCaretVisible = true;
@@ -5916,10 +9853,16 @@ namespace
             else
             {
                 g_sideMode = 0;
-                StartSidebarPanelAnimation(hwnd, true);
+                if (g_immersive)
+                {
+                    g_sidebarOpen = true;
+                    g_immersiveSidebarOpen = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                else StartSidebarPanelAnimation(hwnd, true);
             }
             break;
-        case CmdSettings: MessageBoxW(hwnd, L"主题、视图、缩放和沉浸模式已放在底部状态栏。", L"设置", MB_OK | MB_ICONINFORMATION); break;
+        case CmdSettings: ShowHelpMenu(hwnd); break;
         case CmdSearchRun:
             RunSearch();
             g_sidebarScrollY = 0;
@@ -5988,7 +9931,7 @@ namespace
             if (tab && g_activeAnnotation >= 0) DeleteAnnotation(hwnd, *tab, g_activeAnnotation);
             break;
         case CmdNoteDeleteAll:
-            if (tab && !tab->annotations.empty())
+            if (tab)
             {
                 tab->annotations.clear();
                 tab->dirty = true;
@@ -6009,8 +9952,8 @@ namespace
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdImmersive: ApplyImmersiveWindow(hwnd, !g_immersive); break;
-        case CmdZoomOut: if (tab) { tab->zoom = std::clamp(tab->zoom - 0.1, 0.25, 5.0); InvalidateRect(hwnd, nullptr, FALSE); } break;
-        case CmdZoomIn: if (tab) { tab->zoom = std::clamp(tab->zoom + 0.1, 0.25, 5.0); InvalidateRect(hwnd, nullptr, FALSE); } break;
+        case CmdZoomOut: if (tab) ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), tab->zoom - 0.1); break;
+        case CmdZoomIn: if (tab) ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), tab->zoom + 0.1); break;
         case CmdFirst:
             if (tab)
             {
@@ -6022,7 +9965,14 @@ namespace
             if (tab)
             {
                 if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY - std::max(S(60), PageH(*tab, tab->currentPage) + PageGap()));
-                else tab->currentPage = std::max(0, tab->currentPage - 1);
+                else
+                {
+                    int previous = 0;
+                    for (int start = 0; start < tab->currentPage; start = NextSpreadStart(*tab, start))
+                        previous = start;
+                    tab->currentPage = previous;
+                    g_scrollY = 0;
+                }
                 if (!g_continuousRead) InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
@@ -6030,7 +9980,11 @@ namespace
             if (tab)
             {
                 if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY + std::max(S(60), PageH(*tab, tab->currentPage) + PageGap()));
-                else tab->currentPage = std::min(tab->pageCount - 1, tab->currentPage + 1);
+                else
+                {
+                    tab->currentPage = std::min(tab->pageCount - 1, NextSpreadStart(*tab, FirstPageInSpread(tab->currentPage)));
+                    g_scrollY = 0;
+                }
                 if (!g_continuousRead) InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
@@ -6070,6 +10024,52 @@ namespace
         }
     }
 
+    bool EnsurePaintBuffer(HDC targetDc, int width, int height)
+    {
+        width = std::max(1, width);
+        height = std::max(1, height);
+        if (!g_paintBufferDc)
+            g_paintBufferDc = CreateCompatibleDC(targetDc);
+        if (!g_paintBufferDc) return false;
+        if (g_paintBufferBitmap && g_paintBufferW == width && g_paintBufferH == height)
+            return true;
+
+        HBITMAP bitmap = CreateCompatibleBitmap(targetDc, width, height);
+        if (!bitmap) return false;
+        HGDIOBJ previous = SelectObject(g_paintBufferDc, bitmap);
+        if (!g_paintBufferOldBitmap)
+            g_paintBufferOldBitmap = previous;
+        else if (previous && previous != g_paintBufferOldBitmap)
+            DeleteObject(previous);
+
+        g_paintBufferBitmap = bitmap;
+        g_paintBufferW = width;
+        g_paintBufferH = height;
+        return true;
+    }
+
+    void ReleasePaintBuffer()
+    {
+        if (g_paintBufferDc)
+        {
+            if (g_paintBufferOldBitmap)
+                SelectObject(g_paintBufferDc, g_paintBufferOldBitmap);
+            if (g_paintBufferBitmap)
+                DeleteObject(g_paintBufferBitmap);
+            DeleteDC(g_paintBufferDc);
+        }
+        g_paintBufferDc = nullptr;
+        g_paintBufferBitmap = nullptr;
+        g_paintBufferOldBitmap = nullptr;
+        g_paintBufferW = 0;
+        g_paintBufferH = 0;
+        if (g_imageDrawDc)
+        {
+            DeleteDC(g_imageDrawDc);
+            g_imageDrawDc = nullptr;
+        }
+    }
+
     void Paint(HWND hwnd)
     {
         PAINTSTRUCT ps{};
@@ -6080,11 +10080,13 @@ namespace
         if (IsRectEmpty(&dirty)) dirty = client;
         int dirtyW = std::max<int>(1, dirty.right - dirty.left);
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, dirtyW, dirtyH);
-        HGDIOBJ oldBmp = SelectObject(mem, bmp);
-        SetViewportOrgEx(mem, -dirty.left, -dirty.top, nullptr);
-        if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty);
+        if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
+        {
+            EndPaint(hwnd, &ps);
+            return;
+        }
+        HDC mem = g_paintBufferDc;
+        if (UsesBackdropTheme() && !StageLightPaintActive()) PaintGlassBackdrop(mem, dirty);
         else Fill(mem, dirty, T().bg);
         RECT toolbarRect{ 0, 0, client.right, S(38) };
         RECT tabsRect{ 0, S(38), client.right, S(76) };
@@ -6103,14 +10105,14 @@ namespace
             PaintTabs(mem, client);
         }
         PaintReader(mem, client, dirty);
+        PaintSidebarPanelToggle(mem, client);
         if (repaintUi) PaintStatus(mem, client);
-        PaintHoverTip(mem, client);
+        PaintTabListOverlay(mem, client);
         PaintClearRecentDialog(mem, client);
-        SetViewportOrgEx(mem, 0, 0, nullptr);
-        BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, oldBmp);
-        DeleteObject(bmp);
-        DeleteDC(mem);
+        PaintCustomZoomDialog(mem, client);
+        if (!g_customZoomOpen) PaintHoverTip(mem, client);
+        PaintTabDragOverlay(mem);
+        BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
         EndPaint(hwnd, &ps);
     }
 
@@ -6123,6 +10125,7 @@ namespace
             g_dpi = GetDpiForWindow(hwnd);
             DragAcceptFiles(hwnd, TRUE);
             ShowScrollBar(hwnd, SB_VERT, FALSE);
+            ShowScrollBar(hwnd, SB_HORZ, FALSE);
             {
                 GESTURECONFIG panConfig{};
                 panConfig.dwID = GID_PAN;
@@ -6132,6 +10135,7 @@ namespace
             }
             return 0;
         case WM_ACTIVATEAPP:
+            if (!wParam) StopAutoScroll(hwnd);
             if (wParam) RefreshActiveFileIfChanged(hwnd);
             return 0;
         case WM_QUIETPDF_FILE_CHANGED:
@@ -6140,17 +10144,66 @@ namespace
                 RefreshActiveFileIfChanged(hwnd);
             }
             return 0;
+        case WM_QUIETPDF_DRAG_SCROLL:
+            g_dragScrollPosted = false;
+            if (g_draggingMainScroll && g_active >= 0)
+            {
+                POINT cursor{};
+                if (GetCursorPos(&cursor))
+                {
+                    ScreenToClient(hwnd, &cursor);
+                    g_mousePos = cursor;
+                    UpdateMainScrollDragStateFromPointer(hwnd, cursor.y, true);
+                }
+                ScrollStageTo(hwnd, g_dragScrollTarget, true, false);
+            }
+            return 0;
+        case WM_QUIETPDF_PAGE_RENDERED:
+        {
+            std::unique_ptr<PageRenderResult> result(reinterpret_cast<PageRenderResult*>(lParam));
+            if (!result) return 0;
+            for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+            {
+                PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
+                PageRenderRequest const& request = result->request;
+                if (_wcsicmp(tab.path.c_str(), request.path.c_str()) != 0 ||
+                    tab.renderVersion != request.documentVersion || tab.zoom != request.zoom ||
+                    request.dpi != g_dpi || request.theme != g_theme)
+                    continue;
+
+                PreparePageCache(tab);
+                if (tab.cache.find(request.page) == tab.cache.end())
+                {
+                    tab.cache.emplace(request.page, std::move(result->image));
+                    TrimPageCache(tab, request.page);
+                }
+                if (i == g_active)
+                {
+                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    SchedulePagePrefetch(hwnd);
+                }
+                break;
+            }
+            return 0;
+        }
         case WM_DPICHANGED:
             g_dpi = HIWORD(wParam);
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             return 0;
         case WM_SIZE:
             ShowScrollBar(hwnd, SB_VERT, FALSE);
+            ShowScrollBar(hwnd, SB_HORZ, FALSE);
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             return 0;
         case WM_COMMAND:
             Command(hwnd, LOWORD(wParam));
             return 0;
+        case WM_MEASUREITEM:
+            if (MeasureThemedMenuItem(reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) return TRUE;
+            break;
+        case WM_DRAWITEM:
+            if (DrawThemedMenuItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
+            break;
         case WM_ERASEBKGND:
             return 1;
         case WM_SETCURSOR:
@@ -6160,6 +10213,11 @@ namespace
                 POINT pt{};
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
+                if (g_autoScrollActive)
+                {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    return TRUE;
+                }
                 if (g_resizingSidebar || HitSidebarSplitter(pt.x, pt.y))
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
@@ -6168,6 +10226,9 @@ namespace
             }
             break;
         }
+        case WM_COPYDATA:
+            OpenFilesFromCopyData(hwnd, reinterpret_cast<COPYDATASTRUCT const*>(lParam));
+            return TRUE;
         case WM_DROPFILES:
         {
             HDROP drop = reinterpret_cast<HDROP>(wParam);
@@ -6184,10 +10245,81 @@ namespace
             DragFinish(drop);
             return 0;
         }
+        case WM_MBUTTONDOWN:
+        {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            ToggleAutoScroll(hwnd, POINT{ x, y });
+            return 0;
+        }
+        case WM_MBUTTONUP:
+            return 0;        case WM_LBUTTONDBLCLK:
+        {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            if (g_customZoomOpen || g_confirmClearRecent)
+                return 0;
+            if (PdfTab* tab = Active())
+            {
+                int page = -1;
+                RECT pageRect{};
+                if (PageRectAtPoint(*tab, x, y, page, pageRect))
+                {
+                    if (g_selectingContent)
+                    {
+                        g_selectingContent = false;
+                        ReleaseCapture();
+                    }
+                    if (TrySelectWordAtPoint(hwnd, *tab, page, pageRect, POINT{ x, y }))
+                        return 0;
+                    ClearTextSelection();
+                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    return 0;
+                }
+            }
+            break;
+        }
         case WM_LBUTTONDOWN:
         {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            if (g_autoScrollActive)
+            {
+                StopAutoScroll(hwnd);
+                return 0;
+            }
+            if (g_customZoomOpen)
+            {
+                if (Hit(g_zoomDialogInputRect, x, y))
+                {
+                    g_customZoomFocused = true;
+                    g_customZoomCaretVisible = true;
+                    SetTimer(hwnd, 17, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (Hit(g_zoomDialogConfirmRect, x, y))
+                {
+                    g_pressedButtonRect = g_zoomDialogConfirmRect;
+                    g_hasPressedButton = true;
+                    SetTimer(hwnd, 2, 90, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    CommitCustomZoomDialog(hwnd);
+                    return 0;
+                }
+                if (Hit(g_zoomDialogCancelRect, x, y) || !Hit(g_zoomDialogRect, x, y))
+                {
+                    if (Hit(g_zoomDialogCancelRect, x, y))
+                    {
+                        g_pressedButtonRect = g_zoomDialogCancelRect;
+                        g_hasPressedButton = true;
+                        SetTimer(hwnd, 2, 90, nullptr);
+                    }
+                    CloseCustomZoomDialog(hwnd);
+                    return 0;
+                }
+                return 0;
+            }
             if (g_confirmClearRecent)
             {
                 if (Hit(g_clearDialogConfirmRect, x, y))
@@ -6202,6 +10334,54 @@ namespace
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
+                return 0;
+            }
+            if (g_tabListOpen)
+            {
+                if (Hit(g_tabListScrollThumbRect, x, y))
+                {
+                    g_draggingTabListScroll = true;
+                    g_tabListDragOffset = y - g_tabListScrollThumbRect.top;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g_tabListRect, FALSE);
+                    return 0;
+                }
+                if (Hit(g_tabListScrollTrackRect, x, y))
+                {
+                    int trackH = std::max<int>(1, g_tabListScrollTrackRect.bottom - g_tabListScrollTrackRect.top);
+                    int thumbH = std::max<int>(1, g_tabListScrollThumbRect.bottom - g_tabListScrollThumbRect.top);
+                    int visible = std::max<int>(1, g_tabListRect.bottom - g_tabListRect.top - S(12));
+                    int maxScroll = std::max<int>(0, g_tabListContentHeight - visible);
+                    int travel = std::max<int>(1, trackH - thumbH);
+                    int thumbTop = std::clamp<int>(y - thumbH / 2, g_tabListScrollTrackRect.top, g_tabListScrollTrackRect.bottom - thumbH);
+                    ScrollTabListTo(hwnd, MulDiv(thumbTop - g_tabListScrollTrackRect.top, maxScroll, travel));
+                    return 0;
+                }
+                for (size_t i = 0; i < g_tabListItemRects.size() && i < g_tabListItemIds.size(); ++i)
+                {
+                    if (Hit(g_tabListItemRects[i], x, y))
+                    {
+                        ActivateTab(hwnd, g_tabListItemIds[i]);
+                        return 0;
+                    }
+                }
+                if (Hit(g_tabListRect, x, y))
+                {
+                    return 0;
+                }
+                if (!Hit(g_tabCountRect, x, y))
+                {
+                    g_tabListOpen = false;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
+            if (Hit(g_sidebarPanelToggleRect, x, y))
+            {
+                g_pressedButtonRect = g_sidebarPanelToggleRect;
+                g_hasPressedButton = true;
+                SetTimer(hwnd, 2, 90, nullptr);
+                InvalidateRect(hwnd, &g_sidebarPanelToggleRect, FALSE);
+                Command(hwnd, CmdSidebarPanelToggle);
                 return 0;
             }
             if (!Active())
@@ -6312,6 +10492,28 @@ namespace
             {
                 CancelPageInput(hwnd);
             }
+            if (!Active() && Hit(g_homeScrollThumbRect, x, y))
+            {
+                g_draggingHomeScroll = true;
+                g_homeScrollDragOffset = y - g_homeScrollThumbRect.top;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g_homeScrollTrackRect, FALSE);
+                return 0;
+            }
+            if (!Active() && Hit(g_homeScrollTrackRect, x, y))
+            {
+                int trackH = std::max<int>(1, g_homeScrollTrackRect.bottom - g_homeScrollTrackRect.top);
+                int thumbH = std::max<int>(1, g_homeScrollThumbRect.bottom - g_homeScrollThumbRect.top);
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                RECT viewport = HomeContentViewportRect(client);
+                int visible = std::max<int>(1, viewport.bottom - viewport.top);
+                int maxScroll = std::max<int>(0, g_homeContentHeight - visible);
+                int travel = std::max<int>(1, trackH - thumbH);
+                int thumbTop = std::clamp<int>(y - thumbH / 2, g_homeScrollTrackRect.top, g_homeScrollTrackRect.bottom - thumbH);
+                ScrollHomeTo(hwnd, MulDiv(thumbTop - g_homeScrollTrackRect.top, maxScroll, travel));
+                return 0;
+            }
             if (HitSidebarSplitter(x, y))
             {
                 g_resizingSidebar = true;
@@ -6321,14 +10523,23 @@ namespace
             }
             if (Active() && Hit(g_mainScrollThumbRect, x, y))
             {
+                CancelStageMotion(hwnd);
                 g_draggingMainScroll = true;
                 g_mainScrollDragOffset = y - g_mainScrollThumbRect.top;
+                g_mainScrollDragStartY = y;
+                g_mainScrollDragStartPos = g_scrollY;
+                g_dragScrollTarget = g_scrollY;
+                g_dragScrollPosted = false;
+                g_mainScrollThumbLive = true;
+                g_mainScrollThumbLiveTop = g_mainScrollThumbRect.top;
+                g_mainScrollThumbLiveHeight = std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
                 SetCapture(hwnd);
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
                 return 0;
             }
             if (Active() && Hit(g_mainScrollTrackRect, x, y))
             {
+                CancelStageMotion(hwnd);
                 int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
                 int thumbH = std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
                 int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
@@ -6336,8 +10547,54 @@ namespace
                 int travel = std::max<int>(1, trackH - thumbH);
                 int thumbTop = std::clamp<int>(y - thumbH / 2, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
                 int newScroll = MulDiv(thumbTop - g_mainScrollTrackRect.top, maxScroll, travel);
-                ScrollStageTo(hwnd, newScroll);
+                ScrollStageTo(hwnd, newScroll, true, true);
                 return 0;
+            }
+            if (Active() && Hit(g_mainHScrollThumbRect, x, y))
+            {
+                g_draggingMainHScroll = true;
+                g_mainHScrollDragOffset = x - g_mainHScrollThumbRect.left;
+                g_mainHScrollDragStartX = x;
+                g_mainHScrollDragStartPos = g_scrollX;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+                return 0;
+            }
+            if (Active() && Hit(g_mainHScrollTrackRect, x, y))
+            {
+                int trackW = std::max<int>(1, g_mainHScrollTrackRect.right - g_mainHScrollTrackRect.left);
+                int thumbW = std::max<int>(1, g_mainHScrollThumbRect.right - g_mainHScrollThumbRect.left);
+                int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+                int maxScroll = std::max<int>(0, g_contentWidth - stageW);
+                int travel = std::max<int>(1, trackW - thumbW);
+                int thumbLeft = std::clamp<int>(x - thumbW / 2, g_mainHScrollTrackRect.left, g_mainHScrollTrackRect.right - thumbW);
+                int newScroll = MulDiv(thumbLeft - g_mainHScrollTrackRect.left, maxScroll, travel);
+                ScrollStageXTo(hwnd, newScroll);
+                return 0;
+            }
+            if (Active() && (g_sideMode == 0 || g_sideMode == 1))
+            {
+                UpdateSidebarScrollRects();
+                if (Hit(g_sidebarScrollThumbRect, x, y))
+                {
+                    g_draggingSidebarScroll = true;
+                    g_sidebarScrollDragOffset = y - g_sidebarScrollThumbRect.top;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g_sidebarScrollTrackRect, FALSE);
+                    return 0;
+                }
+                if (Hit(g_sidebarScrollTrackRect, x, y))
+                {
+                    int trackH = std::max<int>(1, g_sidebarScrollTrackRect.bottom - g_sidebarScrollTrackRect.top);
+                    int thumbH = std::max<int>(1, g_sidebarScrollThumbRect.bottom - g_sidebarScrollThumbRect.top);
+                    RECT area = SidebarScrollRect();
+                    int visible = std::max<int>(1, area.bottom - area.top);
+                    int maxScroll = std::max<int>(0, g_sidebarContentHeight - visible);
+                    int travel = std::max<int>(1, trackH - thumbH);
+                    int thumbTop = std::clamp<int>(y - thumbH / 2, g_sidebarScrollTrackRect.top, g_sidebarScrollTrackRect.bottom - thumbH);
+                    ScrollSidebarTo(hwnd, MulDiv(thumbTop - g_sidebarScrollTrackRect.top, maxScroll, travel));
+                    return 0;
+                }
             }
             for (size_t i = 0; i < g_sideTabRects.size(); ++i)
             {
@@ -6401,16 +10658,26 @@ namespace
             }
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
-                RECT close{ g_tabRects[i].right - S(30), g_tabRects[i].top + S(2), g_tabRects[i].right - S(5), g_tabRects[i].bottom - S(2) };
-                if (Hit(close, x, y)) { CloseTab(static_cast<int>(i)); return 0; }
+                int tabId = i < g_tabRectIds.size() ? g_tabRectIds[i] : static_cast<int>(i);
+                RECT close{ g_tabRects[i].right - S(24), g_tabRects[i].top + S(2), g_tabRects[i].right - S(4), g_tabRects[i].bottom - S(2) };
+                if (Hit(close, x, y)) { CloseTab(tabId); return 0; }
                 if (Hit(g_tabRects[i], x, y))
                 {
-                    g_active = static_cast<int>(i);
-                    g_scrollY = 0;
-                    g_selectedOutlineRow = -1;
-                    SetTitle();
-                    StartActiveFileWatcher(hwnd);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    g_pressedButtonRect = g_tabRects[i];
+                    g_hasPressedButton = true;
+                    SetTimer(hwnd, 2, 90, nullptr);
+                    InvalidateRect(hwnd, &g_tabRects[i], FALSE);
+                    ActivateTab(hwnd, tabId);
+                    g_draggingTab = true;
+                    g_tabDetachArmed = false;
+                    g_tabDragFloating = false;
+                    g_draggingTabIndex = tabId;
+                    g_tabDragStart = POINT{ x, y };
+                    g_tabDragOffset = POINT{ x - g_tabRects[i].left, y - g_tabRects[i].top };
+                    g_tabDragSourceRect = g_tabRects[i];
+                    g_tabDragCurrentRect = g_tabRects[i];
+                    g_tabDragInsertIndex = tabId;
+                    SetCapture(hwnd);
                     return 0;
                 }
             }
@@ -6465,6 +10732,7 @@ namespace
                 {
                     g_selectingContent = true;
                     g_hasContentSelection = false;
+                    g_selectionIsImage = false;
                     g_selectionPage = page;
                     g_selectionStart = POINT{ x, y };
                     g_selectionEnd = POINT{ x, y };
@@ -6474,7 +10742,7 @@ namespace
                     return 0;
                 }
             }
-            if (g_sidebarOpen && !g_immersive && Hit(g_sidebar, x, y))
+            if (SidebarVisible() && Hit(g_sidebar, x, y))
             {
                 PdfTab* tab = Active();
                 if (g_sideMode == 0)
@@ -6533,27 +10801,32 @@ namespace
             }
             return 0;
         }
-        case WM_RBUTTONUP:
+        case WM_RBUTTONDOWN:
         {
-            int x = GET_X_LPARAM(lParam);
-            int y = GET_Y_LPARAM(lParam);
-            if (g_hasContentSelection && !g_selectionQuads.empty())
+            if (g_autoScrollActive)
             {
-                POINT pt{ x, y };
-                ClientToScreen(hwnd, &pt);
-                ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y);
+                StopAutoScroll(hwnd);
                 return 0;
             }
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
                 if (Hit(g_tabRects[i], x, y))
                 {
                     POINT pt{ x, y };
                     ClientToScreen(hwnd, &pt);
-                    g_contextTab = static_cast<int>(i);
+                    g_contextTab = i < g_tabRectIds.size() ? g_tabRectIds[i] : static_cast<int>(i);
                     ShowTabMenu(hwnd, pt.x, pt.y);
                     return 0;
                 }
+            }
+            if (g_hasContentSelection && Hit(g_stage, x, y))
+            {
+                POINT pt{ x, y };
+                ClientToScreen(hwnd, &pt);
+                ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y, HasImageSelection());
+                return 0;
             }
             return 0;
         }
@@ -6562,28 +10835,137 @@ namespace
             int mx = GET_X_LPARAM(lParam);
             int my = GET_Y_LPARAM(lParam);
             g_mousePos = POINT{ mx, my };
+            if (g_customZoomOpen)
+            {
+                g_hasHoverTip = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_confirmClearRecent)
             {
                 g_hasHoverTip = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (g_draggingTab)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                int dx = mx - g_tabDragStart.x;
+                int dy = my - g_tabDragStart.y;
+                bool moved = (dx * dx + dy * dy) > S(8) * S(8);
+                int tabTop = g_tabRects.empty() ? S(38) : g_tabRects.front().top;
+                int tabBottom = g_tabRects.empty() ? S(76) : g_tabRects.front().bottom;
+                g_tabDetachArmed = moved && (mx < 0 || mx > client.right || my < tabTop - S(12) || my > tabBottom + S(36));
+                if (moved)
+                {
+                    g_tabDragFloating = true;
+                    int w = g_tabDragSourceRect.right - g_tabDragSourceRect.left;
+                    int h = g_tabDragSourceRect.bottom - g_tabDragSourceRect.top;
+                    g_tabDragCurrentRect = RECT{
+                        mx - g_tabDragOffset.x,
+                        my - g_tabDragOffset.y,
+                        mx - g_tabDragOffset.x + w,
+                        my - g_tabDragOffset.y + h
+                    };
+                    if (!g_tabDetachArmed)
+                        g_tabDragInsertIndex = ComputeTabInsertIndexFromPoint(mx);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                SetCursor(LoadCursorW(nullptr, g_tabDetachArmed ? IDC_SIZEALL : IDC_ARROW));
+                return 0;
+            }
             bool oldMainScrollHover = g_mainScrollHover;
+            bool oldSidebarPanelToggleHover = g_sidebarPanelToggleHover;
+            bool oldMainHScrollHover = g_mainHScrollHover;
+            bool oldHomeScrollHover = g_homeScrollHover;
+            bool oldSidebarScrollHover = g_sidebarScrollHover;
             g_mainScrollHover = Hit(g_mainScrollTrackRect, mx, my);
+            g_mainHScrollHover = Hit(g_mainHScrollTrackRect, mx, my);
+            g_homeScrollHover = Hit(g_homeScrollTrackRect, mx, my);
+            g_sidebarScrollHover = SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) && Hit(SidebarScrollRect(), mx, my);
+            g_sidebarPanelToggleHover = Hit(g_sidebarPanelToggleRect, mx, my);
+            if (oldSidebarPanelToggleHover != g_sidebarPanelToggleHover)
+            {
+                InvalidateRect(hwnd, &g_sidebarPanelToggleRect, FALSE);
+            }
             if (oldMainScrollHover != g_mainScrollHover)
             {
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
             }
+            if (oldMainHScrollHover != g_mainHScrollHover)
+            {
+                InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+            }
+            if (oldHomeScrollHover != g_homeScrollHover)
+            {
+                InvalidateRect(hwnd, &g_homeScrollTrackRect, FALSE);
+            }
+            if (oldSidebarScrollHover != g_sidebarScrollHover)
+            {
+                RECT area = SidebarScrollRect();
+                InvalidateRect(hwnd, &area, FALSE);
+            }
             if (g_draggingMainScroll)
             {
-                int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
-                int thumbH = std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
-                int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-                int maxScroll = std::max<int>(0, g_contentHeight - stageH);
+                UpdateMainScrollDragStateFromPointer(hwnd, my, true);
+                if (!g_dragScrollPosted)
+                {
+                    g_dragScrollPosted = true;
+                    PostMessageW(hwnd, WM_QUIETPDF_DRAG_SCROLL, 0, 0);
+                }
+                return 0;
+            }
+            if (g_draggingMainHScroll)
+            {
+                int trackW = std::max<int>(1, g_mainHScrollTrackRect.right - g_mainHScrollTrackRect.left);
+                int thumbW = std::max<int>(1, g_mainHScrollThumbRect.right - g_mainHScrollThumbRect.left);
+                int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+                int maxScroll = std::max<int>(0, g_contentWidth - stageW);
+                int travel = std::max<int>(1, trackW - thumbW);
+                int dragDelta = mx - g_mainHScrollDragStartX;
+                int newScroll = g_mainHScrollDragStartPos;
+                if (travel > 0 && maxScroll > 0)
+                    newScroll = g_mainHScrollDragStartPos + MulDiv(dragDelta, maxScroll, travel);
+                ScrollStageXTo(hwnd, newScroll);
+                return 0;
+            }
+            if (g_draggingHomeScroll)
+            {
+                int trackH = std::max<int>(1, g_homeScrollTrackRect.bottom - g_homeScrollTrackRect.top);
+                int thumbH = std::max<int>(1, g_homeScrollThumbRect.bottom - g_homeScrollThumbRect.top);
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                RECT viewport = HomeContentViewportRect(client);
+                int visible = std::max<int>(1, viewport.bottom - viewport.top);
+                int maxScroll = std::max<int>(0, g_homeContentHeight - visible);
                 int travel = std::max<int>(1, trackH - thumbH);
-                int thumbTop = std::clamp<int>(my - g_mainScrollDragOffset, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
-                int newScroll = MulDiv(thumbTop - g_mainScrollTrackRect.top, maxScroll, travel);
-                ScrollStageTo(hwnd, newScroll);
+                int thumbTop = std::clamp<int>(my - g_homeScrollDragOffset, g_homeScrollTrackRect.top, g_homeScrollTrackRect.bottom - thumbH);
+                ScrollHomeTo(hwnd, MulDiv(thumbTop - g_homeScrollTrackRect.top, maxScroll, travel));
+                return 0;
+            }
+            if (g_draggingSidebarScroll)
+            {
+                UpdateSidebarScrollRects();
+                int trackH = std::max<int>(1, g_sidebarScrollTrackRect.bottom - g_sidebarScrollTrackRect.top);
+                int thumbH = std::max<int>(1, g_sidebarScrollThumbRect.bottom - g_sidebarScrollThumbRect.top);
+                RECT area = SidebarScrollRect();
+                int visible = std::max<int>(1, area.bottom - area.top);
+                int maxScroll = std::max<int>(0, g_sidebarContentHeight - visible);
+                int travel = std::max<int>(1, trackH - thumbH);
+                int thumbTop = std::clamp<int>(my - g_sidebarScrollDragOffset, g_sidebarScrollTrackRect.top, g_sidebarScrollTrackRect.bottom - thumbH);
+                ScrollSidebarTo(hwnd, MulDiv(thumbTop - g_sidebarScrollTrackRect.top, maxScroll, travel));
+                return 0;
+            }
+            if (g_draggingTabListScroll)
+            {
+                int trackH = std::max<int>(1, g_tabListScrollTrackRect.bottom - g_tabListScrollTrackRect.top);
+                int thumbH = std::max<int>(1, g_tabListScrollThumbRect.bottom - g_tabListScrollThumbRect.top);
+                int visible = std::max<int>(1, g_tabListRect.bottom - g_tabListRect.top - S(12));
+                int maxScroll = std::max<int>(0, g_tabListContentHeight - visible);
+                int travel = std::max<int>(1, trackH - thumbH);
+                int thumbTop = std::clamp<int>(my - g_tabListDragOffset, g_tabListScrollTrackRect.top, g_tabListScrollTrackRect.bottom - thumbH);
+                ScrollTabListTo(hwnd, MulDiv(thumbTop - g_tabListScrollTrackRect.top, maxScroll, travel));
                 return 0;
             }
             if (g_resizingSidebar)
@@ -6608,6 +10990,7 @@ namespace
             int oldHoverSearchResult = g_hoverSearchResult;
             int oldHoverHomeHit = g_hoverHomeHit;
             int oldHoverRecentRect = g_hoverRecentRect;
+            int oldHoverTabListItem = g_hoverTabListItem;
             bool oldHasHoverButton = g_hasHoverButton;
             RECT oldHoverButtonRect = g_hoverButtonRect;
             g_hoverTab = -1;
@@ -6617,19 +11000,32 @@ namespace
             g_hoverSearchResult = -1;
             g_hoverHomeHit = -1;
             g_hoverRecentRect = -1;
+            g_hoverTabListItem = -1;
             g_hasHoverButton = false;
             g_hoverButtonRect = RECT{};
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
-                if (Hit(g_tabRects[i], mx, my)) g_hoverTab = static_cast<int>(i);
-                RECT close{ g_tabRects[i].right - S(30), g_tabRects[i].top + S(2), g_tabRects[i].right - S(5), g_tabRects[i].bottom - S(2) };
+                int tabId = i < g_tabRectIds.size() ? g_tabRectIds[i] : static_cast<int>(i);
+                if (Hit(g_tabRects[i], mx, my)) g_hoverTab = tabId;
+                RECT close{ g_tabRects[i].right - S(24), g_tabRects[i].top + S(2), g_tabRects[i].right - S(4), g_tabRects[i].bottom - S(2) };
                 if (Hit(close, mx, my))
                 {
-                    g_hoverTabClose = static_cast<int>(i);
+                    g_hoverTabClose = tabId;
                     break;
                 }
             }
-            if (g_sidebarOpen && !g_immersive && g_sideMode == 0)
+            if (g_tabListOpen)
+            {
+                for (size_t i = 0; i < g_tabListItemRects.size() && i < g_tabListItemIds.size(); ++i)
+                {
+                    if (Hit(g_tabListItemRects[i], mx, my))
+                    {
+                        g_hoverTabListItem = g_tabListItemIds[i];
+                        break;
+                    }
+                }
+            }
+            if (SidebarVisible() && g_sideMode == 0)
             {
                 for (size_t i = 0; i < g_outlineToggleRects.size() && i < g_outlineToggleRowIds.size(); ++i)
                 {
@@ -6648,7 +11044,7 @@ namespace
                     }
                 }
             }
-            if (g_sidebarOpen && !g_immersive && g_sideMode == 2)
+            if (SidebarVisible() && g_sideMode == 2)
             {
                 for (size_t i = 0; i < g_searchResultRects.size() && i < g_searchResultIds.size(); ++i)
                 {
@@ -6663,6 +11059,19 @@ namespace
             std::wstring oldTip = g_hoverTip;
             g_hasHoverTip = false;
             g_hoverTip.clear();
+            if (g_hoverTab >= 0)
+            {
+                for (size_t i = 0; i < g_tabRects.size() && i < g_tabRectIds.size() && i < g_tabTitleTruncated.size(); ++i)
+                {
+                    if (g_tabRectIds[i] == g_hoverTab && g_tabTitleTruncated[i])
+                    {
+                        g_hasHoverTip = true;
+                        g_hoverTip = g_tabs[static_cast<size_t>(g_hoverTab)]->name;
+                        g_hoverTipRect = g_tabRects[i];
+                        break;
+                    }
+                }
+            }
             if (!Active())
             {
                 for (size_t i = 0; i < g_recentRects.size(); ++i)
@@ -6695,7 +11104,7 @@ namespace
                     g_hasHoverButton = true;
                     g_hoverButtonRect = b.rect;
                 }
-                if (!b.tip.empty() && Hit(b.rect, mx, my))
+                if (!g_hasHoverTip && !b.tip.empty() && Hit(b.rect, mx, my))
                 {
                     g_hasHoverTip = true;
                     g_hoverTip = b.tip;
@@ -6703,7 +11112,7 @@ namespace
                     break;
                 }
             }
-            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect)
+            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect || oldHoverTabListItem != g_hoverTabListItem)
             {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -6743,29 +11152,93 @@ namespace
             break;
         }
         case WM_LBUTTONUP:
+            if (g_draggingTab)
+            {
+                int index = g_draggingTabIndex;
+                int insertIndex = g_tabDragInsertIndex;
+                bool detach = g_tabDetachArmed;
+                bool floating = g_tabDragFloating;
+                g_draggingTab = false;
+                g_tabDetachArmed = false;
+                g_tabDragFloating = false;
+                g_draggingTabIndex = -1;
+                g_tabDragInsertIndex = -1;
+                ReleaseCapture();
+                if (detach)
+                    DetachTabToNewWindow(hwnd, index);
+                else if (floating)
+                    MoveTabToInsertIndex(hwnd, index, insertIndex);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_selectingContent)
             {
                 RECT selection = CurrentSelectionRect();
-                if (PdfTab* tab = Active()) RefreshTextSelection(*tab);
-                g_selectingContent = false;
-                ReleaseCapture();
-                g_hasContentSelection =
-                    !g_selectionQuads.empty() &&
+                bool largeEnough =
                     (selection.right - selection.left) >= S(8) &&
                     (selection.bottom - selection.top) >= S(6);
+                bool imageHit = false;
+                if (PdfTab* tab = Active())
+                {
+                    RefreshTextSelection(*tab);
+                    if (!largeEnough && g_selectionQuads.empty())
+                        imageHit = TrySelectImageAtPoint(*tab, g_selectionPage, g_selectionPageRect, g_selectionEnd);
+                }
+                g_selectingContent = false;
+                ReleaseCapture();
+                g_selectionIsImage = imageHit || (largeEnough && g_selectionQuads.empty());
+                g_hasContentSelection = imageHit || (largeEnough && (!g_selectionQuads.empty() || g_selectionIsImage));
                 if (!g_hasContentSelection)
                 {
                     g_selectionQuads.clear();
                     g_selectionText.clear();
+                    g_selectionIsImage = false;
                 }
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
             if (g_draggingMainScroll)
             {
+                UpdateMainScrollDragStateFromPointer(hwnd, GET_Y_LPARAM(lParam), true);
                 g_draggingMainScroll = false;
+                g_mainScrollThumbLive = false;
+                g_dragScrollPosted = false;
+                ScrollStageTo(hwnd, g_dragScrollTarget, true, false);
+                if (PdfTab* tab = Active())
+                {
+                    SaveActiveTabProgress();
+                    if (g_continuousRead) SyncSidebarProgressFromScroll(hwnd, *tab);
+                }
                 ReleaseCapture();
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+                return 0;
+            }
+            if (g_draggingMainHScroll)
+            {
+                g_draggingMainHScroll = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+                return 0;
+            }
+            if (g_draggingHomeScroll)
+            {
+                g_draggingHomeScroll = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g_homeScrollTrackRect, FALSE);
+                return 0;
+            }
+            if (g_draggingSidebarScroll)
+            {
+                g_draggingSidebarScroll = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
+                return 0;
+            }
+            if (g_draggingTabListScroll)
+            {
+                g_draggingTabListScroll = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g_tabListRect, FALSE);
                 return 0;
             }
             if (g_draggingThumbSlider)
@@ -6801,25 +11274,37 @@ namespace
             if (wParam == 3)
             {
                 KillTimer(hwnd, 3);
-                if (PrefetchOnePage())
+                if (StageLightPaintActive())
                 {
                     SetTimer(hwnd, 3, 80, nullptr);
+                    return 0;
                 }
+                g_pagePrefetchPending = false;
+                PrefetchOnePage();
                 return 0;
             }
             if (wParam == 4)
             {
-                int delta = g_stageScrollTarget - g_scrollY;
-                if (!g_smoothStageScroll || std::abs(delta) <= S(2))
+                if (!g_smoothStageScroll)
                 {
-                    ScrollStageTo(hwnd, g_stageScrollTarget);
+                    KillTimer(hwnd, 4);
+                    return 0;
+                }
+                int current = g_scrollY;
+                int target = ClampStageScrollValue(g_stageScrollTarget);
+                int delta = target - current;
+                if (delta == 0)
+                {
+                    g_stageScrollVelocity = 0.0;
                     g_smoothStageScroll = false;
                     KillTimer(hwnd, 4);
                     return 0;
                 }
-                int step = delta / 3;
-                if (step == 0) step = delta > 0 ? 1 : -1;
-                ScrollStageTo(hwnd, g_scrollY + step);
+                double step = static_cast<double>(delta) * 0.30;
+                int dy = step < 0.0 ? static_cast<int>(std::floor(step)) : static_cast<int>(std::ceil(step));
+                int nextScroll = ClampStageScrollValue(current + dy);
+                ScrollStageTo(hwnd, nextScroll, true);
+                g_stageScrollPos = static_cast<double>(nextScroll);
                 return 0;
             }
             if (wParam == 5)
@@ -6853,17 +11338,33 @@ namespace
             }
             if (wParam == 8)
             {
-                if (GetTickCount64() < g_deferPageRenderUntil)
+                ULONGLONG now = GetTickCount64();
+                if (now < g_stageLightPaintUntil)
                 {
-                    SetTimer(hwnd, 8, 80, nullptr);
+                    SetTimer(hwnd, 8, static_cast<UINT>(std::max<ULONGLONG>(10, g_stageLightPaintUntil - now)), nullptr);
                     return 0;
                 }
                 KillTimer(hwnd, 8);
-                InvalidateRect(hwnd, &g_stage, FALSE);
-                RECT client{};
-                GetClientRect(hwnd, &client);
-                RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
-                InvalidateRect(hwnd, &status, FALSE);
+                g_stageLightPaintUntil = 0;
+                if (PdfTab* tab = Active())
+                {
+                    TouchRecentProgress(*tab, false);
+                    if (g_sidebarProgressRefreshPending)
+                    {
+                        SyncSidebarProgressFromScroll(hwnd, *tab);
+                        g_sidebarProgressRefreshPending = false;
+                    }
+                }
+                if (g_stageIdleRefreshPending)
+                {
+                    g_stageIdleRefreshPending = false;
+                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    if (!IsRectEmpty(&g_mainScrollTrackRect))
+                        InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+                    if (!IsRectEmpty(&g_mainHScrollTrackRect))
+                        InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+                }
+                SchedulePagePrefetch(hwnd);
                 return 0;
             }
             if (wParam == 9)
@@ -6955,13 +11456,49 @@ namespace
                 InvalidateRect(hwnd, &g_homeSearchRect, FALSE);
                 return 0;
             }
+            if (wParam == 16)
+            {
+                FlushTouchPan(hwnd);
+                return 0;
+            }
+            if (wParam == 17)
+            {
+                if (!g_customZoomOpen || !g_customZoomFocused)
+                {
+                    g_customZoomCaretVisible = true;
+                    KillTimer(hwnd, 17);
+                    return 0;
+                }
+                g_customZoomCaretVisible = !g_customZoomCaretVisible;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (wParam == 18)
+            {
+                StepTouchMomentum(hwnd);
+                return 0;
+            }
+            if (wParam == 19)
+            {
+                StepAutoScroll(hwnd);
+                return 0;
+            }
             break;
         case WM_MOUSEWHEEL:
         {
+            StopAutoScroll(hwnd);
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             ScreenToClient(hwnd, &pt);
             ScrollByWheelDelta(hwnd, pt, delta, (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0);
+            return 0;
+        }
+        case WM_MOUSEHWHEEL:
+        {
+            StopAutoScroll(hwnd);
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            int pixels = WheelPixels(delta, S(64), g_stageHWheelRemainder);
+            if (pixels != 0) ScrollStageXTo(hwnd, g_scrollX + pixels);
             return 0;
         }
         case WM_GESTURE:
@@ -6976,11 +11513,15 @@ namespace
             ScreenToClient(hwnd, &pt);
             if (info.dwID == GID_BEGIN)
             {
+                StopTouchMomentum(hwnd);
                 g_gesturePanning = false;
                 g_pageWheelDeltaAccum = 0;
+                g_gestureLastX = pt.x;
+                g_gestureLastY = pt.y;
             }
             else if (info.dwID == GID_END)
             {
+                FlushTouchPan(hwnd);
                 g_gesturePanning = false;
                 g_gestureSidebar = false;
                 g_pageWheelDeltaAccum = 0;
@@ -6990,12 +11531,15 @@ namespace
                 if ((info.dwFlags & GF_BEGIN) != 0 || !g_gesturePanning)
                 {
                     g_gesturePanning = true;
-                    g_gestureSidebar = g_sidebarOpen && !g_immersive && Hit(g_sidebar, pt.x, pt.y);
+                    g_gestureSidebar = SidebarVisible() && Hit(g_sidebar, pt.x, pt.y);
+                    g_gestureLastX = pt.x;
                     g_gestureLastY = pt.y;
                 }
                 else
                 {
+                    int deltaX = pt.x - g_gestureLastX;
                     int deltaY = pt.y - g_gestureLastY;
+                    g_gestureLastX = pt.x;
                     g_gestureLastY = pt.y;
                     POINT targetPt = pt;
                     if (g_gestureSidebar)
@@ -7003,7 +11547,7 @@ namespace
                         targetPt.x = std::clamp(targetPt.x, g_sidebar.left, std::max(g_sidebar.left, g_sidebar.right - 1));
                         targetPt.y = std::clamp(targetPt.y, g_sidebar.top, std::max(g_sidebar.top, g_sidebar.bottom - 1));
                     }
-                    ScrollByPanPixels(hwnd, targetPt, deltaY);
+                    QueueTouchPanPixels(hwnd, targetPt, deltaY, deltaX);
                 }
             }
             CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(lParam));
@@ -7030,31 +11574,74 @@ namespace
             else if (code == SB_BOTTOM) newScroll = g_contentHeight;
             g_smoothStageScroll = false;
             KillTimer(hwnd, 4);
-            ScrollStageTo(hwnd, newScroll);
+            ScrollStageTo(
+                hwnd,
+                newScroll,
+                code == SB_THUMBTRACK || code == SB_THUMBPOSITION,
+                code == SB_THUMBTRACK || code == SB_THUMBPOSITION);
+            return 0;
+        }
+        case WM_HSCROLL:
+        {
+            int code = LOWORD(wParam);
+            int newScroll = g_scrollX;
+            if (code == SB_THUMBTRACK || code == SB_THUMBPOSITION)
+            {
+                SCROLLINFO si{};
+                si.cbSize = sizeof(si);
+                si.fMask = SIF_TRACKPOS;
+                GetScrollInfo(hwnd, SB_HORZ, &si);
+                newScroll = si.nTrackPos;
+            }
+            else if (code == SB_LINELEFT) newScroll -= S(40);
+            else if (code == SB_LINERIGHT) newScroll += S(40);
+            else if (code == SB_PAGELEFT) newScroll -= g_stage.right - g_stage.left;
+            else if (code == SB_PAGERIGHT) newScroll += g_stage.right - g_stage.left;
+            else if (code == SB_LEFT) newScroll = 0;
+            else if (code == SB_RIGHT) newScroll = g_contentWidth;
+            ScrollStageXTo(hwnd, newScroll);
             return 0;
         }
         case WM_KEYDOWN:
-            if ((GetKeyState(VK_CONTROL) & 0x8000) && g_hasContentSelection && !g_selectionQuads.empty())
+            if (wParam == VK_F11) { ApplyImmersiveWindow(hwnd, !g_immersive); return 0; }
+            if (wParam == VK_ESCAPE && g_autoScrollActive) { StopAutoScroll(hwnd); return 0; }
+            if (g_customZoomOpen)
+            {
+                if (wParam == VK_RETURN)
+                {
+                    CommitCustomZoomDialog(hwnd);
+                    return 0;
+                }
+                if (wParam == VK_ESCAPE)
+                {
+                    CloseCustomZoomDialog(hwnd);
+                    return 0;
+                }
+            }
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && g_hasContentSelection)
             {
                 if (wParam == 'C')
                 {
-                    CopyTextToClipboard(hwnd, g_selectionText);
+                    CopyCurrentSelectionToClipboard(hwnd);
                     return 0;
                 }
-                if (wParam == 'H')
+                if (!g_selectionQuads.empty())
                 {
-                    AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
-                    return 0;
-                }
-                if (wParam == 'U')
-                {
-                    AddAnnotationFromSelection(hwnd, AnnotationKind::Underline);
-                    return 0;
-                }
-                if (wParam == 'K')
-                {
-                    AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout);
-                    return 0;
+                    if (wParam == 'H')
+                    {
+                        AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
+                        return 0;
+                    }
+                    if (wParam == 'U')
+                    {
+                        AddAnnotationFromSelection(hwnd, AnnotationKind::Underline);
+                        return 0;
+                    }
+                    if (wParam == 'K')
+                    {
+                        AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout);
+                        return 0;
+                    }
                 }
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'F')
@@ -7074,6 +11661,11 @@ namespace
                 return 0;
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'O') { OpenDialog(hwnd); return 0; }
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'P')
+            {
+                PrintActiveDocument(hwnd);
+                return 0;
+            }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'W') { CloseTab(g_active); return 0; }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'S')
             {
@@ -7087,7 +11679,7 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (wParam == VK_ESCAPE && g_hasContentSelection) { g_hasContentSelection = false; InvalidateRect(hwnd, &g_stage, FALSE); return 0; }
+            if (wParam == VK_ESCAPE && g_hasContentSelection) { ClearTextSelection(); InvalidateRect(hwnd, &g_stage, FALSE); return 0; }
             if (wParam == VK_ESCAPE && g_immersive) { ApplyImmersiveWindow(hwnd, false); return 0; }
             if (wParam == VK_NEXT)
             {
@@ -7105,6 +11697,31 @@ namespace
             }
             break;
         case WM_CHAR:
+            if (g_customZoomOpen && g_customZoomFocused)
+            {
+                if (wParam == VK_BACK)
+                {
+                    if (!g_customZoomText.empty()) g_customZoomText.pop_back();
+                }
+                else if (wParam == VK_RETURN)
+                {
+                    CommitCustomZoomDialog(hwnd);
+                    return 0;
+                }
+                else if ((wParam >= L'0' && wParam <= L'9') && g_customZoomText.size() < 7)
+                {
+                    if (g_customZoomText == L"0") g_customZoomText.clear();
+                    g_customZoomText.push_back(static_cast<wchar_t>(wParam));
+                }
+                else if (wParam == L'.' && g_customZoomText.find(L'.') == std::wstring::npos && !g_customZoomText.empty() && g_customZoomText.size() < 7)
+                {
+                    g_customZoomText.push_back(L'.');
+                }
+                g_customZoomCaretVisible = true;
+                SetTimer(hwnd, 17, 500, nullptr);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_annotationNoteFocused)
             {
                 PdfTab* tab = Active();
@@ -7233,14 +11850,20 @@ namespace
             Paint(hwnd);
             return 0;
         case WM_DESTROY:
+        {
             if (g_immersive) ApplyImmersiveWindow(hwnd, false);
             StopFileWatcher();
+            StopPageRenderWorker();
+            bool saveLastSession = !HasOtherQingYueWindows(hwnd);
             for (auto& tab : g_tabs) TouchRecentProgress(*tab, false);
+            if (saveLastSession) CaptureLastSessionFromOpenTabs();
             for (auto& tab : g_tabs) DropTab(*tab);
+            ReleasePaintBuffer();
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
             SaveState();
             PostQuitMessage(0);
             return 0;
+        }
         default:
             break;
         }
@@ -7252,6 +11875,52 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
 {
     try
     {
+        std::vector<std::wstring> launchFiles;
+        bool forceNewWindow = false;
+        int cliArgc = 0;
+        PWSTR* cliArgv = CommandLineToArgvW(GetCommandLineW(), &cliArgc);
+        if (cliArgv)
+        {
+            for (int i = 1; i < cliArgc; ++i)
+            {
+                if (_wcsicmp(cliArgv[i], L"--set-default-pdf") == 0)
+                {
+                    bool ok = TrySetDefaultPdfAssociationDirect();
+                    int status = g_defaultAssocStatus;
+                    LocalFree(cliArgv);
+                    return ok ? 0 : status;
+                }
+                if (_wcsicmp(cliArgv[i], L"--set-default-pdf-shell") == 0)
+                {
+                    bool ok = RegisterPdfAssociationForCurrentUser() && TrySetDefaultPdfAssociationViaShell();
+                    int status = g_defaultAssocStatus;
+                    LocalFree(cliArgv);
+                    return ok ? 0 : status;
+                }
+                if (_wcsicmp(cliArgv[i], L"--new-window") == 0)
+                {
+                    forceNewWindow = true;
+                    continue;
+                }
+                if (std::filesystem::exists(cliArgv[i]))
+                {
+                    try
+                    {
+                        if (_wcsicmp(std::filesystem::path(cliArgv[i]).extension().c_str(), L".pdf") == 0)
+                            launchFiles.push_back(cliArgv[i]);
+                    }
+                    catch (...) {}
+                }
+            }
+            LocalFree(cliArgv);
+        }
+        if (!forceNewWindow && !launchFiles.empty())
+        {
+            HWND existing = FindWindowW(L"XiaoYuePDFWindow", nullptr);
+            if (existing && SendOpenFilesToExistingWindow(existing, launchFiles))
+                return 0;
+        }
+
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         Gdiplus::GdiplusStartupInput gdiplusInput{};
         Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr);
@@ -7259,6 +11928,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         g_statusOffset = g_statusPinned ? 0 : S(34);
         g_statusTargetOffset = g_statusOffset;
         WNDCLASSW wc{};
+        wc.style = CS_DBLCLKS;
         wc.lpfnWndProc = WindowProc;
         wc.hInstance = instance;
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -7266,19 +11936,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         wc.hbrBackground = nullptr;
         wc.lpszClassName = L"XiaoYuePDFWindow";
         RegisterClassW(&wc);
-        g_hwnd = CreateWindowExW(0, wc.lpszClassName, AppName, WS_OVERLAPPEDWINDOW | WS_VSCROLL,
+        g_hwnd = CreateWindowExW(0, wc.lpszClassName, AppName, WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT, CW_USEDEFAULT, 1180, 840, nullptr, nullptr, instance, nullptr);
         if (!g_hwnd) return 1;
         ApplyWindowChrome();
+        RestoreLastSessionAndOpenLaunchFiles(g_hwnd, launchFiles);
         ShowWindow(g_hwnd, show == SW_SHOWMINIMIZED ? show : SW_SHOWMAXIMIZED);
         UpdateWindow(g_hwnd);
-        int argc = 0;
-        PWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        if (argv)
-        {
-            for (int i = 1; i < argc; ++i) if (std::filesystem::exists(argv[i])) OpenPdf(g_hwnd, argv[i]);
-            LocalFree(argv);
-        }
         MSG msg{};
         while (GetMessageW(&msg, nullptr, 0, 0))
         {
@@ -7294,3 +11958,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         return 1;
     }
 }
+
+
+
