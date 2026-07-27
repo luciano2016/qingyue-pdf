@@ -3788,8 +3788,8 @@ namespace
             for (auto const& entry : tab.cache) total += entry.second.CacheBytes();
             return total;
         };
-        size_t maxBytes = tab.zoom > 2.0 ? 12ull * 1024ull * 1024ull : 84ull * 1024ull * 1024ull;
-        size_t maxPages = tab.zoom > 2.0 ? 2ull : 9ull;
+        size_t maxBytes = tab.zoom > 2.0 ? 10ull * 1024ull * 1024ull : 48ull * 1024ull * 1024ull;
+        size_t maxPages = tab.zoom > 2.0 ? 2ull : 6ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -3954,7 +3954,7 @@ namespace
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& queued) { return queued.priority > priority; });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedPageRenders = 12;
+            constexpr size_t maxQueuedPageRenders = 6;
             while (g_pageRenderQueue.size() > maxQueuedPageRenders)
             {
                 auto victim = std::find_if(
@@ -4025,9 +4025,15 @@ namespace
         {
             return page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end();
         };
+        int enqueueBudget = (g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil)) ? 6 : 4;
         auto enqueue = [&](int page, int priority)
         {
-            if (missing(page)) QueuePageRender(hwnd, *tab, page, priority);
+            if (enqueueBudget <= 0) return;
+            if (missing(page))
+            {
+                QueuePageRender(hwnd, *tab, page, priority);
+                --enqueueBudget;
+            }
         };
 
         int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(*tab) : FirstPageInSpread(std::clamp(tab->currentPage, 0, tab->pageCount - 1));
@@ -4050,8 +4056,8 @@ namespace
 
         int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int forward = rapidScroll ? 5 : 3;
-        int backward = rapidScroll ? 3 : 2;
+        int forward = rapidScroll ? 2 : 1;
+        int backward = 1;
         int nextStart = NextSpreadStart(*tab, lastVisible);
         for (int start = nextStart, n = 0; start < tab->pageCount && n < forward; start = NextSpreadStart(*tab, start), ++n)
         {
@@ -10374,7 +10380,6 @@ namespace
                 if (i == g_active)
                 {
                     InvalidateRect(hwnd, &g_stage, FALSE);
-                    SchedulePagePrefetch(hwnd);
                 }
                 break;
             }
