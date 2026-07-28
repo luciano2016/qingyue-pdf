@@ -4757,7 +4757,11 @@ namespace
                 std::uint8_t b = p[0];
                 std::uint8_t g = p[1];
                 std::uint8_t red = p[2];
-                if (Luma(red, g, b) >= 172)
+                bool paperPixel = red >= 238 && g >= 238 && b >= 238 &&
+                    std::abs(static_cast<int>(red) - static_cast<int>(g)) <= 10 &&
+                    std::abs(static_cast<int>(red) - static_cast<int>(b)) <= 10 &&
+                    std::abs(static_cast<int>(g) - static_cast<int>(b)) <= 10;
+                if (paperPixel)
                 {
                     p[0] = 168;
                     p[1] = 241;
