@@ -1852,12 +1852,19 @@ namespace
         if (travel > 0 && maxScroll > 0)
             newScroll = g_mainScrollDragStartPos + MulDiv(dragDelta, maxScroll, travel);
 
+        int oldTarget = g_dragScrollTarget;
         int liveTop = std::clamp<int>(pointerY - g_mainScrollDragOffset, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
         bool liveChanged = !g_mainScrollThumbLive || g_mainScrollThumbLiveTop != liveTop;
         g_mainScrollThumbLive = true;
         g_mainScrollThumbLiveTop = liveTop;
         g_mainScrollThumbLiveHeight = thumbH;
         g_dragScrollTarget = std::clamp<int>(newScroll, 0, maxScroll);
+
+        if (g_dragScrollTarget != oldTarget && !g_dragScrollPosted)
+        {
+            g_dragScrollPosted = true;
+            PostMessageW(hwnd, WM_QUIETPDF_DRAG_SCROLL, 0, 0);
+        }
 
         if (redrawNow && liveChanged)
             RedrawMainScrollBarNow(hwnd);
@@ -6535,6 +6542,22 @@ namespace
         RedrawMainScrollBarNow(hwnd);
         SchedulePagePrefetch(hwnd);
     }
+
+    void CommitMainScrollDragTarget(HWND hwnd)
+    {
+        if (g_active < 0) return;
+        int target = g_dragScrollTarget;
+        if (target == g_scrollY) return;
+        if (PdfTab* tab = Active())
+            WarmLowZoomPagesAtScroll(*tab, target);
+        ScrollStageTo(hwnd, target, true, false);
+        if (PdfTab* tab = Active())
+        {
+            SaveActiveTabProgress();
+            if (g_continuousRead) SyncSidebarProgressFromScroll(hwnd, *tab);
+        }
+    }
+
 
     void FlushStageForTouch(HWND hwnd, int deltaY)
     {
@@ -11409,6 +11432,8 @@ namespace
                     g_mousePos = cursor;
                     UpdateMainScrollDragStateFromPointer(hwnd, cursor.y, true);
                 }
+                CommitMainScrollDragTarget(hwnd);
+                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
             }
             return 0;
         case WM_QUIETPDF_PAGE_RENDERED:
@@ -12511,14 +12536,7 @@ namespace
                 g_draggingMainScroll = false;
                 g_mainScrollThumbLive = false;
                 g_dragScrollPosted = false;
-                if (PdfTab* tab = Active())
-                    WarmLowZoomPagesAtScroll(*tab, g_dragScrollTarget);
-                ScrollStageTo(hwnd, g_dragScrollTarget, true, false);
-                if (PdfTab* tab = Active())
-                {
-                    SaveActiveTabProgress();
-                    if (g_continuousRead) SyncSidebarProgressFromScroll(hwnd, *tab);
-                }
+                CommitMainScrollDragTarget(hwnd);
                 ReleaseCapture();
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
                 return 0;
