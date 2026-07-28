@@ -297,7 +297,6 @@ namespace
         std::vector<PageInfo> pages;
         std::vector<OutlineItem> outline;
         std::map<int, PageImage> cache;
-        std::map<int, PageImage> zoomBridgeCache;
         std::map<int, PageImage> zoomFallbackCache;
         std::map<TileKey, PageImage> tileCache;
         std::map<int, PageImage> thumbCache;
@@ -314,10 +313,6 @@ namespace
         unsigned zoomFallbackDpi{};
         int zoomFallbackTheme{ -1 };
         ULONGLONG zoomFallbackUntil{};
-        double zoomBridgeZoom{};
-        unsigned zoomBridgeDpi{};
-        int zoomBridgeTheme{ -1 };
-        ULONGLONG zoomBridgeUntil{};
         int cachedThumbSize{};
         int cachedThumbTheme{ -1 };
         std::filesystem::file_time_type fileStamp{};
@@ -3190,7 +3185,6 @@ namespace
             if (i == g_active) continue;
             PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
             tab.cache.clear();
-            tab.zoomBridgeCache.clear();
             tab.zoomFallbackCache.clear();
             tab.tileCache.clear();
             tab.thumbCache.clear();
@@ -3988,67 +3982,6 @@ namespace
             tab.cache.erase(victim);
         }
     }
-    void PruneZoomBridgeCache(PdfTab& tab)
-    {
-        if (tab.zoomBridgeCache.empty()) return;
-        if (tab.zoomBridgeDpi != g_dpi || tab.zoomBridgeTheme != g_theme || GetTickCount64() > tab.zoomBridgeUntil)
-        {
-            tab.zoomBridgeCache.clear();
-            tab.zoomBridgeZoom = 0.0;
-            tab.zoomBridgeDpi = 0;
-            tab.zoomBridgeTheme = -1;
-            tab.zoomBridgeUntil = 0;
-        }
-    }
-
-    PageImage* FindZoomBridgePage(PdfTab& tab, int index)
-    {
-        PruneZoomBridgeCache(tab);
-        if (tab.zoomBridgeCache.empty() || tab.zoomBridgeDpi != g_dpi || tab.zoomBridgeTheme != g_theme) return nullptr;
-        auto found = tab.zoomBridgeCache.find(index);
-        return found == tab.zoomBridgeCache.end() ? nullptr : &found->second;
-    }
-
-    void TrimZoomBridgeCache(PdfTab& tab, int protectedPage)
-    {
-        size_t keepPages = static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + 2, 2, 16));
-        size_t maxBytes = std::clamp<size_t>(DynamicPageCacheByteLimit(tab), 10ull * 1024ull * 1024ull, 24ull * 1024ull * 1024ull);
-        auto cacheBytes = [&]()
-        {
-            size_t total = 0;
-            for (auto const& entry : tab.zoomBridgeCache) total += entry.second.CacheBytes();
-            return total;
-        };
-        while (tab.zoomBridgeCache.size() > keepPages || cacheBytes() > maxBytes)
-        {
-            auto victim = tab.zoomBridgeCache.end();
-            int worstDistance = -1;
-            for (auto candidate = tab.zoomBridgeCache.begin(); candidate != tab.zoomBridgeCache.end(); ++candidate)
-            {
-                if (candidate->first == protectedPage && tab.zoomBridgeCache.size() > 1) continue;
-                int distance = std::abs(candidate->first - tab.currentPage);
-                if (distance > worstDistance)
-                {
-                    worstDistance = distance;
-                    victim = candidate;
-                }
-            }
-            if (victim == tab.zoomBridgeCache.end() || victim->first == protectedPage) break;
-            tab.zoomBridgeCache.erase(victim);
-        }
-    }
-
-    void CaptureZoomBridgeFromPageCache(PdfTab& tab, int protectedPage)
-    {
-        if (tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme || tab.cache.empty()) return;
-        tab.zoomBridgeCache = tab.cache;
-        tab.zoomBridgeZoom = tab.cachedZoom;
-        tab.zoomBridgeDpi = tab.cachedDpi;
-        tab.zoomBridgeTheme = tab.cachedTheme;
-        tab.zoomBridgeUntil = GetTickCount64() + 2200;
-        TrimZoomBridgeCache(tab, protectedPage);
-    }
-
     PageImage* FindCachedPage(PdfTab& tab, int index)
     {
         PreparePageCache(tab);
@@ -4365,7 +4298,6 @@ namespace
         if (!tab) return;
         PreparePageCache(*tab);
         PruneZoomFallbackCache(*tab);
-        PruneZoomBridgeCache(*tab);
 
         for (auto it = tab->cache.begin(); it != tab->cache.end(); )
         {
@@ -6418,8 +6350,7 @@ namespace
                 hadVisible = true;
 
                 bool pageReady = false;
-                PageImage* fallback = FindZoomBridgePage(tab, page);
-                if (!fallback) fallback = FindZoomFallbackPage(tab, page);
+                PageImage* fallback = FindZoomFallbackPage(tab, page);
                 if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                     pageReady = true;
 
@@ -6721,18 +6652,20 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
-        if (tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme && !tab.cache.empty())
+        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme &&
+            tab.zoom < TileRenderZoomThreshold && clampedZoom < 3.25 && !tab.cache.empty())
         {
-            CaptureZoomBridgeFromPageCache(tab, anchorPage);
+            tab.zoomFallbackCache = std::move(tab.cache);
+            tab.zoomFallbackZoom = tab.cachedZoom;
+            tab.zoomFallbackDpi = tab.cachedDpi;
+            tab.zoomFallbackTheme = tab.cachedTheme;
+            tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
-        else if (!tab.zoomBridgeCache.empty() && tab.zoomBridgeDpi == g_dpi && tab.zoomBridgeTheme == g_theme)
+        else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
         {
-            tab.zoomBridgeUntil = GetTickCount64() + 2200;
+            tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
-        if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
-        {
-            tab.zoomFallbackUntil = GetTickCount64() + 1600;
-        }
+
         tab.zoom = clampedZoom;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
@@ -8908,16 +8841,11 @@ namespace
                         bool usingZoomFallback = false;
                         if (!image)
                         {
-                            image = FindZoomBridgePage(tab, i);
-                            usingZoomFallback = image != nullptr;
-                        }
-                        if (!image)
-                        {
                             image = FindZoomFallbackPage(tab, i);
                             usingZoomFallback = image != nullptr;
+                            QueuePageRender(g_hwnd, tab, i, 0);
                         }
-                        if (!image) QueuePageRender(g_hwnd, tab, i, 0);
-                        if (!image) Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, RGB(255, 255, 255));
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -8937,9 +8865,9 @@ namespace
                     }
                     else
                     {
+                        Fill(dc, drawRect, RGB(255, 255, 255));
                         bool fallbackPainted = false;
-                        PageImage* fallback = FindZoomBridgePage(tab, i);
-                        if (!fallback) fallback = FindZoomFallbackPage(tab, i);
+                        PageImage* fallback = FindZoomFallbackPage(tab, i);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                         {
                             int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
@@ -8972,7 +8900,6 @@ namespace
                             if (!fallback && !StageScrollPaintInProgress())
                                 QueueZoomPreviewRender(g_hwnd, tab, i, 10);
                         }
-                        if (!fallbackPainted && !coarsePainted && !targetPainted) Fill(dc, drawRect, RGB(255, 255, 255));
                         if (fallbackPainted || coarsePainted || targetPainted) paintedRenderable = true;
                         if (targetMissing && !fallbackPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                     }
@@ -10379,7 +10306,6 @@ namespace
         tab.pages.clear();
         tab.outline.clear();
         tab.cache.clear();
-        tab.zoomBridgeCache.clear();
         tab.zoomFallbackCache.clear();
         tab.tileCache.clear();
         tab.thumbCache.clear();
