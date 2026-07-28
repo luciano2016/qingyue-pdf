@@ -5926,6 +5926,19 @@ namespace
         if (GetOpenFileNameW(&ofn)) OpenPdf(hwnd, file);
     }
 
+    void DisableNativeScrollbars(HWND hwnd)
+    {
+        if (!hwnd) return;
+        LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        LONG_PTR stripped = style & ~(WS_VSCROLL | WS_HSCROLL);
+        if (stripped != style)
+        {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
+            SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+        ShowScrollBar(hwnd, SB_BOTH, FALSE);
+    }
     void ClampScroll(HWND hwnd)
     {
         PdfTab* tab = Active();
@@ -5944,16 +5957,7 @@ namespace
             TouchRecentProgress(*tab, false);
             SyncSidebarProgressFromScroll(hwnd, *tab);
         }
-        SCROLLINFO si{};
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-        si.nMin = 0;
-        si.nMax = std::max<int>(0, g_contentHeight);
-        si.nPage = static_cast<UINT>(std::max<int>(0, g_stage.bottom - g_stage.top));
-        si.nPos = g_scrollY;
-        SetScrollInfo(hwnd, SB_VERT, &si, FALSE);
-        ShowScrollBar(hwnd, SB_VERT, FALSE);
-        ShowScrollBar(hwnd, SB_HORZ, FALSE);
+        DisableNativeScrollbars(hwnd);
     }
 
     void UpdateVertScrollBar(HWND hwnd)
@@ -5964,16 +5968,7 @@ namespace
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
             g_contentWidth = ReadingContentWidth(*tab);
         }
-        SCROLLINFO si{};
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-        si.nMin = 0;
-        si.nMax = std::max<int>(0, g_contentHeight);
-        si.nPage = static_cast<UINT>(std::max<int>(0, g_stage.bottom - g_stage.top));
-        si.nPos = g_scrollY;
-        SetScrollInfo(hwnd, SB_VERT, &si, FALSE);
-        ShowScrollBar(hwnd, SB_VERT, FALSE);
-        ShowScrollBar(hwnd, SB_HORZ, FALSE);
+        DisableNativeScrollbars(hwnd);
     }
 
     bool Hit(RECT r, int x, int y)
@@ -6211,6 +6206,45 @@ namespace
         SetTimer(hwnd, 8, 140, nullptr);
     }
 
+    bool LowZoomVisiblePagesReady(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.zoom >= TileRenderZoomThreshold || tab.pageCount <= 0) return true;
+        int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        RECT view = g_stage;
+        bool hadVisible = false;
+        bool ready = true;
+        int queued = 0;
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int spreadH = SpreadHeight(tab, start);
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
+            if (g_continuousRead && spreadRect.top > view.bottom + S(8)) break;
+            if (!Intersects(spreadRect, view)) continue;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                if (!Intersects(pageRect, view)) continue;
+                hadVisible = true;
+                PageImage* image = FindCachedPage(tab, page);
+                if (!image || ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0))
+                {
+                    ready = false;
+                    if (queued < 4)
+                    {
+                        QueuePageRender(hwnd, tab, page, -20 + queued);
+                        ++queued;
+                    }
+                }
+            }
+        }
+        return !hadVisible || ready;
+    }
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
         PdfTab* tab = Active();
@@ -6291,7 +6325,11 @@ namespace
         }
         else
         {
-            ScrollStagePixels(hwnd, 0, dy, pageChanged);
+            bool canPixelScroll = true;
+            if (tab && tab->zoom < TileRenderZoomThreshold)
+                canPixelScroll = LowZoomVisiblePagesReady(hwnd, *tab);
+            if (canPixelScroll) ScrollStagePixels(hwnd, 0, dy, pageChanged);
+            else RequestStageRepaint(hwnd, pageChanged);
         }
         UpdateVertScrollBar(hwnd);
         SchedulePagePrefetch(hwnd);
@@ -8783,7 +8821,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        return !hadVisiblePage || paintedRenderable || !missingVisiblePage;
+        return !hadVisiblePage || !missingVisiblePage;
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -10368,8 +10406,7 @@ namespace
             SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
-        ShowScrollBar(hwnd, SB_VERT, FALSE);
-        ShowScrollBar(hwnd, SB_HORZ, FALSE);
+            DisableNativeScrollbars(hwnd);
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 
@@ -11081,8 +11118,7 @@ namespace
             g_dpi = GetDpiForWindow(hwnd);
             DragAcceptFiles(hwnd, TRUE);
             SetWindowLongPtrW(hwnd, GWL_STYLE, GetWindowLongPtrW(hwnd, GWL_STYLE) & ~(WS_VSCROLL | WS_HSCROLL));
-            ShowScrollBar(hwnd, SB_VERT, FALSE);
-            ShowScrollBar(hwnd, SB_HORZ, FALSE);
+            DisableNativeScrollbars(hwnd);
             {
                 GESTURECONFIG panConfig{};
                 panConfig.dwID = GID_PAN;
@@ -11198,8 +11234,7 @@ namespace
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             return 0;
         case WM_SIZE:
-            ShowScrollBar(hwnd, SB_VERT, FALSE);
-            ShowScrollBar(hwnd, SB_HORZ, FALSE);
+            DisableNativeScrollbars(hwnd);
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             return 0;
         case WM_COMMAND:
