@@ -1354,7 +1354,8 @@ namespace
         { L"\u62a4\u773c\u7c73\u767d", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
         { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
         { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) }
+        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) },
+        { L"IDEA light", RGB(246,247,249), RGB(242,243,245), RGB(255,255,255), RGB(238,240,243), RGB(255,255,255), RGB(43,48,56), RGB(116,123,132), RGB(213,217,222), RGB(83,145,207) }
     };
 
     Theme const& T()
@@ -1375,6 +1376,11 @@ namespace
     bool IsBeigeTheme()
     {
         return g_theme == 1;
+    }
+
+    bool IsIdeaLightTheme()
+    {
+        return g_theme == 5;
     }
 
     bool SidebarVisible()
@@ -1408,7 +1414,7 @@ namespace
 
     bool IsDarkTheme()
     {
-        return g_theme >= 2;
+        return g_theme >= 2 && g_theme <= 4;
     }
 
     COLORREF ForegroundOn(COLORREF bg)
@@ -1421,7 +1427,8 @@ namespace
     COLORREF SidebarHoverFill()
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
-        if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.08);
+        if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.115);
+        if (IsIdeaLightTheme()) return RGB(235, 237, 240);
         if (IsBeigeTheme()) return MixColor(RGB(246, 241, 231), RGB(0, 0, 0), 0.03);
         if (IsDarkTheme()) return MixColor(T().panel2, RGB(255, 255, 255), 0.04);
         return MixColor(T().panel2, T().accent, 0.10);
@@ -1430,7 +1437,8 @@ namespace
     COLORREF SidebarSelectedFill()
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.075);
-        if (IsGlassTheme()) return MixColor(T().accent, RGB(255, 255, 255), 0.10);
+        if (IsGlassTheme()) return MixColor(T().accent, RGB(255, 255, 255), 0.18);
+        if (IsIdeaLightTheme()) return RGB(221, 232, 244);
         if (IsBeigeTheme()) return T().panel2;
         if (IsDarkTheme()) return MixColor(T().accent, T().panel2, 0.18);
         return MixColor(T().accent, T().paper, 0.12);
@@ -1439,6 +1447,7 @@ namespace
     COLORREF SidebarSelectedBorder()
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
+        if (IsIdeaLightTheme()) return RGB(190, 209, 231);
         if (IsDarkTheme() && !IsAuroraTheme()) return MixColor(T().accent, T().panel2, 0.25);
         if (IsBeigeTheme()) return T().line;
         return SidebarSelectedFill();
@@ -1447,6 +1456,7 @@ namespace
     COLORREF SidebarTreeColor()
     {
         if (IsAuroraTheme()) return MixColor(T().line, T().accent, 0.30);
+        if (IsIdeaLightTheme()) return RGB(205, 210, 216);
         if (IsDarkTheme()) return MixColor(T().line, T().muted, 0.28);
         return MixColor(T().line, T().muted, 0.44);
     }
@@ -1454,6 +1464,7 @@ namespace
     COLORREF SidebarToggleFill(bool hovered)
     {
         if (IsAuroraTheme()) return hovered ? MixColor(T().panel2, T().accent, 0.30) : MixColor(T().panel2, T().accent, 0.16);
+        if (IsIdeaLightTheme()) return hovered ? RGB(229, 232, 236) : RGB(246, 247, 249);
         if (IsBeigeTheme()) return hovered ? SidebarSelectedFill() : MixColor(RGB(251, 247, 239), RGB(0, 0, 0), 0.03);
         if (IsDarkTheme()) return hovered ? MixColor(T().panel2, T().text, 0.18) : MixColor(T().panel2, T().line, 0.12);
         return hovered ? MixColor(T().panel2, T().text, 0.12) : MixColor(T().panel2, T().line, 0.08);
@@ -1462,6 +1473,7 @@ namespace
     COLORREF SidebarToggleLine(bool hovered)
     {
         if (IsAuroraTheme()) return hovered ? MixColor(T().accent, RGB(255, 255, 255), 0.18) : MixColor(T().accent, T().text, 0.20);
+        if (IsIdeaLightTheme()) return hovered ? RGB(83, 145, 207) : RGB(103, 111, 120);
         if (IsBeigeTheme()) return hovered ? RGB(111, 155, 255) : RGB(111, 106, 99);
         return hovered ? MixColor(T().text, T().muted, 0.22) : MixColor(T().muted, T().text, 0.16);
     }
@@ -1469,6 +1481,7 @@ namespace
     COLORREF SidebarIconColor()
     {
         if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.34);
+        if (IsIdeaLightTheme()) return RGB(100, 109, 118);
         if (IsBeigeTheme()) return RGB(111, 106, 99);
         return MixColor(T().muted, T().text, IsDarkTheme() ? 0.18 : 0.10);
     }
@@ -1540,7 +1553,7 @@ namespace
     COLORREF ScrollTrackColor()
     {
         if (IsAuroraTheme()) return MixColor(T().bg, T().panel, 0.58);
-        if (IsGlassTheme()) return MixColor(T().panel, RGB(255, 255, 255), 0.34);
+        if (IsGlassTheme()) return MixColor(T().panel, RGB(255, 255, 255), 0.28);
         if (IsDarkTheme()) return MixColor(T().bg, T().panel, 0.64);
         return MixColor(T().bg, T().panel, 0.42);
     }
@@ -3046,7 +3059,7 @@ namespace
                 int savedTheme = std::atoi(line.c_str() + 6);
                 if (themeSchema2)
                 {
-                    g_theme = std::clamp(savedTheme, 0, 4);
+                    g_theme = std::clamp(savedTheme, 0, 5);
                 }
                 else switch (savedTheme)
                 {
@@ -6309,13 +6322,16 @@ namespace
         CancelStageMotion(hwnd);
 
         int anchorPage = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
+        double anchorX = 0.5;
         double anchorY = 0.5;
         RECT pageRect{};
         int hoveredPage = -1;
         if (PageRectAtPoint(tab, clientPt.x, clientPt.y, hoveredPage, pageRect))
         {
             anchorPage = hoveredPage;
+            int pageW = std::max<int>(1, pageRect.right - pageRect.left);
             int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+            anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme &&
@@ -6336,12 +6352,29 @@ namespace
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
 
+
+        auto restoreHorizontalAnchor = [&]()
+        {
+            int savedScrollX = g_scrollX;
+            g_scrollX = 0;
+            RECT newPageRect{};
+            int start = FirstPageInSpread(anchorPage);
+            bool hasRect = BuildSpreadPageRect(tab, start, 0, anchorPage, newPageRect);
+            g_scrollX = savedScrollX;
+            if (!hasRect) return;
+            int pageW = std::max<int>(1, newPageRect.right - newPageRect.left);
+            int desiredX = newPageRect.left + static_cast<int>(anchorX * pageW + 0.5) - clientPt.x;
+            int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
+            g_scrollX = std::clamp(desiredX, 0, maxScrollX);
+        };
         if (g_continuousRead)
         {
             int pageTop = PageTopScroll(tab, anchorPage);
             int pageH = PageH(tab, anchorPage);
             int desiredScroll = g_stage.top + pageTop + static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
             g_contentHeight = ContinuousContentHeight(tab);
+            g_contentWidth = ReadingContentWidth(tab);
+            restoreHorizontalAnchor();
             int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
             g_scrollY = std::clamp(desiredScroll, 0, maxScroll);
             tab.currentPage = PageFromScroll(tab, g_scrollY);
@@ -6353,12 +6386,15 @@ namespace
             int pageH = PageH(tab, anchorPage);
             int desiredScroll = g_stage.top + S(28) + static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
             g_contentHeight = SinglePageContentHeight(tab);
+            g_contentWidth = ReadingContentWidth(tab);
+            restoreHorizontalAnchor();
             g_scrollY = std::clamp(desiredScroll, 0, SinglePageMaxScroll(tab));
             TouchRecentProgress(tab, false);
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
 
         UpdateVertScrollBar(hwnd);
+        if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
         InvalidateRect(hwnd, nullptr, FALSE);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -6743,7 +6779,6 @@ namespace
             g_scrollY = 0;
             return;
         }
-
         if (g_continuousRead)
         {
             g_contentHeight = ContinuousContentHeight(*tab);
@@ -6963,10 +6998,10 @@ namespace
                     }
                     else
                     {
-                        AlphaFill(dc, r, RGB(255, 255, 255), pressed ? 196 : (active ? 168 : 112));
+                        AlphaFill(dc, r, RGB(255, 255, 255), pressed ? 196 : (active ? 132 : 112));
                         RoundFill(dc, r, S(9),
-                            pressed ? RGB(245, 249, 252) : (active ? RGB(250, 252, 254) : RGB(255, 255, 255)),
-                            pressed ? RGB(198, 208, 220) : (active ? RGB(218, 224, 232) : RGB(230, 235, 241)));
+                            pressed ? RGB(245, 249, 252) : (active ? RGB(239, 246, 251) : RGB(255, 255, 255)),
+                            pressed ? RGB(198, 208, 220) : (active ? RGB(198, 211, 224) : RGB(230, 235, 241)));
                         AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), pressed ? 48 : 36);
                     }
                 }
@@ -12738,6 +12773,3 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         return 1;
     }
 }
-
-
-
