@@ -1680,6 +1680,45 @@ namespace
         DeleteDC(mem);
     }
 
+    void AlphaFillFeathered(HDC dc, RECT r, COLORREF color, BYTE alpha)
+    {
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w <= 0 || h <= 0) return;
+        if (w <= 2 || h <= 2 || alpha >= 254)
+        {
+            AlphaFill(dc, r, color, alpha);
+            return;
+        }
+        RECT core{ r.left + 1, r.top + 1, r.right - 1, r.bottom - 1 };
+        AlphaFill(dc, core, color, alpha);
+        BYTE edge = static_cast<BYTE>(std::max<int>(24, alpha / 2));
+        AlphaFill(dc, RECT{ r.left, r.top + 1, r.left + 1, r.bottom - 1 }, color, edge);
+        AlphaFill(dc, RECT{ r.right - 1, r.top + 1, r.right, r.bottom - 1 }, color, edge);
+        AlphaFill(dc, RECT{ r.left + 1, r.top, r.right - 1, r.top + 1 }, color, edge);
+        AlphaFill(dc, RECT{ r.left + 1, r.bottom - 1, r.right - 1, r.bottom }, color, edge);
+        BYTE corner = static_cast<BYTE>(std::max<int>(12, alpha / 3));
+        AlphaFill(dc, RECT{ r.left, r.top, r.left + 1, r.top + 1 }, color, corner);
+        AlphaFill(dc, RECT{ r.right - 1, r.top, r.right, r.top + 1 }, color, corner);
+        AlphaFill(dc, RECT{ r.left, r.bottom - 1, r.left + 1, r.bottom }, color, corner);
+        AlphaFill(dc, RECT{ r.right - 1, r.bottom - 1, r.right, r.bottom }, color, corner);
+    }
+    void AlphaFillFeatherEdges(HDC dc, RECT r, COLORREF color, BYTE alpha)
+    {
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w <= 0 || h <= 0) return;
+        BYTE edge = static_cast<BYTE>(std::max<int>(16, alpha));
+        AlphaFill(dc, RECT{ r.left, r.top + 1, r.left + 1, r.bottom - 1 }, color, edge);
+        AlphaFill(dc, RECT{ r.right - 1, r.top + 1, r.right, r.bottom - 1 }, color, edge);
+        AlphaFill(dc, RECT{ r.left + 1, r.top, r.right - 1, r.top + 1 }, color, edge);
+        AlphaFill(dc, RECT{ r.left + 1, r.bottom - 1, r.right - 1, r.bottom }, color, edge);
+        BYTE corner = static_cast<BYTE>(std::max<int>(8, alpha / 2));
+        AlphaFill(dc, RECT{ r.left, r.top, r.left + 1, r.top + 1 }, color, corner);
+        AlphaFill(dc, RECT{ r.right - 1, r.top, r.right, r.top + 1 }, color, corner);
+        AlphaFill(dc, RECT{ r.left, r.bottom - 1, r.left + 1, r.bottom }, color, corner);
+        AlphaFill(dc, RECT{ r.right - 1, r.bottom - 1, r.right, r.bottom }, color, corner);
+    }
     void PaintGlassBackdrop(HDC dc, RECT r)
     {
         RECT client{};
@@ -5006,9 +5045,14 @@ namespace
         }
 
         if (touchedPaper)
+        {
             BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+            AlphaFillFeatherEdges(dc, r, selectionFill, 42);
+        }
         else
-            AlphaFill(dc, r, selectionFill, TextSelectionAlpha());
+        {
+            AlphaFillFeathered(dc, r, selectionFill, TextSelectionAlpha());
+        }
         SelectObject(mem, old);
         DeleteObject(bitmap);
         DeleteDC(mem);
@@ -6701,11 +6745,11 @@ namespace
             tab.zoomFallbackZoom = tab.cachedZoom;
             tab.zoomFallbackDpi = tab.cachedDpi;
             tab.zoomFallbackTheme = tab.cachedTheme;
-            tab.zoomFallbackUntil = GetTickCount64() + 1800;
+            tab.zoomFallbackUntil = GetTickCount64() + 3000;
         }
         else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
         {
-            tab.zoomFallbackUntil = GetTickCount64() + 1800;
+            tab.zoomFallbackUntil = GetTickCount64() + 3000;
         }
 
         tab.zoom = clampedZoom;
@@ -6754,6 +6798,23 @@ namespace
         }
 
         UpdateVertScrollBar(hwnd);
+        if (tab.zoom >= TileRenderZoomThreshold)
+        {
+            g_stageScrollDirection = 0;
+            int zoomTileBudget = 18;
+            RECT zoomPrefetch = g_stage;
+            InflateRect(&zoomPrefetch, S(48), S(48));
+            int start = FirstPageInSpread(anchorPage);
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && zoomTileBudget > 0; ++j)
+            {
+                int page = start + j;
+                RECT newPageRect{};
+                if (BuildSpreadPageRect(tab, start, y, page, newPageRect))
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, newPageRect, zoomPrefetch, 0, -16, zoomTileBudget);
+            }
+        }
         if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
         InvalidateRect(hwnd, nullptr, FALSE);
         RECT client{};
@@ -8997,7 +9058,7 @@ namespace
                             RECT visibleSelection{};
                             if (IntersectRect(&visibleSelection, &selection, &pageRect))
                             {
-                                AlphaFill(dc, visibleSelection, TextSelectionFillColor(), TextSelectionAlpha());
+                                AlphaFillFeathered(dc, visibleSelection, TextSelectionFillColor(), TextSelectionAlpha());
                                 RECT top{ visibleSelection.left, visibleSelection.top, visibleSelection.right, visibleSelection.top + std::max(1, S(1)) };
                                 RECT bottom{ visibleSelection.left, visibleSelection.bottom - std::max(1, S(1)), visibleSelection.right, visibleSelection.bottom };
                                 RECT left{ visibleSelection.left, visibleSelection.top, visibleSelection.left + std::max(1, S(1)), visibleSelection.bottom };
