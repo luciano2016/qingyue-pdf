@@ -1242,9 +1242,6 @@ namespace
     HDC g_paintBufferDc{};
     HDC g_imageDrawDc{};
     HBITMAP g_paintBufferBitmap{};
-    HBITMAP g_zoomStageSnapshot{};
-    RECT g_zoomStageSnapshotRect{};
-    ULONGLONG g_zoomStageSnapshotUntil{};
     HGDIOBJ g_paintBufferOldBitmap{};
     int g_glassBackdropW{};
     int g_glassBackdropH{};
@@ -3951,6 +3948,38 @@ namespace
         return &found->second;
     }
 
+    void WarmZoomPreviewPagesForCurrentView(PdfTab& tab, int anchorPage)
+    {
+        if (tab.zoom < TileRenderZoomThreshold || tab.pageCount <= 0) return;
+        RECT view = g_stage;
+        InflateRect(&view, S(8), S(8));
+        int firstVisible = g_continuousRead ?
+            std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(anchorPage, 0, tab.pageCount - 1));
+        int warmed = 0;
+        for (int start = firstVisible; start < tab.pageCount && warmed < 4; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+            if (g_continuousRead && spreadRect.top > view.bottom) break;
+            if (!Intersects(spreadRect, view) && (g_continuousRead || start != firstVisible)) continue;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && warmed < 4; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                if (!Intersects(pageRect, view)) continue;
+                if (!FindZoomFallbackPage(tab, page))
+                    EnsureZoomPreviewPage(tab, page);
+                ++warmed;
+            }
+            if (!g_continuousRead) break;
+        }
+    }
+
+
     size_t DynamicPageCacheByteLimit(PdfTab const& tab)
     {
         if (tab.zoom >= TileRenderZoomThreshold) return 6ull * 1024ull * 1024ull;
@@ -6609,80 +6638,6 @@ namespace
     bool ScrollByPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX = 0);
     void StopAutoScroll(HWND hwnd);
     void QueueTouchPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX = 0);
-    void ClearZoomStageSnapshot()
-    {
-        if (g_zoomStageSnapshot)
-        {
-            DeleteObject(g_zoomStageSnapshot);
-            g_zoomStageSnapshot = nullptr;
-        }
-        g_zoomStageSnapshotRect = {};
-        g_zoomStageSnapshotUntil = 0;
-    }
-
-    bool ZoomStageSnapshotActive()
-    {
-        if (!g_zoomStageSnapshot) return false;
-        if (GetTickCount64() <= g_zoomStageSnapshotUntil) return true;
-        ClearZoomStageSnapshot();
-        return false;
-    }
-
-    void CaptureZoomStageSnapshot(HWND hwnd)
-    {
-        if (IsRectEmpty(&g_stage)) return;
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        RECT capture{};
-        if (!IntersectRect(&capture, &g_stage, &client)) return;
-        int w = capture.right - capture.left;
-        int h = capture.bottom - capture.top;
-        if (w <= 0 || h <= 0) return;
-
-        HDC dc = GetDC(hwnd);
-        if (!dc) return;
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bitmap = mem ? CreateCompatibleBitmap(dc, w, h) : nullptr;
-        if (mem && bitmap)
-        {
-            HGDIOBJ old = SelectObject(mem, bitmap);
-            if (BitBlt(mem, 0, 0, w, h, dc, capture.left, capture.top, SRCCOPY))
-            {
-                ClearZoomStageSnapshot();
-                g_zoomStageSnapshot = bitmap;
-                g_zoomStageSnapshotRect = capture;
-                g_zoomStageSnapshotUntil = GetTickCount64() + 650;
-                bitmap = nullptr;
-            }
-            SelectObject(mem, old);
-        }
-        if (bitmap) DeleteObject(bitmap);
-        if (mem) DeleteDC(mem);
-        ReleaseDC(hwnd, dc);
-    }
-
-    bool PaintZoomStageSnapshot(HDC dc, RECT dest)
-    {
-        if (!ZoomStageSnapshotActive()) return false;
-        RECT visible{};
-        if (!IntersectRect(&visible, &dest, &g_zoomStageSnapshotRect)) return false;
-        HDC src = CreateCompatibleDC(dc);
-        if (!src) return false;
-        HGDIOBJ old = SelectObject(src, g_zoomStageSnapshot);
-        bool ok = BitBlt(
-            dc,
-            visible.left,
-            visible.top,
-            visible.right - visible.left,
-            visible.bottom - visible.top,
-            src,
-            visible.left - g_zoomStageSnapshotRect.left,
-            visible.top - g_zoomStageSnapshotRect.top,
-            SRCCOPY) != 0;
-        SelectObject(src, old);
-        DeleteDC(src);
-        return ok;
-    }
     bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
 
     void StopTouchMomentum(HWND hwnd)
@@ -6795,7 +6750,6 @@ namespace
     {
         double clampedZoom = std::clamp(newZoom, 0.0833, 64.0);
         if (std::abs(clampedZoom - tab.zoom) < 0.0001) return;
-        CaptureZoomStageSnapshot(hwnd);
         CancelStageMotion(hwnd);
 
         int anchorPage = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
@@ -6870,6 +6824,7 @@ namespace
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
 
+        WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
         UpdateVertScrollBar(hwnd);
         if (tab.zoom >= TileRenderZoomThreshold)
         {
@@ -8934,16 +8889,10 @@ namespace
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
         bool lightPaint = StageLightPaintActive();
-        bool zoomSnapshotPainted = false;
-        if (ZoomStageSnapshotActive())
-            zoomSnapshotPainted = PaintZoomStageSnapshot(dc, stageDirty);
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
-        if (!zoomSnapshotPainted)
-        {
-            Fill(dc, stageDirty, T().stage);
-        }
+        Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -8996,8 +8945,7 @@ namespace
                             usingZoomFallback = image != nullptr;
                             QueuePageRender(g_hwnd, tab, i, 0);
                         }
-                        bool drawRectHasSnapshot = zoomSnapshotPainted && Intersects(drawRect, g_zoomStageSnapshotRect);
-                        if (!drawRectHasSnapshot) Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, RGB(255, 255, 255));
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -9017,8 +8965,7 @@ namespace
                     }
                     else
                     {
-                        bool drawRectHasSnapshot = zoomSnapshotPainted && Intersects(drawRect, g_zoomStageSnapshotRect);
-                        if (!drawRectHasSnapshot) Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, RGB(255, 255, 255));
                         bool fallbackPainted = false;
                         PageImage* fallback = FindZoomFallbackPage(tab, i);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
@@ -13268,7 +13215,6 @@ namespace
             if (saveLastSession) CaptureLastSessionFromOpenTabs();
             for (auto& tab : g_tabs) DropTab(*tab);
             ReleasePaintBuffer();
-            ClearZoomStageSnapshot();
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
             SaveState();
             PostQuitMessage(0);
