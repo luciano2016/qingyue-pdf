@@ -6387,6 +6387,64 @@ namespace
         }
         return LowZoomVisiblePagesReady(hwnd, tab);
     }
+    void WarmLowZoomPagesAtScroll(PdfTab& tab, int targetScrollY)
+    {
+        if (tab.zoom >= TileRenderZoomThreshold || tab.pageCount <= 0) return;
+        PreparePageCache(tab);
+
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        int contentH = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
+        int maxScroll = std::max<int>(0, contentH - stageH);
+        targetScrollY = std::clamp<int>(targetScrollY, 0, maxScroll);
+
+        RECT view = g_stage;
+        view.top -= S(8);
+        view.bottom += S(8);
+
+        int firstVisible = g_continuousRead ?
+            std::max(0, PageFromScroll(tab, targetScrollY)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int startAt = firstVisible;
+        if (g_continuousRead)
+        {
+            for (int previous = PreviousSpreadStart(tab, startAt); previous >= 0; previous = PreviousSpreadStart(tab, previous))
+            {
+                int y = g_stage.top + SpreadTopScroll(tab, previous) - targetScrollY;
+                if (y + SpreadHeight(tab, previous) < view.top) break;
+                startAt = previous;
+                if (previous == 0) break;
+            }
+        }
+
+        int warmed = 0;
+        for (int start = startAt; start < tab.pageCount && warmed < 4; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? g_stage.top + SpreadTopScroll(tab, start) - targetScrollY : g_stage.top + S(28) - targetScrollY;
+            int spreadH = SpreadHeight(tab, start);
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
+            if (g_continuousRead && spreadRect.top > view.bottom) break;
+            if (!Intersects(spreadRect, view) && (g_continuousRead || start != firstVisible)) continue;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && warmed < 4; ++j)
+            {
+                int page = start + j;
+                if (page < 0 || page >= tab.pageCount) continue;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                if (!Intersects(pageRect, view)) continue;
+                auto found = tab.cache.find(page);
+                if (found == tab.cache.end() || ((!found->second.dib && found->second.bgra.empty()) || found->second.width <= 0 || found->second.height <= 0))
+                {
+                    tab.cache[page] = RenderPageAtZoom(tab, page, tab.zoom);
+                }
+                ++warmed;
+            }
+            if (!g_continuousRead) break;
+        }
+        TrimPageCache(tab, firstVisible);
+    }
+
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
         PdfTab* tab = Active();
@@ -11351,7 +11409,6 @@ namespace
                     g_mousePos = cursor;
                     UpdateMainScrollDragStateFromPointer(hwnd, cursor.y, true);
                 }
-                ScrollStageTo(hwnd, g_dragScrollTarget, true, false);
             }
             return 0;
         case WM_QUIETPDF_PAGE_RENDERED:
@@ -12165,11 +12222,6 @@ namespace
             if (g_draggingMainScroll)
             {
                 UpdateMainScrollDragStateFromPointer(hwnd, my, true);
-                if (!g_dragScrollPosted)
-                {
-                    g_dragScrollPosted = true;
-                    PostMessageW(hwnd, WM_QUIETPDF_DRAG_SCROLL, 0, 0);
-                }
                 return 0;
             }
             if (g_draggingMainHScroll)
@@ -12459,6 +12511,8 @@ namespace
                 g_draggingMainScroll = false;
                 g_mainScrollThumbLive = false;
                 g_dragScrollPosted = false;
+                if (PdfTab* tab = Active())
+                    WarmLowZoomPagesAtScroll(*tab, g_dragScrollTarget);
                 ScrollStageTo(hwnd, g_dragScrollTarget, true, false);
                 if (PdfTab* tab = Active())
                 {
