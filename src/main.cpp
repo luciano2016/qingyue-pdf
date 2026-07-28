@@ -6206,6 +6206,8 @@ namespace
         SetTimer(hwnd, 8, 140, nullptr);
     }
 
+    bool TileLevelFullyCached(PdfTab& tab, int page, RECT pageRect, RECT drawRect, int level);
+
     bool LowZoomVisiblePagesReady(HWND hwnd, PdfTab& tab)
     {
         if (tab.zoom >= TileRenderZoomThreshold || tab.pageCount <= 0) return true;
@@ -6244,6 +6246,71 @@ namespace
             }
         }
         return !hadVisible || ready;
+    }
+    bool HighZoomVisiblePagesReady(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.zoom < TileRenderZoomThreshold || tab.pageCount <= 0) return true;
+        int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        RECT view = g_stage;
+        bool hadVisible = false;
+        bool ready = true;
+        int queued = 0;
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int spreadH = SpreadHeight(tab, start);
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
+            if (g_continuousRead && spreadRect.top > view.bottom + S(8)) break;
+            if (!Intersects(spreadRect, view)) continue;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                RECT drawRect{};
+                if (!IntersectRect(&drawRect, &pageRect, &view)) continue;
+                hadVisible = true;
+
+                bool pageReady = false;
+                PageImage* fallback = FindZoomFallbackPage(tab, page);
+                if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                    pageReady = true;
+
+                int pageW = PageW(tab, page);
+                int pageH = PageH(tab, page);
+                int targetLevel = TileLevelForPage(tab, page, pageW, pageH);
+                if (!pageReady && TileLevelFullyCached(tab, page, pageRect, drawRect, 0))
+                    pageReady = true;
+                for (int level = targetLevel; !pageReady && level >= 1; --level)
+                {
+                    if (TileLevelFullyCached(tab, page, pageRect, drawRect, level))
+                        pageReady = true;
+                }
+
+                if (!pageReady)
+                {
+                    ready = false;
+                    QueueZoomPreviewRender(hwnd, tab, page, -20 + queued);
+                    int queueBudget = 10;
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect, 0, queued, queueBudget);
+                    ++queued;
+                }
+            }
+        }
+        return !hadVisible || ready;
+    }
+
+    bool VisiblePagesReadyForPixelScroll(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.zoom >= TileRenderZoomThreshold)
+        {
+            ScheduleVisibleTilePrefetch(hwnd, tab);
+            return false;
+        }
+        return LowZoomVisiblePagesReady(hwnd, tab);
     }
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
@@ -6325,9 +6392,7 @@ namespace
         }
         else
         {
-            bool canPixelScroll = true;
-            if (tab && tab->zoom < TileRenderZoomThreshold)
-                canPixelScroll = LowZoomVisiblePagesReady(hwnd, *tab);
+            bool canPixelScroll = tab ? VisiblePagesReadyForPixelScroll(hwnd, *tab) : true;
             if (canPixelScroll) ScrollStagePixels(hwnd, 0, dy, pageChanged);
             else RequestStageRepaint(hwnd, pageChanged);
         }
@@ -6355,7 +6420,9 @@ namespace
             return;
         }
         MarkStageScrolling(hwnd);
-        ScrollStagePixels(hwnd, old - g_scrollX, 0, false);
+        bool canPixelScroll = tab ? VisiblePagesReadyForPixelScroll(hwnd, *tab) : true;
+        if (canPixelScroll) ScrollStagePixels(hwnd, old - g_scrollX, 0, false);
+        else RequestStageRepaint(hwnd, false);
         UpdateVertScrollBar(hwnd);
     }
 
