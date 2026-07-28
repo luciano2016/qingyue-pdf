@@ -11105,7 +11105,31 @@ namespace
         PaintCustomZoomDialog(mem, client);
         if (!g_customZoomOpen) PaintHoverTip(mem, client);
         PaintTabDragOverlay(mem);
-        if (shouldFlush) BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
+        auto flushRect = [&](RECT r)
+        {
+            RECT clipped{};
+            if (!IntersectRect(&clipped, &r, &dirty)) return;
+            int w = clipped.right - clipped.left;
+            int h = clipped.bottom - clipped.top;
+            if (w > 0 && h > 0)
+                BitBlt(dc, clipped.left, clipped.top, w, h, mem, clipped.left, clipped.top, SRCCOPY);
+        };
+        if (shouldFlush)
+        {
+            BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
+        }
+        else
+        {
+            flushRect(toolbarRect);
+            flushRect(tabsRect);
+            flushRect(statusRect);
+            RECT sidebarPanel{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
+            flushRect(sidebarPanel);
+            flushRect(g_mainScrollTrackRect);
+            flushRect(g_mainHScrollTrackRect);
+            flushRect(g_sidebarPanelToggleRect);
+
+        }
         EndPaint(hwnd, &ps);
     }
 
