@@ -3857,7 +3857,7 @@ namespace
 
     void TrimZoomFallbackCache(PdfTab& tab, int protectedPage)
     {
-        while (tab.zoomFallbackCache.size() > 4)
+        while (tab.zoomFallbackCache.size() > 2)
         {
             auto victim = tab.zoomFallbackCache.end();
             int worstDistance = -1;
@@ -3913,7 +3913,7 @@ namespace
 
     size_t DynamicPageCacheByteLimit(PdfTab const& tab)
     {
-        if (tab.zoom >= TileRenderZoomThreshold) return 10ull * 1024ull * 1024ull;
+        if (tab.zoom >= TileRenderZoomThreshold) return 6ull * 1024ull * 1024ull;
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
@@ -3930,7 +3930,7 @@ namespace
             return total;
         };
         size_t maxBytes = DynamicPageCacheByteLimit(tab);
-        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 2ull : 4ull;
+        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 1ull : 4ull;
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -4221,12 +4221,13 @@ namespace
     RECT TileScreenRect(RECT pageRect, TileKey const& key)
     {
         int scale = TileLevelScale(key.level);
-        return RECT{
-            pageRect.left + key.x * scale,
-            pageRect.top + key.y * scale,
-            pageRect.left + (key.x + key.w) * scale,
-            pageRect.top + (key.y + key.h) * scale
-        };
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        int left = std::clamp<int>(key.x * scale, 0, pageW);
+        int top = std::clamp<int>(key.y * scale, 0, pageH);
+        int right = std::clamp<int>((key.x + key.w) * scale, left + 1, pageW);
+        int bottom = std::clamp<int>((key.y + key.h) * scale, top + 1, pageH);
+        return RECT{ pageRect.left + left, pageRect.top + top, pageRect.left + right, pageRect.top + bottom };
     }
 
     bool TileVisibleNearby(PdfTab const& tab, TileKey const& key, double viewportScreens = 1.35)
@@ -4255,10 +4256,52 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
-        size_t target = visibleBytes * 3ull + 12ull * 1024ull * 1024ull;
-        return std::clamp<size_t>(target, 20ull * 1024ull * 1024ull, 40ull * 1024ull * 1024ull);
+        size_t target = visibleBytes * 2ull + 8ull * 1024ull * 1024ull;
+        return std::clamp<size_t>(target, 14ull * 1024ull * 1024ull, 28ull * 1024ull * 1024ull);
     }
 
+    void TrimIdleRenderCaches(HWND hwnd)
+    {
+        UNREFERENCED_PARAMETER(hwnd);
+        PdfTab* tab = Active();
+        if (!tab) return;
+        PreparePageCache(*tab);
+        PruneZoomFallbackCache(*tab);
+
+        for (auto it = tab->cache.begin(); it != tab->cache.end(); )
+        {
+            if (std::abs(it->first - tab->currentPage) > 1) it = tab->cache.erase(it);
+            else ++it;
+        }
+        for (auto it = tab->tileCache.begin(); it != tab->tileCache.end(); )
+        {
+            if (!TileVisibleNearby(*tab, it->first, 0.35)) it = tab->tileCache.erase(it);
+            else ++it;
+        }
+        while (tab->zoomFallbackCache.size() > 1)
+        {
+            auto victim = tab->zoomFallbackCache.end();
+            int worstDistance = -1;
+            for (auto candidate = tab->zoomFallbackCache.begin(); candidate != tab->zoomFallbackCache.end(); ++candidate)
+            {
+                int distance = std::abs(candidate->first - tab->currentPage);
+                if (distance > worstDistance)
+                {
+                    worstDistance = distance;
+                    victim = candidate;
+                }
+            }
+            if (victim == tab->zoomFallbackCache.end()) break;
+            tab->zoomFallbackCache.erase(victim);
+        }
+        TrimBackgroundRenderCaches();
+        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+    }
+    void ScheduleIdleCacheTrim(HWND hwnd)
+    {
+        KillTimer(hwnd, 20);
+        SetTimer(hwnd, 20, 1200, nullptr);
+    }
     void TrimTileCache(PdfTab& tab, TileKey const& protectedKey)
     {
         auto cacheBytes = [&]()
@@ -4272,7 +4315,7 @@ namespace
         size_t maxTiles = std::clamp<size_t>((static_cast<size_t>(std::max<int>(1, g_stage.right - g_stage.left)) /
             static_cast<size_t>(TileSize) + 3ull) *
             (static_cast<size_t>(std::max<int>(1, g_stage.bottom - g_stage.top)) /
-                static_cast<size_t>(TileSize) + 4ull), 48ull, 128ull);
+                static_cast<size_t>(TileSize) + 3ull), 40ull, 96ull);
         while (tab.tileCache.size() > maxTiles || cacheBytes() > maxTileBytes)
         {
             auto victim = tab.tileCache.end();
@@ -6392,11 +6435,10 @@ namespace
         }
         else
         {
-            bool canPixelScroll = tab ? VisiblePagesReadyForPixelScroll(hwnd, *tab) : true;
-            if (canPixelScroll) ScrollStagePixels(hwnd, 0, dy, pageChanged);
-            else RequestStageRepaint(hwnd, pageChanged);
+            RequestStageRepaint(hwnd, pageChanged);
         }
         UpdateVertScrollBar(hwnd);
+        RedrawMainScrollBarNow(hwnd);
         SchedulePagePrefetch(hwnd);
     }
 
@@ -6420,10 +6462,9 @@ namespace
             return;
         }
         MarkStageScrolling(hwnd);
-        bool canPixelScroll = tab ? VisiblePagesReadyForPixelScroll(hwnd, *tab) : true;
-        if (canPixelScroll) ScrollStagePixels(hwnd, old - g_scrollX, 0, false);
-        else RequestStageRepaint(hwnd, false);
+        RequestStageRepaint(hwnd, false);
         UpdateVertScrollBar(hwnd);
+        RedrawMainScrollBarNow(hwnd);
     }
 
     void ScrollSidebarTo(HWND hwnd, int newScrollY)
@@ -6642,6 +6683,7 @@ namespace
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         RedrawWindow(hwnd, &status, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
         SchedulePagePrefetch(hwnd);
+        ScheduleIdleCacheTrim(hwnd);
     }
 
     void CloseCustomZoomDialog(HWND hwnd)
@@ -8657,9 +8699,18 @@ namespace
                     continue;
                 }
                 RECT tileDest = TileScreenRect(pageRect, key);
+                RECT tileClip{};
+                if (!IntersectRect(&tileClip, &tileDest, &pageRect)) continue;
                 RECT clippedDest{};
-                if (!IntersectRect(&clippedDest, &tileDest, &pageRect)) continue;
-                if (DrawCachedImage(dc, *image, tileDest)) painted = true;
+                if (!IntersectRect(&clippedDest, &tileClip, &drawRect)) continue;
+
+                int destW = std::max<int>(1, tileDest.right - tileDest.left);
+                int destH = std::max<int>(1, tileDest.bottom - tileDest.top);
+                int sx = std::clamp<int>(MulDiv(clippedDest.left - tileDest.left, image->width, destW), 0, image->width - 1);
+                int sy = std::clamp<int>(MulDiv(clippedDest.top - tileDest.top, image->height, destH), 0, image->height - 1);
+                int ex = std::clamp<int>(MulDiv(clippedDest.right - tileDest.left, image->width, destW), sx + 1, image->width);
+                int ey = std::clamp<int>(MulDiv(clippedDest.bottom - tileDest.top, image->height, destH), sy + 1, image->height);
+                if (DrawCachedImagePart(dc, *image, clippedDest, sx, sy, ex - sx, ey - sy)) painted = true;
             }
         }
         return painted;
@@ -8890,7 +8941,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        return !hadVisiblePage || !missingVisiblePage;
+        return true;
     }
 
     std::wstring ElideText(std::wstring text, size_t maxChars)
@@ -11307,9 +11358,9 @@ namespace
                         {
                             g_stageIdleRefreshPending = true;
                         }
-                        else if (!IsRectEmpty(&dirtyRect))
+                        else
                         {
-                            InvalidateRect(hwnd, &dirtyRect, FALSE);
+                            RequestStageRepaint(hwnd, false);
                         }
                     }
                     else
@@ -12500,6 +12551,7 @@ namespace
                         InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
                 }
                 SchedulePagePrefetch(hwnd);
+                ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
             if (wParam == 9)
@@ -12616,6 +12668,12 @@ namespace
             if (wParam == 19)
             {
                 StepAutoScroll(hwnd);
+                return 0;
+            }
+            if (wParam == 20)
+            {
+                KillTimer(hwnd, 20);
+                if (!StageScrollPaintInProgress()) TrimIdleRenderCaches(hwnd);
                 return 0;
             }
             break;
