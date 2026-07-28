@@ -3812,8 +3812,10 @@ namespace
     {
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
+            bool sameRenderSurface = tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme;
             tab.cache.clear();
-            tab.tileCache.clear();
+            if (!sameRenderSurface)
+                tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
@@ -3869,8 +3871,10 @@ namespace
         PruneZoomFallbackCache(tab);
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
+            bool sameRenderSurface = tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme;
             tab.cache.clear();
-            tab.tileCache.clear();
+            if (!sameRenderSurface)
+                tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
@@ -3923,14 +3927,14 @@ namespace
         if (index < 0 || index >= tab.pageCount) return nullptr;
         PruneZoomFallbackCache(tab);
         double previewZoom = PreviewZoomForPage(tab, index);
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme ||
-            std::abs(tab.zoomFallbackZoom - previewZoom) > 0.001)
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme)
         {
             tab.zoomFallbackCache.clear();
-            tab.zoomFallbackZoom = previewZoom;
             tab.zoomFallbackDpi = g_dpi;
             tab.zoomFallbackTheme = g_theme;
         }
+        if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
+            tab.zoomFallbackZoom = previewZoom;
         tab.zoomFallbackUntil = GetTickCount64() + 8000;
         auto found = tab.zoomFallbackCache.find(index);
         if (found == tab.zoomFallbackCache.end())
@@ -4158,14 +4162,14 @@ namespace
         double previewZoom = PreviewZoomForPage(tab, page);
         if (previewZoom <= 0.0 || previewZoom >= tab.zoom - 0.001) return;
         PruneZoomFallbackCache(tab);
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme ||
-            std::abs(tab.zoomFallbackZoom - previewZoom) > 0.001)
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme)
         {
             tab.zoomFallbackCache.clear();
-            tab.zoomFallbackZoom = previewZoom;
             tab.zoomFallbackDpi = g_dpi;
             tab.zoomFallbackTheme = g_theme;
         }
+        if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
+            tab.zoomFallbackZoom = previewZoom;
         tab.zoomFallbackUntil = GetTickCount64() + 8000;
         if (tab.zoomFallbackCache.find(page) != tab.zoomFallbackCache.end()) return;
 
@@ -4380,6 +4384,29 @@ namespace
         PreparePageCache(tab);
         auto found = tab.tileCache.find(key);
         return found == tab.tileCache.end() ? nullptr : &found->second;
+    }
+
+    PageImage* FindReplacementTile(PdfTab& tab, TileKey const& key)
+    {
+        PreparePageCache(tab);
+        PageImage* best = nullptr;
+        int bestZoomDelta = std::numeric_limits<int>::max();
+        for (auto& entry : tab.tileCache)
+        {
+            TileKey const& candidate = entry.first;
+            if (candidate.page != key.page || candidate.theme != key.theme || candidate.level != key.level) continue;
+            if (candidate.x != key.x || candidate.y != key.y) continue;
+            if (candidate.zoom == key.zoom) continue;
+            PageImage& image = entry.second;
+            if ((!image.dib && image.bgra.empty()) || image.width <= 0 || image.height <= 0) continue;
+            int zoomDelta = std::abs(candidate.zoom - key.zoom);
+            if (zoomDelta < bestZoomDelta)
+            {
+                bestZoomDelta = zoomDelta;
+                best = &image;
+            }
+        }
+        return best;
     }
 
     void QueueTileRender(HWND hwnd, PdfTab& tab, TileKey const& key, int priority = 0)
@@ -8745,7 +8772,8 @@ namespace
                         missingVisiblePage = true;
                         QueueTileRender(g_hwnd, tab, key, 0);
                     }
-                    continue;
+                    image = FindReplacementTile(tab, key);
+                    if (!image) continue;
                 }
                 if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0)
                 {
@@ -8789,8 +8817,6 @@ namespace
         else if (IsGlassTheme())
         {
             Fill(dc, stageDirty, T().stage);
-            RECT washTop{ stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.top + std::max<int>(1, (stageDirty.bottom - stageDirty.top) / 3) };
-            AlphaFill(dc, washTop, RGB(255, 255, 255), 38);
         }
         else Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
@@ -11376,14 +11402,14 @@ namespace
                 }
                 else if (isPreview)
                 {
-                    if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme ||
-                        std::abs(tab.zoomFallbackZoom - request.renderZoom) > 0.001)
+                    if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme)
                     {
                         tab.zoomFallbackCache.clear();
-                        tab.zoomFallbackZoom = request.renderZoom;
                         tab.zoomFallbackDpi = g_dpi;
                         tab.zoomFallbackTheme = g_theme;
                     }
+                    if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
+                        tab.zoomFallbackZoom = request.renderZoom;
                     if (tab.zoomFallbackCache.find(request.page) == tab.zoomFallbackCache.end())
                     {
                         tab.zoomFallbackCache.emplace(request.page, std::move(result->image));
