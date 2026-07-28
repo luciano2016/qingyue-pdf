@@ -1224,6 +1224,7 @@ namespace
     bool g_sidebarAnimating{};
     bool g_stageIdleRefreshPending{};
     unsigned long long g_viewportGeneration{};
+    int g_stageScrollDirection{};
     bool g_sidebarProgressRefreshPending{};
     bool g_gesturePanning{};
     bool g_gestureSidebar{};
@@ -1231,6 +1232,7 @@ namespace
     bool g_touchMomentum{};
     bool g_pagePrefetchPending{};
     ULONGLONG g_lastStageRepaintMs{};
+    ULONGLONG g_lastTileRepaintMs{};
     ULONGLONG g_lastSidebarRepaintMs{};
     ULONGLONG g_lastSidebarResizeMs{};
     ULONGLONG g_lastTouchFollowPaintMs{};
@@ -3488,6 +3490,16 @@ namespace
         return start + 2;
     }
 
+
+    int PreviousSpreadStart(PdfTab const& tab, int start)
+    {
+        if (start <= 0) return -1;
+        int previous = 0;
+        for (int probe = 0; probe < tab.pageCount && probe < start; probe = NextSpreadStart(tab, probe))
+            previous = probe;
+        return previous < start ? previous : -1;
+    }
+
     int SpreadPageCount(PdfTab const& tab, int start)
     {
         if (start < 0 || start >= tab.pageCount) return 0;
@@ -4174,15 +4186,16 @@ namespace
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& queued) { return queued.priority > priority; });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedPageRenders = 6;
-            while (g_pageRenderQueue.size() > maxQueuedPageRenders)
+            constexpr size_t maxQueuedPreviewRenders = 2;
+            auto isQueuedPreview = [](PageRenderRequest const& queued)
             {
-                auto victim = std::find_if(
-                    g_pageRenderQueue.rbegin(),
-                    g_pageRenderQueue.rend(),
-                    [](PageRenderRequest const& queued) { return queued.priority > 0; });
-                if (victim == g_pageRenderQueue.rend()) g_pageRenderQueue.pop_back();
-                else g_pageRenderQueue.erase(std::next(victim).base());
+                return !queued.tile && queued.renderZoom > 0.0 && queued.renderZoom < queued.zoom - 0.001;
+            };
+            while (std::count_if(g_pageRenderQueue.begin(), g_pageRenderQueue.end(), isQueuedPreview) > maxQueuedPreviewRenders)
+            {
+                auto victim = std::find_if(g_pageRenderQueue.rbegin(), g_pageRenderQueue.rend(), isQueuedPreview);
+                if (victim == g_pageRenderQueue.rend()) break;
+                g_pageRenderQueue.erase(std::next(victim).base());
             }
         }
         g_pageRenderCv.notify_one();
@@ -4398,7 +4411,7 @@ namespace
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& queued) { return queued.priority > priority; });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedTileRenders = 36;
+            constexpr size_t maxQueuedTileRenders = 40;
             while (g_pageRenderQueue.size() > maxQueuedTileRenders)
             {
                 auto victim = std::find_if(
@@ -4432,10 +4445,10 @@ namespace
         int levelBottom = std::clamp<int>((localBottom + scale - 1) / scale, levelTop + 1, levelPageH);
         int tileLeft = (levelLeft / TileSize) * TileSize;
         int tileTop = (levelTop / TileSize) * TileSize;
-        for (int ty = tileTop; ty < levelBottom && budget > 0; ty += TileSize)
+        auto queueRow = [&](int ty)
         {
             int h = std::min(TileSize, levelPageH - ty);
-            if (h <= 0) continue;
+            if (h <= 0) return;
             for (int tx = tileLeft; tx < levelRight && budget > 0; tx += TileSize)
             {
                 int w = std::min(TileSize, levelPageW - tx);
@@ -4447,15 +4460,26 @@ namespace
                     --budget;
                 }
             }
+        };
+        if (g_stageScrollDirection > 0)
+        {
+            int bottomRow = ((levelBottom - 1) / TileSize) * TileSize;
+            for (int ty = bottomRow; ty >= tileTop && budget > 0; ty -= TileSize)
+                queueRow(ty);
+        }
+        else
+        {
+            for (int ty = tileTop; ty < levelBottom && budget > 0; ty += TileSize)
+                queueRow(ty);
         }
     }
 
     void QueueVisibleTilesForPage(HWND hwnd, PdfTab& tab, int page, RECT pageRect, RECT clip, int priority, int& budget)
     {
         int targetLevel = TileLevelForPage(tab, page, std::max<int>(1, pageRect.right - pageRect.left), std::max<int>(1, pageRect.bottom - pageRect.top));
+        QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, 0, priority, budget);
         if (targetLevel > 0)
-            QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, targetLevel, priority, budget);
-        QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, 0, priority + 1, budget);
+            QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, targetLevel, priority + 2, budget);
     }
 
     void ScheduleVisibleTilePrefetch(HWND hwnd, PdfTab& tab)
@@ -4463,32 +4487,82 @@ namespace
         if (tab.pageCount <= 0) return;
         PreparePageCache(tab);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int budget = rapidScroll ? 16 : 10;
+        int budget = rapidScroll ? 14 : 12;
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         RECT visible = g_stage;
-        visible.top -= S(32);
-        visible.bottom += rapidScroll ? S(360) : S(160);
-
-        int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
-        for (int start = firstVisible; start < tab.pageCount && budget > 0; start = NextSpreadStart(tab, start))
+        int backwardPad = rapidScroll ? S(96) : S(128);
+        int forwardPad = rapidScroll ? std::max(S(420), stageH / 2) : std::max(S(220), stageH / 4);
+        if (g_stageScrollDirection < 0)
         {
-            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
-            int spreadH = SpreadHeight(tab, start);
-            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
-            if (g_continuousRead && spreadRect.top > visible.bottom) break;
-            if (!Intersects(spreadRect, visible) && (g_continuousRead || start != firstVisible)) continue;
+            visible.top -= forwardPad;
+            visible.bottom += backwardPad;
+        }
+        else if (g_stageScrollDirection > 0)
+        {
+            visible.top -= backwardPad;
+            visible.bottom += forwardPad;
+        }
+        else
+        {
+            visible.top -= S(96);
+            visible.bottom += S(160);
+        }
 
-            int count = SpreadPageCount(tab, start);
-            for (int j = 0; j < count && budget > 0; ++j)
+        auto queueSpreads = [&](RECT const& clip, int basePriority)
+        {
+            int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+            int startAt = firstVisible;
+            if (g_continuousRead && clip.top < g_stage.top)
             {
-                int page = start + j;
-                RECT pageRect{};
-                if (BuildSpreadPageRect(tab, start, y, page, pageRect))
+                for (int previous = PreviousSpreadStart(tab, startAt); previous >= 0; previous = PreviousSpreadStart(tab, previous))
                 {
-                    QueueZoomPreviewRender(hwnd, tab, page, -10);
-                    QueueVisibleTilesForPage(hwnd, tab, page, pageRect, visible, 0, budget);
+                    int y = SpreadVisualTop(tab, previous);
+                    if (y + SpreadHeight(tab, previous) < clip.top) break;
+                    startAt = previous;
+                    if (previous == 0) break;
                 }
             }
-            if (!g_continuousRead) break;
+            for (int start = startAt; start < tab.pageCount && budget > 0; start = NextSpreadStart(tab, start))
+            {
+                int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+                int spreadH = SpreadHeight(tab, start);
+                RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + spreadH };
+                if (g_continuousRead && spreadRect.top > clip.bottom) break;
+                if (!Intersects(spreadRect, clip) && (g_continuousRead || start != firstVisible)) continue;
+
+                int count = SpreadPageCount(tab, start);
+                for (int j = 0; j < count && budget > 0; ++j)
+                {
+                    int page = start + j;
+                    RECT pageRect{};
+                    if (BuildSpreadPageRect(tab, start, y, page, pageRect))
+                        QueueVisibleTilesForPage(hwnd, tab, page, pageRect, clip, basePriority, budget);
+                }
+                if (!g_continuousRead) break;
+            }
+        };
+
+        queueSpreads(g_stage, -12);
+        queueSpreads(visible, 0);
+
+        if (!rapidScroll)
+        {
+            int previewBudget = 2;
+            int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+            for (int start = firstVisible; start < tab.pageCount && previewBudget > 0; start = NextSpreadStart(tab, start))
+            {
+                int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+                RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+                if (g_continuousRead && spreadRect.top > visible.bottom) break;
+                if (!Intersects(spreadRect, visible) && (g_continuousRead || start != firstVisible)) continue;
+                int count = SpreadPageCount(tab, start);
+                for (int j = 0; j < count && previewBudget > 0; ++j)
+                {
+                    QueueZoomPreviewRender(hwnd, tab, start + j, 10);
+                    --previewBudget;
+                }
+                if (!g_continuousRead) break;
+            }
         }
     }
     bool TileRequestScreenRect(PdfTab const& tab, PageRenderRequest const& request, RECT& out)
@@ -6336,7 +6410,7 @@ namespace
                 if (!pageReady)
                 {
                     ready = false;
-                    QueueZoomPreviewRender(hwnd, tab, page, -20 + queued);
+                    QueueZoomPreviewRender(hwnd, tab, page, 10 + queued);
                     int queueBudget = 10;
                     QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect, 0, queued, queueBudget);
                     ++queued;
@@ -6386,7 +6460,11 @@ namespace
             g_stageScrollLastTick = GetTickCount64();
         }
 
-        if (dy != 0) ++g_viewportGeneration;
+        if (dy != 0)
+        {
+            g_stageScrollDirection = dy < 0 ? 1 : -1;
+            ++g_viewportGeneration;
+        }
 
         if (dy == 0)
         {
@@ -8814,7 +8892,7 @@ namespace
                         Fill(dc, drawRect, RGB(255, 255, 255));
                         bool fallbackPainted = false;
                         PageImage* fallback = FindZoomFallbackPage(tab, i);
-                        if (!fallback) QueueZoomPreviewRender(g_hwnd, tab, i, -10);
+                        if (!fallback) QueueZoomPreviewRender(g_hwnd, tab, i, 8);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                         {
                             int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
@@ -8824,6 +8902,7 @@ namespace
                             fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
                         }
                         int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
+                        bool coarsePainted = false;
                         if (!fallbackPainted)
                         {
                             for (int level = targetLevel; level >= 1; --level)
@@ -8832,25 +8911,22 @@ namespace
                                 bool ignoredMissing = false;
                                 if (DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing))
                                 {
-                                    fallbackPainted = true;
+                                    coarsePainted = true;
                                     break;
                                 }
                             }
                         }
                         bool targetMissing = false;
-                        bool targetPainted = false;
-                        if (TileLevelFullyCached(tab, i, pageRect, drawRect, 0))
-                        {
-                            targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, targetMissing);
-                        }
-                        else
+                        bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
+                        if (targetMissing)
                         {
                             int queueBudget = 12;
-                            QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, 0, queueBudget);
-                            targetMissing = true;
+                            QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                            if (!fallback && !StageScrollPaintInProgress())
+                                QueueZoomPreviewRender(g_hwnd, tab, i, 10);
                         }
-                        if (fallbackPainted || targetPainted) paintedRenderable = true;
-                        if (targetMissing && !fallbackPainted) missingVisiblePage = true;
+                        if (fallbackPainted || coarsePainted || targetPainted) paintedRenderable = true;
+                        if (targetMissing && !fallbackPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                     }
                     if (IsDarkTheme())
                     {
@@ -11354,7 +11430,18 @@ namespace
                 {
                     if (request.tile)
                     {
-                        if (StageScrollPaintInProgress())
+                        ULONGLONG now = GetTickCount64();
+                        bool currentTile = request.level == 0 && !IsRectEmpty(&dirtyRect);
+                        if (StageScrollPaintInProgress() && currentTile)
+                        {
+                            g_stageIdleRefreshPending = true;
+                            if (now - g_lastTileRepaintMs >= 16)
+                            {
+                                g_lastTileRepaintMs = now;
+                                RequestStageRepaint(hwnd, false);
+                            }
+                        }
+                        else if (StageScrollPaintInProgress())
                         {
                             g_stageIdleRefreshPending = true;
                         }
