@@ -3812,10 +3812,8 @@ namespace
     {
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
-            bool sameRenderSurface = tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme;
             tab.cache.clear();
-            if (!sameRenderSurface)
-                tab.tileCache.clear();
+            tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
@@ -3871,10 +3869,8 @@ namespace
         PruneZoomFallbackCache(tab);
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
         {
-            bool sameRenderSurface = tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme;
             tab.cache.clear();
-            if (!sameRenderSurface)
-                tab.tileCache.clear();
+            tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = g_theme;
@@ -4384,29 +4380,6 @@ namespace
         PreparePageCache(tab);
         auto found = tab.tileCache.find(key);
         return found == tab.tileCache.end() ? nullptr : &found->second;
-    }
-
-    PageImage* FindReplacementTile(PdfTab& tab, TileKey const& key)
-    {
-        PreparePageCache(tab);
-        PageImage* best = nullptr;
-        int bestZoomDelta = std::numeric_limits<int>::max();
-        for (auto& entry : tab.tileCache)
-        {
-            TileKey const& candidate = entry.first;
-            if (candidate.page != key.page || candidate.theme != key.theme || candidate.level != key.level) continue;
-            if (candidate.x != key.x || candidate.y != key.y) continue;
-            if (candidate.zoom == key.zoom) continue;
-            PageImage& image = entry.second;
-            if ((!image.dib && image.bgra.empty()) || image.width <= 0 || image.height <= 0) continue;
-            int zoomDelta = std::abs(candidate.zoom - key.zoom);
-            if (zoomDelta < bestZoomDelta)
-            {
-                bestZoomDelta = zoomDelta;
-                best = &image;
-            }
-        }
-        return best;
     }
 
     void QueueTileRender(HWND hwnd, PdfTab& tab, TileKey const& key, int priority = 0)
@@ -8772,8 +8745,7 @@ namespace
                         missingVisiblePage = true;
                         QueueTileRender(g_hwnd, tab, key, 0);
                     }
-                    image = FindReplacementTile(tab, key);
-                    if (!image) continue;
+                    continue;
                 }
                 if ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0)
                 {
@@ -8918,13 +8890,23 @@ namespace
                             }
                         }
                         bool targetMissing = false;
-                        bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
-                        if (targetMissing)
+                        bool targetPainted = false;
+                        if (fallbackPainted && !TileLevelFullyCached(tab, i, pageRect, drawRect, 0))
                         {
+                            targetMissing = true;
                             int queueBudget = 12;
                             QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                            if (!fallback && !StageScrollPaintInProgress())
-                                QueueZoomPreviewRender(g_hwnd, tab, i, 10);
+                        }
+                        else
+                        {
+                            targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
+                            if (targetMissing)
+                            {
+                                int queueBudget = 12;
+                                QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                                if (!fallback && !StageScrollPaintInProgress())
+                                    QueueZoomPreviewRender(g_hwnd, tab, i, 10);
+                            }
                         }
                         if (fallbackPainted || coarsePainted || targetPainted) paintedRenderable = true;
                         if (targetMissing && !fallbackPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
