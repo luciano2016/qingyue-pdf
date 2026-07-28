@@ -1680,45 +1680,6 @@ namespace
         DeleteDC(mem);
     }
 
-    void AlphaFillFeathered(HDC dc, RECT r, COLORREF color, BYTE alpha)
-    {
-        int w = r.right - r.left;
-        int h = r.bottom - r.top;
-        if (w <= 0 || h <= 0) return;
-        if (w <= 2 || h <= 2 || alpha >= 254)
-        {
-            AlphaFill(dc, r, color, alpha);
-            return;
-        }
-        RECT core{ r.left + 1, r.top + 1, r.right - 1, r.bottom - 1 };
-        AlphaFill(dc, core, color, alpha);
-        BYTE edge = static_cast<BYTE>(std::max<int>(24, alpha / 2));
-        AlphaFill(dc, RECT{ r.left, r.top + 1, r.left + 1, r.bottom - 1 }, color, edge);
-        AlphaFill(dc, RECT{ r.right - 1, r.top + 1, r.right, r.bottom - 1 }, color, edge);
-        AlphaFill(dc, RECT{ r.left + 1, r.top, r.right - 1, r.top + 1 }, color, edge);
-        AlphaFill(dc, RECT{ r.left + 1, r.bottom - 1, r.right - 1, r.bottom }, color, edge);
-        BYTE corner = static_cast<BYTE>(std::max<int>(12, alpha / 3));
-        AlphaFill(dc, RECT{ r.left, r.top, r.left + 1, r.top + 1 }, color, corner);
-        AlphaFill(dc, RECT{ r.right - 1, r.top, r.right, r.top + 1 }, color, corner);
-        AlphaFill(dc, RECT{ r.left, r.bottom - 1, r.left + 1, r.bottom }, color, corner);
-        AlphaFill(dc, RECT{ r.right - 1, r.bottom - 1, r.right, r.bottom }, color, corner);
-    }
-    void AlphaFillFeatherEdges(HDC dc, RECT r, COLORREF color, BYTE alpha)
-    {
-        int w = r.right - r.left;
-        int h = r.bottom - r.top;
-        if (w <= 0 || h <= 0) return;
-        BYTE edge = static_cast<BYTE>(std::max<int>(16, alpha));
-        AlphaFill(dc, RECT{ r.left, r.top + 1, r.left + 1, r.bottom - 1 }, color, edge);
-        AlphaFill(dc, RECT{ r.right - 1, r.top + 1, r.right, r.bottom - 1 }, color, edge);
-        AlphaFill(dc, RECT{ r.left + 1, r.top, r.right - 1, r.top + 1 }, color, edge);
-        AlphaFill(dc, RECT{ r.left + 1, r.bottom - 1, r.right - 1, r.bottom }, color, edge);
-        BYTE corner = static_cast<BYTE>(std::max<int>(8, alpha / 2));
-        AlphaFill(dc, RECT{ r.left, r.top, r.left + 1, r.top + 1 }, color, corner);
-        AlphaFill(dc, RECT{ r.right - 1, r.top, r.right, r.top + 1 }, color, corner);
-        AlphaFill(dc, RECT{ r.left, r.bottom - 1, r.left + 1, r.bottom }, color, corner);
-        AlphaFill(dc, RECT{ r.right - 1, r.bottom - 1, r.right, r.bottom }, color, corner);
-    }
     void PaintGlassBackdrop(HDC dc, RECT r)
     {
         RECT client{};
@@ -3653,6 +3614,24 @@ namespace
     }
 
     int ContinuousContentHeight(PdfTab const& tab);
+    int VisiblePageCountForCache(PdfTab const& tab)
+    {
+        if (tab.pageCount <= 0) return 1;
+        if (!g_continuousRead)
+            return std::max(1, SpreadPageCount(tab, FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1))));
+        int first = std::max(0, FirstVisibleSpreadStart(tab));
+        RECT view = g_stage;
+        int visiblePages = 0;
+        for (int start = first; start < tab.pageCount; start = NextSpreadStart(tab, start))
+        {
+            int y = SpreadVisualTop(tab, start);
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+            if (spreadRect.top > view.bottom + S(96)) break;
+            if (!Intersects(spreadRect, view)) continue;
+            visiblePages += std::max(1, SpreadPageCount(tab, start));
+        }
+        return std::clamp(visiblePages, 1, 80);
+    }
     int SinglePageContentHeight(PdfTab const& tab);
     int SinglePageMaxScroll(PdfTab const& tab);
 
@@ -3981,7 +3960,7 @@ namespace
             return total;
         };
         size_t maxBytes = DynamicPageCacheByteLimit(tab);
-        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 1ull : 4ull;
+        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 1ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 12 : 4), 4, 96));
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -4966,96 +4945,31 @@ namespace
         return 78;
     }
 
-    void FillTextSelectionPaperExact(HDC dc, RECT r)
+    BYTE TextSelectionOverlayAlpha()
     {
-        int w = r.right - r.left;
-        int h = r.bottom - r.top;
-        if (w <= 0 || h <= 0) return;
+        if (IsDarkTheme() || IsAuroraTheme()) return 72;
+        if (IsIdeaLightTheme()) return 88;
+        if (IsGlassTheme()) return 86;
+        return 84;
+    }
 
-        COLORREF selectionFill = TextSelectionFillColor();
-        if (IsDarkTheme() || IsAuroraTheme())
-        {
-            AlphaFill(dc, r, selectionFill, TextSelectionAlpha());
-            return;
-        }
-        std::uint8_t fillB = static_cast<std::uint8_t>(GetBValue(selectionFill));
-        std::uint8_t fillG = static_cast<std::uint8_t>(GetGValue(selectionFill));
-        std::uint8_t fillR = static_cast<std::uint8_t>(GetRValue(selectionFill));
-
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = w;
-        info.bmiHeader.biHeight = -h;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-
-        void* bits = nullptr;
-        HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bitmap || !bits)
-        {
-            if (bitmap) DeleteObject(bitmap);
-            Fill(dc, r, selectionFill);
-            return;
-        }
-
-        HDC mem = CreateCompatibleDC(dc);
-        if (!mem)
-        {
-            DeleteObject(bitmap);
-            Fill(dc, r, selectionFill);
-            return;
-        }
-
-        HGDIOBJ old = SelectObject(mem, bitmap);
-        BitBlt(mem, 0, 0, w, h, dc, r.left, r.top, SRCCOPY);
-
-        auto* px = static_cast<std::uint8_t*>(bits);
-        COLORREF paper = T().paper;
-        int paperR = GetRValue(paper);
-        int paperG = GetGValue(paper);
-        int paperB = GetBValue(paper);
-        bool touchedPaper = false;
-        for (int y = 0; y < h; ++y)
-        {
-            for (int x = 0; x < w; ++x)
-            {
-                std::uint8_t* p = px + (static_cast<size_t>(y) * w + x) * 4;
-                std::uint8_t b = p[0];
-                std::uint8_t g = p[1];
-                std::uint8_t red = p[2];
-                int maxDiff = std::max({
-                    std::abs(static_cast<int>(red) - static_cast<int>(g)),
-                    std::abs(static_cast<int>(red) - static_cast<int>(b)),
-                    std::abs(static_cast<int>(g) - static_cast<int>(b)) });
-                int lum = Luma(red, g, b);
-                bool neutralPaper = maxDiff <= (IsDarkTheme() || IsAuroraTheme() ? 26 : 18) && lum >= (IsDarkTheme() || IsAuroraTheme() ? 70 : 188);
-                bool themedPaper = std::abs(static_cast<int>(red) - paperR) <= 34 &&
-                    std::abs(static_cast<int>(g) - paperG) <= 34 &&
-                    std::abs(static_cast<int>(b) - paperB) <= 34;
-                if (neutralPaper || themedPaper)
-                {
-                    p[0] = fillB;
-                    p[1] = fillG;
-                    p[2] = fillR;
-                    p[3] = 255;
-                    touchedPaper = true;
-                }
-            }
-        }
-
-        if (touchedPaper)
-        {
-            BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
-            AlphaFillFeatherEdges(dc, r, selectionFill, 42);
-        }
-        else
-        {
-            AlphaFillFeathered(dc, r, selectionFill, TextSelectionAlpha());
-        }
-        SelectObject(mem, old);
-        DeleteObject(bitmap);
-        DeleteDC(mem);
+    void FillTextSelectionOverlay(HDC dc, RECT r)
+    {
+        if (r.right <= r.left || r.bottom <= r.top) return;
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
+        Gdiplus::RectF rect(
+            static_cast<Gdiplus::REAL>(r.left) - 0.5f,
+            static_cast<Gdiplus::REAL>(r.top) - 0.5f,
+            static_cast<Gdiplus::REAL>(r.right - r.left) + 1.0f,
+            static_cast<Gdiplus::REAL>(r.bottom - r.top) + 1.0f);
+        path.AddRectangle(rect);
+        Gdiplus::SolidBrush fill(GdiColor(TextSelectionFillColor(), TextSelectionOverlayAlpha()));
+        g.FillPath(&fill, &path);
+        Gdiplus::Pen border(GdiColor(TextSelectionBorderColor(), 54), 1.0f);
+        g.DrawPath(&border, &path);
     }
     void DrawTextSelectionQuads(HDC dc, RECT pageRect, std::vector<fz_quad> const& quads)
     {
@@ -5130,7 +5044,7 @@ namespace
             r.right = std::clamp(r.right, pageRect.left, pageRect.right);
             r.top = std::clamp(r.top, pageRect.top, pageRect.bottom);
             r.bottom = std::clamp(r.bottom, pageRect.top, pageRect.bottom);
-            FillTextSelectionPaperExact(dc, r);
+            FillTextSelectionOverlay(dc, r);
         }
     }
 
@@ -6398,7 +6312,7 @@ namespace
                 if (!image || ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0))
                 {
                     ready = false;
-                    if (queued < 4)
+                    if (queued < std::clamp(VisiblePageCountForCache(tab), 4, 24))
                     {
                         QueuePageRender(hwnd, tab, page, -20 + queued);
                         ++queued;
@@ -6745,11 +6659,11 @@ namespace
             tab.zoomFallbackZoom = tab.cachedZoom;
             tab.zoomFallbackDpi = tab.cachedDpi;
             tab.zoomFallbackTheme = tab.cachedTheme;
-            tab.zoomFallbackUntil = GetTickCount64() + 3000;
+            tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
         else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
         {
-            tab.zoomFallbackUntil = GetTickCount64() + 3000;
+            tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
 
         tab.zoom = clampedZoom;
@@ -6815,12 +6729,13 @@ namespace
                     QueueVisibleTilesForPageLevel(hwnd, tab, page, newPageRect, zoomPrefetch, 0, -16, zoomTileBudget);
             }
         }
+        if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
         if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        InvalidateRect(hwnd, &g_stage, FALSE);
         RECT client{};
         GetClientRect(hwnd, &client);
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
-        RedrawWindow(hwnd, &status, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        InvalidateRect(hwnd, &status, FALSE);
         SchedulePagePrefetch(hwnd);
         ScheduleIdleCacheTrim(hwnd);
     }
@@ -8953,7 +8868,6 @@ namespace
                         Fill(dc, drawRect, RGB(255, 255, 255));
                         bool fallbackPainted = false;
                         PageImage* fallback = FindZoomFallbackPage(tab, i);
-                        if (!fallback) QueueZoomPreviewRender(g_hwnd, tab, i, 8);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                         {
                             int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
@@ -9058,7 +8972,7 @@ namespace
                             RECT visibleSelection{};
                             if (IntersectRect(&visibleSelection, &selection, &pageRect))
                             {
-                                AlphaFillFeathered(dc, visibleSelection, TextSelectionFillColor(), TextSelectionAlpha());
+                                FillTextSelectionOverlay(dc, visibleSelection);
                                 RECT top{ visibleSelection.left, visibleSelection.top, visibleSelection.right, visibleSelection.top + std::max(1, S(1)) };
                                 RECT bottom{ visibleSelection.left, visibleSelection.bottom - std::max(1, S(1)), visibleSelection.right, visibleSelection.bottom };
                                 RECT left{ visibleSelection.left, visibleSelection.top, visibleSelection.left + std::max(1, S(1)), visibleSelection.bottom };
