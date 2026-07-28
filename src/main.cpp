@@ -1351,11 +1351,11 @@ namespace
     int g_themedMenuPressed{ -1 };
     Theme g_themes[] = {
         { L"\u4e91\u6bcd\u767d", RGB(244,247,250), RGB(255,255,255), RGB(250,252,254), RGB(238,243,247), RGB(255,255,255), RGB(31,35,40), RGB(105,113,125), RGB(210,217,226), RGB(59,170,124) },
+        { L"\u8f7b\u67d4\u7070", RGB(246,247,249), RGB(242,243,245), RGB(255,255,255), RGB(238,240,243), RGB(255,255,255), RGB(43,48,56), RGB(116,123,132), RGB(213,217,222), RGB(83,145,207) },
         { L"\u62a4\u773c\u7c73\u767d", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
         { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
         { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) },
-        { L"IDEA light", RGB(246,247,249), RGB(242,243,245), RGB(255,255,255), RGB(238,240,243), RGB(255,255,255), RGB(43,48,56), RGB(116,123,132), RGB(213,217,222), RGB(83,145,207) }
+        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) }
     };
 
     Theme const& T()
@@ -1370,17 +1370,17 @@ namespace
 
     bool IsAuroraTheme()
     {
-        return g_theme == 4;
+        return g_theme == 5;
     }
 
     bool IsBeigeTheme()
     {
-        return g_theme == 1;
+        return g_theme == 2;
     }
 
     bool IsIdeaLightTheme()
     {
-        return g_theme == 5;
+        return g_theme == 1;
     }
 
     bool SidebarVisible()
@@ -1414,7 +1414,7 @@ namespace
 
     bool IsDarkTheme()
     {
-        return g_theme >= 2 && g_theme <= 4;
+        return g_theme >= 3 && g_theme <= 5;
     }
 
     COLORREF ForegroundOn(COLORREF bg)
@@ -1573,8 +1573,8 @@ namespace
     void ApplyPdfThemeFor(int theme, std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
         int clampedTheme = std::clamp(theme, 0, static_cast<int>(std::size(g_themes)) - 1);
-        if (clampedTheme == 0) return;
-        if (clampedTheme == 2 || clampedTheme == 3 || clampedTheme == 4) return;
+        if (clampedTheme == 0 || clampedTheme == 1) return;
+        if (clampedTheme >= 3 && clampedTheme <= 5) return;
 
         int lum = Luma(r, g, b);
         COLORREF paper = g_themes[clampedTheme].paper;
@@ -3051,22 +3051,35 @@ namespace
         std::vector<std::string> lines;
         std::string line;
         while (std::getline(in, line)) lines.push_back(line);
+        bool themeSchema3 = std::find(lines.begin(), lines.end(), "themeSchema=3") != lines.end();
         bool themeSchema2 = std::find(lines.begin(), lines.end(), "themeSchema=2") != lines.end();
         for (auto const& line : lines)
         {
             if (line.rfind("theme=", 0) == 0)
             {
                 int savedTheme = std::atoi(line.c_str() + 6);
-                if (themeSchema2)
+                if (themeSchema3)
                 {
                     g_theme = std::clamp(savedTheme, 0, 5);
                 }
+                else if (themeSchema2)
+                {
+                    switch (std::clamp(savedTheme, 0, 5))
+                    {
+                    case 1: g_theme = 2; break; // schema2 eye-care beige -> eye-care beige
+                    case 2: g_theme = 3; break; // schema2 night black -> night black
+                    case 3: g_theme = 4; break; // schema2 graphite black -> graphite black
+                    case 4: g_theme = 5; break; // schema2 aurora green -> aurora green
+                    case 5: g_theme = 1; break; // schema2 IDEA light -> soft gray
+                    default: g_theme = 0; break;
+                    }
+                }
                 else switch (savedTheme)
                 {
-                case 1: g_theme = 2; break; // legacy dark mica -> night black
-                case 2: g_theme = 4; break; // legacy aurora -> aurora green
-                case 3: g_theme = 3; break; // legacy graphite -> graphite black
-                case 4: g_theme = 1; break; // legacy eye-care paper -> eye-care beige
+                case 1: g_theme = 3; break; // legacy dark mica -> night black
+                case 2: g_theme = 5; break; // legacy aurora -> aurora green
+                case 3: g_theme = 4; break; // legacy graphite -> graphite black
+                case 4: g_theme = 2; break; // legacy eye-care paper -> eye-care beige
                 case 5: g_theme = 0; break; // legacy frosted mica -> mica white
                 default: g_theme = 0; break;
                 }
@@ -3127,7 +3140,7 @@ namespace
     void SaveState()
     {
         std::ofstream out(StatePath(), std::ios::binary | std::ios::trunc);
-        out << "themeSchema=2\n";
+        out << "themeSchema=3\n";
         out << "theme=" << g_theme << "\n";
         out << "sidebar=" << std::max(g_sidebarExpandedWidth, g_sidebarWidth) << "\n";
         out << "outline=" << g_outlineFont << "\n";
@@ -3356,7 +3369,7 @@ namespace
     void ApplyWindowChrome()
     {
         if (!g_hwnd) return;
-        BOOL dark = g_theme == 2 || g_theme == 3 || g_theme == 4;
+        BOOL dark = IsDarkTheme();
         DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof(dark));
         int backdrop = IsGlassTheme() ? 4 : 2;
         DwmSetWindowAttribute(g_hwnd, 38, &backdrop, sizeof(backdrop));
@@ -4727,11 +4740,45 @@ namespace
         };
     }
 
+    COLORREF TextSelectionFillColor()
+    {
+        if (IsGlassTheme()) return RGB(255, 241, 168);
+        if (IsIdeaLightTheme()) return RGB(166, 210, 255);
+        if (IsBeigeTheme()) return RGB(220, 230, 188);
+        if (g_theme == 3) return RGB(142, 176, 255);
+        if (g_theme == 4) return RGB(238, 205, 145);
+        if (IsAuroraTheme()) return RGB(141, 226, 188);
+        return MixColor(T().paper, T().accent, 0.36);
+    }
+
+    COLORREF TextSelectionBorderColor()
+    {
+        if (IsGlassTheme()) return RGB(232, 190, 70);
+        if (IsIdeaLightTheme()) return RGB(88, 148, 207);
+        if (IsBeigeTheme()) return RGB(152, 166, 103);
+        if (g_theme == 3) return RGB(104, 139, 220);
+        if (g_theme == 4) return RGB(207, 158, 82);
+        if (IsAuroraTheme()) return RGB(66, 194, 134);
+        return T().accent;
+    }
+
+    BYTE TextSelectionAlpha()
+    {
+        if (IsDarkTheme() || IsAuroraTheme()) return 86;
+        if (IsGlassTheme()) return 92;
+        return 78;
+    }
+
     void FillTextSelectionPaperExact(HDC dc, RECT r)
     {
         int w = r.right - r.left;
         int h = r.bottom - r.top;
         if (w <= 0 || h <= 0) return;
+
+        COLORREF selectionFill = TextSelectionFillColor();
+        std::uint8_t fillB = static_cast<std::uint8_t>(GetBValue(selectionFill));
+        std::uint8_t fillG = static_cast<std::uint8_t>(GetGValue(selectionFill));
+        std::uint8_t fillR = static_cast<std::uint8_t>(GetRValue(selectionFill));
 
         BITMAPINFO info{};
         info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -4746,7 +4793,7 @@ namespace
         if (!bitmap || !bits)
         {
             if (bitmap) DeleteObject(bitmap);
-            Fill(dc, r, RGB(255, 241, 168));
+            Fill(dc, r, selectionFill);
             return;
         }
 
@@ -4754,7 +4801,7 @@ namespace
         if (!mem)
         {
             DeleteObject(bitmap);
-            Fill(dc, r, RGB(255, 241, 168));
+            Fill(dc, r, selectionFill);
             return;
         }
 
@@ -4762,6 +4809,11 @@ namespace
         BitBlt(mem, 0, 0, w, h, dc, r.left, r.top, SRCCOPY);
 
         auto* px = static_cast<std::uint8_t*>(bits);
+        COLORREF paper = T().paper;
+        int paperR = GetRValue(paper);
+        int paperG = GetGValue(paper);
+        int paperB = GetBValue(paper);
+        bool touchedPaper = false;
         for (int y = 0; y < h; ++y)
         {
             for (int x = 0; x < w; ++x)
@@ -4770,21 +4822,30 @@ namespace
                 std::uint8_t b = p[0];
                 std::uint8_t g = p[1];
                 std::uint8_t red = p[2];
-                bool paperPixel = red >= 238 && g >= 238 && b >= 238 &&
-                    std::abs(static_cast<int>(red) - static_cast<int>(g)) <= 10 &&
-                    std::abs(static_cast<int>(red) - static_cast<int>(b)) <= 10 &&
-                    std::abs(static_cast<int>(g) - static_cast<int>(b)) <= 10;
-                if (paperPixel)
+                int maxDiff = std::max({
+                    std::abs(static_cast<int>(red) - static_cast<int>(g)),
+                    std::abs(static_cast<int>(red) - static_cast<int>(b)),
+                    std::abs(static_cast<int>(g) - static_cast<int>(b)) });
+                int lum = Luma(red, g, b);
+                bool neutralPaper = maxDiff <= (IsDarkTheme() || IsAuroraTheme() ? 26 : 18) && lum >= (IsDarkTheme() || IsAuroraTheme() ? 70 : 188);
+                bool themedPaper = std::abs(static_cast<int>(red) - paperR) <= 34 &&
+                    std::abs(static_cast<int>(g) - paperG) <= 34 &&
+                    std::abs(static_cast<int>(b) - paperB) <= 34;
+                if (neutralPaper || themedPaper)
                 {
-                    p[0] = 168;
-                    p[1] = 241;
-                    p[2] = 255;
+                    p[0] = fillB;
+                    p[1] = fillG;
+                    p[2] = fillR;
                     p[3] = 255;
+                    touchedPaper = true;
                 }
             }
         }
 
-        BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+        if (touchedPaper)
+            BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+        else
+            AlphaFill(dc, r, selectionFill, TextSelectionAlpha());
         SelectObject(mem, old);
         DeleteObject(bitmap);
         DeleteDC(mem);
@@ -8244,14 +8305,14 @@ namespace
     COLORREF PdfOverlayColor()
     {
         if (IsAuroraTheme()) return RGB(0, 42, 30);
-        if (g_theme == 3) return RGB(28, 25, 22);
+        if (g_theme == 4) return RGB(28, 25, 22);
         return RGB(7, 10, 20);
     }
 
     BYTE PdfOverlayAlpha()
     {
         if (IsAuroraTheme()) return 42;
-        if (g_theme == 3) return 40;
+        if (g_theme == 4) return 40;
         return 46;
     }
 
@@ -8578,15 +8639,16 @@ namespace
                             RECT visibleSelection{};
                             if (IntersectRect(&visibleSelection, &selection, &pageRect))
                             {
-                                AlphaFill(dc, visibleSelection, RGB(86, 156, 255), IsDarkTheme() || IsAuroraTheme() ? 42 : 32);
+                                AlphaFill(dc, visibleSelection, TextSelectionFillColor(), TextSelectionAlpha());
                                 RECT top{ visibleSelection.left, visibleSelection.top, visibleSelection.right, visibleSelection.top + std::max(1, S(1)) };
                                 RECT bottom{ visibleSelection.left, visibleSelection.bottom - std::max(1, S(1)), visibleSelection.right, visibleSelection.bottom };
                                 RECT left{ visibleSelection.left, visibleSelection.top, visibleSelection.left + std::max(1, S(1)), visibleSelection.bottom };
                                 RECT right{ visibleSelection.right - std::max(1, S(1)), visibleSelection.top, visibleSelection.right, visibleSelection.bottom };
-                                Fill(dc, top, MixColor(T().accent, RGB(255, 255, 255), 0.10));
-                                Fill(dc, bottom, MixColor(T().accent, RGB(255, 255, 255), 0.10));
-                                Fill(dc, left, MixColor(T().accent, RGB(255, 255, 255), 0.10));
-                                Fill(dc, right, MixColor(T().accent, RGB(255, 255, 255), 0.10));
+                                COLORREF selectionBorder = TextSelectionBorderColor();
+                                Fill(dc, top, selectionBorder);
+                                Fill(dc, bottom, selectionBorder);
+                                Fill(dc, left, selectionBorder);
+                                Fill(dc, right, selectionBorder);
                             }
                         }
                     }
