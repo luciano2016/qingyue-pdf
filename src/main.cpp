@@ -8705,23 +8705,25 @@ namespace
                             int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
                             fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
                         }
-                        bool scrollingPaint = StageScrollPaintInProgress();
                         int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
                         if (!fallbackPainted)
                         {
                             for (int level = targetLevel; level >= 1; --level)
                             {
-                                if (scrollingPaint && !TileLevelFullyCached(tab, i, pageRect, drawRect, level)) continue;
+                                if (!TileLevelFullyCached(tab, i, pageRect, drawRect, level)) continue;
                                 bool ignoredMissing = false;
-                                if (DrawTileLevel(dc, tab, i, pageRect, drawRect, level, level == targetLevel, ignoredMissing))
+                                if (DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing))
+                                {
                                     fallbackPainted = true;
+                                    break;
+                                }
                             }
                         }
                         bool targetMissing = false;
                         bool targetPainted = false;
-                        if (!scrollingPaint || TileLevelFullyCached(tab, i, pageRect, drawRect, 0))
+                        if (TileLevelFullyCached(tab, i, pageRect, drawRect, 0))
                         {
-                            targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
+                            targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, targetMissing);
                         }
                         else
                         {
