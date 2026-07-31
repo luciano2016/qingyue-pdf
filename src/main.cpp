@@ -1680,6 +1680,60 @@ namespace
         DeleteDC(mem);
     }
 
+
+    void MultiplyHighlightFill(HDC dc, RECT r, COLORREF color, BYTE alpha)
+    {
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        if (w <= 0 || h <= 0 || alpha == 0) return;
+
+        HDC mem = CreateCompatibleDC(dc);
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (!bmp)
+        {
+            DeleteDC(mem);
+            return;
+        }
+
+        HGDIOBJ oldBmp = SelectObject(mem, bmp);
+        if (BitBlt(mem, 0, 0, w, h, dc, r.left, r.top, SRCCOPY))
+        {
+            auto* px = static_cast<std::uint8_t*>(bits);
+            int hr = GetRValue(color);
+            int hg = GetGValue(color);
+            int hb = GetBValue(color);
+            int a = alpha;
+            for (int y = 0; y < h; ++y)
+            {
+                auto* row = px + static_cast<size_t>(y) * w * 4;
+                for (int x = 0; x < w; ++x)
+                {
+                    std::uint8_t& b = row[x * 4 + 0];
+                    std::uint8_t& g = row[x * 4 + 1];
+                    std::uint8_t& rr = row[x * 4 + 2];
+                    int mb = (static_cast<int>(b) * hb + 127) / 255;
+                    int mg = (static_cast<int>(g) * hg + 127) / 255;
+                    int mr = (static_cast<int>(rr) * hr + 127) / 255;
+                    b = static_cast<std::uint8_t>((static_cast<int>(b) * (255 - a) + mb * a + 127) / 255);
+                    g = static_cast<std::uint8_t>((static_cast<int>(g) * (255 - a) + mg * a + 127) / 255);
+                    rr = static_cast<std::uint8_t>((static_cast<int>(rr) * (255 - a) + mr * a + 127) / 255);
+                }
+            }
+            BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+        }
+        SelectObject(mem, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+    }
+
     void PaintGlassBackdrop(HDC dc, RECT r)
     {
         RECT client{};
@@ -9048,7 +9102,7 @@ namespace
                             if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
                             if (annotation.kind == AnnotationKind::Highlight)
                             {
-                                AlphaFill(dc, visibleMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 76 : 132);
+                                MultiplyHighlightFill(dc, visibleMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 88 : 122);
                             }
                             else
                             {
