@@ -5124,15 +5124,17 @@ namespace
 
     BYTE TextSelectionOverlayAlpha()
     {
-        if (IsDarkTheme() || IsAuroraTheme()) return 72;
-        if (IsIdeaLightTheme()) return 88;
-        if (IsGlassTheme()) return 86;
-        return 84;
+        if (IsDarkTheme() || IsAuroraTheme()) return 178;
+        if (IsIdeaLightTheme()) return 214;
+        if (IsGlassTheme()) return 255;
+        return 222;
     }
 
     void FillTextSelectionOverlay(HDC dc, RECT r)
     {
         if (r.right <= r.left || r.bottom <= r.top) return;
+        MultiplyHighlightFill(dc, r, TextSelectionFillColor(), TextSelectionOverlayAlpha());
+
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
@@ -5143,11 +5145,10 @@ namespace
             static_cast<Gdiplus::REAL>(r.right - r.left) + 1.0f,
             static_cast<Gdiplus::REAL>(r.bottom - r.top) + 1.0f);
         path.AddRectangle(rect);
-        Gdiplus::SolidBrush fill(GdiColor(TextSelectionFillColor(), TextSelectionOverlayAlpha()));
-        g.FillPath(&fill, &path);
-        Gdiplus::Pen border(GdiColor(TextSelectionBorderColor(), 54), 1.0f);
+        Gdiplus::Pen border(GdiColor(TextSelectionBorderColor(), IsDarkTheme() || IsAuroraTheme() ? 58 : 66), 1.0f);
         g.DrawPath(&border, &path);
     }
+
     void DrawTextSelectionQuads(HDC dc, RECT pageRect, std::vector<fz_quad> const& quads)
     {
         struct SelectionLine
