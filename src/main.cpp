@@ -4849,6 +4849,90 @@ namespace
         g_scrollY = g_continuousRead ? SpreadTopScroll(tab, page) : 0;
     }
 
+    void UpdateVertScrollBar(HWND hwnd);
+
+    double AnnotationTopNorm(PdfAnnotation const& annotation)
+    {
+        double top = annotation.y0;
+        if (!annotation.segments.empty())
+        {
+            top = 1.0;
+            for (auto const& segment : annotation.segments)
+                top = std::min(top, segment.y0);
+        }
+        return std::clamp(top, 0.0, 1.0);
+    }
+
+    double AnnotationCenterXNorm(PdfAnnotation const& annotation)
+    {
+        double left = annotation.x0;
+        double right = annotation.x1;
+        if (!annotation.segments.empty())
+        {
+            left = 1.0;
+            right = 0.0;
+            for (auto const& segment : annotation.segments)
+            {
+                left = std::min(left, segment.x0);
+                right = std::max(right, segment.x1);
+            }
+        }
+        return std::clamp((left + right) * 0.5, 0.0, 1.0);
+    }
+
+    int PageOffsetXInSpread(PdfTab const& tab, int start, int page)
+    {
+        int offset = 0;
+        int count = SpreadPageCount(tab, start);
+        for (int i = 0; i < count; ++i)
+        {
+            int p = start + i;
+            if (p == page) return offset;
+            offset += PageW(tab, p) + FacingPageGap();
+        }
+        return 0;
+    }
+
+    void JumpToAnnotation(HWND hwnd, PdfTab& tab, PdfAnnotation const& annotation)
+    {
+        if (tab.pageCount <= 0) return;
+        int page = std::clamp(annotation.page, 0, tab.pageCount - 1);
+        int start = FirstPageInSpread(page);
+        int spreadH = SpreadHeight(tab, start);
+        int pageH = PageH(tab, page);
+        int pageW = PageW(tab, page);
+        int pageOffsetY = std::max(0, (spreadH - pageH) / 2);
+        int markY = static_cast<int>(AnnotationTopNorm(annotation) * pageH + 0.5);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        int targetMargin = std::clamp(stageH / 3, S(42), S(190));
+
+        tab.currentPage = page;
+        g_contentHeight = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
+        g_contentWidth = ReadingContentWidth(tab);
+        int maxY = std::max<int>(0, g_contentHeight - stageH);
+        int baseY = g_continuousRead ? SpreadTopScroll(tab, page) : S(28);
+        g_scrollY = std::clamp(baseY + pageOffsetY + markY - targetMargin, 0, maxY);
+
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int maxX = std::max<int>(0, g_contentWidth - stageW);
+        if (maxX > 0)
+        {
+            int spreadW = SpreadWidth(tab, start);
+            int maxSpreadW = MaxSpreadWidth(tab);
+            int pageOffsetX = PageOffsetXInSpread(tab, start, page);
+            int markX = static_cast<int>(AnnotationCenterXNorm(annotation) * pageW + 0.5);
+            int targetX = S(28) + (maxSpreadW - spreadW) / 2 + pageOffsetX + markX - stageW / 2;
+            g_scrollX = std::clamp(targetX, 0, maxX);
+        }
+        else
+        {
+            g_scrollX = 0;
+        }
+
+        TouchRecentProgress(tab, false);
+        UpdateVertScrollBar(hwnd);
+        SchedulePagePrefetch(hwnd);
+    }
     int PageTopScroll(PdfTab& tab, int page)
     {
         return SpreadTopScroll(tab, page);
@@ -5537,7 +5621,7 @@ namespace
         g_activeAnnotation = index;
         g_annotationToolbarOpen = true;
         g_annotationNoteFocused = false;
-        if (jump) ScrollToPage(tab, tab.annotations[static_cast<size_t>(index)].page);
+        if (jump) JumpToAnnotation(hwnd, tab, tab.annotations[static_cast<size_t>(index)]);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
