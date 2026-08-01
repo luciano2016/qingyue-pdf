@@ -645,6 +645,310 @@ extern "C" int quiet_pdf_select_word_at_point(
 
     return count;
 }
+struct quiet_visual_char
+{
+    fz_stext_char* ch;
+    fz_rect rect;
+    float cx;
+    float cy;
+    float size;
+};
+
+struct quiet_visual_line
+{
+    std::vector<quiet_visual_char> chars;
+    float y0;
+    float y1;
+    float cy;
+    float size;
+};
+
+struct quiet_visual_caret
+{
+    int line;
+    int boundary;
+};
+
+enum class quiet_gap_policy
+{
+    nearest,
+    previous_line_end,
+    next_line_start
+};
+
+static int quiet_clamp_int(int value, int low, int high)
+{
+    return std::min(std::max(value, low), high);
+}
+static bool quiet_is_selectable_rune(int c)
+{
+    return c != 0 && c != '\r' && c != '\n';
+}
+
+static bool quiet_line_accepts_char(const quiet_visual_line& line, const quiet_visual_char& ch)
+{
+    float line_h = std::max(1.0f, line.y1 - line.y0);
+    float char_h = std::max(1.0f, ch.rect.y1 - ch.rect.y0);
+    float tolerance = std::max({ line_h * 0.42f, char_h * 0.42f, ch.size * 0.38f, 1.2f });
+    return std::abs(ch.cy - line.cy) <= tolerance || (ch.rect.y0 <= line.y1 && ch.rect.y1 >= line.y0);
+}
+
+static void quiet_add_char_to_line(quiet_visual_line& line, const quiet_visual_char& ch)
+{
+    line.chars.push_back(ch);
+    line.y0 = std::min(line.y0, ch.rect.y0);
+    line.y1 = std::max(line.y1, ch.rect.y1);
+    line.cy = (line.y0 + line.y1) * 0.5f;
+    line.size = std::max(line.size, ch.size);
+}
+
+static std::vector<quiet_visual_line> quiet_build_visual_lines(fz_stext_page* stext)
+{
+    std::vector<quiet_visual_char> chars;
+    for (fz_stext_block* block = stext ? stext->first_block : nullptr; block; block = block->next)
+    {
+        if (block->type != FZ_STEXT_BLOCK_TEXT)
+            continue;
+        for (fz_stext_line* line = block->u.t.first_line; line; line = line->next)
+        {
+            for (fz_stext_char* ch = line->first_char; ch; ch = ch->next)
+            {
+                if (!quiet_is_selectable_rune(ch->c))
+                    continue;
+                fz_rect rect = quiet_rect_from_quad(ch->quad);
+                if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                    continue;
+                chars.push_back(quiet_visual_char{
+                    ch,
+                    rect,
+                    (rect.x0 + rect.x1) * 0.5f,
+                    (rect.y0 + rect.y1) * 0.5f,
+                    std::max(1.0f, ch->size)
+                });
+            }
+        }
+    }
+
+    std::sort(chars.begin(), chars.end(), [](const quiet_visual_char& a, const quiet_visual_char& b)
+    {
+        float ay = a.cy;
+        float by = b.cy;
+        float tolerance = std::max({ a.size, b.size, 1.0f }) * 0.45f;
+        if (std::abs(ay - by) > tolerance)
+            return ay < by;
+        return a.cx < b.cx;
+    });
+
+    std::vector<quiet_visual_line> lines;
+    for (const quiet_visual_char& ch : chars)
+    {
+        int best = -1;
+        float bestDistance = 3.402823466e+38F;
+        for (int i = static_cast<int>(lines.size()) - 1; i >= 0; --i)
+        {
+            if (ch.cy > lines[static_cast<size_t>(i)].cy + std::max(8.0f, ch.size * 2.0f))
+                break;
+            if (!quiet_line_accepts_char(lines[static_cast<size_t>(i)], ch))
+                continue;
+            float distance = std::abs(ch.cy - lines[static_cast<size_t>(i)].cy);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+        if (best >= 0)
+        {
+            quiet_add_char_to_line(lines[static_cast<size_t>(best)], ch);
+        }
+        else
+        {
+            quiet_visual_line line;
+            line.y0 = ch.rect.y0;
+            line.y1 = ch.rect.y1;
+            line.cy = ch.cy;
+            line.size = ch.size;
+            line.chars.push_back(ch);
+            lines.push_back(std::move(line));
+        }
+    }
+
+    for (quiet_visual_line& line : lines)
+    {
+        std::sort(line.chars.begin(), line.chars.end(), [](const quiet_visual_char& a, const quiet_visual_char& b)
+        {
+            return a.cx < b.cx;
+        });
+    }
+    std::sort(lines.begin(), lines.end(), [](const quiet_visual_line& a, const quiet_visual_line& b)
+    {
+        if (std::abs(a.cy - b.cy) > 1.0f)
+            return a.cy < b.cy;
+        float ax = a.chars.empty() ? 0.0f : a.chars.front().cx;
+        float bx = b.chars.empty() ? 0.0f : b.chars.front().cx;
+        return ax < bx;
+    });
+    return lines;
+}
+
+static int quiet_char_boundary_index(const quiet_visual_line& line, fz_point p)
+{
+    if (line.chars.empty()) return 0;
+    int best = 0;
+    float bestDistance = std::abs(p.x - line.chars.front().rect.x0);
+    for (int i = 0; i < static_cast<int>(line.chars.size()); ++i)
+    {
+        const quiet_visual_char& ch = line.chars[static_cast<size_t>(i)];
+        float leftDistance = std::abs(p.x - ch.rect.x0);
+        if (leftDistance < bestDistance)
+        {
+            bestDistance = leftDistance;
+            best = i;
+        }
+        float rightDistance = std::abs(p.x - ch.rect.x1);
+        if (rightDistance < bestDistance)
+        {
+            bestDistance = rightDistance;
+            best = i + 1;
+        }
+        if (p.x >= ch.rect.x0 && p.x <= ch.rect.x1)
+            return (p.x < ch.cx) ? i : i + 1;
+    }
+    return quiet_clamp_int(best, 0, static_cast<int>(line.chars.size()));
+}
+
+static quiet_visual_caret quiet_caret_for_visual_point(
+    const std::vector<quiet_visual_line>& lines,
+    fz_point p,
+    quiet_gap_policy gap_policy)
+{
+    if (lines.empty())
+        return quiet_visual_caret{ -1, 0 };
+
+    for (int i = 0; i < static_cast<int>(lines.size()); ++i)
+    {
+        const quiet_visual_line& line = lines[static_cast<size_t>(i)];
+        if (line.chars.empty())
+            continue;
+
+        float pad = std::max(1.0f, line.size * 0.16f);
+        if (p.y >= line.y0 - pad && p.y <= line.y1 + pad)
+            return quiet_visual_caret{ i, quiet_char_boundary_index(line, p) };
+
+        if (p.y < line.y0 - pad)
+        {
+            if (i == 0)
+                return quiet_visual_caret{ i, 0 };
+
+            int prev_index = i - 1;
+            const quiet_visual_line& prev = lines[static_cast<size_t>(prev_index)];
+            if (gap_policy == quiet_gap_policy::previous_line_end)
+                return quiet_visual_caret{ prev_index, static_cast<int>(prev.chars.size()) };
+            if (gap_policy == quiet_gap_policy::next_line_start)
+                return quiet_visual_caret{ i, 0 };
+
+            float prev_distance = std::abs(p.y - prev.y1);
+            float next_distance = std::abs(line.y0 - p.y);
+            if (prev_distance <= next_distance)
+                return quiet_visual_caret{ prev_index, quiet_char_boundary_index(prev, p) };
+            return quiet_visual_caret{ i, quiet_char_boundary_index(line, p) };
+        }
+    }
+
+    for (int i = static_cast<int>(lines.size()) - 1; i >= 0; --i)
+    {
+        const quiet_visual_line& line = lines[static_cast<size_t>(i)];
+        if (!line.chars.empty())
+            return quiet_visual_caret{ i, static_cast<int>(line.chars.size()) };
+    }
+    return quiet_visual_caret{ -1, 0 };
+}
+static void quiet_append_line_text(fz_context* ctx, fz_buffer* buffer, const quiet_visual_line& line, int first, int last)
+{
+    first = quiet_clamp_int(first, 0, static_cast<int>(line.chars.size()));
+    last = quiet_clamp_int(last, first, static_cast<int>(line.chars.size()));
+    for (int i = first; i < last; ++i)
+        fz_append_rune(ctx, buffer, line.chars[static_cast<size_t>(i)].ch->c);
+}
+
+static bool quiet_line_quad(const quiet_visual_line& line, int first, int last, fz_rect& out)
+{
+    first = quiet_clamp_int(first, 0, static_cast<int>(line.chars.size()));
+    last = quiet_clamp_int(last, first, static_cast<int>(line.chars.size()));
+    bool have = false;
+    for (int i = first; i < last; ++i)
+    {
+        fz_rect r = line.chars[static_cast<size_t>(i)].rect;
+        if (!have)
+        {
+            out = r;
+            have = true;
+        }
+        else
+        {
+            out.x0 = std::min(out.x0, r.x0);
+            out.y0 = std::min(out.y0, r.y0);
+            out.x1 = std::max(out.x1, r.x1);
+            out.y1 = std::max(out.y1, r.y1);
+        }
+    }
+    return have;
+}
+
+static int quiet_append_line_quads(
+    const quiet_visual_line& line,
+    int first,
+    int last,
+    fz_rect bounds,
+    fz_quad* quads,
+    int count,
+    int max_quads)
+{
+    first = quiet_clamp_int(first, 0, static_cast<int>(line.chars.size()));
+    last = quiet_clamp_int(last, first, static_cast<int>(line.chars.size()));
+    if (last <= first)
+        return count;
+
+    fz_rect run = line.chars[static_cast<size_t>(first)].rect;
+    fz_rect previous = run;
+    auto flush_run = [&]()
+    {
+        if (count >= max_quads)
+            return;
+        fz_quad quad{};
+        quad.ul = fz_point{ run.x0, run.y0 };
+        quad.ur = fz_point{ run.x1, run.y0 };
+        quad.ll = fz_point{ run.x0, run.y1 };
+        quad.lr = fz_point{ run.x1, run.y1 };
+        quiet_normalize_quad(quad, bounds);
+        quads[count++] = quad;
+    };
+
+    for (int i = first + 1; i < last; ++i)
+    {
+        fz_rect r = line.chars[static_cast<size_t>(i)].rect;
+        float gap = r.x0 - previous.x1;
+        float split_gap = std::max(3.0f, line.size * 0.72f);
+        if (gap > split_gap)
+        {
+            flush_run();
+            run = r;
+        }
+        else
+        {
+            run.x0 = std::min(run.x0, r.x0);
+            run.y0 = std::min(run.y0, r.y0);
+            run.x1 = std::max(run.x1, r.x1);
+            run.y1 = std::max(run.y1, r.y1);
+        }
+        previous = r;
+        if (count >= max_quads)
+            return count;
+    }
+
+    flush_run();
+    return count;
+}
 extern "C" int quiet_pdf_select_text(
     fz_context* ctx,
     fz_document* doc,
@@ -664,8 +968,11 @@ extern "C" int quiet_pdf_select_text(
         quiet_set_last_error("invalid quiet_pdf_select_text arguments");
         return 0;
     }
+    if (text && text_capacity > 0)
+        text[0] = 0;
 
     fz_stext_page* stext = nullptr;
+    fz_buffer* text_buffer = nullptr;
     int count = 0;
 
     fz_try(ctx)
@@ -691,46 +998,66 @@ extern "C" int quiet_pdf_select_text(
             bounds.y0 + fz_clamp(by, 0.0f, 1.0f) * (bounds.y1 - bounds.y0)
         };
 
-        count = fz_highlight_selection(ctx, stext, a, b, quads, max_quads);
-        for (int i = 0; i < count; ++i)
+        std::vector<quiet_visual_line> lines = quiet_build_visual_lines(stext);
+        bool selectingDown = (b.y > a.y) || (std::abs(b.y - a.y) < 0.01f && b.x >= a.x);
+        quiet_visual_caret caretA = quiet_caret_for_visual_point(lines, a, quiet_gap_policy::nearest);
+        quiet_visual_caret caretB = quiet_caret_for_visual_point(
+            lines,
+            b,
+            selectingDown ? quiet_gap_policy::previous_line_end : quiet_gap_policy::next_line_start);
+        if (caretA.line < 0 || caretB.line < 0)
+            return 0;
+
+        int lineA = caretA.line;
+        int lineB = caretB.line;
+        int boundaryA = caretA.boundary;
+        int boundaryB = caretB.boundary;
+        if (lineB < lineA || (lineB == lineA && boundaryB < boundaryA))
         {
-            quads[i].ul.x = (quads[i].ul.x - bounds.x0) / (bounds.x1 - bounds.x0);
-            quads[i].ur.x = (quads[i].ur.x - bounds.x0) / (bounds.x1 - bounds.x0);
-            quads[i].ll.x = (quads[i].ll.x - bounds.x0) / (bounds.x1 - bounds.x0);
-            quads[i].lr.x = (quads[i].lr.x - bounds.x0) / (bounds.x1 - bounds.x0);
-            quads[i].ul.y = (quads[i].ul.y - bounds.y0) / (bounds.y1 - bounds.y0);
-            quads[i].ur.y = (quads[i].ur.y - bounds.y0) / (bounds.y1 - bounds.y0);
-            quads[i].ll.y = (quads[i].ll.y - bounds.y0) / (bounds.y1 - bounds.y0);
-            quads[i].lr.y = (quads[i].lr.y - bounds.y0) / (bounds.y1 - bounds.y0);
+            std::swap(lineA, lineB);
+            std::swap(boundaryA, boundaryB);
         }
 
-        if (text && text_capacity > 0)
+        text_buffer = fz_new_buffer(ctx, 1024);
+        for (int lineIndex = lineA; lineIndex <= lineB && count < max_quads; ++lineIndex)
         {
-            text[0] = 0;
-            char* copied = fz_copy_selection(ctx, stext, a, b, 1);
-            if (copied)
+            const quiet_visual_line& line = lines[static_cast<size_t>(lineIndex)];
+            if (line.chars.empty()) continue;
+            int first = lineIndex == lineA ? boundaryA : 0;
+            int last = lineIndex == lineB ? boundaryB : static_cast<int>(line.chars.size());
+            if (last <= first) continue;
+
+            count = quiet_append_line_quads(line, first, last, bounds, quads, count, max_quads);
+
+            if (text_buffer)
             {
-                size_t i = 0;
-                for (; i + 1 < static_cast<size_t>(text_capacity) && copied[i]; ++i)
-                    text[i] = copied[i];
-                text[i] = 0;
-                fz_free(ctx, copied);
+                if (lineIndex > lineA)
+                    fz_append_byte(ctx, text_buffer, '\n');
+                quiet_append_line_text(ctx, text_buffer, line, first, last);
             }
+        }
+
+        if (text && text_capacity > 0 && text_buffer)
+        {
+            fz_terminate_buffer(ctx, text_buffer);
+            quiet_copy_text(text, static_cast<size_t>(text_capacity), fz_string_from_buffer(ctx, text_buffer));
         }
     }
     fz_always(ctx)
     {
+        if (text_buffer) fz_drop_buffer(ctx, text_buffer);
         if (stext) fz_drop_stext_page(ctx, stext);
     }
     fz_catch(ctx)
     {
         quiet_set_last_error(fz_caught_message(ctx));
         count = 0;
+        if (text && text_capacity > 0)
+            text[0] = 0;
     }
 
     return count;
 }
-
 extern "C" int quiet_pdf_find_image_at_point(
     fz_context* ctx,
     fz_document* doc,

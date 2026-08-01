@@ -5171,9 +5171,11 @@ namespace
     {
         struct SelectionLine
         {
-            RECT bounds{};
+            std::vector<RECT> rects;
             int centerY{};
             int height{};
+            int top{};
+            int bottom{};
         };
 
         std::vector<RECT> rects;
@@ -5220,27 +5222,56 @@ namespace
 
             if (!best)
             {
-                lines.push_back(SelectionLine{ r, center, height });
+                SelectionLine line{};
+                line.rects.push_back(r);
+                line.centerY = center;
+                line.height = height;
+                line.top = r.top;
+                line.bottom = r.bottom;
+                lines.push_back(std::move(line));
                 continue;
             }
 
-            best->bounds.left = std::min(best->bounds.left, r.left);
-            best->bounds.top = std::min(best->bounds.top, r.top);
-            best->bounds.right = std::max(best->bounds.right, r.right);
-            best->bounds.bottom = std::max(best->bounds.bottom, r.bottom);
-            best->centerY = (best->bounds.top + best->bounds.bottom) / 2;
-            best->height = std::max<int>(best->height, static_cast<int>(best->bounds.bottom - best->bounds.top));
+            best->rects.push_back(r);
+            best->top = std::min<int>(best->top, static_cast<int>(r.top));
+            best->bottom = std::max<int>(best->bottom, static_cast<int>(r.bottom));
+            best->centerY = (best->top + best->bottom) / 2;
+            best->height = std::max<int>(best->height, best->bottom - best->top);
         }
 
-        for (SelectionLine const& line : lines)
+        for (SelectionLine& line : lines)
         {
-            RECT r = line.bounds;
-            InflateRect(&r, S(1), S(1));
-            r.left = std::clamp(r.left, pageRect.left, pageRect.right);
-            r.right = std::clamp(r.right, pageRect.left, pageRect.right);
-            r.top = std::clamp(r.top, pageRect.top, pageRect.bottom);
-            r.bottom = std::clamp(r.bottom, pageRect.top, pageRect.bottom);
-            FillTextSelectionOverlay(dc, r);
+            std::sort(line.rects.begin(), line.rects.end(), [](RECT const& a, RECT const& b)
+            {
+                return a.left < b.left;
+            });
+
+            int lineTop = std::clamp<int>(line.top - S(1), static_cast<int>(pageRect.top), static_cast<int>(pageRect.bottom));
+            int lineBottom = std::clamp<int>(line.bottom + S(1), static_cast<int>(pageRect.top), static_cast<int>(pageRect.bottom));
+            std::vector<RECT> merged;
+            for (RECT r : line.rects)
+            {
+                r.left = static_cast<LONG>(std::clamp<int>(static_cast<int>(r.left) - S(1), static_cast<int>(pageRect.left), static_cast<int>(pageRect.right)));
+                r.right = static_cast<LONG>(std::clamp<int>(static_cast<int>(r.right) + S(1), static_cast<int>(pageRect.left), static_cast<int>(pageRect.right)));
+                r.top = lineTop;
+                r.bottom = lineBottom;
+                if (r.right <= r.left || r.bottom <= r.top)
+                    continue;
+
+                if (!merged.empty() && r.left <= merged.back().right + S(2))
+                {
+                    merged.back().right = std::max(merged.back().right, r.right);
+                    merged.back().top = std::min(merged.back().top, r.top);
+                    merged.back().bottom = std::max(merged.back().bottom, r.bottom);
+                }
+                else
+                {
+                    merged.push_back(r);
+                }
+            }
+
+            for (RECT const& r : merged)
+                FillTextSelectionOverlay(dc, r);
         }
     }
 
@@ -5368,48 +5399,6 @@ namespace
         return true;
     }
 
-    bool AdjustSelectionEndAwayFromLineGap(std::vector<fz_quad> const& quads, POINT& adjustedEnd)
-    {
-        if (quads.empty() || IsRectEmpty(&g_selectionPageRect)) return false;
-        int dy = g_selectionEnd.y - g_selectionStart.y;
-        if (std::abs(dy) < S(4)) return false;
-
-        bool downward = dy > 0;
-        int tolerance = std::max(1, S(1));
-        bool hasEndpointSideText = false;
-        bool hasKeptText = false;
-        int targetCenter = downward ? INT_MIN : INT_MAX;
-
-        for (fz_quad const& quad : quads)
-        {
-            RECT r = QuadToRect(quad, g_selectionPageRect);
-            RECT clipped{};
-            if (!IntersectRect(&clipped, &r, &g_selectionPageRect)) continue;
-            if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) continue;
-
-            bool beyondEndpoint = downward
-                ? clipped.top > g_selectionEnd.y + tolerance
-                : clipped.bottom < g_selectionEnd.y - tolerance;
-            if (beyondEndpoint)
-            {
-                hasEndpointSideText = true;
-                continue;
-            }
-
-            hasKeptText = true;
-            int center = (clipped.top + clipped.bottom) / 2;
-            if (downward) targetCenter = std::max(targetCenter, center);
-            else targetCenter = std::min(targetCenter, center);
-        }
-
-        if (!hasEndpointSideText || !hasKeptText) return false;
-        if (targetCenter == INT_MIN || targetCenter == INT_MAX) return false;
-        targetCenter = std::clamp<int>(targetCenter, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom));
-        if (std::abs(targetCenter - g_selectionEnd.y) <= tolerance) return false;
-        adjustedEnd.y = targetCenter;
-        return true;
-    }
-
     bool RefreshTextSelection(PdfTab& tab)
     {
         g_selectionQuads.clear();
@@ -5440,33 +5429,6 @@ namespace
             return false;
 
         quads.resize(static_cast<size_t>(count));
-        POINT adjustedEnd = g_selectionEnd;
-        if (AdjustSelectionEndAwayFromLineGap(quads, adjustedEnd))
-        {
-            fz_point adjusted = NormalizeSelectionPoint(g_selectionPageRect, adjustedEnd);
-            std::vector<fz_quad> adjustedQuads(256);
-            std::string adjustedText(65536, '\0');
-            int adjustedCount = g_pdf.selectText(
-                tab.ctx,
-                tab.doc,
-                g_selectionPage,
-                start.x,
-                start.y,
-                adjusted.x,
-                adjusted.y,
-                adjustedQuads.data(),
-                static_cast<int>(adjustedQuads.size()),
-                adjustedText.data(),
-                static_cast<int>(adjustedText.size()));
-            if (adjustedCount > 0)
-            {
-                g_selectionEnd = adjustedEnd;
-                adjustedQuads.resize(static_cast<size_t>(adjustedCount));
-                quads = std::move(adjustedQuads);
-                text = std::move(adjustedText);
-            }
-        }
-
         g_selectionQuads = std::move(quads);
         g_selectionNorm = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
         g_selectionText = FromUtf8(text.c_str());
