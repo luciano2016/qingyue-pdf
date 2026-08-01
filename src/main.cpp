@@ -10548,6 +10548,41 @@ namespace
         }
     }
 
+    bool ReopenPdfHandlesPreservingView(PdfTab& tab, const std::wstring& path)
+    {
+        unsigned long oldVersion = tab.renderVersion;
+        int oldPageCount = tab.pageCount;
+        tab.renderVersion = ++g_nextRenderVersion;
+        DropTab(tab);
+
+        try
+        {
+            g_pdf.Load();
+            tab.ctx = g_pdf.newContext(nullptr, nullptr, 24 << 20, "1.28.0");
+            g_pdf.setAaLevel(tab.ctx, 8);
+            g_pdf.registerHandlers(tab.ctx);
+            auto utf8 = ToUtf8(path);
+            tab.doc = g_pdf.openDocument(tab.ctx, utf8.c_str());
+            int newPageCount = g_pdf.countPages(tab.ctx, tab.doc);
+            if (oldPageCount > 0 && newPageCount != oldPageCount)
+            {
+                DropTab(tab);
+                tab.renderVersion = oldVersion;
+                return false;
+            }
+            tab.pageCount = newPageCount;
+            tab.path = path;
+            tab.name = std::filesystem::path(path).filename().wstring();
+            UpdateTabFileStamp(tab);
+            return true;
+        }
+        catch (...)
+        {
+            DropTab(tab);
+            tab.renderVersion = oldVersion;
+            return false;
+        }
+    }
     bool ReloadPdfTab(PdfTab& tab, const std::wstring& path, int page, double zoom)
     {
         tab.renderVersion = ++g_nextRenderVersion;
@@ -10692,8 +10727,9 @@ namespace
         std::wstring originalPath = tab.path;
         auto pendingAnnotations = tab.annotations;
         bool pendingDirty = tab.dirty;
+
+        StopPageRenderWorker();
         DropTab(tab);
-        Sleep(80);
         DWORD replaceError = ERROR_SUCCESS;
         bool replaced = ReplacePdfOnDisk(source, temp, replaceError);
 
@@ -10703,21 +10739,42 @@ namespace
             tab.annotations = std::move(pendingAnnotations);
             tab.dirty = pendingDirty;
             RestoreScrollAfterReload(hwnd, tab, oldScroll);
-            std::wstring msg = L"PDF \u5df2\u751f\u6210\u4e34\u65f6\u4fdd\u5b58\u6587\u4ef6\uff0c\u4f46\u66ff\u6362\u539f\u6587\u4ef6\u5931\u8d25\u3002\n\n\u539f\u56e0\uff1a" + LastErrorText(replaceError) +
-                L"\n\n\u8bf7\u786e\u8ba4\u8fd9\u4e2a PDF \u6ca1\u6709\u88ab\u5176\u5b83\u7a0b\u5e8f\u5360\u7528\u3002\n\u4e34\u65f6\u6587\u4ef6\uff1a\n" + temp.wstring();
-            MessageBoxW(hwnd, msg.c_str(), L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
+            std::wstring msg = L"PDF 已生成临时保存文件，但替换原文件失败。\n\n原因：" + LastErrorText(replaceError) +
+                L"\n\n请确认这个 PDF 没有被其它程序占用。\n临时文件：\n" + temp.wstring();
+            MessageBoxW(hwnd, msg.c_str(), L"保存", MB_OK | MB_ICONWARNING);
             return;
         }
 
-        if (!ReloadPdfTab(tab, source.wstring(), page, zoom))
+        if (!ReopenPdfHandlesPreservingView(tab, source.wstring()))
         {
-            MessageBoxW(hwnd, L"PDF \u5df2\u4fdd\u5b58\uff0c\u4f46\u91cd\u65b0\u8f7d\u5165\u5931\u8d25\u3002\u8bf7\u91cd\u65b0\u6253\u5f00\u6587\u4ef6\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
-            return;
+            if (!ReloadPdfTab(tab, source.wstring(), page, zoom))
+            {
+                MessageBoxW(hwnd, L"PDF 已保存，但重新载入失败。请重新打开文件。", L"保存", MB_OK | MB_ICONWARNING);
+                return;
+            }
+            RestoreScrollAfterReload(hwnd, tab, oldScroll);
         }
-        RestoreScrollAfterReload(hwnd, tab, oldScroll);
+        else
+        {
+            tab.currentPage = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
+            g_contentHeight = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
+            g_contentWidth = ReadingContentWidth(tab);
+            int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+            g_scrollY = std::clamp(oldScroll, 0, maxScroll);
+            if (g_continuousRead) tab.currentPage = PageFromScroll(tab, g_scrollY);
+            g_scrollX = std::clamp(g_scrollX, 0, std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left)));
+            UpdateVertScrollBar(hwnd);
+        }
+
+        for (auto& annotation : tab.annotations) annotation.persisted = true;
+        tab.dirty = false;
         TouchRecentProgress(tab, true);
         SetTitle();
-        InvalidateRect(hwnd, nullptr, FALSE);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        RECT chrome{ 0, 0, client.right, g_stage.top };
+        InvalidateRect(hwnd, &chrome, FALSE);
+        if (SidebarVisible()) InvalidateRect(hwnd, &g_sidebar, FALSE);
     }
 
     void RefreshActiveFileIfChanged(HWND hwnd)
