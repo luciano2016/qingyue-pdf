@@ -1303,6 +1303,13 @@ namespace
     fz_rect g_selectionNorm{};
     std::vector<fz_quad> g_selectionQuads;
     std::wstring g_selectionText;
+    bool g_selectionHadTextDuringDrag{};
+    POINT g_lastDragSelectionStart{};
+    POINT g_lastDragSelectionEnd{};
+    RECT g_lastDragSelectionPageRect{};
+    fz_rect g_lastDragSelectionNorm{};
+    std::vector<fz_quad> g_lastDragSelectionQuads;
+    std::wstring g_lastDragSelectionText;
     int g_activeAnnotation{ -1 };
     bool g_annotationToolbarOpen{};
     bool g_annotationNoteOpen{};
@@ -5314,6 +5321,42 @@ namespace
         return IntersectRect(&out, &selection, &g_selectionPageRect) != FALSE;
     }
 
+    void ResetDragSelectionLatch()
+    {
+        g_selectionHadTextDuringDrag = false;
+        g_lastDragSelectionStart = {};
+        g_lastDragSelectionEnd = {};
+        g_lastDragSelectionPageRect = {};
+        g_lastDragSelectionNorm = {};
+        g_lastDragSelectionQuads.clear();
+        g_lastDragSelectionText.clear();
+    }
+
+    void RememberDragTextSelection()
+    {
+        if (!g_selectingContent || g_selectionQuads.empty()) return;
+        g_selectionHadTextDuringDrag = true;
+        g_lastDragSelectionStart = g_selectionStart;
+        g_lastDragSelectionEnd = g_selectionEnd;
+        g_lastDragSelectionPageRect = g_selectionPageRect;
+        g_lastDragSelectionNorm = g_selectionNorm;
+        g_lastDragSelectionQuads = g_selectionQuads;
+        g_lastDragSelectionText = g_selectionText;
+    }
+
+    bool RestoreLastDragTextSelection()
+    {
+        if (!g_selectionHadTextDuringDrag || g_lastDragSelectionQuads.empty()) return false;
+        g_selectionStart = g_lastDragSelectionStart;
+        g_selectionEnd = g_lastDragSelectionEnd;
+        g_selectionPageRect = g_lastDragSelectionPageRect;
+        g_selectionNorm = g_lastDragSelectionNorm;
+        g_selectionQuads = g_lastDragSelectionQuads;
+        g_selectionText = g_lastDragSelectionText;
+        g_selectionIsImage = false;
+        return true;
+    }
+
     bool RefreshTextSelection(PdfTab& tab)
     {
         g_selectionQuads.clear();
@@ -5503,6 +5546,7 @@ namespace
         g_selectionNorm = {};
         g_selectionQuads.clear();
         g_selectionText.clear();
+        ResetDragSelectionLatch();
     }
 
     void ScrollToPage(PdfTab& tab, int page);
@@ -12292,6 +12336,7 @@ namespace
                     g_selectionStart = POINT{ x, y };
                     g_selectionEnd = POINT{ x, y };
                     g_selectionPageRect = pageRect;
+                    ResetDragSelectionLatch();
                     SetCapture(hwnd);
                     InvalidateRect(hwnd, &g_stage, FALSE);
                     return 0;
@@ -12529,7 +12574,10 @@ namespace
                     static_cast<LONG>(std::clamp(mx, static_cast<int>(g_selectionPageRect.left), static_cast<int>(g_selectionPageRect.right))),
                     static_cast<LONG>(std::clamp(my, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom)))
                 };
-                if (PdfTab* tab = Active()) RefreshTextSelection(*tab);
+                if (PdfTab* tab = Active())
+                {
+                    if (RefreshTextSelection(*tab)) RememberDragTextSelection();
+                }
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
@@ -12730,14 +12778,16 @@ namespace
                 bool imageHit = false;
                 if (PdfTab* tab = Active())
                 {
-                    RefreshTextSelection(*tab);
+                    if (RefreshTextSelection(*tab)) RememberDragTextSelection();
+                    else if (largeEnough) RestoreLastDragTextSelection();
                     if (!largeEnough && g_selectionQuads.empty())
                         imageHit = TrySelectImageAtPoint(*tab, g_selectionPage, g_selectionPageRect, g_selectionEnd);
                 }
                 g_selectingContent = false;
                 ReleaseCapture();
-                g_selectionIsImage = imageHit || (largeEnough && g_selectionQuads.empty());
-                g_hasContentSelection = imageHit || (largeEnough && (!g_selectionQuads.empty() || g_selectionIsImage));
+                if (largeEnough && g_selectionQuads.empty()) RestoreLastDragTextSelection();
+                g_selectionIsImage = imageHit || (largeEnough && g_selectionQuads.empty() && !g_selectionHadTextDuringDrag);
+                g_hasContentSelection = imageHit || !g_selectionQuads.empty() || (largeEnough && g_selectionIsImage);
                 if (!g_hasContentSelection)
                 {
                     g_selectionQuads.clear();
