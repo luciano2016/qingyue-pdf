@@ -5368,6 +5368,48 @@ namespace
         return true;
     }
 
+    bool AdjustSelectionEndAwayFromLineGap(std::vector<fz_quad> const& quads, POINT& adjustedEnd)
+    {
+        if (quads.empty() || IsRectEmpty(&g_selectionPageRect)) return false;
+        int dy = g_selectionEnd.y - g_selectionStart.y;
+        if (std::abs(dy) < S(4)) return false;
+
+        bool downward = dy > 0;
+        int tolerance = std::max(1, S(1));
+        bool hasEndpointSideText = false;
+        bool hasKeptText = false;
+        int targetCenter = downward ? INT_MIN : INT_MAX;
+
+        for (fz_quad const& quad : quads)
+        {
+            RECT r = QuadToRect(quad, g_selectionPageRect);
+            RECT clipped{};
+            if (!IntersectRect(&clipped, &r, &g_selectionPageRect)) continue;
+            if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) continue;
+
+            bool beyondEndpoint = downward
+                ? clipped.top > g_selectionEnd.y + tolerance
+                : clipped.bottom < g_selectionEnd.y - tolerance;
+            if (beyondEndpoint)
+            {
+                hasEndpointSideText = true;
+                continue;
+            }
+
+            hasKeptText = true;
+            int center = (clipped.top + clipped.bottom) / 2;
+            if (downward) targetCenter = std::max(targetCenter, center);
+            else targetCenter = std::min(targetCenter, center);
+        }
+
+        if (!hasEndpointSideText || !hasKeptText) return false;
+        if (targetCenter == INT_MIN || targetCenter == INT_MAX) return false;
+        targetCenter = std::clamp<int>(targetCenter, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom));
+        if (std::abs(targetCenter - g_selectionEnd.y) <= tolerance) return false;
+        adjustedEnd.y = targetCenter;
+        return true;
+    }
+
     bool RefreshTextSelection(PdfTab& tab)
     {
         g_selectionQuads.clear();
@@ -5398,6 +5440,33 @@ namespace
             return false;
 
         quads.resize(static_cast<size_t>(count));
+        POINT adjustedEnd = g_selectionEnd;
+        if (AdjustSelectionEndAwayFromLineGap(quads, adjustedEnd))
+        {
+            fz_point adjusted = NormalizeSelectionPoint(g_selectionPageRect, adjustedEnd);
+            std::vector<fz_quad> adjustedQuads(256);
+            std::string adjustedText(65536, '\0');
+            int adjustedCount = g_pdf.selectText(
+                tab.ctx,
+                tab.doc,
+                g_selectionPage,
+                start.x,
+                start.y,
+                adjusted.x,
+                adjusted.y,
+                adjustedQuads.data(),
+                static_cast<int>(adjustedQuads.size()),
+                adjustedText.data(),
+                static_cast<int>(adjustedText.size()));
+            if (adjustedCount > 0)
+            {
+                g_selectionEnd = adjustedEnd;
+                adjustedQuads.resize(static_cast<size_t>(adjustedCount));
+                quads = std::move(adjustedQuads);
+                text = std::move(adjustedText);
+            }
+        }
+
         g_selectionQuads = std::move(quads);
         g_selectionNorm = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
         g_selectionText = FromUtf8(text.c_str());
