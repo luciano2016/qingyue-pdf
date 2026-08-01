@@ -16,4 +16,7 @@ if not exist "%MAKENSIS%" (
 "%MAKENSIS%" /INPUTCHARSET UTF8 /V2 "%CD%\installer\xiaoyue-modern.nsi"
 if errorlevel 1 exit /b %errorlevel%
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\installer\post_build_setup.ps1"
+if errorlevel 1 exit /b %errorlevel%
+
 echo Built NSIS installer.
