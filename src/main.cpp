@@ -1597,9 +1597,20 @@ namespace
         }
     }
 
+    int PdfRenderThemeForUiTheme(int theme)
+    {
+        int clampedTheme = std::clamp(theme, 0, static_cast<int>(std::size(g_themes)) - 1);
+        return clampedTheme == 2 ? 2 : 0;
+    }
+
+    int PdfRenderTheme()
+    {
+        return PdfRenderThemeForUiTheme(g_theme);
+    }
+
     void ApplyPdfTheme(std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
-        ApplyPdfThemeFor(g_theme, b, g, r);
+        ApplyPdfThemeFor(PdfRenderTheme(), b, g, r);
     }
 
     int S(int value)
@@ -3745,7 +3756,7 @@ namespace
                 std::uint8_t b = components >= 3 ? px[2] : px[0];
                 std::uint8_t g = components >= 3 ? px[1] : px[0];
                 std::uint8_t r = px[0];
-                if (applyTheme) ApplyPdfThemeFor(renderTheme >= 0 ? renderTheme : g_theme, b, g, r);
+                if (applyTheme) ApplyPdfThemeFor(renderTheme >= 0 ? renderTheme : PdfRenderTheme(), b, g, r);
                 dst[x * 4 + 0] = b;
                 dst[x * 4 + 1] = g;
                 dst[x * 4 + 2] = r;
@@ -3770,7 +3781,7 @@ namespace
             g_homeThumbWidth = targetWidth;
         }
 
-        std::wstring key = item.path + L"#" + std::to_wstring(targetWidth) + L"#" + std::to_wstring(g_theme);
+        std::wstring key = item.path + L"#" + std::to_wstring(targetWidth) + L"#" + std::to_wstring(PdfRenderTheme());
         auto found = g_homeThumbCache.find(key);
         if (found != g_homeThumbCache.end()) return &found->second;
 
@@ -3848,7 +3859,7 @@ namespace
 
     PageImage PixmapToImage(PdfTab& tab, fz_pixmap* pixmap)
     {
-        return PixmapToImageFor(tab, pixmap, g_theme);
+        return PixmapToImageFor(tab, pixmap, PdfRenderTheme());
     }
 
     PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme)
@@ -3873,18 +3884,18 @@ namespace
     PageImage RenderPageTile(PdfTab& tab, int index, RECT tile)
     {
         double renderScale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
-        return RenderPageTileAtScale(tab, index, tile, renderScale, g_theme);
+        return RenderPageTileAtScale(tab, index, tile, renderScale, PdfRenderTheme());
     }
 
     PageImage& EnsureTile(PdfTab& tab, TileKey key)
     {
-        if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
+        if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme())
         {
             tab.cache.clear();
             tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
-            tab.cachedTheme = g_theme;
+            tab.cachedTheme = PdfRenderTheme();
         }
 
         auto it = tab.tileCache.find(key);
@@ -3922,7 +3933,7 @@ namespace
     void PruneZoomFallbackCache(PdfTab& tab)
     {
         if (tab.zoomFallbackCache.empty()) return;
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme || GetTickCount64() > tab.zoomFallbackUntil)
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme() || GetTickCount64() > tab.zoomFallbackUntil)
         {
             tab.zoomFallbackCache.clear();
             tab.zoomFallbackZoom = 0.0;
@@ -3935,20 +3946,20 @@ namespace
     void PreparePageCache(PdfTab& tab)
     {
         PruneZoomFallbackCache(tab);
-        if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != g_theme)
+        if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme())
         {
             tab.cache.clear();
             tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
-            tab.cachedTheme = g_theme;
+            tab.cachedTheme = PdfRenderTheme();
         }
     }
 
     PageImage* FindZoomFallbackPage(PdfTab& tab, int index)
     {
         PruneZoomFallbackCache(tab);
-        if (tab.zoomFallbackCache.empty() || tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme) return nullptr;
+        if (tab.zoomFallbackCache.empty() || tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme()) return nullptr;
         auto found = tab.zoomFallbackCache.find(index);
         return found == tab.zoomFallbackCache.end() ? nullptr : &found->second;
     }
@@ -3991,11 +4002,11 @@ namespace
         if (index < 0 || index >= tab.pageCount) return nullptr;
         PruneZoomFallbackCache(tab);
         double previewZoom = PreviewZoomForPage(tab, index);
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme)
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
         {
             tab.zoomFallbackCache.clear();
             tab.zoomFallbackDpi = g_dpi;
-            tab.zoomFallbackTheme = g_theme;
+            tab.zoomFallbackTheme = PdfRenderTheme();
         }
         if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
             tab.zoomFallbackZoom = previewZoom;
@@ -4214,7 +4225,7 @@ namespace
     void QueuePageRender(HWND hwnd, PdfTab const& tab, int page, int priority = 0)
     {
         if (page < 0 || page >= tab.pageCount || tab.zoom >= TileRenderZoomThreshold) return;
-        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme && tab.cache.find(page) != tab.cache.end()) return;
+        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() && tab.cache.find(page) != tab.cache.end()) return;
         EnsurePageRenderWorker();
         PageRenderRequest request;
         request.documentVersion = tab.renderVersion;
@@ -4223,7 +4234,7 @@ namespace
         request.page = page;
         request.zoom = tab.zoom;
         request.dpi = g_dpi;
-        request.theme = g_theme;
+        request.theme = PdfRenderTheme();
         request.priority = priority;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
@@ -4258,11 +4269,11 @@ namespace
         double previewZoom = PreviewZoomForPage(tab, page);
         if (previewZoom <= 0.0 || previewZoom >= tab.zoom - 0.001) return;
         PruneZoomFallbackCache(tab);
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme)
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
         {
             tab.zoomFallbackCache.clear();
             tab.zoomFallbackDpi = g_dpi;
-            tab.zoomFallbackTheme = g_theme;
+            tab.zoomFallbackTheme = PdfRenderTheme();
         }
         if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
             tab.zoomFallbackZoom = previewZoom;
@@ -4278,7 +4289,7 @@ namespace
         request.zoom = tab.zoom;
         request.renderZoom = previewZoom;
         request.dpi = g_dpi;
-        request.theme = g_theme;
+        request.theme = PdfRenderTheme();
         request.viewportGeneration = g_viewportGeneration;
         request.priority = priority;
         {
@@ -4504,7 +4515,7 @@ namespace
         request.level = key.level;
         request.viewportGeneration = g_viewportGeneration;
         request.dpi = g_dpi;
-        request.theme = g_theme;
+        request.theme = PdfRenderTheme();
         request.priority = priority;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
@@ -4571,7 +4582,7 @@ namespace
             {
                 int w = std::min(TileSize, levelPageW - tx);
                 if (w <= 0) continue;
-                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, level, tx, ty, w, h };
+                TileKey key{ page, TileZoomKey(tab.zoom), PdfRenderTheme(), level, tx, ty, w, h };
                 if (!FindCachedTile(tab, key))
                 {
                     QueueTileRender(hwnd, tab, key, priority);
@@ -4731,11 +4742,11 @@ namespace
 
     PageImage& EnsureThumb(PdfTab& tab, int index)
     {
-        if (tab.cachedThumbSize != g_thumbSize || tab.cachedThumbTheme != g_theme)
+        if (tab.cachedThumbSize != g_thumbSize || tab.cachedThumbTheme != PdfRenderTheme())
         {
             tab.thumbCache.clear();
             tab.cachedThumbSize = g_thumbSize;
-            tab.cachedThumbTheme = g_theme;
+            tab.cachedThumbTheme = PdfRenderTheme();
         }
         auto it = tab.thumbCache.find(index);
         if (it == tab.thumbCache.end())
@@ -6948,7 +6959,7 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
-        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == g_theme &&
+        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() &&
             tab.zoom < TileRenderZoomThreshold && clampedZoom < 3.25 && !tab.cache.empty())
         {
             tab.zoomFallbackCache = std::move(tab.cache);
@@ -6957,7 +6968,7 @@ namespace
             tab.zoomFallbackTheme = tab.cachedTheme;
             tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
-        else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == g_theme)
+        else if (!tab.zoomFallbackCache.empty() && tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == PdfRenderTheme())
         {
             tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
@@ -8999,7 +9010,7 @@ namespace
             {
                 int w = std::min(TileSize, levelPageW - tx);
                 if (w <= 0) continue;
-                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, level, tx, ty, w, h };
+                TileKey key{ page, TileZoomKey(tab.zoom), PdfRenderTheme(), level, tx, ty, w, h };
                 PageImage* image = FindCachedTile(tab, key);
                 if (!image || ((!image->dib && image->bgra.empty()) || image->width <= 0 || image->height <= 0))
                     return false;
@@ -9033,7 +9044,7 @@ namespace
             {
                 int w = std::min(TileSize, levelPageW - tx);
                 if (w <= 0) continue;
-                TileKey key{ page, TileZoomKey(tab.zoom), g_theme, level, tx, ty, w, h };
+                TileKey key{ page, TileZoomKey(tab.zoom), PdfRenderTheme(), level, tx, ty, w, h };
                 PageImage* image = FindCachedTile(tab, key);
                 if (!image)
                 {
@@ -11174,10 +11185,9 @@ namespace
         {
             g_theme = id - 2200;
             SaveState();
-            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
             ApplyWindowChrome();
+            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
             DwmFlush();
-            InvalidateRect(hwnd, nullptr, FALSE);
             return;
         }
         if (id >= 2300 && id <= 2302)
@@ -11707,7 +11717,7 @@ namespace
                 PageRenderRequest const& request = result->request;
                 if (_wcsicmp(tab.path.c_str(), request.path.c_str()) != 0 ||
                     tab.renderVersion != request.documentVersion || tab.zoom != request.zoom ||
-                    request.dpi != g_dpi || request.theme != g_theme)
+                    request.dpi != g_dpi || request.theme != PdfRenderTheme())
                     continue;
 
                 PreparePageCache(tab);
@@ -11727,11 +11737,11 @@ namespace
                 }
                 else if (isPreview)
                 {
-                    if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != g_theme)
+                    if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
                     {
                         tab.zoomFallbackCache.clear();
                         tab.zoomFallbackDpi = g_dpi;
-                        tab.zoomFallbackTheme = g_theme;
+                        tab.zoomFallbackTheme = PdfRenderTheme();
                     }
                     if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
                         tab.zoomFallbackZoom = request.renderZoom;
