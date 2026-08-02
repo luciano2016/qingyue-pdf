@@ -1373,7 +1373,8 @@ namespace
         { L"\u62a4\u773c\u7c73", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
         { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
         { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) }
+        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) },
+        { L"\u82f9\u679c\u98ce", RGB(245,245,247), RGB(245,245,247), RGB(255,255,255), RGB(245,245,247), RGB(255,255,255), RGB(29,29,31), RGB(110,110,115), RGB(210,210,215), RGB(0,113,227) }
     };
 
     Theme const& T()
@@ -1399,6 +1400,11 @@ namespace
     bool IsIdeaLightTheme()
     {
         return g_theme == 1;
+    }
+
+    bool IsAppleTheme()
+    {
+        return g_theme == 6;
     }
 
     bool SidebarVisible()
@@ -1446,6 +1452,7 @@ namespace
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
         if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.115);
+        if (IsAppleTheme()) return RGB(251, 251, 253);
         if (IsIdeaLightTheme()) return RGB(235, 237, 240);
         if (IsBeigeTheme()) return MixColor(RGB(246, 241, 231), RGB(0, 0, 0), 0.03);
         if (IsDarkTheme()) return MixColor(T().panel2, RGB(255, 255, 255), 0.04);
@@ -1456,6 +1463,7 @@ namespace
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.075);
         if (IsGlassTheme()) return MixColor(T().accent, RGB(255, 255, 255), 0.18);
+        if (IsAppleTheme()) return RGB(229, 241, 255);
         if (IsIdeaLightTheme()) return RGB(221, 232, 244);
         if (IsBeigeTheme()) return T().panel2;
         if (IsDarkTheme()) return MixColor(T().accent, T().panel2, 0.18);
@@ -1465,6 +1473,7 @@ namespace
     COLORREF SidebarSelectedBorder()
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
+        if (IsAppleTheme()) return RGB(198, 222, 248);
         if (IsIdeaLightTheme()) return RGB(190, 209, 231);
         if (IsDarkTheme() && !IsAuroraTheme()) return MixColor(T().accent, T().panel2, 0.25);
         if (IsBeigeTheme()) return T().line;
@@ -1474,6 +1483,7 @@ namespace
     COLORREF SidebarTreeColor()
     {
         if (IsAuroraTheme()) return MixColor(T().line, T().accent, 0.30);
+        if (IsAppleTheme()) return RGB(210, 210, 215);
         if (IsIdeaLightTheme()) return RGB(205, 210, 216);
         if (IsDarkTheme()) return MixColor(T().line, T().muted, 0.28);
         return MixColor(T().line, T().muted, 0.44);
@@ -1482,6 +1492,7 @@ namespace
     COLORREF SidebarToggleFill(bool hovered)
     {
         if (IsAuroraTheme()) return hovered ? MixColor(T().panel2, T().accent, 0.30) : MixColor(T().panel2, T().accent, 0.16);
+        if (IsAppleTheme()) return hovered ? RGB(245, 245, 247) : RGB(255, 255, 255);
         if (IsIdeaLightTheme()) return hovered ? RGB(229, 232, 236) : RGB(246, 247, 249);
         if (IsBeigeTheme()) return hovered ? SidebarSelectedFill() : MixColor(RGB(251, 247, 239), RGB(0, 0, 0), 0.03);
         if (IsDarkTheme()) return hovered ? MixColor(T().panel2, T().text, 0.18) : MixColor(T().panel2, T().line, 0.12);
@@ -1491,6 +1502,7 @@ namespace
     COLORREF SidebarToggleLine(bool hovered)
     {
         if (IsAuroraTheme()) return hovered ? MixColor(T().accent, RGB(255, 255, 255), 0.18) : MixColor(T().accent, T().text, 0.20);
+        if (IsAppleTheme()) return hovered ? T().accent : RGB(110, 110, 115);
         if (IsIdeaLightTheme()) return hovered ? RGB(83, 145, 207) : RGB(103, 111, 120);
         if (IsBeigeTheme()) return hovered ? RGB(111, 155, 255) : RGB(111, 106, 99);
         return hovered ? MixColor(T().text, T().muted, 0.22) : MixColor(T().muted, T().text, 0.16);
@@ -1499,6 +1511,7 @@ namespace
     COLORREF SidebarIconColor()
     {
         if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.34);
+        if (IsAppleTheme()) return RGB(110, 110, 115);
         if (IsIdeaLightTheme()) return RGB(100, 109, 118);
         if (IsBeigeTheme()) return RGB(111, 106, 99);
         return MixColor(T().muted, T().text, IsDarkTheme() ? 0.18 : 0.10);
@@ -1558,6 +1571,7 @@ namespace
     COLORREF ChromeBarColor()
     {
         if (IsAuroraTheme()) return RGB(6, 49, 45);
+        if (IsAppleTheme()) return RGB(245, 245, 247);
         if (IsGlassTheme()) return RGB(244, 247, 250);
         if (IsDarkTheme()) return T().panel;
         return T().panel;
@@ -1566,11 +1580,13 @@ namespace
     COLORREF ChromeDividerColor()
     {
         if (IsAuroraTheme()) return RGB(38, 114, 101);
+        if (IsAppleTheme()) return RGB(210, 210, 215);
         return T().line;
     }
     COLORREF ScrollTrackColor()
     {
         if (IsAuroraTheme()) return MixColor(T().bg, T().panel, 0.58);
+        if (IsAppleTheme()) return RGB(232, 232, 237);
         if (IsGlassTheme()) return MixColor(T().panel, RGB(255, 255, 255), 0.28);
         if (IsDarkTheme()) return MixColor(T().bg, T().panel, 0.64);
         return MixColor(T().bg, T().panel, 0.42);
@@ -1580,6 +1596,7 @@ namespace
     {
         if (active) return T().accent;
         if (IsAuroraTheme()) return MixColor(T().accent, T().paper, 0.26);
+        if (IsAppleTheme()) return RGB(174, 174, 178);
         if (IsDarkTheme()) return MixColor(T().muted, T().text, 0.22);
         return MixColor(T().muted, T().text, 0.14);
     }
@@ -3361,7 +3378,7 @@ namespace
                 int savedTheme = std::atoi(line.c_str() + 6);
                 if (themeSchema3)
                 {
-                    g_theme = std::clamp(savedTheme, 0, 5);
+                    g_theme = std::clamp(savedTheme, 0, static_cast<int>(std::size(g_themes)) - 1);
                 }
                 else if (themeSchema2)
                 {
@@ -5334,6 +5351,7 @@ namespace
     COLORREF TextSelectionFillColor()
     {
         if (IsGlassTheme()) return RGB(255, 241, 168);
+        if (IsAppleTheme()) return RGB(187, 223, 255);
         if (IsIdeaLightTheme()) return RGB(166, 210, 255);
         if (IsBeigeTheme()) return RGB(220, 230, 188);
         if (g_theme == 3) return RGB(142, 176, 255);
@@ -5345,6 +5363,7 @@ namespace
     COLORREF TextSelectionBorderColor()
     {
         if (IsGlassTheme()) return RGB(232, 190, 70);
+        if (IsAppleTheme()) return RGB(0, 113, 227);
         if (IsIdeaLightTheme()) return RGB(88, 148, 207);
         if (IsBeigeTheme()) return RGB(152, 166, 103);
         if (g_theme == 3) return RGB(104, 139, 220);
@@ -9947,6 +9966,7 @@ namespace
     COLORREF MenuPopupFill()
     {
         if (IsAuroraTheme()) return T().panel;
+        if (IsAppleTheme()) return RGB(255, 255, 255);
         if (IsBeigeTheme()) return RGB(251, 247, 239);
         if (IsGlassTheme()) return MixColor(T().panel2, T().bg, 0.20);
         if (IsDarkTheme()) return T().panel;
@@ -9956,6 +9976,7 @@ namespace
     COLORREF MenuPopupLine()
     {
         if (IsAuroraTheme()) return MixColor(T().line, T().accent, 0.12);
+        if (IsAppleTheme()) return RGB(232, 232, 237);
         if (IsBeigeTheme()) return RGB(222, 217, 208);
         if (IsDarkTheme()) return MixColor(T().line, T().muted, 0.12);
         return T().line;
@@ -9965,6 +9986,7 @@ namespace
     {
         COLORREF fill = MenuPopupFill();
         if (IsAuroraTheme()) return MixColor(fill, T().accent, 0.26);
+        if (IsAppleTheme()) return RGB(210, 210, 215);
         if (IsBeigeTheme()) return RGB(211, 206, 198);
         if (IsDarkTheme()) return MixColor(fill, RGB(255, 255, 255), 0.20);
         return MixColor(fill, RGB(86, 96, 108), 0.24);
@@ -9973,6 +9995,7 @@ namespace
     COLORREF MenuPopupHoverFill()
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.085);
+        if (IsAppleTheme()) return RGB(245, 245, 247);
         if (IsBeigeTheme()) return MixColor(RGB(251, 247, 239), RGB(0, 0, 0), 0.035);
         if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.085);
         if (IsDarkTheme()) return MixColor(T().panel2, RGB(255, 255, 255), 0.045);
@@ -9982,6 +10005,7 @@ namespace
     COLORREF MenuPopupPressedFill()
     {
         if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.13);
+        if (IsAppleTheme()) return RGB(232, 242, 255);
         if (IsBeigeTheme()) return MixColor(RGB(251, 247, 239), RGB(111, 155, 255), 0.16);
         if (IsDarkTheme()) return MixColor(T().panel2, T().accent, 0.12);
         return MixColor(T().panel2, T().accent, 0.13);
