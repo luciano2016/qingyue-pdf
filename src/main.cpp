@@ -1939,7 +1939,7 @@ namespace
             redraw = merged;
         }
         if (!IsRectEmpty(&redraw))
-            InvalidateRect(hwnd, &redraw, FALSE);
+            RedrawWindow(hwnd, &redraw, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     }
 
     void UpdateMainScrollDragStateFromPointer(HWND hwnd, int pointerY, bool redrawNow)
@@ -7313,13 +7313,7 @@ namespace
         }
         else
         {
-            int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-            bool overlayOpen = g_annotationToolbarOpen || g_annotationNoteOpen;
-            bool pixelScroll = !overlayOpen && std::abs(dy) > 0 && std::abs(dy) < stageH * 3 / 4;
-            if (pixelScroll)
-                ScrollStagePixels(hwnd, 0, dy, pageChanged);
-            else
-                RequestStageRepaint(hwnd, pageChanged);
+            RequestStageRepaint(hwnd, pageChanged);
         }
         UpdateVertScrollBar(hwnd);
         RedrawMainScrollBarNow(hwnd);
