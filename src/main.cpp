@@ -3031,36 +3031,29 @@ namespace
         }
         case SideTabIcon::Notes:
         {
-            float l = cx - S(8.8f);
-            float t = cy - S(8.3f);
-            float rr = cx + S(8.4f);
-            float b = cy + S(8.7f);
-            float r2 = S(2.1f);
-            g.DrawLine(&pen, l + r2, t, cx + S(4.6f), t);
-            g.DrawLine(&pen, rr, cy - S(3.0f), rr, b - r2);
+            float l = cx - S(8.4f);
+            float t = cy - S(8.2f);
+            float rr = cx + S(8.3f);
+            float b = cy + S(8.3f);
+            float r2 = S(2.0f);
+            g.DrawLine(&pen, l + r2, t, cx + S(4.2f), t);
+            g.DrawLine(&pen, rr, cy - S(2.7f), rr, b - r2);
             g.DrawArc(&pen, rr - r2 * 2.0f, b - r2 * 2.0f, r2 * 2.0f, r2 * 2.0f, 0.0f, 90.0f);
             g.DrawLine(&pen, rr - r2, b, l + r2, b);
             g.DrawArc(&pen, l, b - r2 * 2.0f, r2 * 2.0f, r2 * 2.0f, 90.0f, 90.0f);
             g.DrawLine(&pen, l, b - r2, l, t + r2);
             g.DrawArc(&pen, l, t, r2 * 2.0f, r2 * 2.0f, 180.0f, 90.0f);
 
-            Gdiplus::PointF pencilBody[] = {
-                Gdiplus::PointF(cx - S(3.4f), cy + S(3.7f)),
-                Gdiplus::PointF(cx - S(1.5f), cy - S(0.9f)),
-                Gdiplus::PointF(cx + S(7.0f), cy - S(9.4f)),
-                Gdiplus::PointF(cx + S(9.3f), cy - S(7.1f))
+            Gdiplus::PointF pencil[] = {
+                Gdiplus::PointF(cx - S(4.1f), cy + S(4.9f)),
+                Gdiplus::PointF(cx - S(3.0f), cy + S(1.2f)),
+                Gdiplus::PointF(cx + S(6.2f), cy - S(8.0f)),
+                Gdiplus::PointF(cx + S(8.2f), cy - S(6.0f)),
+                Gdiplus::PointF(cx - S(1.0f), cy + S(3.2f))
             };
-            Gdiplus::GraphicsPath pencil;
-            pencil.AddPolygon(pencilBody, static_cast<INT>(std::size(pencilBody)));
-            g.FillPath(&brush, &pencil);
-            Gdiplus::PointF pencilTip[] = {
-                Gdiplus::PointF(cx - S(3.4f), cy + S(3.7f)),
-                Gdiplus::PointF(cx - S(4.2f), cy + S(6.3f)),
-                Gdiplus::PointF(cx - S(1.6f), cy + S(5.5f))
-            };
-            Gdiplus::GraphicsPath tip;
-            tip.AddPolygon(pencilTip, static_cast<INT>(std::size(pencilTip)));
-            g.FillPath(&brush, &tip);
+            Gdiplus::GraphicsPath pencilPath;
+            pencilPath.AddPolygon(pencil, static_cast<INT>(std::size(pencil)));
+            g.FillPath(&brush, &pencilPath);
             break;
         }
         }
@@ -3143,6 +3136,37 @@ namespace
         else if (id == CmdNoteNext) drawArrowBox(true);
         else if (id == CmdNoteDelete) drawTrash(false);
         else if (id == CmdNoteDeleteAll) drawTrash(true);
+    }
+
+    bool HitNoteToolButton(int x, int y, int& command, RECT* outRect = nullptr)
+    {
+        command = 0;
+        if (g_sideMode != 3 || !SidebarVisible()) return false;
+        int buttonTop = g_sidebar.top + S(33);
+        int buttonSize = S(30);
+        int buttonGap = S(3);
+        int groupGap = S(11);
+        int buttonLeft = g_sidebar.left + S(10);
+        int available = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left) - S(20));
+        int desired = buttonSize * 6 + buttonGap * 3 + groupGap * 2 + S(2);
+        if (desired > available)
+            buttonSize = std::max(S(24), (available - buttonGap * 3 - groupGap * 2 - S(2)) / 6);
+        int ids[] = { CmdNoteExpandAll, CmdNoteCollapseAll, CmdNotePrev, CmdNoteNext, CmdNoteDelete, CmdNoteDeleteAll };
+        int bx = buttonLeft;
+        for (int i = 0; i < static_cast<int>(std::size(ids)); ++i)
+        {
+            RECT r{ bx, buttonTop, bx + buttonSize, buttonTop + buttonSize };
+            if (Hit(r, x, y))
+            {
+                command = ids[i];
+                if (outRect) *outRect = r;
+                return true;
+            }
+            bx += buttonSize;
+            if (i == 1 || i == 3) bx += buttonGap;
+            else bx += groupGap;
+        }
+        return false;
     }
 
     void DrawFilledCircle(HDC dc, int cx, int cy, float radius, COLORREF color)
@@ -6238,7 +6262,8 @@ namespace
     {
         if (index < 0 || index >= static_cast<int>(tab.annotations.size())) return;
         g_activeAnnotation = index;
-        g_annotationToolbarOpen = true;
+        g_annotationToolbarOpen = false;
+        g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
         if (jump) JumpToAnnotation(hwnd, tab, tab.annotations[static_cast<size_t>(index)]);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -12985,6 +13010,20 @@ namespace
                         SetTimer(hwnd, 12, 500, nullptr);
                     }
                     InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            if (g_sideMode == 3)
+            {
+                int noteCommand = 0;
+                RECT noteButton{};
+                if (HitNoteToolButton(x, y, noteCommand, &noteButton))
+                {
+                    g_pressedButtonRect = noteButton;
+                    g_hasPressedButton = true;
+                    SetTimer(hwnd, 2, 90, nullptr);
+                    InvalidateRect(hwnd, &noteButton, FALSE);
+                    Command(hwnd, noteCommand);
                     return 0;
                 }
             }
