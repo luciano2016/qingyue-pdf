@@ -3031,14 +3031,36 @@ namespace
         }
         case SideTabIcon::Notes:
         {
-            Gdiplus::RectF note{ cx - S(7.0f), cy - S(8.2f), S(14.0f), S(16.4f) };
-            DrawGdiRoundRect(g, pen, note, S(2.4f));
-            g.DrawLine(&pen, cx - S(3.8f), cy - S(3.2f), cx + S(3.8f), cy - S(3.2f));
-            g.DrawLine(&pen, cx - S(3.8f), cy + S(1.5f), cx + S(2.0f), cy + S(1.5f));
-            Gdiplus::Pen markPen(GdiColor(iconColor), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
-            markPen.SetStartCap(Gdiplus::LineCapRound);
-            markPen.SetEndCap(Gdiplus::LineCapRound);
-            g.DrawLine(&markPen, cx + S(3.0f), cy + S(5.4f), cx + S(6.0f), cy + S(8.2f));
+            float l = cx - S(8.8f);
+            float t = cy - S(8.3f);
+            float rr = cx + S(8.4f);
+            float b = cy + S(8.7f);
+            float r2 = S(2.1f);
+            g.DrawLine(&pen, l + r2, t, cx + S(4.6f), t);
+            g.DrawLine(&pen, rr, cy - S(3.0f), rr, b - r2);
+            g.DrawArc(&pen, rr - r2 * 2.0f, b - r2 * 2.0f, r2 * 2.0f, r2 * 2.0f, 0.0f, 90.0f);
+            g.DrawLine(&pen, rr - r2, b, l + r2, b);
+            g.DrawArc(&pen, l, b - r2 * 2.0f, r2 * 2.0f, r2 * 2.0f, 90.0f, 90.0f);
+            g.DrawLine(&pen, l, b - r2, l, t + r2);
+            g.DrawArc(&pen, l, t, r2 * 2.0f, r2 * 2.0f, 180.0f, 90.0f);
+
+            Gdiplus::PointF pencilBody[] = {
+                Gdiplus::PointF(cx - S(3.4f), cy + S(3.7f)),
+                Gdiplus::PointF(cx - S(1.5f), cy - S(0.9f)),
+                Gdiplus::PointF(cx + S(7.0f), cy - S(9.4f)),
+                Gdiplus::PointF(cx + S(9.3f), cy - S(7.1f))
+            };
+            Gdiplus::GraphicsPath pencil;
+            pencil.AddPolygon(pencilBody, static_cast<INT>(std::size(pencilBody)));
+            g.FillPath(&brush, &pencil);
+            Gdiplus::PointF pencilTip[] = {
+                Gdiplus::PointF(cx - S(3.4f), cy + S(3.7f)),
+                Gdiplus::PointF(cx - S(4.2f), cy + S(6.3f)),
+                Gdiplus::PointF(cx - S(1.6f), cy + S(5.5f))
+            };
+            Gdiplus::GraphicsPath tip;
+            tip.AddPolygon(pencilTip, static_cast<INT>(std::size(pencilTip)));
+            g.FillPath(&brush, &tip);
             break;
         }
         }
