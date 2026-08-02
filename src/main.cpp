@@ -1289,6 +1289,7 @@ namespace
     std::wstring g_pageInputText;
     int g_searchCaretIndex{};
     int g_pageCaretIndex{};
+    int g_homeSearchCaretIndex{};
     std::wstring g_homeSearchQuery;
     std::vector<SearchResult> g_searchResults;
     std::set<int> g_collapsedOutlineRows;
@@ -8253,9 +8254,9 @@ namespace
             g_homeSearchQuery.empty() ? MixColor(T().muted, T().paper, 0.16) : T().text);
         if (g_homeSearchFocused && g_homeSearchCaretVisible)
         {
-            SIZE caretSize{};
-            GetTextExtentPoint32W(dc, g_homeSearchQuery.c_str(), static_cast<int>(g_homeSearchQuery.size()), &caretSize);
-            int caretX = std::min(inputText.right - S(2), inputText.left + caretSize.cx + S(2));
+            g_homeSearchCaretIndex = std::clamp(g_homeSearchCaretIndex, 0, static_cast<int>(g_homeSearchQuery.size()));
+            int caretX = CaretXCurrentFont(dc, g_homeSearchQuery, inputText, g_homeSearchCaretIndex, false) + S(2);
+            caretX = std::clamp<int>(caretX, inputText.left + S(1), inputText.right - S(2));
             HPEN caretPen = CreatePen(PS_SOLID, std::max(1, S(1)), T().text);
             HGDIOBJ oldCaret = SelectObject(dc, caretPen);
             MoveToEx(dc, caretX, g_homeSearchRect.top + S(11), nullptr);
@@ -12354,6 +12355,7 @@ namespace
                 if (!g_homeSearchQuery.empty() && Hit(g_homeSearchClearRect, x, y))
                 {
                     g_homeSearchQuery.clear();
+                    g_homeSearchCaretIndex = 0;
                     g_homeSearchFocused = true;
                     g_homeSearchCaretVisible = true;
                     SetTimer(hwnd, 15, 500, nullptr);
@@ -12362,6 +12364,8 @@ namespace
                 }
                 if (Hit(g_homeSearchRect, x, y))
                 {
+                    RECT inputText{ g_homeSearchRect.left + S(40), g_homeSearchRect.top, g_homeSearchRect.right - (g_homeSearchQuery.empty() ? S(14) : S(42)), g_homeSearchRect.bottom };
+                    g_homeSearchCaretIndex = CaretIndexFromPoint(hwnd, g_homeSearchQuery, inputText, 11, x, false);
                     g_homeSearchFocused = true;
                     g_homeSearchCaretVisible = true;
                     SetTimer(hwnd, 15, 500, nullptr);
@@ -13638,6 +13642,7 @@ namespace
                 if (!Active())
                 {
                     g_homeSearchFocused = true;
+                    g_homeSearchCaretIndex = static_cast<int>(g_homeSearchQuery.size());
                     g_homeSearchCaretVisible = true;
                     SetTimer(hwnd, 15, 500, nullptr);
                     InvalidateRect(hwnd, nullptr, FALSE);
@@ -13693,6 +13698,21 @@ namespace
                     g_searchLastQuery.clear();
                     g_searchCaretVisible = true;
                     SetTimer(hwnd, 12, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            if (g_homeSearchFocused && !Active())
+            {
+                if (wParam == VK_LEFT) { g_homeSearchCaretIndex = std::max(0, g_homeSearchCaretIndex - 1); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_RIGHT) { g_homeSearchCaretIndex = std::min(static_cast<int>(g_homeSearchQuery.size()), g_homeSearchCaretIndex + 1); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_HOME) { g_homeSearchCaretIndex = 0; g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_END) { g_homeSearchCaretIndex = static_cast<int>(g_homeSearchQuery.size()); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_DELETE && g_homeSearchCaretIndex < static_cast<int>(g_homeSearchQuery.size()))
+                {
+                    g_homeSearchQuery.erase(static_cast<size_t>(g_homeSearchCaretIndex), 1);
+                    g_homeSearchCaretVisible = true;
+                    SetTimer(hwnd, 15, 500, nullptr);
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -13823,11 +13843,13 @@ namespace
             if (g_homeSearchFocused && !Active())
             {
                 bool changed = false;
+                g_homeSearchCaretIndex = std::clamp(g_homeSearchCaretIndex, 0, static_cast<int>(g_homeSearchQuery.size()));
                 if (wParam == VK_BACK)
                 {
-                    if (!g_homeSearchQuery.empty())
+                    if (g_homeSearchCaretIndex > 0)
                     {
-                        g_homeSearchQuery.pop_back();
+                        g_homeSearchQuery.erase(static_cast<size_t>(g_homeSearchCaretIndex - 1), 1);
+                        --g_homeSearchCaretIndex;
                         changed = true;
                     }
                 }
@@ -13837,7 +13859,8 @@ namespace
                 }
                 else if (wParam >= 32 && g_homeSearchQuery.size() < 120)
                 {
-                    g_homeSearchQuery.push_back(static_cast<wchar_t>(wParam));
+                    g_homeSearchQuery.insert(g_homeSearchQuery.begin() + g_homeSearchCaretIndex, static_cast<wchar_t>(wParam));
+                    ++g_homeSearchCaretIndex;
                     changed = true;
                 }
                 if (changed)
