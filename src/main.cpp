@@ -6284,8 +6284,15 @@ namespace
         GetClientRect(hwnd, &client);
         int clamped = ClampHomeScrollValue(client, value);
         if (clamped == g_homeScrollY) return;
+        RECT oldTrack = g_homeScrollTrackRect;
         g_homeScrollY = clamped;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        RECT viewport = HomeContentViewportRect(client);
+        InvalidateRect(hwnd, &viewport, FALSE);
+        UpdateHomeScrollRects(client);
+        RECT scrollDirty = oldTrack;
+        if (!IsRectEmpty(&scrollDirty)) UnionRect(&scrollDirty, &scrollDirty, &g_homeScrollTrackRect);
+        else scrollDirty = g_homeScrollTrackRect;
+        if (!IsRectEmpty(&scrollDirty)) InvalidateRect(hwnd, &scrollDirty, FALSE);
     }
 
     void EnsureTabWindowVisible(int index)
@@ -8594,6 +8601,7 @@ namespace
         PaintHomeHeader(dc, client);
         RECT viewport = HomeContentViewportRect(client);
         g_homeThumbProtectedKeys.clear();
+        RECT paintWindow{ viewport.left, viewport.top - S(80), viewport.right, viewport.bottom + S(80) };
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -8652,6 +8660,14 @@ namespace
             RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
             RECT tile{ x, y, x + tileW, y + tileH };
             g_recentRects.push_back(tile);
+            bool visibleTile = Intersects(tile, paintWindow);
+            if (!visibleTile)
+            {
+                lastBottom = std::max(lastBottom, static_cast<int>(tile.bottom));
+                if (tile.top > paintWindow.bottom) break;
+                advance();
+                continue;
+            }
             RECT cover{ tile.left, tile.top, tile.right, tile.top + coverH };
             bool hovered = Hit(cover, g_mousePos.x, g_mousePos.y);
             drawCoverFrame(cover, hovered || item.pinned);
@@ -8729,6 +8745,7 @@ namespace
         Text(dc, L"\u6240\u5728\u76ee\u5f55", RECT{ dirX, headerTop, sizeX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         Text(dc, L"\u5927\u5c0f", RECT{ sizeX, headerTop, actionX - S(16), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         RECT rowsViewport{ viewport.left, headerTop + S(34), viewport.right, viewport.bottom };
+        RECT rowPaintWindow{ rowsViewport.left, rowsViewport.top - S(60), rowsViewport.right, rowsViewport.bottom + S(60) };
         int y = rowsViewport.top - g_homeScrollY;
         int lastBottom = y;
         g_recentRects.push_back(RECT{});
@@ -8740,6 +8757,14 @@ namespace
             RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
             RECT row{ left - S(10), y, client.right - S(44), y + rowH };
             g_recentRects.push_back(row);
+            bool visibleRow = Intersects(row, rowPaintWindow);
+            if (!visibleRow)
+            {
+                lastBottom = std::max(lastBottom, static_cast<int>(row.bottom));
+                y += rowH;
+                if (row.top > rowPaintWindow.bottom) break;
+                continue;
+            }
             bool rowHover = Hit(row, g_mousePos.x, g_mousePos.y);
             if (rowHover) RoundFill(dc, row, S(7), SidebarHoverFill(), SidebarHoverFill());
             RECT name{ left, row.top, dateX - S(20), row.bottom };
