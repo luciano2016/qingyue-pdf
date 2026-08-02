@@ -947,7 +947,6 @@ namespace
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
         using MatchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int);
-        using QuietSearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
@@ -981,7 +980,6 @@ namespace
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
             Get(searchPageNumber, "fz_search_page_number");
             GetOptional(matchPageNumber, "fz_match_page_number");
-            GetOptional(quietSearchPageNumber, "quiet_pdf_search_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(loadAnnotations, "quiet_pdf_load_annotations");
             Get(selectText, "quiet_pdf_select_text");
@@ -1015,7 +1013,6 @@ namespace
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
         SearchPageNumberFn searchPageNumber{};
         MatchPageNumberFn matchPageNumber{};
-        QuietSearchPageNumberFn quietSearchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
         LoadAnnotationsFn loadAnnotations{};
         SelectTextFn selectText{};
@@ -1205,8 +1202,7 @@ namespace
     bool g_searchInputFocused{};
     bool g_searchHasRun{};
     bool g_searchCaretVisible{ true };
-    bool g_searchWholeWord{ true };
-    bool g_searchMatchCase{ true };
+    bool g_searchMatchCase{};
     RECT g_searchOptionsButtonRect{};
     int g_zoomButtonMode{ 2400 };
     bool g_hasPressedButton{};
@@ -1291,6 +1287,8 @@ namespace
     std::wstring g_searchQuery;
     std::wstring g_searchLastQuery;
     std::wstring g_pageInputText;
+    int g_searchCaretIndex{};
+    int g_pageCaretIndex{};
     std::wstring g_homeSearchQuery;
     std::vector<SearchResult> g_searchResults;
     std::set<int> g_collapsedOutlineRows;
@@ -2201,6 +2199,54 @@ namespace
         DrawTextW(dc, s.c_str(), -1, &r, flags);
     }
 
+    int TextWidthCurrentFont(HDC dc, const std::wstring& text, int count)
+    {
+        count = std::clamp(count, 0, static_cast<int>(text.size()));
+        if (count <= 0) return 0;
+        SIZE size{};
+        GetTextExtentPoint32W(dc, text.c_str(), count, &size);
+        return size.cx;
+    }
+
+    int CaretXCurrentFont(HDC dc, const std::wstring& text, RECT r, int index, bool centered)
+    {
+        index = std::clamp(index, 0, static_cast<int>(text.size()));
+        int fullW = TextWidthCurrentFont(dc, text, static_cast<int>(text.size()));
+        int start = centered ? r.left + ((r.right - r.left) - fullW) / 2 : r.left;
+        int x = start + TextWidthCurrentFont(dc, text, index);
+        return std::clamp<int>(x, static_cast<int>(r.left) + S(1), static_cast<int>(r.right) - S(2));
+    }
+
+    int CaretIndexFromPoint(HWND hwnd, const std::wstring& text, RECT r, int fontPt, int x, bool centered)
+    {
+        HDC dc = GetDC(hwnd);
+        HFONT font = Font(fontPt);
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        int fullW = TextWidthCurrentFont(dc, text, static_cast<int>(text.size()));
+        int start = centered ? r.left + ((r.right - r.left) - fullW) / 2 : r.left;
+        int index = static_cast<int>(text.size());
+        if (x <= start)
+        {
+            index = 0;
+        }
+        else
+        {
+            for (int i = 0; i < static_cast<int>(text.size()); ++i)
+            {
+                int leftW = TextWidthCurrentFont(dc, text, i);
+                int rightW = TextWidthCurrentFont(dc, text, i + 1);
+                if (x < start + (leftW + rightW) / 2)
+                {
+                    index = i;
+                    break;
+                }
+            }
+        }
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        ReleaseDC(hwnd, dc);
+        return std::clamp(index, 0, static_cast<int>(text.size()));
+    }
     void DrawImageFit(HDC dc, const PageImage& image, RECT box)
     {
         if (image.bgra.empty() || image.width <= 0 || image.height <= 0) return;
@@ -2752,7 +2798,7 @@ namespace
 
             if (icon == StatusIcon::Actual)
             {
-                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                g.DrawRectangle(&aaPen, page.X, page.Y, page.Width, page.Height);
                 HFONT f = Font(5);
                 HGDIOBJ oldFont = SelectObject(dc, f);
                 Text(dc, L"1:1", iconBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE, color);
@@ -2761,22 +2807,22 @@ namespace
             }
             else if (icon == StatusIcon::FitPage)
             {
-                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                g.DrawRectangle(&aaPen, page.X, page.Y, page.Width, page.Height);
                 g.DrawLine(&aaPen, page.X + S(2.0f), page.Y + S(2.0f), page.X + S(5.0f), page.Y + S(2.0f));
                 g.DrawLine(&aaPen, page.GetRight() - S(2.0f), page.GetBottom() - S(2.0f), page.GetRight() - S(5.0f), page.GetBottom() - S(2.0f));
             }
             else if (icon == StatusIcon::FitWidth)
             {
-                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                g.DrawRectangle(&aaPen, page.X, page.Y, page.Width, page.Height);
                 float mid = (page.Y + page.GetBottom()) * 0.5f;
                 g.DrawLine(&aaPen, page.X - S(1.2f), mid, page.X + S(3.0f), mid);
                 g.DrawLine(&aaPen, page.GetRight() + S(1.2f), mid, page.GetRight() - S(3.0f), mid);
             }
             else if (icon == StatusIcon::FitContent)
             {
-                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                g.DrawRectangle(&aaPen, page.X, page.Y, page.Width, page.Height);
                 Gdiplus::RectF content{ page.X + S(2.8f), page.Y + S(2.7f), page.Width - S(5.6f), page.Height - S(5.4f) };
-                DrawGdiRoundRect(g, aaPen, content, S(1.0f));
+                g.DrawRectangle(&aaPen, content.X, content.Y, content.Width, content.Height);
             }
             else
             {
@@ -6087,10 +6133,10 @@ namespace
         PdfTab* tab = Active();
         if (!tab) return;
         g_searchInputFocused = false;
-        KillTimer(hwnd, 21);
         g_pageInputFocused = true;
         g_pageCaretVisible = true;
         g_pageInputText = std::to_wstring(tab->currentPage + 1);
+        g_pageCaretIndex = static_cast<int>(g_pageInputText.size());
         SetTimer(hwnd, 10, 500, nullptr);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -6103,6 +6149,7 @@ namespace
         if (!g_pageInputFocused) return;
         g_pageInputFocused = false;
         g_pageInputText.clear();
+        g_pageCaretIndex = 0;
         KillTimer(hwnd, 10);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -6156,11 +6203,7 @@ namespace
             fz_quad boxes[32]{};
             int searchOptions = g_searchMatchCase ? 0 : 1;
             int count = 0;
-            if (g_searchWholeWord && g_pdf.quietSearchPageNumber)
-            {
-                count = g_pdf.quietSearchPageNumber(tab->ctx, tab->doc, page, needle.c_str(), marks, boxes, 32, searchOptions, 1);
-            }
-            else if (g_pdf.matchPageNumber)
+            if (g_pdf.matchPageNumber)
             {
                 count = g_pdf.matchPageNumber(tab->ctx, tab->doc, page, needle.c_str(), marks, boxes, 32, searchOptions);
             }
@@ -7210,7 +7253,7 @@ namespace
         PdfTab* tab = Active();
         if (!tab) return;
         int pct = static_cast<int>(tab->zoom * 100.0 + 0.5);
-        g_customZoomText = std::to_wstring(std::clamp(pct, 1, 6400));
+        g_customZoomText = std::to_wstring(std::clamp(pct, 1, 1600));
         g_customZoomOpen = true;
         g_customZoomFocused = true;
         g_customZoomCaretVisible = true;
@@ -7227,7 +7270,7 @@ namespace
             return;
         }
         double pct = _wtof(g_customZoomText.c_str());
-        pct = std::clamp(pct, 8.33, 6400.0);
+        pct = std::clamp(pct, 8.33, 1600.0);
         ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), pct / 100.0);
         CloseCustomZoomDialog(hwnd);
     }
@@ -8675,23 +8718,19 @@ namespace
         {
             g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(48) };
             if (g_searchInputFocused)
-            {
-                double phase = (static_cast<double>(GetTickCount64() % 1600ull) / 1600.0) * 6.283185307179586;
-                double breath = 0.5 + 0.5 * std::sin(phase);
-                BYTE glowAlpha = static_cast<BYTE>((IsDarkTheme() || IsAuroraTheme() ? 66 : 54) + breath * (IsDarkTheme() || IsAuroraTheme() ? 36 : 30));
-                DrawSoftGlowRect(dc, g_searchInputRect, 8, T().accent, glowAlpha);
-            }
+                DrawSoftGlowRect(dc, g_searchInputRect, 8, T().accent, IsDarkTheme() || IsAuroraTheme() ? 84 : 70);
             RoundFill(dc, g_searchInputRect, S(8), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
             RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
             RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
+            HFONT searchFont = Font(9);
+            HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
             Text(dc, g_searchQuery.empty() ? L"\u8f93\u5165\u5173\u952e\u8bcd" : g_searchQuery, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, g_searchQuery.empty() ? T().muted : T().text);
             if (g_searchInputFocused && g_searchCaretVisible)
             {
-                SIZE sz{};
-                std::wstring caretText = g_searchQuery;
-                GetTextExtentPoint32W(dc, caretText.c_str(), static_cast<int>(caretText.size()), &sz);
-                int cx = std::clamp(inputText.left + sz.cx + S(2), inputText.left + S(2), inputText.right - S(4));
+                g_searchCaretIndex = std::clamp(g_searchCaretIndex, 0, static_cast<int>(g_searchQuery.size()));
+                int cx = CaretXCurrentFont(dc, g_searchQuery, inputText, g_searchCaretIndex, false) + S(2);
+                cx = std::clamp<int>(cx, static_cast<int>(inputText.left) + S(2), static_cast<int>(inputText.right) - S(4));
                 HPEN caret = CreatePen(PS_SOLID, std::max(1, S(1)), T().accent);
                 HGDIOBJ oldPen = SelectObject(dc, caret);
                 MoveToEx(dc, cx, inputText.top + S(8), nullptr);
@@ -8699,6 +8738,8 @@ namespace
                 SelectObject(dc, oldPen);
                 DeleteObject(caret);
             }
+            SelectObject(dc, oldSearchFont);
+            DeleteObject(searchFont);
             RECT clearRect{ g_searchInputRect.right - S(77), g_searchInputRect.top + S(6), g_searchInputRect.right - S(49), g_searchInputRect.bottom - S(6) };
             DrawSearchIconButton(dc, CmdSearchClear, clearRect, clearRect, DrawCloseGlyph, L"清除");
             RECT gearRect{ g_searchInputRect.right - S(38), g_searchInputRect.top + S(8), g_searchInputRect.right - S(14), g_searchInputRect.bottom - S(8) };
@@ -9690,9 +9731,8 @@ namespace
         Text(dc, pageText, pageBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         if (g_pageInputFocused && g_pageCaretVisible)
         {
-            SIZE caretText{};
-            GetTextExtentPoint32W(dc, pageText.c_str(), static_cast<int>(pageText.size()), &caretText);
-            int caretX = pageBox.left + ((pageBox.right - pageBox.left) + caretText.cx) / 2 + S(2);
+            g_pageCaretIndex = std::clamp(g_pageCaretIndex, 0, static_cast<int>(pageText.size()));
+            int caretX = CaretXCurrentFont(dc, pageText, pageBox, g_pageCaretIndex, true) + S(2);
             int caretTop = pageBox.top + S(5);
             int caretBottom = pageBox.bottom - S(5);
             HPEN caretPen = CreatePen(PS_SOLID, std::max(1, S(1)), T().muted);
@@ -10440,8 +10480,7 @@ namespace
     {
         RECT anchor = g_searchOptionsButtonRect;
         HMENU menu = CreatePopupMenu();
-        AppendThemedMenuItem(menu, 2440, L"全词匹配", g_searchWholeWord);
-        AppendThemedMenuItem(menu, 2441, L"区分大小写", g_searchMatchCase);
+        AppendThemedMenuItem(menu, 2441, L"\u533a\u5206\u5927\u5c0f\u5199", g_searchMatchCase);
         if (IsRectEmpty(&anchor))
         {
             POINT cursor{};
@@ -11457,10 +11496,9 @@ namespace
             }
             return;
         }
-        if (id == 2440 || id == 2441)
+        if (id == 2441)
         {
-            if (id == 2440) g_searchWholeWord = !g_searchWholeWord;
-            else g_searchMatchCase = !g_searchMatchCase;
+            g_searchMatchCase = !g_searchMatchCase;
             if (g_searchHasRun) RunSearch();
             InvalidateRect(hwnd, nullptr, FALSE);
             return;
@@ -11547,9 +11585,9 @@ namespace
             if (g_immersive) g_immersiveSidebarOpen = true;
             g_sideMode = 2;
             g_searchInputFocused = true;
+            g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
             g_searchCaretVisible = true;
             SetTimer(hwnd, 12, 500, nullptr);
-            SetTimer(hwnd, 21, 40, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdBookmark:
@@ -11605,9 +11643,9 @@ namespace
             g_searchHasRun = false;
             g_searchLastQuery.clear();
             g_searchInputFocused = true;
+            g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
             g_searchCaretVisible = true;
             SetTimer(hwnd, 12, 500, nullptr);
-            SetTimer(hwnd, 21, 40, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdNoteExpandAll:
@@ -12282,7 +12320,6 @@ namespace
                 InvalidateRect(hwnd, &g_stage, FALSE);
             }
             g_searchInputFocused = false;
-            KillTimer(hwnd, 21);
             if (g_pageInputFocused && !Hit(g_pageInputRect, x, y))
             {
                 CancelPageInput(hwnd);
@@ -12400,9 +12437,9 @@ namespace
                     g_searchInputFocused = g_sideMode == 2;
                     if (g_searchInputFocused)
                     {
+                        g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
                         g_searchCaretVisible = true;
                         SetTimer(hwnd, 12, 500, nullptr);
-                        SetTimer(hwnd, 21, 40, nullptr);
                     }
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
@@ -12435,15 +12472,20 @@ namespace
                 if (Hit(clearRect, x, y))
                 {
                     g_searchQuery.clear();
+                    g_searchCaretIndex = 0;
                     g_searchResults.clear();
                     g_searchCurrent = 0;
                     g_searchHasRun = false;
                     g_searchLastQuery.clear();
                 }
+                else
+                {
+                    RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
+                    g_searchCaretIndex = CaretIndexFromPoint(hwnd, g_searchQuery, inputText, 9, x, false);
+                }
                 g_searchInputFocused = true;
                 g_searchCaretVisible = true;
                 SetTimer(hwnd, 12, 500, nullptr);
-                SetTimer(hwnd, 21, 40, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
@@ -12493,6 +12535,7 @@ namespace
             if (Active() && Hit(g_pageInputRect, x, y))
             {
                 FocusPageInput(hwnd);
+                g_pageCaretIndex = CaretIndexFromPoint(hwnd, g_pageInputText, g_pageInputRect, 10, x, true);
                 return 0;
             }
             for (auto const& b : g_buttons) if (Hit(b.rect, x, y))
@@ -13295,18 +13338,6 @@ namespace
                 if (!StageScrollPaintInProgress()) TrimIdleRenderCaches(hwnd);
                 return 0;
             }
-            if (wParam == 21)
-            {
-                if (!g_searchInputFocused || g_sideMode != 2)
-                {
-                    KillTimer(hwnd, 21);
-                    return 0;
-                }
-                RECT glowRect = g_searchInputRect;
-                InflateRect(&glowRect, S(8), S(8));
-                InvalidateRect(hwnd, &glowRect, FALSE);
-                return 0;
-            }
             break;
         case WM_MOUSEWHEEL:
         {
@@ -13481,7 +13512,9 @@ namespace
                 g_sidebarOpen = true;
                 g_sideMode = 2;
                 g_searchInputFocused = true;
-                SetTimer(hwnd, 21, 40, nullptr);
+                g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
+                g_searchCaretVisible = true;
+                SetTimer(hwnd, 12, 500, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
@@ -13496,6 +13529,39 @@ namespace
             {
                 if (PdfTab* tab = Active()) SaveAnnotationsToPdf(hwnd, *tab);
                 return 0;
+            }
+            if (g_pageInputFocused)
+            {
+                if (wParam == VK_LEFT) { g_pageCaretIndex = std::max(0, g_pageCaretIndex - 1); g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_RIGHT) { g_pageCaretIndex = std::min(static_cast<int>(g_pageInputText.size()), g_pageCaretIndex + 1); g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_HOME) { g_pageCaretIndex = 0; g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_END) { g_pageCaretIndex = static_cast<int>(g_pageInputText.size()); g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_DELETE && g_pageCaretIndex < static_cast<int>(g_pageInputText.size()))
+                {
+                    g_pageInputText.erase(static_cast<size_t>(g_pageCaretIndex), 1);
+                    g_pageCaretVisible = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            if (g_searchInputFocused && g_sideMode == 2)
+            {
+                if (wParam == VK_LEFT) { g_searchCaretIndex = std::max(0, g_searchCaretIndex - 1); g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_RIGHT) { g_searchCaretIndex = std::min(static_cast<int>(g_searchQuery.size()), g_searchCaretIndex + 1); g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_HOME) { g_searchCaretIndex = 0; g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_END) { g_searchCaretIndex = static_cast<int>(g_searchQuery.size()); g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+                if (wParam == VK_DELETE && g_searchCaretIndex < static_cast<int>(g_searchQuery.size()))
+                {
+                    g_searchQuery.erase(static_cast<size_t>(g_searchCaretIndex), 1);
+                    g_searchResults.clear();
+                    g_searchCurrent = 0;
+                    g_searchHasRun = false;
+                    g_searchLastQuery.clear();
+                    g_searchCaretVisible = true;
+                    SetTimer(hwnd, 12, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
             }
             if (wParam == VK_ESCAPE && g_pageInputFocused) { CancelPageInput(hwnd); return 0; }
             if (wParam == VK_ESCAPE && g_homeSearchFocused)
@@ -13589,9 +13655,14 @@ namespace
             }
             if (g_pageInputFocused)
             {
+                g_pageCaretIndex = std::clamp(g_pageCaretIndex, 0, static_cast<int>(g_pageInputText.size()));
                 if (wParam == VK_BACK)
                 {
-                    if (!g_pageInputText.empty()) g_pageInputText.pop_back();
+                    if (g_pageCaretIndex > 0)
+                    {
+                        g_pageInputText.erase(static_cast<size_t>(g_pageCaretIndex - 1), 1);
+                        --g_pageCaretIndex;
+                    }
                 }
                 else if (wParam == VK_RETURN)
                 {
@@ -13600,8 +13671,13 @@ namespace
                 }
                 else if (wParam >= L'0' && wParam <= L'9' && g_pageInputText.size() < 6)
                 {
-                    if (g_pageInputText == L"0") g_pageInputText.clear();
-                    g_pageInputText.push_back(static_cast<wchar_t>(wParam));
+                    if (g_pageInputText == L"0")
+                    {
+                        g_pageInputText.clear();
+                        g_pageCaretIndex = 0;
+                    }
+                    g_pageInputText.insert(g_pageInputText.begin() + g_pageCaretIndex, static_cast<wchar_t>(wParam));
+                    ++g_pageCaretIndex;
                 }
                 g_pageCaretVisible = true;
                 RECT client{};
@@ -13641,11 +13717,13 @@ namespace
             if (g_searchInputFocused && g_sideMode == 2)
             {
                 bool changed = false;
+                g_searchCaretIndex = std::clamp(g_searchCaretIndex, 0, static_cast<int>(g_searchQuery.size()));
                 if (wParam == VK_BACK)
                 {
-                    if (!g_searchQuery.empty())
+                    if (g_searchCaretIndex > 0)
                     {
-                        g_searchQuery.pop_back();
+                        g_searchQuery.erase(static_cast<size_t>(g_searchCaretIndex - 1), 1);
+                        --g_searchCaretIndex;
                         changed = true;
                     }
                 }
@@ -13655,7 +13733,8 @@ namespace
                 }
                 else if (wParam >= 32)
                 {
-                    g_searchQuery.push_back(static_cast<wchar_t>(wParam));
+                    g_searchQuery.insert(g_searchQuery.begin() + g_searchCaretIndex, static_cast<wchar_t>(wParam));
+                    ++g_searchCaretIndex;
                     changed = true;
                 }
                 if (changed)
