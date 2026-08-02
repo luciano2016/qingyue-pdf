@@ -17,6 +17,7 @@ EXPORTS
     fz_device_rgb
     fz_new_pixmap_from_page_number
     fz_search_page_number
+    fz_match_page_number
     fz_pixmap_width
     fz_pixmap_height
     fz_pixmap_components
@@ -28,5 +29,6 @@ EXPORTS
     quiet_pdf_load_annotations
     quiet_pdf_last_error
     quiet_pdf_select_text
+    quiet_pdf_search_page_number
     quiet_pdf_select_word_at_point
     quiet_pdf_find_image_at_point

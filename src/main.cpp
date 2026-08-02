@@ -386,6 +386,7 @@ namespace
         CmdSearchPrev,
         CmdSearchNext,
         CmdSearchClear,
+        CmdSearchOptions,
         CmdZoomMenu,
         CmdStatusPin,
         CmdPageInput,
@@ -945,6 +946,8 @@ namespace
         using NewPixmapFromPageNumberFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int);
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
+        using MatchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int);
+        using QuietSearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
@@ -977,6 +980,8 @@ namespace
             Get(newPixmapFromPageNumber, "fz_new_pixmap_from_page_number");
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
             Get(searchPageNumber, "fz_search_page_number");
+            GetOptional(matchPageNumber, "fz_match_page_number");
+            GetOptional(quietSearchPageNumber, "quiet_pdf_search_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(loadAnnotations, "quiet_pdf_load_annotations");
             Get(selectText, "quiet_pdf_select_text");
@@ -1009,6 +1014,8 @@ namespace
         NewPixmapFromPageNumberFn newPixmapFromPageNumber{};
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
         SearchPageNumberFn searchPageNumber{};
+        MatchPageNumberFn matchPageNumber{};
+        QuietSearchPageNumberFn quietSearchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
         LoadAnnotationsFn loadAnnotations{};
         SelectTextFn selectText{};
@@ -1198,6 +1205,9 @@ namespace
     bool g_searchInputFocused{};
     bool g_searchHasRun{};
     bool g_searchCaretVisible{ true };
+    bool g_searchWholeWord{ true };
+    bool g_searchMatchCase{ true };
+    RECT g_searchOptionsButtonRect{};
     bool g_hasPressedButton{};
     bool g_hasHoverButton{};
     bool g_hasHoverTip{};
@@ -2934,6 +2944,42 @@ namespace
         g.DrawEllipse(&pen, cx - rad, cy - rad, rad * 2.0f, rad * 2.0f);
         g.DrawLine(&pen, cx + S(4.5f), cy + S(4.5f), cx + S(9.4f), cy + S(9.4f));
     }
+    void DrawSoftGlowRect(HDC dc, RECT r, int radius, COLORREF color, BYTE maxAlpha)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        for (int i = 3; i >= 1; --i)
+        {
+            BYTE alpha = static_cast<BYTE>(maxAlpha / (i + 1));
+            Gdiplus::Pen pen(GdiColor(color, alpha), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+            Gdiplus::RectF rr{
+                static_cast<Gdiplus::REAL>(r.left - S(i)),
+                static_cast<Gdiplus::REAL>(r.top - S(i)),
+                static_cast<Gdiplus::REAL>(r.right - r.left + S(i * 2)),
+                static_cast<Gdiplus::REAL>(r.bottom - r.top + S(i * 2)) };
+            DrawGdiRoundRect(g, pen, rr, S(static_cast<float>(radius + i)));
+        }
+    }
+
+    void DrawSearchIconButton(HDC dc, int id, RECT hotRect, RECT iconRect, void(*drawIcon)(HDC, RECT, COLORREF), const std::wstring& tip)
+    {
+        bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &hotRect);
+        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &hotRect);
+        if (hovered || pressed)
+        {
+            COLORREF fill = pressed
+                ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.14)
+                : MixColor(T().panel2, T().paper, IsDarkTheme() || IsAuroraTheme() ? 0.18 : 0.48);
+            COLORREF line = pressed ? MixColor(T().line, T().accent, 0.34) : MixColor(T().line, T().text, 0.08);
+            RoundFill(dc, hotRect, S(6), fill, line);
+        }
+        AddButton(id, hotRect, L"", tip);
+        COLORREF iconColor = pressed ? T().accent : (hovered ? MixColor(T().muted, T().accent, 0.28) : T().muted);
+        drawIcon(dc, iconRect, iconColor);
+    }
+
+
 
     void DrawGearGlyph(HDC dc, RECT r, COLORREF color)
     {
@@ -2990,14 +3036,16 @@ namespace
 
     void DrawSearchActionButton(HDC dc, int id, RECT r, const std::wstring& label)
     {
-        bool hovered = Hit(r, g_mousePos.x, g_mousePos.y);
+        bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &r);
         bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
-        COLORREF fill = pressed ? MixColor(T().panel2, T().line, 0.45) : (hovered ? T().panel2 : T().paper);
-        COLORREF line = pressed ? T().accent : T().line;
+        COLORREF fill = pressed
+            ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.14)
+            : (hovered ? MixColor(T().panel2, T().paper, IsDarkTheme() || IsAuroraTheme() ? 0.18 : 0.50) : T().paper);
+        COLORREF line = pressed ? MixColor(T().line, T().accent, 0.42) : (hovered ? MixColor(T().line, T().text, 0.12) : T().line);
         RoundFill(dc, r, S(7), fill, line);
         HFONT f = Font(10);
         HGDIOBJ oldFont = SelectObject(dc, f);
-        Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+        Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, pressed ? T().accent : T().text);
         SelectObject(dc, oldFont);
         DeleteObject(f);
         (void)id;
@@ -6051,7 +6099,20 @@ namespace
         {
             int marks[32]{};
             fz_quad boxes[32]{};
-            int count = g_pdf.searchPageNumber(tab->ctx, tab->doc, page, needle.c_str(), marks, boxes, 32);
+            int searchOptions = g_searchMatchCase ? 0 : 1;
+            int count = 0;
+            if (g_searchWholeWord && g_pdf.quietSearchPageNumber)
+            {
+                count = g_pdf.quietSearchPageNumber(tab->ctx, tab->doc, page, needle.c_str(), marks, boxes, 32, searchOptions, 1);
+            }
+            else if (g_pdf.matchPageNumber)
+            {
+                count = g_pdf.matchPageNumber(tab->ctx, tab->doc, page, needle.c_str(), marks, boxes, 32, searchOptions);
+            }
+            else
+            {
+                count = g_pdf.searchPageNumber(tab->ctx, tab->doc, page, needle.c_str(), marks, boxes, 32);
+            }
             if (count > 0)
             {
                 for (int hit = 0; hit < count && totalHits < 500; ++hit)
@@ -8558,7 +8619,9 @@ namespace
         else if (g_sideMode == 2)
         {
             g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(48) };
-            RoundFill(dc, g_searchInputRect, S(8), T().paper, g_searchInputFocused ? T().accent : T().line);
+            if (g_searchInputFocused)
+                DrawSoftGlowRect(dc, g_searchInputRect, 8, T().accent, IsDarkTheme() || IsAuroraTheme() ? 84 : 70);
+            RoundFill(dc, g_searchInputRect, S(8), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
             RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
             RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
@@ -8577,20 +8640,11 @@ namespace
                 DeleteObject(caret);
             }
             RECT clearRect{ g_searchInputRect.right - S(77), g_searchInputRect.top + S(6), g_searchInputRect.right - S(49), g_searchInputRect.bottom - S(6) };
-            if (Hit(clearRect, g_mousePos.x, g_mousePos.y))
-            {
-                RoundFill(dc, clearRect, S(6), T().panel2, T().line);
-            }
-            AddButton(CmdSearchClear, clearRect, L"\u00d7");
-            DrawCloseGlyph(dc, clearRect, T().muted);
+            DrawSearchIconButton(dc, CmdSearchClear, clearRect, clearRect, DrawCloseGlyph, L"清除");
             RECT gearRect{ g_searchInputRect.right - S(38), g_searchInputRect.top + S(8), g_searchInputRect.right - S(14), g_searchInputRect.bottom - S(8) };
             RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
-            if (Hit(gearHotRect, g_mousePos.x, g_mousePos.y))
-            {
-                RoundFill(dc, gearHotRect, S(6), T().panel2, T().line);
-            }
-            AddButton(0, gearHotRect, L"");
-            DrawGearGlyph(dc, gearRect, T().muted);
+            g_searchOptionsButtonRect = gearHotRect;
+            DrawSearchIconButton(dc, CmdSearchOptions, gearHotRect, gearRect, DrawGearGlyph, L"搜索设置");
 
             int rowLeft = g_sidebar.left + S(14);
             int rowRight = g_sidebar.right - S(14);
@@ -9837,6 +9891,60 @@ namespace
         measure->itemHeight = S(25);
         return true;
     }
+    void DrawZoomMenuIcon(HDC dc, RECT r, UINT id, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(GdiColor(color, 235), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        float cx = (r.left + r.right) * 0.5f;
+        float cy = (r.top + r.bottom) * 0.5f;
+        float w = static_cast<float>(std::max<int>(1, r.right - r.left));
+        float h = static_cast<float>(std::max<int>(1, r.bottom - r.top));
+        Gdiplus::RectF page{ cx - w * 0.30f, cy - h * 0.36f, w * 0.60f, h * 0.72f };
+        if (id == 2400)
+        {
+            DrawGdiRoundRect(g, pen, page, S(1.6f));
+            HFONT f = Font(5);
+            HGDIOBJ oldFont = SelectObject(dc, f);
+            Text(dc, L"1:1", r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, color);
+            SelectObject(dc, oldFont);
+            DeleteObject(f);
+            return;
+        }
+        if (id == 2401)
+        {
+            DrawGdiRoundRect(g, pen, page, S(1.6f));
+            g.DrawLine(&pen, page.X + S(2.0f), page.Y + S(2.0f), page.X + S(5.0f), page.Y + S(2.0f));
+            g.DrawLine(&pen, page.GetRight() - S(2.0f), page.GetBottom() - S(2.0f), page.GetRight() - S(5.0f), page.GetBottom() - S(2.0f));
+            return;
+        }
+        if (id == 2402)
+        {
+            DrawGdiRoundRect(g, pen, page, S(1.6f));
+            g.DrawLine(&pen, page.X - S(1.5f), cy, page.X + S(3.5f), cy);
+            g.DrawLine(&pen, page.GetRight() + S(1.5f), cy, page.GetRight() - S(3.5f), cy);
+            return;
+        }
+        if (id == 2403)
+        {
+            Gdiplus::RectF content{ page.X + S(3.0f), page.Y + S(2.8f), page.Width - S(6.0f), page.Height - S(5.6f) };
+            DrawGdiRoundRect(g, pen, page, S(1.6f));
+            DrawGdiRoundRect(g, pen, content, S(1.1f));
+            return;
+        }
+        if (id == 2404)
+        {
+            g.DrawEllipse(&pen, cx - S(5.4f), cy - S(5.4f), S(10.8f), S(10.8f));
+            g.DrawLine(&pen, cx + S(3.8f), cy + S(3.8f), cx + S(8.0f), cy + S(8.0f));
+            g.DrawLine(&pen, cx - S(3.0f), cy, cx + S(3.0f), cy);
+            return;
+        }
+    }
+
+
 
     void DrawThemedMenuCheck(HDC dc, RECT r, COLORREF color)
     {
@@ -9884,7 +9992,12 @@ namespace
             RoundFill(draw->hDC, hot, S(6), fill, fill);
         }
 
-        if (checked)
+        if (item->id >= 2400 && item->id <= 2404)
+        {
+            RECT icon{ r.left + S(9), r.top + S(5), r.left + S(25), r.bottom - S(5) };
+            DrawZoomMenuIcon(draw->hDC, icon, item->id, disabled ? MenuPopupShortcutText(true) : (checked ? T().accent : MenuPopupShortcutText(false)));
+        }
+        else if (checked)
         {
             RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
             DrawThemedMenuCheck(draw->hDC, check, disabled ? MenuPopupShortcutText(true) : T().accent);
@@ -9940,7 +10053,12 @@ namespace
             RoundFill(dc, hot, S(6), fill, fill);
         }
 
-        if (item.checked)
+        if (item.id >= 2400 && item.id <= 2404)
+        {
+            RECT icon{ r.left + S(9), r.top + S(5), r.left + S(25), r.bottom - S(5) };
+            DrawZoomMenuIcon(dc, icon, item.id, item.disabled ? MenuPopupShortcutText(true) : (item.checked ? T().accent : MenuPopupShortcutText(false)));
+        }
+        else if (item.checked)
         {
             RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
             DrawThemedMenuCheck(dc, check, item.disabled ? MenuPopupShortcutText(true) : T().accent);
@@ -10293,8 +10411,6 @@ namespace
         AppendThemedMenuItem(menu, 2404, L"\u81ea\u5b9a\u4e49\u7f29\u653e");
         struct ZoomItem { int id; double zoom; const wchar_t* label; };
         ZoomItem items[] = {
-            { 2410, 64.0, L"6400%" },
-            { 2411, 32.0, L"3200%" },
             { 2412, 16.0, L"1600%" },
             { 2413, 8.0, L"800%" },
             { 2414, 4.0, L"400%" },
@@ -10314,6 +10430,24 @@ namespace
         }
         AppendThemedMenuSeparator(menu);
         AppendThemedMenuItem(menu, 2430, L"\u8bbe\u7f6e\u9ed8\u8ba4\u7f29\u653e\u6bd4\u4f8b");
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
+    }
+
+    void ShowSearchOptionsMenu(HWND hwnd)
+    {
+        RECT anchor = g_searchOptionsButtonRect;
+        HMENU menu = CreatePopupMenu();
+        AppendThemedMenuItem(menu, 2440, L"全词匹配", g_searchWholeWord);
+        AppendThemedMenuItem(menu, 2441, L"区分大小写", g_searchMatchCase);
+        if (IsRectEmpty(&anchor))
+        {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            ShowThemedPopupMenu(hwnd, menu, cursor.x, cursor.y);
+            return;
+        }
+        POINT pt{ anchor.left, anchor.bottom + S(4) };
+        ClientToScreen(hwnd, &pt);
         ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
     }
 
@@ -11318,6 +11452,15 @@ namespace
             }
             return;
         }
+        if (id == 2440 || id == 2441)
+        {
+            if (id == 2440) g_searchWholeWord = !g_searchWholeWord;
+            else g_searchMatchCase = !g_searchMatchCase;
+            if (g_searchHasRun) RunSearch();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+
         if (id == 2501)
         {
             CopyCurrentSelectionToClipboard(hwnd);
@@ -11445,6 +11588,10 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
+        case CmdSearchOptions:
+            ShowSearchOptionsMenu(hwnd);
+            break;
+
         case CmdSearchClear:
             g_searchQuery.clear();
             g_searchResults.clear();

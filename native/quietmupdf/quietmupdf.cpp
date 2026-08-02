@@ -441,6 +441,11 @@ static int quiet_token_class(int c)
     return 3;
 }
 
+static bool quiet_is_non_cjk_search_word_char(int c)
+{
+    return quiet_token_class(c) == 1;
+}
+
 static fz_rect quiet_rect_from_quad(fz_quad q)
 {
     fz_rect r;
@@ -449,6 +454,142 @@ static fz_rect quiet_rect_from_quad(fz_quad q)
     r.x1 = std::max({ q.ul.x, q.ur.x, q.ll.x, q.lr.x });
     r.y1 = std::max({ q.ul.y, q.ur.y, q.ll.y, q.lr.y });
     return r;
+}
+
+static bool quiet_rects_intersect(fz_rect a, fz_rect b)
+{
+    return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+}
+
+static bool quiet_search_hit_has_word_boundaries(
+    fz_stext_page* stext,
+    const fz_quad* quads,
+    int quad_count)
+{
+    if (!stext || !quads || quad_count <= 0)
+        return true;
+
+    struct search_char
+    {
+        int c;
+        fz_rect rect;
+    };
+    std::vector<search_char> chars;
+    for (fz_stext_block* block = stext->first_block; block; block = block->next)
+    {
+        if (block->type != FZ_STEXT_BLOCK_TEXT)
+            continue;
+        for (fz_stext_line* line = block->u.t.first_line; line; line = line->next)
+        {
+            for (fz_stext_char* ch = line->first_char; ch; ch = ch->next)
+            {
+                fz_rect rect = quiet_rect_from_quad(ch->quad);
+                if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                    continue;
+                chars.push_back(search_char{ ch->c, rect });
+            }
+        }
+    }
+
+    if (chars.empty())
+        return true;
+
+    int first = -1;
+    int last = -1;
+    for (int i = 0; i < static_cast<int>(chars.size()); ++i)
+    {
+        for (int q = 0; q < quad_count; ++q)
+        {
+            fz_rect hit = quiet_rect_from_quad(quads[q]);
+            if (!quiet_rects_intersect(chars[static_cast<size_t>(i)].rect, hit))
+                continue;
+            if (first < 0)
+                first = i;
+            last = i;
+            break;
+        }
+    }
+
+    if (first < 0 || last < first)
+        return true;
+
+    const int firstChar = chars[static_cast<size_t>(first)].c;
+    const int lastChar = chars[static_cast<size_t>(last)].c;
+    bool leftOk = !quiet_is_non_cjk_search_word_char(firstChar) ||
+        first == 0 ||
+        !quiet_is_non_cjk_search_word_char(chars[static_cast<size_t>(first - 1)].c);
+    bool rightOk = !quiet_is_non_cjk_search_word_char(lastChar) ||
+        last + 1 >= static_cast<int>(chars.size()) ||
+        !quiet_is_non_cjk_search_word_char(chars[static_cast<size_t>(last + 1)].c);
+    return leftOk && rightOk;
+}
+
+extern "C" int quiet_pdf_search_page_number(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    const char* needle,
+    int* hit_mark,
+    fz_quad* hit_bbox,
+    int hit_max,
+    int search_options,
+    int whole_word)
+{
+    quiet_set_last_error("");
+    if (!ctx || !doc || page_number < 0 || !needle || !hit_bbox || hit_max <= 0)
+    {
+        quiet_set_last_error("invalid quiet_pdf_search_page_number arguments");
+        return 0;
+    }
+
+    fz_page* page = nullptr;
+    fz_stext_page* stext = nullptr;
+    std::vector<int> marks(static_cast<size_t>(hit_max));
+    std::vector<fz_quad> boxes(static_cast<size_t>(hit_max));
+    int out_count = 0;
+
+    fz_try(ctx)
+    {
+        page = fz_load_page(ctx, doc, page_number);
+        fz_stext_options opts{};
+        opts.flags = FZ_STEXT_DEHYPHENATE;
+        stext = fz_new_stext_page_from_page(ctx, page, &opts);
+        int count = fz_match_stext_page(ctx, stext, needle, marks.data(), boxes.data(), hit_max, static_cast<fz_search_options>(search_options));
+
+        for (int i = 0; i < count && i < hit_max;)
+        {
+            int mark = marks[static_cast<size_t>(i)];
+            int group_end = i + 1;
+            while (group_end < count && group_end < hit_max && marks[static_cast<size_t>(group_end)] == mark)
+                ++group_end;
+
+            bool keep = !whole_word ||
+                quiet_search_hit_has_word_boundaries(stext, boxes.data() + i, group_end - i);
+            if (keep)
+            {
+                for (int j = i; j < group_end && out_count < hit_max; ++j)
+                {
+                    if (hit_mark)
+                        hit_mark[out_count] = marks[static_cast<size_t>(j)];
+                    hit_bbox[out_count] = boxes[static_cast<size_t>(j)];
+                    ++out_count;
+                }
+            }
+            i = group_end;
+        }
+    }
+    fz_always(ctx)
+    {
+        if (stext) fz_drop_stext_page(ctx, stext);
+        if (page) fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        out_count = 0;
+    }
+
+    return out_count;
 }
 
 static fz_rect quiet_inflate_rect(fz_rect r, float pad)
