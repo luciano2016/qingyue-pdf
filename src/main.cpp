@@ -1208,6 +1208,7 @@ namespace
     bool g_searchWholeWord{ true };
     bool g_searchMatchCase{ true };
     RECT g_searchOptionsButtonRect{};
+    int g_zoomButtonMode{ 2400 };
     bool g_hasPressedButton{};
     bool g_hasHoverButton{};
     bool g_hasHoverTip{};
@@ -2556,6 +2557,10 @@ namespace
         Theme,
         View,
         Actual,
+        FitPage,
+        FitWidth,
+        FitContent,
+        CustomZoom,
         ZoomOut,
         ZoomIn,
         Fullscreen,
@@ -2721,19 +2726,66 @@ namespace
             return;
         }
         case StatusIcon::Actual:
+        case StatusIcon::FitPage:
+        case StatusIcon::FitWidth:
+        case StatusIcon::FitContent:
+        case StatusIcon::CustomZoom:
         {
             int left = r.left + S(4);
             int top = cy - S(6);
-            square(left, top, S(12));
+            RECT iconBox{ left, top, left + S(12), top + S(12) };
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(pen);
-            HFONT f = Font(5);
-            HGDIOBJ oldFont = SelectObject(dc, f);
-            RECT label{ left, top, left + S(12), top + S(12) };
-            Text(dc, L"1:1", label, DT_CENTER | DT_VCENTER | DT_SINGLELINE, color);
-            SelectObject(dc, oldFont);
-            DeleteObject(f);
+
+            Gdiplus::Graphics g(dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            Gdiplus::Pen aaPen(GdiColor(color), std::max<Gdiplus::REAL>(1.25f, S(1.05f)));
+            aaPen.SetStartCap(Gdiplus::LineCapRound);
+            aaPen.SetEndCap(Gdiplus::LineCapRound);
+            aaPen.SetLineJoin(Gdiplus::LineJoinRound);
+            Gdiplus::RectF page{
+                static_cast<Gdiplus::REAL>(iconBox.left) + S(1.0f),
+                static_cast<Gdiplus::REAL>(iconBox.top) + S(0.8f),
+                static_cast<Gdiplus::REAL>(iconBox.right - iconBox.left) - S(2.0f),
+                static_cast<Gdiplus::REAL>(iconBox.bottom - iconBox.top) - S(1.6f) };
+
+            if (icon == StatusIcon::Actual)
+            {
+                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                HFONT f = Font(5);
+                HGDIOBJ oldFont = SelectObject(dc, f);
+                Text(dc, L"1:1", iconBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE, color);
+                SelectObject(dc, oldFont);
+                DeleteObject(f);
+            }
+            else if (icon == StatusIcon::FitPage)
+            {
+                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                g.DrawLine(&aaPen, page.X + S(2.0f), page.Y + S(2.0f), page.X + S(5.0f), page.Y + S(2.0f));
+                g.DrawLine(&aaPen, page.GetRight() - S(2.0f), page.GetBottom() - S(2.0f), page.GetRight() - S(5.0f), page.GetBottom() - S(2.0f));
+            }
+            else if (icon == StatusIcon::FitWidth)
+            {
+                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                float mid = (page.Y + page.GetBottom()) * 0.5f;
+                g.DrawLine(&aaPen, page.X - S(1.2f), mid, page.X + S(3.0f), mid);
+                g.DrawLine(&aaPen, page.GetRight() + S(1.2f), mid, page.GetRight() - S(3.0f), mid);
+            }
+            else if (icon == StatusIcon::FitContent)
+            {
+                DrawGdiRoundRect(g, aaPen, page, S(1.7f));
+                Gdiplus::RectF content{ page.X + S(2.8f), page.Y + S(2.7f), page.Width - S(5.6f), page.Height - S(5.4f) };
+                DrawGdiRoundRect(g, aaPen, content, S(1.0f));
+            }
+            else
+            {
+                float mx = (iconBox.left + iconBox.right) * 0.5f - S(1.4f);
+                float my = (iconBox.top + iconBox.bottom) * 0.5f - S(1.3f);
+                g.DrawEllipse(&aaPen, mx - S(4.5f), my - S(4.5f), S(9.0f), S(9.0f));
+                g.DrawLine(&aaPen, mx + S(3.1f), my + S(3.1f), mx + S(7.0f), my + S(7.0f));
+                g.DrawLine(&aaPen, mx - S(2.6f), my, mx + S(2.6f), my);
+            }
             DrawDownCaret(dc, left + S(20), cy, color);
             return;
         }
@@ -2949,16 +3001,18 @@ namespace
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        for (int i = 3; i >= 1; --i)
+        for (int i = 5; i >= 1; --i)
         {
-            BYTE alpha = static_cast<BYTE>(maxAlpha / (i + 1));
+            float spread = S(static_cast<float>(i));
+            BYTE alpha = static_cast<BYTE>(maxAlpha * (6 - i) / 18);
             Gdiplus::Pen pen(GdiColor(color, alpha), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+            pen.SetLineJoin(Gdiplus::LineJoinRound);
             Gdiplus::RectF rr{
-                static_cast<Gdiplus::REAL>(r.left - S(i)),
-                static_cast<Gdiplus::REAL>(r.top - S(i)),
-                static_cast<Gdiplus::REAL>(r.right - r.left + S(i * 2)),
-                static_cast<Gdiplus::REAL>(r.bottom - r.top + S(i * 2)) };
-            DrawGdiRoundRect(g, pen, rr, S(static_cast<float>(radius + i)));
+                static_cast<Gdiplus::REAL>(r.left) - spread + 0.5f,
+                static_cast<Gdiplus::REAL>(r.top) - spread + 0.5f,
+                static_cast<Gdiplus::REAL>(r.right - r.left) + spread * 2.0f - 1.0f,
+                static_cast<Gdiplus::REAL>(r.bottom - r.top) + spread * 2.0f - 1.0f };
+            DrawGdiRoundRect(g, pen, rr, S(static_cast<float>(radius)) + spread);
         }
     }
 
@@ -6033,6 +6087,7 @@ namespace
         PdfTab* tab = Active();
         if (!tab) return;
         g_searchInputFocused = false;
+        KillTimer(hwnd, 21);
         g_pageInputFocused = true;
         g_pageCaretVisible = true;
         g_pageInputText = std::to_wstring(tab->currentPage + 1);
@@ -8620,7 +8675,12 @@ namespace
         {
             g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(48) };
             if (g_searchInputFocused)
-                DrawSoftGlowRect(dc, g_searchInputRect, 8, T().accent, IsDarkTheme() || IsAuroraTheme() ? 84 : 70);
+            {
+                double phase = (static_cast<double>(GetTickCount64() % 1600ull) / 1600.0) * 6.283185307179586;
+                double breath = 0.5 + 0.5 * std::sin(phase);
+                BYTE glowAlpha = static_cast<BYTE>((IsDarkTheme() || IsAuroraTheme() ? 66 : 54) + breath * (IsDarkTheme() || IsAuroraTheme() ? 36 : 30));
+                DrawSoftGlowRect(dc, g_searchInputRect, 8, T().accent, glowAlpha);
+            }
             RoundFill(dc, g_searchInputRect, S(8), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
             RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
@@ -9664,7 +9724,7 @@ namespace
         };
         auto addStatusIcon = [&](int id, StatusIcon icon, const std::wstring& tip, int w = 30, COLORREF color = RGB(120, 126, 134))
         {
-            bool hasCaret = icon == StatusIcon::Theme || icon == StatusIcon::View || icon == StatusIcon::Actual;
+            bool hasCaret = icon == StatusIcon::Theme || icon == StatusIcon::View || icon == StatusIcon::Actual || icon == StatusIcon::FitPage || icon == StatusIcon::FitWidth || icon == StatusIcon::FitContent || icon == StatusIcon::CustomZoom;
             w = hasCaret ? std::min(w, 34) : std::min(w, 26);
             RECT r{ rx, bar.top + S(7), rx + S(w), bar.bottom - S(7) };
             AddButton(id, r, L"", tip);
@@ -9673,9 +9733,17 @@ namespace
             rx += S(w + 3);
             if (id == CmdTheme || id == CmdView) rx += S(5);
         };
+        auto zoomStatusIcon = []()
+        {
+            if (g_zoomButtonMode == 2401) return StatusIcon::FitPage;
+            if (g_zoomButtonMode == 2402) return StatusIcon::FitWidth;
+            if (g_zoomButtonMode == 2403) return StatusIcon::FitContent;
+            if (g_zoomButtonMode == 2404) return StatusIcon::CustomZoom;
+            return StatusIcon::Actual;
+        };
         addStatusIcon(CmdTheme, StatusIcon::Theme, L"\u4e3b\u9898\uff1a" + std::wstring(T().name), 34, iconColor);
         addStatusIcon(CmdView, StatusIcon::View, L"\u9605\u8bfb\u89c6\u56fe", 34, iconColor);
-        addStatusIcon(CmdZoomMenu, StatusIcon::Actual, L"\u9875\u9762\u7f29\u653e", 34, iconColor);
+        addStatusIcon(CmdZoomMenu, zoomStatusIcon(), L"\u9875\u9762\u7f29\u653e", 34, iconColor);
         separator();
         addStatusIcon(CmdZoomOut, StatusIcon::ZoomOut, L"\u7f29\u5c0f", 34, iconColor);
         std::wstring zoom = tab ? std::to_wstring(static_cast<int>(tab->zoom * 100.0 + 0.5)) + L"%" : L"100%";
@@ -9853,7 +9921,7 @@ namespace
 
     int ThemedMenuFontPt(ThemedMenuItem const* item)
     {
-        if (item && item->id >= 2410 && item->id <= 2422) return 10;
+        if (item && item->id >= 2412 && item->id <= 2422) return 10;
         return 9;
     }
     bool MeasureThemedMenuItem(MEASUREITEMSTRUCT* measure)
@@ -9891,61 +9959,6 @@ namespace
         measure->itemHeight = S(25);
         return true;
     }
-    void DrawZoomMenuIcon(HDC dc, RECT r, UINT id, COLORREF color)
-    {
-        Gdiplus::Graphics g(dc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        Gdiplus::Pen pen(GdiColor(color, 235), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
-        pen.SetStartCap(Gdiplus::LineCapRound);
-        pen.SetEndCap(Gdiplus::LineCapRound);
-        pen.SetLineJoin(Gdiplus::LineJoinRound);
-        float cx = (r.left + r.right) * 0.5f;
-        float cy = (r.top + r.bottom) * 0.5f;
-        float w = static_cast<float>(std::max<int>(1, r.right - r.left));
-        float h = static_cast<float>(std::max<int>(1, r.bottom - r.top));
-        Gdiplus::RectF page{ cx - w * 0.30f, cy - h * 0.36f, w * 0.60f, h * 0.72f };
-        if (id == 2400)
-        {
-            DrawGdiRoundRect(g, pen, page, S(1.6f));
-            HFONT f = Font(5);
-            HGDIOBJ oldFont = SelectObject(dc, f);
-            Text(dc, L"1:1", r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, color);
-            SelectObject(dc, oldFont);
-            DeleteObject(f);
-            return;
-        }
-        if (id == 2401)
-        {
-            DrawGdiRoundRect(g, pen, page, S(1.6f));
-            g.DrawLine(&pen, page.X + S(2.0f), page.Y + S(2.0f), page.X + S(5.0f), page.Y + S(2.0f));
-            g.DrawLine(&pen, page.GetRight() - S(2.0f), page.GetBottom() - S(2.0f), page.GetRight() - S(5.0f), page.GetBottom() - S(2.0f));
-            return;
-        }
-        if (id == 2402)
-        {
-            DrawGdiRoundRect(g, pen, page, S(1.6f));
-            g.DrawLine(&pen, page.X - S(1.5f), cy, page.X + S(3.5f), cy);
-            g.DrawLine(&pen, page.GetRight() + S(1.5f), cy, page.GetRight() - S(3.5f), cy);
-            return;
-        }
-        if (id == 2403)
-        {
-            Gdiplus::RectF content{ page.X + S(3.0f), page.Y + S(2.8f), page.Width - S(6.0f), page.Height - S(5.6f) };
-            DrawGdiRoundRect(g, pen, page, S(1.6f));
-            DrawGdiRoundRect(g, pen, content, S(1.1f));
-            return;
-        }
-        if (id == 2404)
-        {
-            g.DrawEllipse(&pen, cx - S(5.4f), cy - S(5.4f), S(10.8f), S(10.8f));
-            g.DrawLine(&pen, cx + S(3.8f), cy + S(3.8f), cx + S(8.0f), cy + S(8.0f));
-            g.DrawLine(&pen, cx - S(3.0f), cy, cx + S(3.0f), cy);
-            return;
-        }
-    }
-
-
-
     void DrawThemedMenuCheck(HDC dc, RECT r, COLORREF color)
     {
         Gdiplus::Graphics g(dc);
@@ -9992,12 +10005,7 @@ namespace
             RoundFill(draw->hDC, hot, S(6), fill, fill);
         }
 
-        if (item->id >= 2400 && item->id <= 2404)
-        {
-            RECT icon{ r.left + S(9), r.top + S(5), r.left + S(25), r.bottom - S(5) };
-            DrawZoomMenuIcon(draw->hDC, icon, item->id, disabled ? MenuPopupShortcutText(true) : (checked ? T().accent : MenuPopupShortcutText(false)));
-        }
-        else if (checked)
+        if (checked)
         {
             RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
             DrawThemedMenuCheck(draw->hDC, check, disabled ? MenuPopupShortcutText(true) : T().accent);
@@ -10053,12 +10061,7 @@ namespace
             RoundFill(dc, hot, S(6), fill, fill);
         }
 
-        if (item.id >= 2400 && item.id <= 2404)
-        {
-            RECT icon{ r.left + S(9), r.top + S(5), r.left + S(25), r.bottom - S(5) };
-            DrawZoomMenuIcon(dc, icon, item.id, item.disabled ? MenuPopupShortcutText(true) : (item.checked ? T().accent : MenuPopupShortcutText(false)));
-        }
-        else if (item.checked)
+        if (item.checked)
         {
             RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
             DrawThemedMenuCheck(dc, check, item.disabled ? MenuPopupShortcutText(true) : T().accent);
@@ -11393,6 +11396,7 @@ namespace
             {
                 ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), zoom);
             };
+            if (id >= 2400 && id <= 2404) g_zoomButtonMode = id;
             if (id == 2400) applyZoom(1.0);
             else if (id == 2401 && !tab->pages.empty())
             {
@@ -11415,10 +11419,11 @@ namespace
             {
                 OpenCustomZoomDialog(hwnd);
             }
-            else if (id >= 2410 && id <= 2422)
+            else if (id >= 2412 && id <= 2422)
             {
-                double values[] = { 64.0, 32.0, 16.0, 8.0, 4.0, 2.0, 1.5, 1.25, 1.0, 0.5, 0.25, 0.125, 0.0833 };
-                applyZoom(values[id - 2410]);
+                g_zoomButtonMode = 2404;
+                double values[] = { 16.0, 8.0, 4.0, 2.0, 1.5, 1.25, 1.0, 0.5, 0.25, 0.125, 0.0833 };
+                applyZoom(values[id - 2412]);
             }
             return;
         }
@@ -11544,6 +11549,7 @@ namespace
             g_searchInputFocused = true;
             g_searchCaretVisible = true;
             SetTimer(hwnd, 12, 500, nullptr);
+            SetTimer(hwnd, 21, 40, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdBookmark:
@@ -11601,6 +11607,7 @@ namespace
             g_searchInputFocused = true;
             g_searchCaretVisible = true;
             SetTimer(hwnd, 12, 500, nullptr);
+            SetTimer(hwnd, 21, 40, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdNoteExpandAll:
@@ -11654,8 +11661,8 @@ namespace
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdImmersive: ApplyImmersiveWindow(hwnd, !g_immersive); break;
-        case CmdZoomOut: if (tab) ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), tab->zoom - 0.1); break;
-        case CmdZoomIn: if (tab) ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), tab->zoom + 0.1); break;
+        case CmdZoomOut: if (tab) { g_zoomButtonMode = 2404; ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), tab->zoom - 0.1); } break;
+        case CmdZoomIn: if (tab) { g_zoomButtonMode = 2404; ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), tab->zoom + 0.1); } break;
         case CmdFirst:
             if (tab)
             {
@@ -12275,6 +12282,7 @@ namespace
                 InvalidateRect(hwnd, &g_stage, FALSE);
             }
             g_searchInputFocused = false;
+            KillTimer(hwnd, 21);
             if (g_pageInputFocused && !Hit(g_pageInputRect, x, y))
             {
                 CancelPageInput(hwnd);
@@ -12394,6 +12402,7 @@ namespace
                     {
                         g_searchCaretVisible = true;
                         SetTimer(hwnd, 12, 500, nullptr);
+                        SetTimer(hwnd, 21, 40, nullptr);
                     }
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
@@ -12411,6 +12420,18 @@ namespace
             if (g_sideMode == 2 && Hit(g_searchInputRect, x, y))
             {
                 RECT clearRect{ g_searchInputRect.right - S(77), g_searchInputRect.top + S(6), g_searchInputRect.right - S(49), g_searchInputRect.bottom - S(6) };
+                RECT gearRect{ g_searchInputRect.right - S(38), g_searchInputRect.top + S(8), g_searchInputRect.right - S(14), g_searchInputRect.bottom - S(8) };
+                RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
+                if (Hit(gearHotRect, x, y))
+                {
+                    g_searchOptionsButtonRect = gearHotRect;
+                    g_pressedButtonRect = gearHotRect;
+                    g_hasPressedButton = true;
+                    SetTimer(hwnd, 2, 90, nullptr);
+                    InvalidateRect(hwnd, &gearHotRect, FALSE);
+                    ShowSearchOptionsMenu(hwnd);
+                    return 0;
+                }
                 if (Hit(clearRect, x, y))
                 {
                     g_searchQuery.clear();
@@ -12422,6 +12443,7 @@ namespace
                 g_searchInputFocused = true;
                 g_searchCaretVisible = true;
                 SetTimer(hwnd, 12, 500, nullptr);
+                SetTimer(hwnd, 21, 40, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
@@ -13273,6 +13295,18 @@ namespace
                 if (!StageScrollPaintInProgress()) TrimIdleRenderCaches(hwnd);
                 return 0;
             }
+            if (wParam == 21)
+            {
+                if (!g_searchInputFocused || g_sideMode != 2)
+                {
+                    KillTimer(hwnd, 21);
+                    return 0;
+                }
+                RECT glowRect = g_searchInputRect;
+                InflateRect(&glowRect, S(8), S(8));
+                InvalidateRect(hwnd, &glowRect, FALSE);
+                return 0;
+            }
             break;
         case WM_MOUSEWHEEL:
         {
@@ -13447,6 +13481,7 @@ namespace
                 g_sidebarOpen = true;
                 g_sideMode = 2;
                 g_searchInputFocused = true;
+                SetTimer(hwnd, 21, 40, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
