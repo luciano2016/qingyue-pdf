@@ -1273,6 +1273,7 @@ namespace
     ULONGLONG g_lastSidebarRepaintMs{};
     ULONGLONG g_lastSidebarResizeMs{};
     ULONGLONG g_lastTouchFollowPaintMs{};
+    ULONGLONG g_lastMainScrollDragMoveMs{};
     ULONGLONG g_stageLightPaintUntil{};
     ULONGLONG g_sidebarAnimationStartMs{};
     HBITMAP g_glassBackdrop{};
@@ -1972,10 +1973,14 @@ namespace
         g_mainScrollThumbLiveHeight = thumbH;
         g_dragScrollTarget = std::clamp<int>(newScroll, 0, maxScroll);
 
-        if (g_dragScrollTarget != oldTarget && !g_dragScrollPosted)
+        if (g_dragScrollTarget != oldTarget)
         {
-            g_dragScrollPosted = true;
-            PostMessageW(hwnd, WM_QUIETPDF_DRAG_SCROLL, 0, 0);
+            g_lastMainScrollDragMoveMs = GetTickCount64();
+            if (!g_dragScrollPosted)
+            {
+                g_dragScrollPosted = true;
+                PostMessageW(hwnd, WM_QUIETPDF_DRAG_SCROLL, 0, 0);
+            }
         }
 
         if (redrawNow && liveChanged)
@@ -5162,11 +5167,17 @@ namespace
             QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, targetLevel, priority + 2, budget);
     }
 
+    bool MainScrollDragRecentlyMoved()
+    {
+        if (!g_draggingMainScroll || g_lastMainScrollDragMoveMs == 0) return false;
+        return GetTickCount64() - g_lastMainScrollDragMoveMs < 96;
+    }
+
     void ScheduleVisibleTilePrefetch(HWND hwnd, PdfTab& tab)
     {
         if (tab.pageCount <= 0) return;
         PreparePageCache(tab);
-        bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
+        bool rapidScroll = MainScrollDragRecentlyMoved() || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
         int budget = rapidScroll ? 5 : 12;
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         RECT visible = g_stage;
@@ -5337,7 +5348,7 @@ namespace
         PdfTab* tab = Active();
         if (!tab || tab->pageCount <= 0) return;
         bool scrolling = (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil) ||
-            g_draggingMainScroll || g_draggingMainHScroll || g_smoothStageScroll ||
+            MainScrollDragRecentlyMoved() || g_draggingMainHScroll || g_smoothStageScroll ||
             g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
         if (tab->zoom >= TileRenderZoomThreshold)
         {
@@ -5382,7 +5393,7 @@ namespace
         if (scrolling) return;
 
         int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
-        bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
+        bool rapidScroll = MainScrollDragRecentlyMoved() || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
         int forward = rapidScroll ? 2 : 2;
         int backward = rapidScroll ? 1 : 1;
         int nextStart = NextSpreadStart(*tab, lastVisible);
@@ -7120,7 +7131,7 @@ namespace
         return g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil;
     }    bool StageScrollPaintInProgress()
     {
-        return StageLightPaintActive() || g_draggingMainScroll || g_draggingMainHScroll ||
+        return StageLightPaintActive() || MainScrollDragRecentlyMoved() || g_draggingMainHScroll ||
             g_smoothStageScroll || g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
     }
 
@@ -12948,6 +12959,7 @@ namespace
                 g_mainScrollDragStartY = y;
                 g_mainScrollDragStartPos = g_scrollY;
                 g_dragScrollTarget = g_scrollY;
+                g_lastMainScrollDragMoveMs = GetTickCount64();
                 g_dragScrollPosted = false;
                 g_mainScrollThumbLive = true;
                 g_mainScrollThumbLiveTop = g_mainScrollThumbRect.top;
@@ -13672,6 +13684,7 @@ namespace
             {
                 UpdateMainScrollDragStateFromPointer(hwnd, GET_Y_LPARAM(lParam), true);
                 g_draggingMainScroll = false;
+                g_lastMainScrollDragMoveMs = 0;
                 g_mainScrollThumbLive = false;
                 g_dragScrollPosted = false;
                 CommitMainScrollDragTarget(hwnd);
