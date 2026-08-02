@@ -5118,22 +5118,27 @@ namespace
         if (tab.pageCount <= 0) return;
         PreparePageCache(tab);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int budget = rapidScroll ? 14 : 12;
+        int budget = rapidScroll ? 5 : 12;
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         RECT visible = g_stage;
         int backwardPad = rapidScroll ? S(96) : S(128);
         int forwardPad = rapidScroll ? std::max(S(420), stageH / 2) : std::max(S(220), stageH / 4);
-        if (g_stageScrollDirection < 0)
+        if (rapidScroll)
+        {
+            backwardPad = 0;
+            forwardPad = 0;
+        }
+        if (!rapidScroll && g_stageScrollDirection < 0)
         {
             visible.top -= forwardPad;
             visible.bottom += backwardPad;
         }
-        else if (g_stageScrollDirection > 0)
+        else if (!rapidScroll && g_stageScrollDirection > 0)
         {
             visible.top -= backwardPad;
             visible.bottom += forwardPad;
         }
-        else
+        else if (!rapidScroll)
         {
             visible.top -= S(96);
             visible.bottom += S(160);
@@ -5173,8 +5178,9 @@ namespace
             }
         };
 
-        queueSpreads(g_stage, -12);
-        queueSpreads(visible, 0);
+        queueSpreads(g_stage, rapidScroll ? -16 : -12);
+        if (!rapidScroll)
+            queueSpreads(visible, 0);
 
         if (!rapidScroll)
         {
@@ -5295,7 +5301,7 @@ namespace
         {
             return page >= 0 && page < tab->pageCount && tab->cache.find(page) == tab->cache.end();
         };
-        int enqueueBudget = scrolling ? 4 : 8;
+        int enqueueBudget = scrolling ? 2 : 8;
         auto enqueue = [&](int page, int priority)
         {
             if (enqueueBudget <= 0) return;
@@ -5323,6 +5329,8 @@ namespace
 
             if (!g_continuousRead) break;
         }
+
+        if (scrolling) return;
 
         int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
         bool rapidScroll = g_draggingMainScroll || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
@@ -9670,6 +9678,7 @@ namespace
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
         bool lightPaint = StageLightPaintActive();
+        bool stageScrolling = StageScrollPaintInProgress();
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
@@ -9777,7 +9786,7 @@ namespace
                         if (fallbackPainted && !TileLevelFullyCached(tab, i, pageRect, drawRect, 0))
                         {
                             targetMissing = true;
-                            int queueBudget = 12;
+                            int queueBudget = stageScrolling ? 4 : 12;
                             QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
                         }
                         else
@@ -9785,9 +9794,9 @@ namespace
                             targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
                             if (targetMissing)
                             {
-                                int queueBudget = 12;
+                                int queueBudget = stageScrolling ? 4 : 12;
                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                                if (!fallback && !StageScrollPaintInProgress())
+                                if (!fallback && !stageScrolling)
                                     QueueZoomPreviewRender(g_hwnd, tab, i, 10);
                             }
                         }
@@ -12469,10 +12478,11 @@ namespace
                         if (StageScrollPaintInProgress() && currentTile)
                         {
                             g_stageIdleRefreshPending = true;
-                            if (now - g_lastTileRepaintMs >= 16)
+                            if (now - g_lastTileRepaintMs >= 24)
                             {
                                 g_lastTileRepaintMs = now;
-                                RequestStageRepaint(hwnd, false);
+                                if (!IsRectEmpty(&dirtyRect))
+                                    InvalidateRect(hwnd, &dirtyRect, FALSE);
                             }
                         }
                         else if (StageScrollPaintInProgress())
