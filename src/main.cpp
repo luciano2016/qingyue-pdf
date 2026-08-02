@@ -2755,32 +2755,32 @@ namespace
             Gdiplus::Graphics g(dc);
             g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
             g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-            Gdiplus::Pen shirtPen(GdiColor(color, 238), std::max<Gdiplus::REAL>(1.55f, S(1.2f)));
+            Gdiplus::Pen shirtPen(GdiColor(color, 238), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
             shirtPen.SetStartCap(Gdiplus::LineCapRound);
             shirtPen.SetEndCap(Gdiplus::LineCapRound);
             shirtPen.SetLineJoin(Gdiplus::LineJoinRound);
-            float l = static_cast<float>(left) + S(1.0f);
+            float l = static_cast<float>(left) + S(0.2f);
             float t = static_cast<float>(top) + S(1.2f);
-            float rr = static_cast<float>(left + size) - S(1.0f);
+            float rr = static_cast<float>(left + size) - S(0.2f);
             float b = static_cast<float>(top + size) - S(1.0f);
             float mid = (l + rr) * 0.5f;
             Gdiplus::PointF shirt[] = {
-                Gdiplus::PointF(mid - S(3.0f), t),
+                Gdiplus::PointF(mid - S(3.4f), t),
                 Gdiplus::PointF(mid - S(1.7f), t),
                 Gdiplus::PointF(mid - S(1.15f), t + S(1.45f)),
                 Gdiplus::PointF(mid, t + S(1.95f)),
                 Gdiplus::PointF(mid + S(1.15f), t + S(1.45f)),
                 Gdiplus::PointF(mid + S(1.7f), t),
-                Gdiplus::PointF(mid + S(3.0f), t),
+                Gdiplus::PointF(mid + S(3.4f), t),
                 Gdiplus::PointF(rr, t + S(3.5f)),
                 Gdiplus::PointF(rr - S(1.7f), t + S(5.3f)),
-                Gdiplus::PointF(rr - S(3.0f), t + S(4.2f)),
-                Gdiplus::PointF(rr - S(3.0f), b),
-                Gdiplus::PointF(l + S(3.0f), b),
-                Gdiplus::PointF(l + S(3.0f), t + S(4.2f)),
+                Gdiplus::PointF(rr - S(2.5f), t + S(4.2f)),
+                Gdiplus::PointF(rr - S(2.5f), b),
+                Gdiplus::PointF(l + S(2.5f), b),
+                Gdiplus::PointF(l + S(2.5f), t + S(4.2f)),
                 Gdiplus::PointF(l + S(1.7f), t + S(5.3f)),
                 Gdiplus::PointF(l, t + S(3.5f)),
-                Gdiplus::PointF(mid - S(3.0f), t)
+                Gdiplus::PointF(mid - S(3.4f), t)
             };
             g.DrawLines(&shirtPen, shirt, static_cast<INT>(std::size(shirt)));
             DrawDownCaret(dc, left + S(20), cy, color);
@@ -9763,6 +9763,8 @@ namespace
         int barH = S(34);
         if (!g_statusPinned && g_statusOffset >= barH) return;
         RECT bar{ 0, client.bottom - barH + g_statusOffset, client.right, client.bottom + g_statusOffset };
+        if (IsGlassTheme() && !g_statusPinned)
+            Fill(dc, bar, ChromeBarColor());
         GlassSurface(dc, bar, 154);
         RECT topLine{ bar.left, bar.top, bar.right, bar.top + std::max(1, S(1)) };
         GlassDivider(dc, topLine);
