@@ -6281,13 +6281,23 @@ namespace
         {
             PdfAnnotation const& annotation = tab.annotations[static_cast<size_t>(i)];
             if (annotation.page != page) continue;
-            RECT mark = DenormalizeAnnotationRect(annotation, pageRect);
-            InflateRect(&mark, S(3), S(5));
-            if (Hit(mark, x, y))
+            auto hitMark = [&](RECT mark)
             {
-                if (hitRect) *hitRect = mark;
-                return i;
+                RECT clipped{};
+                if (!IntersectRect(&clipped, &mark, &pageRect)) return false;
+                InflateRect(&clipped, S(1), S(1));
+                if (!Hit(clipped, x, y)) return false;
+                if (hitRect) *hitRect = clipped;
+                return true;
+            };
+            if (!annotation.segments.empty())
+            {
+                for (auto const& segment : annotation.segments)
+                {
+                    if (hitMark(DenormalizeAnnotationSegment(segment, pageRect))) return i;
+                }
             }
+            else if (hitMark(DenormalizeAnnotationRect(annotation, pageRect))) return i;
         }
         return -1;
     }
@@ -9888,7 +9898,11 @@ namespace
                             if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
                             if (annotation.kind == AnnotationKind::Highlight)
                             {
-                                MultiplyHighlightFill(dc, visibleMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 88 : 122);
+                                int h = std::max<int>(1, visibleMark.bottom - visibleMark.top);
+                                int trim = std::clamp<int>(h / 10, 0, S(3));
+                                RECT fillMark{ visibleMark.left, visibleMark.top + trim, visibleMark.right, visibleMark.bottom - trim };
+                                if (fillMark.bottom <= fillMark.top) fillMark = visibleMark;
+                                MultiplyHighlightFill(dc, fillMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 88 : 122);
                             }
                             else
                             {
@@ -11304,7 +11318,7 @@ namespace
             annotation.y1 = std::clamp<double>(item.y1, 0.0, 1.0);
             annotation.kind = item.kind == 1 ? AnnotationKind::Underline : (item.kind == 2 ? AnnotationKind::Strikeout : AnnotationKind::Highlight);
             annotation.colorIndex = AnnotationColorIndexFromRgb(item.colorR, item.colorG, item.colorB);
-            annotation.createdAt = item.createdAtMs > 0 ? item.createdAtMs : NowMs();
+            annotation.createdAt = item.createdAtMs;
             annotation.persisted = true;
             AppendUniqueSegment(annotation.segments, AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
             annotation.author = FromUtf8(item.author);
@@ -12882,24 +12896,7 @@ namespace
                 }
             }
             bool hadTextSelection = g_hasContentSelection || !g_selectionQuads.empty();
-            bool clickedAnnotation = false;
-            if (PdfTab* tab = Active())
-            {
-                RECT hitRect{};
-                int annotationIndex = HitTestAnnotation(*tab, x, y, &hitRect);
-                if (annotationIndex >= 0)
-                {
-                    ClearTextSelection();
-                    g_activeAnnotation = annotationIndex;
-                    g_annotationHitRect = hitRect;
-                    g_annotationToolbarOpen = true;
-                    g_annotationNoteFocused = false;
-                    clickedAnnotation = true;
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                    return 0;
-                }
-            }
-            if (g_annotationToolbarOpen && !clickedAnnotation)
+            if (g_annotationToolbarOpen)
             {
                 ClearAnnotationFocus();
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -13651,6 +13648,22 @@ namespace
                     g_selectionQuads.clear();
                     g_selectionText.clear();
                     g_selectionIsImage = false;
+                    if (!largeEnough)
+                    {
+                        if (PdfTab* tab = Active())
+                        {
+                            RECT hitRect{};
+                            int annotationIndex = HitTestAnnotation(*tab, g_selectionEnd.x, g_selectionEnd.y, &hitRect);
+                            if (annotationIndex >= 0)
+                            {
+                                g_activeAnnotation = annotationIndex;
+                                g_annotationHitRect = hitRect;
+                                g_annotationToolbarOpen = true;
+                                g_annotationNoteOpen = false;
+                                g_annotationNoteFocused = false;
+                            }
+                        }
+                    }
                 }
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;

@@ -328,52 +328,46 @@ extern "C" int quiet_pdf_load_annotations(
                         if (kind < 0)
                             continue;
 
-                        fz_rect rect = fz_invalid_rect;
-                        int quad_count = pdf_annot_quad_point_count(ctx, annot);
-                        if (quad_count > 0)
-                        {
-                            for (int q = 0; q < quad_count; ++q)
-                            {
-                                fz_rect qr = fz_rect_from_quad(pdf_annot_quad_point(ctx, annot, q));
-                                if (q == 0) rect = qr;
-                                else
-                                {
-                                    if (qr.x0 < rect.x0) rect.x0 = qr.x0;
-                                    if (qr.y0 < rect.y0) rect.y0 = qr.y0;
-                                    if (qr.x1 > rect.x1) rect.x1 = qr.x1;
-                                    if (qr.y1 > rect.y1) rect.y1 = qr.y1;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            rect = pdf_annot_rect(ctx, annot);
-                        }
-
-                        if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
-                            continue;
-
-                        quiet_pdf_annotation_info& item = out[count];
-                        std::memset(&item, 0, sizeof(item));
-                        item.page = page_index;
-                        item.kind = kind;
-                        item.x0 = fz_clamp((rect.x0 - bounds.x0) / page_w, 0.0f, 1.0f);
-                        item.y0 = fz_clamp((rect.y0 - bounds.y0) / page_h, 0.0f, 1.0f);
-                        item.x1 = fz_clamp((rect.x1 - bounds.x0) / page_w, 0.0f, 1.0f);
-                        item.y1 = fz_clamp((rect.y1 - bounds.y0) / page_h, 0.0f, 1.0f);
                         float color[4] = { 1.0f, 0.82f, 0.0f, 1.0f };
                         int n = 0;
                         pdf_annot_color(ctx, annot, &n, color);
-                        item.color_r = n > 0 ? color[0] : 1.0f;
-                        item.color_g = n > 1 ? color[1] : 0.82f;
-                        item.color_b = n > 2 ? color[2] : 0.0f;
-                        item.opacity = pdf_annot_opacity(ctx, annot);
                         int64_t date = pdf_annot_creation_date(ctx, annot);
                         if (date <= 0) date = pdf_annot_modification_date(ctx, annot);
-                        item.created_at_ms = date > 0 ? date * 1000 : 0;
-                        quiet_copy_text(item.author, sizeof(item.author), pdf_annot_author(ctx, annot));
-                        quiet_copy_text(item.contents, sizeof(item.contents), pdf_annot_contents(ctx, annot));
-                        ++count;
+                        const char* author = pdf_annot_author(ctx, annot);
+                        const char* contents = pdf_annot_contents(ctx, annot);
+
+                        auto append_rect = [&](fz_rect rect)
+                        {
+                            if (count >= max_annotations || rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                                return;
+                            quiet_pdf_annotation_info& item = out[count];
+                            std::memset(&item, 0, sizeof(item));
+                            item.page = page_index;
+                            item.kind = kind;
+                            item.x0 = fz_clamp((rect.x0 - bounds.x0) / page_w, 0.0f, 1.0f);
+                            item.y0 = fz_clamp((rect.y0 - bounds.y0) / page_h, 0.0f, 1.0f);
+                            item.x1 = fz_clamp((rect.x1 - bounds.x0) / page_w, 0.0f, 1.0f);
+                            item.y1 = fz_clamp((rect.y1 - bounds.y0) / page_h, 0.0f, 1.0f);
+                            item.color_r = n > 0 ? color[0] : 1.0f;
+                            item.color_g = n > 1 ? color[1] : 0.82f;
+                            item.color_b = n > 2 ? color[2] : 0.0f;
+                            item.opacity = pdf_annot_opacity(ctx, annot);
+                            item.created_at_ms = date > 0 ? date * 1000 : 0;
+                            quiet_copy_text(item.author, sizeof(item.author), author);
+                            quiet_copy_text(item.contents, sizeof(item.contents), contents);
+                            ++count;
+                        };
+
+                        int quad_count = pdf_annot_quad_point_count(ctx, annot);
+                        if (quad_count > 0)
+                        {
+                            for (int q = 0; q < quad_count && count < max_annotations; ++q)
+                                append_rect(fz_rect_from_quad(pdf_annot_quad_point(ctx, annot, q)));
+                        }
+                        else
+                        {
+                            append_rect(pdf_annot_rect(ctx, annot));
+                        }
                     }
                 }
             }
