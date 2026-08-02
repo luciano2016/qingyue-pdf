@@ -1210,6 +1210,7 @@ namespace
     bool g_sidebarOpen{ true };
     bool g_immersive{};
     bool g_immersiveSidebarOpen{};
+    bool g_lastImmersiveSidebarOpen{};
     bool g_hasPreImmersivePlacement{};
     bool g_resizingSidebar{};
     bool g_draggingThumbSlider{};
@@ -2775,9 +2776,9 @@ namespace
             break;
         case StatusIcon::Theme:
         {
-            int size = S(12);
-            int left = r.left + S(4);
-            int top = cy - size / 2;
+            float size = S(13.2f);
+            float left = static_cast<float>(r.left) + S(3.4f);
+            float top = static_cast<float>(cy) - size * 0.5f;
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(pen);
@@ -2789,10 +2790,10 @@ namespace
             shirtPen.SetStartCap(Gdiplus::LineCapRound);
             shirtPen.SetEndCap(Gdiplus::LineCapRound);
             shirtPen.SetLineJoin(Gdiplus::LineJoinRound);
-            float l = static_cast<float>(left) + S(0.2f);
-            float t = static_cast<float>(top) + S(1.2f);
-            float rr = static_cast<float>(left + size) - S(0.2f);
-            float b = static_cast<float>(top + size) - S(1.0f);
+            float l = left + S(0.2f);
+            float t = top + S(1.2f);
+            float rr = left + size - S(0.2f);
+            float b = top + size - S(1.0f);
             float mid = (l + rr) * 0.5f;
             Gdiplus::PointF shirt[] = {
                 Gdiplus::PointF(mid - S(3.4f), t),
@@ -2813,7 +2814,7 @@ namespace
                 Gdiplus::PointF(mid - S(3.4f), t)
             };
             g.DrawLines(&shirtPen, shirt, static_cast<INT>(std::size(shirt)));
-            DrawDownCaret(dc, left + S(20), cy, color);
+            DrawDownCaret(dc, static_cast<int>(left + S(20.0f)), cy, color);
             return;
         }
         case StatusIcon::View:
@@ -2869,7 +2870,7 @@ namespace
             {
                 g.DrawLine(&aaPen, ix, iy + ih * 0.5f, ix + iw, iy + ih * 0.5f);
             }
-            DrawDownCaret(dc, left + S(20), cy, color);
+            DrawDownCaret(dc, static_cast<int>(left + S(20.0f)), cy, color);
             return;
         }
         case StatusIcon::Actual:
@@ -2934,7 +2935,7 @@ namespace
                 g.DrawLine(&aaPen, mx + S(3.1f), my + S(3.1f), mx + S(7.0f), my + S(7.0f));
                 g.DrawLine(&aaPen, mx - S(2.6f), my, mx + S(2.6f), my);
             }
-            DrawDownCaret(dc, left + S(20), cy, color);
+            DrawDownCaret(dc, static_cast<int>(left + S(20.0f)), cy, color);
             return;
         }
         case StatusIcon::ZoomOut:
@@ -3045,11 +3046,11 @@ namespace
             g.DrawArc(&pen, l, t, r2 * 2.0f, r2 * 2.0f, 180.0f, 90.0f);
 
             Gdiplus::PointF pencil[] = {
-                Gdiplus::PointF(cx - S(4.1f), cy + S(4.9f)),
-                Gdiplus::PointF(cx - S(3.0f), cy + S(1.2f)),
-                Gdiplus::PointF(cx + S(6.2f), cy - S(8.0f)),
-                Gdiplus::PointF(cx + S(8.2f), cy - S(6.0f)),
-                Gdiplus::PointF(cx - S(1.0f), cy + S(3.2f))
+                Gdiplus::PointF(cx - S(2.8f), cy + S(3.8f)),
+                Gdiplus::PointF(cx - S(1.8f), cy + S(0.1f)),
+                Gdiplus::PointF(cx + S(7.4f), cy - S(9.1f)),
+                Gdiplus::PointF(cx + S(9.7f), cy - S(6.8f)),
+                Gdiplus::PointF(cx + S(0.5f), cy + S(2.4f))
             };
             Gdiplus::GraphicsPath pencilPath;
             pencilPath.AddPolygon(pencil, static_cast<INT>(std::size(pencil)));
@@ -3130,7 +3131,7 @@ namespace
             }
         };
 
-        if (id == CmdNoteExpandAll) drawTree(true);
+        if (id == CmdNoteExpandAll) drawTree(!g_collapsedAnnotationPages.empty());
         else if (id == CmdNoteCollapseAll) drawTree(false);
         else if (id == CmdNotePrev) drawArrowBox(false);
         else if (id == CmdNoteNext) drawArrowBox(true);
@@ -3148,10 +3149,10 @@ namespace
         int groupGap = S(11);
         int buttonLeft = g_sidebar.left + S(10);
         int available = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left) - S(20));
-        int desired = buttonSize * 6 + buttonGap * 3 + groupGap * 2 + S(2);
+        int desired = buttonSize * 5 + buttonGap * 4 + groupGap * 2 + S(2);
         if (desired > available)
-            buttonSize = std::max(S(24), (available - buttonGap * 3 - groupGap * 2 - S(2)) / 6);
-        int ids[] = { CmdNoteExpandAll, CmdNoteCollapseAll, CmdNotePrev, CmdNoteNext, CmdNoteDelete, CmdNoteDeleteAll };
+            buttonSize = std::max(S(24), (available - buttonGap * 4 - groupGap * 2 - S(2)) / 5);
+        int ids[] = { CmdNoteExpandAll, CmdNotePrev, CmdNoteNext, CmdNoteDelete, CmdNoteDeleteAll };
         int bx = buttonLeft;
         for (int i = 0; i < static_cast<int>(std::size(ids)); ++i)
         {
@@ -3163,8 +3164,8 @@ namespace
                 return true;
             }
             bx += buttonSize;
-            if (i == 1 || i == 3) bx += buttonGap;
-            else bx += groupGap;
+            if (i == 0 || i == 2) bx += buttonGap + groupGap;
+            else bx += buttonGap;
         }
         return false;
     }
@@ -3477,6 +3478,7 @@ namespace
             else if (line.rfind("homeList=", 0) == 0) g_homeListView = std::atoi(line.c_str() + 9) != 0;
             else if (line.rfind("continuous=", 0) == 0) g_continuousRead = std::atoi(line.c_str() + 11) != 0;
             else if (line.rfind("statusPinned=", 0) == 0) g_statusPinned = std::atoi(line.c_str() + 13) != 0;
+            else if (line.rfind("immersiveSidebar=", 0) == 0) g_lastImmersiveSidebarOpen = std::atoi(line.c_str() + 17) != 0;
             else if (line.rfind("lastSessionActive=", 0) == 0) g_lastSessionActive = std::atoi(line.c_str() + 18);
             else if (line.rfind("lastSessionTab=", 0) == 0)
             {
@@ -3525,6 +3527,7 @@ namespace
         out << "homeList=" << (g_homeListView ? 1 : 0) << "\n";
         out << "continuous=" << (g_continuousRead ? 1 : 0) << "\n";
         out << "statusPinned=" << (g_statusPinned ? 1 : 0) << "\n";
+        out << "immersiveSidebar=" << (g_lastImmersiveSidebarOpen ? 1 : 0) << "\n";
         out << "lastSessionActive=" << g_lastSessionActive << "\n";
         for (auto const& item : g_lastSessionTabs)
         {
@@ -9264,15 +9267,15 @@ namespace
             int groupGap = S(11);
             int buttonLeft = g_sidebar.left + S(10);
             int available = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left) - S(20));
-            int desired = buttonSize * 6 + buttonGap * 3 + groupGap * 2 + S(2);
+            int desired = buttonSize * 5 + buttonGap * 4 + groupGap * 2 + S(2);
             if (desired > available)
             {
-                buttonSize = std::max(S(24), (available - buttonGap * 3 - groupGap * 2 - S(2)) / 6);
+                buttonSize = std::max(S(24), (available - buttonGap * 4 - groupGap * 2 - S(2)) / 5);
             }
+            bool notesExpanded = g_collapsedAnnotationPages.empty();
             struct NoteTool { int id; const wchar_t* tip; };
             NoteTool tools[] = {
-                { CmdNoteExpandAll, L"\u5c55\u5f00\u6240\u6709\u6ce8\u91ca" },
-                { CmdNoteCollapseAll, L"\u6536\u8d77\u6240\u6709\u6ce8\u91ca" },
+                { CmdNoteExpandAll, notesExpanded ? L"\u6536\u8d77\u6240\u6709\u6ce8\u91ca" : L"\u5c55\u5f00\u6240\u6709\u6ce8\u91ca" },
                 { CmdNotePrev, L"\u4e0a\u4e00\u4e2a\u6ce8\u91ca" },
                 { CmdNoteNext, L"\u4e0b\u4e00\u4e2a\u6ce8\u91ca" },
                 { CmdNoteDelete, L"\u5220\u9664\u5f53\u524d\u6ce8\u91ca" },
@@ -9291,7 +9294,7 @@ namespace
                 RECT icon{ r.left + S(3), r.top + S(3), r.right - S(3), r.bottom - S(3) };
                 DrawNoteToolIcon(dc, icon, tools[i].id, noteIcon);
                 x += buttonSize;
-                if (i == 1 || i == 3)
+                if (i == 0 || i == 2)
                 {
                     x += buttonGap;
                     int sepX = x + groupGap / 2;
@@ -11643,7 +11646,12 @@ namespace
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_preImmersiveExStyle & ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
             g_immersive = true;
-            g_immersiveSidebarOpen = false;
+            g_immersiveSidebarOpen = g_lastImmersiveSidebarOpen;
+            if (g_immersiveSidebarOpen)
+            {
+                g_sidebarOpen = true;
+                if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
+            }
             SetWindowPos(hwnd, HWND_TOP,
                 monitorInfo.rcMonitor.left,
                 monitorInfo.rcMonitor.top,
@@ -11653,6 +11661,7 @@ namespace
         }
         else
         {
+            g_lastImmersiveSidebarOpen = g_immersiveSidebarOpen;
             SetWindowLongPtrW(hwnd, GWL_STYLE, (g_preImmersiveStyle ? g_preImmersiveStyle : WS_OVERLAPPEDWINDOW) & ~(WS_VSCROLL | WS_HSCROLL));
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_preImmersiveExStyle);
             g_immersive = false;
@@ -12085,11 +12094,13 @@ namespace
             if (g_immersive)
             {
                 g_immersiveSidebarOpen = !g_immersiveSidebarOpen;
+                g_lastImmersiveSidebarOpen = g_immersiveSidebarOpen;
                 if (g_immersiveSidebarOpen)
                 {
                     g_sidebarOpen = true;
                     if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
                 }
+                SaveState();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             else StartSidebarPanelAnimation(hwnd, !g_sidebarOpen);
@@ -12113,7 +12124,12 @@ namespace
         case CmdSidebar: Command(hwnd, CmdSidebarPanelToggle); break;
         case CmdSearch:
             g_sidebarOpen = true;
-            if (g_immersive) g_immersiveSidebarOpen = true;
+            if (g_immersive)
+            {
+                g_immersiveSidebarOpen = true;
+                g_lastImmersiveSidebarOpen = true;
+                SaveState();
+            }
             g_sideMode = 2;
             g_searchInputFocused = true;
             g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
@@ -12130,6 +12146,8 @@ namespace
                 {
                     g_sidebarOpen = true;
                     g_immersiveSidebarOpen = true;
+                    g_lastImmersiveSidebarOpen = true;
+                    SaveState();
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 else StartSidebarPanelAnimation(hwnd, true);
@@ -12180,7 +12198,11 @@ namespace
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdNoteExpandAll:
-            g_collapsedAnnotationPages.clear();
+            if (tab && g_collapsedAnnotationPages.empty())
+            {
+                for (auto const& annotation : tab->annotations) g_collapsedAnnotationPages.insert(annotation.page);
+            }
+            else g_collapsedAnnotationPages.clear();
             InvalidateRect(hwnd, &g_sidebar, FALSE);
             break;
         case CmdNoteCollapseAll:
