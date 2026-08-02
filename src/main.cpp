@@ -8467,7 +8467,9 @@ namespace
             bool hovered = Hit(cover, g_mousePos.x, g_mousePos.y);
             drawCoverFrame(cover, hovered || item.pinned);
             RECT inner{ cover.left + S(7), cover.top + S(7), cover.right - S(7), cover.bottom - S(7) };
-            PageImage* thumb = LoadHomeThumb(item, inner.right - inner.left);
+            RECT preload{ viewport.left, viewport.top - S(260), viewport.right, viewport.bottom + S(260) };
+            bool nearViewport = Intersects(tile, preload);
+            PageImage* thumb = nearViewport ? LoadHomeThumb(item, inner.right - inner.left) : nullptr;
             if (thumb && !thumb->bgra.empty()) DrawImageFit(dc, *thumb, inner);
             else
             {
@@ -11636,6 +11638,12 @@ namespace
         if (id >= 2200 && id < 2200 + static_cast<int>(std::size(g_themes)))
         {
             g_theme = id - 2200;
+            g_homeThumbCache.clear();
+            {
+                std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+                g_homeThumbPending.clear();
+                g_homeThumbQueue.clear();
+            }
             SaveState();
             ApplyWindowChrome();
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
@@ -12272,9 +12280,15 @@ namespace
                 std::lock_guard<std::mutex> lock(g_homeThumbMutex);
                 g_homeThumbPending.erase(result->key);
             }
+            std::wstring expectedSuffix = L"#" + std::to_wstring(g_homeThumbWidth) + L"#" + std::to_wstring(PdfRenderTheme());
+            if (result->key.size() < expectedSuffix.size() ||
+                result->key.compare(result->key.size() - expectedSuffix.size(), expectedSuffix.size(), expectedSuffix) != 0)
+            {
+                return 0;
+            }
             if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
             {
-                while (g_homeThumbCache.size() >= 14) g_homeThumbCache.erase(g_homeThumbCache.begin());
+                while (g_homeThumbCache.size() >= 24) g_homeThumbCache.erase(g_homeThumbCache.begin());
                 g_homeThumbCache.emplace(result->key, std::move(result->image));
             }
             if (!Active())
