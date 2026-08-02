@@ -1053,7 +1053,10 @@ namespace
 
     struct HomeThumbResult
     {
+        RecentItem item;
         std::wstring key;
+        int targetWidth{};
+        int renderTheme{};
         PageImage image;
     };
 
@@ -1064,6 +1067,8 @@ namespace
     std::vector<RecentItem> g_recent;
     std::vector<LastSessionItem> g_lastSessionTabs;
     std::map<std::wstring, PageImage> g_homeThumbCache;
+    std::map<std::wstring, ULONGLONG> g_homeThumbLastUsed;
+    std::set<std::wstring> g_homeThumbProtectedKeys;
     std::mutex g_homeThumbMutex;
     std::condition_variable g_homeThumbCv;
     std::thread g_homeThumbThread;
@@ -3502,6 +3507,181 @@ namespace
         return total;
     }
 
+    constexpr size_t kHomeThumbMemoryBudgetBytes = 8ull * 1024ull * 1024ull;
+
+    std::filesystem::path HomeThumbCacheDir()
+    {
+        PWSTR appData = nullptr;
+        std::filesystem::path dir;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData)))
+        {
+            dir = appData;
+            CoTaskMemFree(appData);
+        }
+        else
+        {
+            dir = std::filesystem::current_path();
+        }
+        dir /= L"QingYuePDF";
+        dir /= L"thumbs";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir;
+    }
+
+    std::wstring HashWideForPath(std::wstring const& text)
+    {
+        HCRYPTPROV provider{};
+        HCRYPTHASH hash{};
+        BYTE digest[16]{};
+        DWORD digestSize = sizeof(digest);
+        bool ok = CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) &&
+            CryptCreateHash(provider, CALG_MD5, 0, 0, &hash) &&
+            CryptHashData(hash, reinterpret_cast<const BYTE*>(text.data()), static_cast<DWORD>(text.size() * sizeof(wchar_t)), 0) &&
+            CryptGetHashParam(hash, HP_HASHVAL, digest, &digestSize, 0);
+        if (hash) CryptDestroyHash(hash);
+        if (provider) CryptReleaseContext(provider, 0);
+        if (ok)
+        {
+            static const wchar_t* hex = L"0123456789abcdef";
+            std::wstring out;
+            out.reserve(digestSize * 2);
+            for (DWORD i = 0; i < digestSize; ++i)
+            {
+                out.push_back(hex[(digest[i] >> 4) & 0xf]);
+                out.push_back(hex[digest[i] & 0xf]);
+            }
+            return out;
+        }
+
+        unsigned long long fnv = 1469598103934665603ull;
+        for (wchar_t ch : text)
+        {
+            fnv ^= static_cast<unsigned long long>(std::towlower(ch));
+            fnv *= 1099511628211ull;
+        }
+        wchar_t buffer[32]{};
+        swprintf_s(buffer, L"%016llx", fnv);
+        return buffer;
+    }
+
+    std::filesystem::path HomeThumbDiskPath(const RecentItem& item, int targetWidth, int renderTheme)
+    {
+        std::wstring normalized = item.path;
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        normalized += L"#" + std::to_wstring(targetWidth) + L"#" + std::to_wstring(renderTheme);
+        return HomeThumbCacheDir() / (HashWideForPath(normalized) + L".png");
+    }
+
+    bool FileIsNewerThan(std::filesystem::path const& file, std::filesystem::path const& other)
+    {
+        std::error_code ec1, ec2;
+        auto a = std::filesystem::last_write_time(file, ec1);
+        auto b = std::filesystem::last_write_time(other, ec2);
+        return !ec1 && !ec2 && a > b;
+    }
+
+    int PngEncoderClsid(CLSID& clsid)
+    {
+        UINT count = 0;
+        UINT bytes = 0;
+        if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || bytes == 0) return -1;
+        std::vector<std::uint8_t> storage(bytes);
+        auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(storage.data());
+        if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok) return -1;
+        for (UINT i = 0; i < count; ++i)
+        {
+            if (wcscmp(encoders[i].MimeType, L"image/png") == 0)
+            {
+                clsid = encoders[i].Clsid;
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    bool LoadHomeThumbFromDisk(const RecentItem& item, int targetWidth, int renderTheme, PageImage& image)
+    {
+        std::filesystem::path thumbPath = HomeThumbDiskPath(item, targetWidth, renderTheme);
+        std::error_code ec;
+        if (!std::filesystem::exists(thumbPath, ec)) return false;
+        if (FileIsNewerThan(item.path, thumbPath))
+        {
+            std::filesystem::remove(thumbPath, ec);
+            return false;
+        }
+
+        Gdiplus::Bitmap bitmap(thumbPath.c_str());
+        if (bitmap.GetLastStatus() != Gdiplus::Ok) return false;
+        int width = static_cast<int>(bitmap.GetWidth());
+        int height = static_cast<int>(bitmap.GetHeight());
+        if (width <= 0 || height <= 0) return false;
+
+        Gdiplus::Rect rect(0, 0, width, height);
+        Gdiplus::BitmapData data{};
+        if (bitmap.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok) return false;
+        PageImage loaded;
+        loaded.width = width;
+        loaded.height = height;
+        loaded.bgra.resize(static_cast<size_t>(width) * height * 4);
+        for (int y = 0; y < height; ++y)
+        {
+            auto* src = reinterpret_cast<std::uint8_t*>(data.Scan0) + static_cast<ptrdiff_t>(y) * data.Stride;
+            auto* dst = loaded.bgra.data() + static_cast<size_t>(y) * width * 4;
+            std::memcpy(dst, src, static_cast<size_t>(width) * 4);
+        }
+        bitmap.UnlockBits(&data);
+        image = std::move(loaded);
+        return true;
+    }
+
+    void SaveHomeThumbToDisk(const RecentItem& item, int targetWidth, int renderTheme, PageImage const& image)
+    {
+        if (image.width <= 0 || image.height <= 0 || image.bgra.empty()) return;
+        std::filesystem::path thumbPath = HomeThumbDiskPath(item, targetWidth, renderTheme);
+        std::error_code ec;
+        std::filesystem::create_directories(thumbPath.parent_path(), ec);
+        CLSID png{};
+        if (PngEncoderClsid(png) < 0) return;
+        Gdiplus::Bitmap bitmap(image.width, image.height, image.width * 4, PixelFormat32bppARGB, const_cast<BYTE*>(image.bgra.data()));
+        if (bitmap.GetLastStatus() == Gdiplus::Ok) bitmap.Save(thumbPath.c_str(), &png, nullptr);
+    }
+
+    void TouchHomeThumb(std::wstring const& key)
+    {
+        g_homeThumbLastUsed[key] = GetTickCount64();
+    }
+
+    void ClearHomeThumbCacheState()
+    {
+        g_homeThumbCache.clear();
+        g_homeThumbLastUsed.clear();
+        g_homeThumbProtectedKeys.clear();
+    }
+
+    void TrimHomeThumbCache()
+    {
+        while (ImageCacheBytes(g_homeThumbCache) > kHomeThumbMemoryBudgetBytes)
+        {
+            auto victim = g_homeThumbCache.end();
+            ULONGLONG oldest = 0xffffffffffffffffull;
+            for (auto it = g_homeThumbCache.begin(); it != g_homeThumbCache.end(); ++it)
+            {
+                if (g_homeThumbProtectedKeys.find(it->first) != g_homeThumbProtectedKeys.end()) continue;
+                auto used = g_homeThumbLastUsed.find(it->first);
+                ULONGLONG lastUsed = used == g_homeThumbLastUsed.end() ? 0 : used->second;
+                if (victim == g_homeThumbCache.end() || lastUsed < oldest)
+                {
+                    victim = it;
+                    oldest = lastUsed;
+                }
+            }
+            if (victim == g_homeThumbCache.end()) break;
+            g_homeThumbLastUsed.erase(victim->first);
+            g_homeThumbCache.erase(victim);
+        }
+    }
+
     void TrimBackgroundRenderCaches()
     {
         for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
@@ -3514,11 +3694,7 @@ namespace
             tab.thumbCache.clear();
         }
 
-        while (g_homeThumbCache.size() > 10 || ImageCacheBytes(g_homeThumbCache) > 8ull * 1024ull * 1024ull)
-        {
-            if (g_homeThumbCache.empty()) break;
-            g_homeThumbCache.erase(g_homeThumbCache.begin());
-        }
+        TrimHomeThumbCache();
     }
 
     bool ReadFileStamp(const std::wstring& path, std::filesystem::file_time_type& stamp)
@@ -4079,7 +4255,7 @@ namespace
         if (targetWidth <= 0 || item.path.empty()) return nullptr;
         if (g_homeThumbWidth != targetWidth)
         {
-            g_homeThumbCache.clear();
+            ClearHomeThumbCacheState();
             std::lock_guard<std::mutex> lock(g_homeThumbMutex);
             g_homeThumbPending.clear();
             g_homeThumbQueue.clear();
@@ -4088,8 +4264,17 @@ namespace
 
         int renderTheme = PdfRenderTheme();
         std::wstring key = HomeThumbKey(item, targetWidth, renderTheme);
+        TouchHomeThumb(key);
         auto found = g_homeThumbCache.find(key);
         if (found != g_homeThumbCache.end()) return &found->second;
+
+        PageImage diskImage;
+        if (LoadHomeThumbFromDisk(item, targetWidth, renderTheme, diskImage))
+        {
+            auto inserted = g_homeThumbCache.emplace(key, std::move(diskImage)).first;
+            TrimHomeThumbCache();
+            return &inserted->second;
+        }
 
         QueueHomeThumb(item, targetWidth, key, renderTheme, g_dpi, g_hwnd);
         return nullptr;
@@ -4503,7 +4688,10 @@ namespace
             }
 
             auto result = std::make_unique<HomeThumbResult>();
+            result->item = request.item;
             result->key = request.key;
+            result->targetWidth = request.targetWidth;
+            result->renderTheme = request.renderTheme;
             result->image = RenderHomeThumbSync(request.item, request.targetWidth, request.renderTheme, request.dpi);
             if (!IsWindow(request.target) || !PostMessageW(request.target, WM_QUIETPDF_HOME_THUMB_READY, 0, reinterpret_cast<LPARAM>(result.get())))
             {
@@ -8405,6 +8593,7 @@ namespace
         g_homeScrollY = ClampHomeScrollValue(client, g_homeScrollY);
         PaintHomeHeader(dc, client);
         RECT viewport = HomeContentViewportRect(client);
+        g_homeThumbProtectedKeys.clear();
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -8469,6 +8658,7 @@ namespace
             RECT inner{ cover.left + S(7), cover.top + S(7), cover.right - S(7), cover.bottom - S(7) };
             RECT preload{ viewport.left, viewport.top - S(260), viewport.right, viewport.bottom + S(260) };
             bool nearViewport = Intersects(tile, preload);
+            if (nearViewport) g_homeThumbProtectedKeys.insert(HomeThumbKey(item, inner.right - inner.left, PdfRenderTheme()));
             PageImage* thumb = nearViewport ? LoadHomeThumb(item, inner.right - inner.left) : nullptr;
             if (thumb && !thumb->bgra.empty()) DrawImageFit(dc, *thumb, inner);
             else
@@ -11552,7 +11742,12 @@ namespace
     {
         for (auto it = g_homeThumbCache.begin(); it != g_homeThumbCache.end(); )
         {
-            if (it->first.rfind(path + L"#", 0) == 0) it = g_homeThumbCache.erase(it);
+            if (it->first.rfind(path + L"#", 0) == 0)
+            {
+                g_homeThumbLastUsed.erase(it->first);
+                g_homeThumbProtectedKeys.erase(it->first);
+                it = g_homeThumbCache.erase(it);
+            }
             else ++it;
         }
     }
@@ -11597,7 +11792,9 @@ namespace
     void ClearRecentRecords()
     {
         g_recent.clear();
-        g_homeThumbCache.clear();
+        ClearHomeThumbCacheState();
+        std::error_code ec;
+        std::filesystem::remove_all(HomeThumbCacheDir(), ec);
         SaveState();
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
@@ -11638,7 +11835,7 @@ namespace
         if (id >= 2200 && id < 2200 + static_cast<int>(std::size(g_themes)))
         {
             g_theme = id - 2200;
-            g_homeThumbCache.clear();
+            ClearHomeThumbCacheState();
             {
                 std::lock_guard<std::mutex> lock(g_homeThumbMutex);
                 g_homeThumbPending.clear();
@@ -12286,10 +12483,15 @@ namespace
             {
                 return 0;
             }
-            if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
+            if (!result->image.bgra.empty())
             {
-                while (g_homeThumbCache.size() >= 24) g_homeThumbCache.erase(g_homeThumbCache.begin());
-                g_homeThumbCache.emplace(result->key, std::move(result->image));
+                SaveHomeThumbToDisk(result->item, result->targetWidth, result->renderTheme, result->image);
+                if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
+                {
+                    TouchHomeThumb(result->key);
+                    g_homeThumbCache.emplace(result->key, std::move(result->image));
+                    TrimHomeThumbCache();
+                }
             }
             if (!Active())
             {
