@@ -9,6 +9,7 @@
 #include <shobjidl.h>
 #include <sddl.h>
 #include <wincrypt.h>
+#include <imm.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1040,6 +1041,22 @@ namespace
         }
     };
 
+    struct HomeThumbRequest
+    {
+        RecentItem item;
+        std::wstring key;
+        int targetWidth{};
+        int renderTheme{};
+        unsigned dpi{};
+        HWND target{};
+    };
+
+    struct HomeThumbResult
+    {
+        std::wstring key;
+        PageImage image;
+    };
+
     MuPdf g_pdf;
     HWND g_hwnd{};
     unsigned g_dpi{ 96 };
@@ -1047,6 +1064,12 @@ namespace
     std::vector<RecentItem> g_recent;
     std::vector<LastSessionItem> g_lastSessionTabs;
     std::map<std::wstring, PageImage> g_homeThumbCache;
+    std::mutex g_homeThumbMutex;
+    std::condition_variable g_homeThumbCv;
+    std::thread g_homeThumbThread;
+    std::deque<HomeThumbRequest> g_homeThumbQueue;
+    std::set<std::wstring> g_homeThumbPending;
+    bool g_homeThumbStop{};
     std::vector<Button> g_buttons;
     std::vector<RECT> g_tabRects;
     std::vector<int> g_tabRectIds;
@@ -1067,6 +1090,7 @@ namespace
     constexpr UINT WM_QUIETPDF_FILE_CHANGED = WM_APP + 41;
     constexpr UINT WM_QUIETPDF_DRAG_SCROLL = WM_APP + 42;
     constexpr UINT WM_QUIETPDF_PAGE_RENDERED = WM_APP + 43;
+    constexpr UINT WM_QUIETPDF_HOME_THUMB_READY = WM_APP + 44;
 
     struct PageRenderRequest
     {
@@ -3993,31 +4017,19 @@ namespace
         return RenderPageAtScale(tab, index, zoom * static_cast<double>(g_dpi) / 72.0, true);
     }
 
-    PageImage* LoadHomeThumb(const RecentItem& item, int targetWidth)
+    std::wstring HomeThumbKey(const RecentItem& item, int targetWidth, int renderTheme)
     {
-        if (targetWidth <= 0 || item.path.empty()) return nullptr;
-        if (g_homeThumbWidth != targetWidth)
-        {
-            g_homeThumbCache.clear();
-            g_homeThumbWidth = targetWidth;
-        }
+        return item.path + L"#" + std::to_wstring(targetWidth) + L"#" + std::to_wstring(renderTheme);
+    }
 
-        std::wstring key = item.path + L"#" + std::to_wstring(targetWidth) + L"#" + std::to_wstring(PdfRenderTheme());
-        auto found = g_homeThumbCache.find(key);
-        if (found != g_homeThumbCache.end()) return &found->second;
-
-        auto store = [&](PageImage image) -> PageImage*
-        {
-            while (g_homeThumbCache.size() >= 14) g_homeThumbCache.erase(g_homeThumbCache.begin());
-            auto inserted = g_homeThumbCache.emplace(key, std::move(image));
-            return &inserted.first->second;
-        };
-
+    PageImage RenderHomeThumbSync(const RecentItem& item, int targetWidth, int renderTheme, unsigned dpi)
+    {
         PageImage result;
+        if (targetWidth <= 0 || item.path.empty()) return result;
         PdfTab temp;
         try
         {
-            if (!std::filesystem::exists(item.path)) return store({});
+            if (!std::filesystem::exists(item.path)) return result;
             g_pdf.Load();
             temp.ctx = g_pdf.newContext(nullptr, nullptr, 8 << 20, "1.28.0");
             g_pdf.setAaLevel(temp.ctx, 8);
@@ -4028,26 +4040,60 @@ namespace
             if (temp.pageCount <= 0)
             {
                 DropTab(temp);
-                return store({});
+                return result;
             }
 
             fz_page* page = g_pdf.loadPage(temp.ctx, temp.doc, 0);
             fz_rect bounds = g_pdf.boundPage(temp.ctx, page);
             g_pdf.dropPage(temp.ctx, page);
             double widthPt = std::max(1.0, static_cast<double>(bounds.x1 - bounds.x0));
-            double pageWidthAtZoom1 = widthPt * static_cast<double>(g_dpi) / 72.0;
+            double pageWidthAtZoom1 = widthPt * static_cast<double>(dpi) / 72.0;
             double zoom = std::clamp(static_cast<double>(targetWidth) / std::max(1.0, pageWidthAtZoom1), 0.04, 0.35);
-            result = RenderPageAtZoom(temp, 0, zoom);
+            result = RenderPageAtScale(temp, 0, zoom * static_cast<double>(dpi) / 72.0, true, renderTheme);
         }
         catch (...)
         {
             result = {};
         }
         DropTab(temp);
-
-        return store(std::move(result));
+        return result;
     }
 
+    void EnsureHomeThumbWorker();
+
+    void QueueHomeThumb(const RecentItem& item, int targetWidth, const std::wstring& key, int renderTheme, unsigned dpi, HWND target)
+    {
+        if (!target || targetWidth <= 0 || item.path.empty()) return;
+        EnsureHomeThumbWorker();
+        {
+            std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+            if (g_homeThumbPending.find(key) != g_homeThumbPending.end()) return;
+            g_homeThumbPending.insert(key);
+            g_homeThumbQueue.push_back(HomeThumbRequest{ item, key, targetWidth, renderTheme, dpi, target });
+        }
+        g_homeThumbCv.notify_one();
+    }
+
+    PageImage* LoadHomeThumb(const RecentItem& item, int targetWidth)
+    {
+        if (targetWidth <= 0 || item.path.empty()) return nullptr;
+        if (g_homeThumbWidth != targetWidth)
+        {
+            g_homeThumbCache.clear();
+            std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+            g_homeThumbPending.clear();
+            g_homeThumbQueue.clear();
+            g_homeThumbWidth = targetWidth;
+        }
+
+        int renderTheme = PdfRenderTheme();
+        std::wstring key = HomeThumbKey(item, targetWidth, renderTheme);
+        auto found = g_homeThumbCache.find(key);
+        if (found != g_homeThumbCache.end()) return &found->second;
+
+        QueueHomeThumb(item, targetWidth, key, renderTheme, g_dpi, g_hwnd);
+        return nullptr;
+    }
     PageImage PixmapToImageFor(PdfTab& tab, fz_pixmap* pixmap, int renderTheme)
     {
         PageImage image;
@@ -4443,6 +4489,53 @@ namespace
         if (g_pageRenderThread.joinable()) g_pageRenderThread.join();
     }
 
+    void HomeThumbWorkerMain()
+    {
+        for (;;)
+        {
+            HomeThumbRequest request;
+            {
+                std::unique_lock<std::mutex> lock(g_homeThumbMutex);
+                g_homeThumbCv.wait(lock, [] { return g_homeThumbStop || !g_homeThumbQueue.empty(); });
+                if (g_homeThumbStop) break;
+                request = std::move(g_homeThumbQueue.front());
+                g_homeThumbQueue.pop_front();
+            }
+
+            auto result = std::make_unique<HomeThumbResult>();
+            result->key = request.key;
+            result->image = RenderHomeThumbSync(request.item, request.targetWidth, request.renderTheme, request.dpi);
+            if (!IsWindow(request.target) || !PostMessageW(request.target, WM_QUIETPDF_HOME_THUMB_READY, 0, reinterpret_cast<LPARAM>(result.get())))
+            {
+                std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+                g_homeThumbPending.erase(request.key);
+                continue;
+            }
+            result.release();
+        }
+    }
+
+    void EnsureHomeThumbWorker()
+    {
+        if (g_homeThumbThread.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+            g_homeThumbStop = false;
+        }
+        g_homeThumbThread = std::thread(HomeThumbWorkerMain);
+    }
+
+    void StopHomeThumbWorker()
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+            g_homeThumbStop = true;
+            g_homeThumbQueue.clear();
+            g_homeThumbPending.clear();
+        }
+        g_homeThumbCv.notify_all();
+        if (g_homeThumbThread.joinable()) g_homeThumbThread.join();
+    }
     void QueuePageRender(HWND hwnd, PdfTab const& tab, int page, int priority = 0)
     {
         if (page < 0 || page >= tab.pageCount || tab.zoom >= TileRenderZoomThreshold) return;
@@ -8230,6 +8323,23 @@ namespace
         Text(dc, label, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
     }
 
+    void SetImeCompositionPoint(HWND hwnd, POINT pt)
+    {
+        HIMC imc = ImmGetContext(hwnd);
+        if (!imc) return;
+
+        COMPOSITIONFORM composition{};
+        composition.dwStyle = CFS_POINT;
+        composition.ptCurrentPos = pt;
+        ImmSetCompositionWindow(imc, &composition);
+
+        CANDIDATEFORM candidate{};
+        candidate.dwIndex = 0;
+        candidate.dwStyle = CFS_CANDIDATEPOS;
+        candidate.ptCurrentPos = POINT{ pt.x, pt.y + S(4) };
+        ImmSetCandidateWindow(imc, &candidate);
+        ImmReleaseContext(hwnd, imc);
+    }
     void PaintHomeHeader(HDC dc, RECT client)
     {
         HFONT titleFont = Font(22, FW_SEMIBOLD);
@@ -8261,6 +8371,7 @@ namespace
             HGDIOBJ oldCaret = SelectObject(dc, caretPen);
             MoveToEx(dc, caretX, g_homeSearchRect.top + S(11), nullptr);
             LineTo(dc, caretX, g_homeSearchRect.bottom - S(11));
+            if (g_hwnd) SetImeCompositionPoint(g_hwnd, POINT{ caretX, g_homeSearchRect.bottom - S(9) });
             SelectObject(dc, oldCaret);
             DeleteObject(caretPen);
         }
@@ -12153,6 +12264,28 @@ namespace
             }
             return 0;
         }
+        case WM_QUIETPDF_HOME_THUMB_READY:
+        {
+            std::unique_ptr<HomeThumbResult> result(reinterpret_cast<HomeThumbResult*>(lParam));
+            if (!result) return 0;
+            {
+                std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+                g_homeThumbPending.erase(result->key);
+            }
+            if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
+            {
+                while (g_homeThumbCache.size() >= 14) g_homeThumbCache.erase(g_homeThumbCache.begin());
+                g_homeThumbCache.emplace(result->key, std::move(result->image));
+            }
+            if (!Active())
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                RECT viewport = HomeContentViewportRect(client);
+                InvalidateRect(hwnd, &viewport, FALSE);
+            }
+            return 0;
+        }
         case WM_DPICHANGED:
             g_dpi = HIWORD(wParam);
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
@@ -13915,6 +14048,7 @@ namespace
             if (g_immersive) ApplyImmersiveWindow(hwnd, false);
             StopFileWatcher();
             StopPageRenderWorker();
+            StopHomeThumbWorker();
             bool saveLastSession = !HasOtherQingYueWindows(hwnd);
             for (auto& tab : g_tabs) TouchRecentProgress(*tab, false);
             if (saveLastSession) CaptureLastSessionFromOpenTabs();
