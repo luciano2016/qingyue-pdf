@@ -8771,7 +8771,7 @@ namespace
             int content = S(146);
             for (size_t i = 0; i < g_searchResults.size(); ++i)
             {
-                RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(54) };
+                RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(42) };
                 if (visible(row))
                 {
                     g_searchResultRects.push_back(row);
@@ -8787,13 +8787,13 @@ namespace
                         COLORREF line = selected ? MixColor(T().line, T().accent, 0.45) : T().line;
                         RoundFill(dc, row, S(7), fill, line);
                     }
-                    RECT text{ row.left + S(8), row.top, row.right - S(54), row.bottom };
+                    RECT text{ row.left + S(8), row.top, row.right - S(50), row.bottom };
                     DrawHighlightedSnippet(dc, g_searchResults[i], text, T().muted);
-                    RECT page{ row.right - S(44), row.top, row.right - S(6), row.bottom };
+                    RECT page{ row.right - S(40), row.top, row.right - S(6), row.bottom };
                     Text(dc, std::to_wstring(g_searchResults[i].page + 1), page, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, T().muted);
                 }
-                y += S(56);
-                content += S(56);
+                y += S(44);
+                content += S(44);
             }
             RestoreDC(dc, clipDc);
             g_sidebarContentHeight = std::max(0, content - S(146));
@@ -9728,11 +9728,12 @@ namespace
         HFONT pageFont = Font(10);
         HGDIOBJ oldPageFont = SelectObject(dc, pageFont);
         std::wstring pageText = g_pageInputFocused ? g_pageInputText : currentPageText;
-        Text(dc, pageText, pageBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+        RECT pageTextBox{ pageBox.left + S(8), pageBox.top, pageBox.right - S(8), pageBox.bottom };
+        Text(dc, pageText, pageTextBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         if (g_pageInputFocused && g_pageCaretVisible)
         {
             g_pageCaretIndex = std::clamp(g_pageCaretIndex, 0, static_cast<int>(pageText.size()));
-            int caretX = CaretXCurrentFont(dc, pageText, pageBox, g_pageCaretIndex, true) + S(2);
+            int caretX = CaretXCurrentFont(dc, pageText, pageTextBox, g_pageCaretIndex, true);
             int caretTop = pageBox.top + S(5);
             int caretBottom = pageBox.bottom - S(5);
             HPEN caretPen = CreatePen(PS_SOLID, std::max(1, S(1)), T().muted);
@@ -9964,6 +9965,22 @@ namespace
         if (item && item->id >= 2412 && item->id <= 2422) return 10;
         return 9;
     }
+    bool IsCheckboxMenuItem(UINT id)
+    {
+        return id == 2441;
+    }
+
+    int ThemedMenuRowHeight(ThemedMenuItem const* item)
+    {
+        if (!item || item->separator) return S(6);
+        if (IsCheckboxMenuItem(item->id)) return S(24);
+        return S(25);
+    }
+
+    int ThemedMenuTextLeft(ThemedMenuItem const* item)
+    {
+        return IsCheckboxMenuItem(item ? item->id : 0) ? S(34) : S(28);
+    }
     bool MeasureThemedMenuItem(MEASUREITEMSTRUCT* measure)
     {
         if (!measure || measure->CtlType != ODT_MENU) return false;
@@ -9995,9 +10012,34 @@ namespace
         ReleaseDC(g_hwnd, dc);
 
         int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
-        measure->itemWidth = std::max(S(112), textW + (shortcut.empty() ? S(54) : S(62)));
-        measure->itemHeight = S(25);
+        measure->itemWidth = IsCheckboxMenuItem(item->id) ? std::max(S(96), textW + S(46)) : std::max(S(112), textW + (shortcut.empty() ? S(54) : S(62)));
+        measure->itemHeight = ThemedMenuRowHeight(item);
         return true;
+    }
+    void DrawThemedMenuCheckbox(HDC dc, RECT r, bool checked, COLORREF color, COLORREF borderColor)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::Pen border(GdiColor(borderColor, 210), std::max<Gdiplus::REAL>(1.0f, S(0.9f)));
+        border.SetLineJoin(Gdiplus::LineJoinRound);
+        Gdiplus::RectF box{
+            static_cast<Gdiplus::REAL>(r.left) + S(0.5f),
+            static_cast<Gdiplus::REAL>(r.top) + S(0.5f),
+            static_cast<Gdiplus::REAL>(r.right - r.left) - S(1.0f),
+            static_cast<Gdiplus::REAL>(r.bottom - r.top) - S(1.0f) };
+        DrawGdiRoundRect(g, border, box, S(2.0f));
+        if (!checked) return;
+        Gdiplus::SolidBrush fill(GdiColor(MixColor(color, MenuPopupFill(), 0.70), 62));
+        FillGdiRoundRect(g, fill, box, S(2.0f));
+        Gdiplus::Pen tick(GdiColor(color, 240), std::max<Gdiplus::REAL>(1.35f, S(1.0f)));
+        tick.SetStartCap(Gdiplus::LineCapRound);
+        tick.SetEndCap(Gdiplus::LineCapRound);
+        tick.SetLineJoin(Gdiplus::LineJoinRound);
+        float w = std::max(1.0f, box.Width);
+        float h = std::max(1.0f, box.Height);
+        g.DrawLine(&tick, box.X + w * 0.24f, box.Y + h * 0.52f, box.X + w * 0.43f, box.Y + h * 0.70f);
+        g.DrawLine(&tick, box.X + w * 0.43f, box.Y + h * 0.70f, box.X + w * 0.78f, box.Y + h * 0.30f);
     }
     void DrawThemedMenuCheck(HDC dc, RECT r, COLORREF color)
     {
@@ -10045,7 +10087,14 @@ namespace
             RoundFill(draw->hDC, hot, S(6), fill, fill);
         }
 
-        if (checked)
+        if (IsCheckboxMenuItem(item->id))
+        {
+            int box = S(13);
+            int cy = (r.top + r.bottom) / 2;
+            RECT check{ r.left + S(11), cy - box / 2, r.left + S(11) + box, cy - box / 2 + box };
+            DrawThemedMenuCheckbox(draw->hDC, check, checked, disabled ? MenuPopupShortcutText(true) : T().accent, MenuPopupShortcutText(disabled));
+        }
+        else if (checked)
         {
             RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
             DrawThemedMenuCheck(draw->hDC, check, disabled ? MenuPopupShortcutText(true) : T().accent);
@@ -10062,7 +10111,7 @@ namespace
 
         HFONT font = Font(ThemedMenuFontPt(item));
         HGDIOBJ old = SelectObject(draw->hDC, font);
-        RECT textRect{ r.left + S(28), r.top, r.right - S(10), r.bottom };
+        RECT textRect{ r.left + ThemedMenuTextLeft(item), r.top, r.right - S(10), r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
         Text(draw->hDC, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(disabled));
         if (!shortcut.empty())
@@ -10101,7 +10150,14 @@ namespace
             RoundFill(dc, hot, S(6), fill, fill);
         }
 
-        if (item.checked)
+        if (IsCheckboxMenuItem(item.id))
+        {
+            int box = S(13);
+            int cy = (r.top + r.bottom) / 2;
+            RECT check{ r.left + S(11), cy - box / 2, r.left + S(11) + box, cy - box / 2 + box };
+            DrawThemedMenuCheckbox(dc, check, item.checked, item.disabled ? MenuPopupShortcutText(true) : T().accent, MenuPopupShortcutText(item.disabled));
+        }
+        else if (item.checked)
         {
             RECT check{ r.left + S(10), r.top + S(6), r.left + S(23), r.bottom - S(6) };
             DrawThemedMenuCheck(dc, check, item.disabled ? MenuPopupShortcutText(true) : T().accent);
@@ -10118,7 +10174,7 @@ namespace
 
         HFONT font = Font(ThemedMenuFontPt(&item));
         HGDIOBJ old = SelectObject(dc, font);
-        RECT textRect{ r.left + S(28), r.top, r.right - S(10), r.bottom };
+        RECT textRect{ r.left + ThemedMenuTextLeft(&item), r.top, r.right - S(10), r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
         Text(dc, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(item.disabled));
         if (!shortcut.empty())
@@ -10317,13 +10373,16 @@ namespace
         HDC dc = GetDC(hwnd);
         HFONT font = Font(8);
         HGDIOBJ old = SelectObject(dc, font);
-        int width = S(112);
-        int height = S(6);
+        bool compactCheckboxMenu = g_themedMenuItems.size() == 1 && IsCheckboxMenuItem(g_themedMenuItems.front()->id);
+        int width = compactCheckboxMenu ? S(96) : S(112);
+        int outerPad = compactCheckboxMenu ? S(4) : S(6);
+        int rowInset = compactCheckboxMenu ? S(2) : S(3);
+        int height = outerPad;
         std::vector<int> heights;
         heights.reserve(g_themedMenuItems.size());
         for (auto const& item : g_themedMenuItems)
         {
-            int rowH = item->separator ? S(6) : S(25);
+            int rowH = ThemedMenuRowHeight(item.get());
             heights.push_back(rowH);
             if (!item->separator)
             {
@@ -10344,11 +10403,11 @@ namespace
                 SelectObject(dc, oldRowFont);
                 DeleteObject(rowFont);
                 int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
-                width = std::max(width, textW + (shortcut.empty() ? S(54) : S(62)));
+                width = std::max(width, IsCheckboxMenuItem(item->id) ? textW + S(46) : textW + (shortcut.empty() ? S(54) : S(62)));
             }
             height += rowH;
         }
-        height += S(6);
+        height += outerPad;
         SelectObject(dc, old);
         DeleteObject(font);
         ReleaseDC(hwnd, dc);
@@ -10357,10 +10416,10 @@ namespace
         int popupHeight = height;
 
         g_themedMenuItemRects.clear();
-        int rowTop = S(3);
+        int rowTop = rowInset;
         for (int h : heights)
         {
-            g_themedMenuItemRects.push_back(RECT{ S(3), rowTop, width - S(3), rowTop + h });
+            g_themedMenuItemRects.push_back(RECT{ rowInset, rowTop, width - rowInset, rowTop + h });
             rowTop += h;
         }
 
@@ -12535,7 +12594,8 @@ namespace
             if (Active() && Hit(g_pageInputRect, x, y))
             {
                 FocusPageInput(hwnd);
-                g_pageCaretIndex = CaretIndexFromPoint(hwnd, g_pageInputText, g_pageInputRect, 10, x, true);
+                RECT pageTextBox{ g_pageInputRect.left + S(8), g_pageInputRect.top, g_pageInputRect.right - S(8), g_pageInputRect.bottom };
+                g_pageCaretIndex = CaretIndexFromPoint(hwnd, g_pageInputText, pageTextBox, 10, x, true);
                 return 0;
             }
             for (auto const& b : g_buttons) if (Hit(b.rect, x, y))
