@@ -2745,30 +2745,96 @@ namespace
             break;
         case StatusIcon::Theme:
         {
+            int size = S(13);
             int left = r.left + S(4);
-            int top = cy - S(6);
-            square(left, top, S(12));
-            MoveToEx(dc, left + S(3), top + S(12), nullptr);
-            LineTo(dc, left + S(12), top + S(3));
-            MoveToEx(dc, left + S(3), top + S(9), nullptr);
-            LineTo(dc, left + S(9), top + S(3));
+            int top = cy - size / 2;
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(pen);
-            DrawDownCaret(dc, left + S(20), cy, color);
+
+            Gdiplus::Graphics g(dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+            Gdiplus::Pen frame(GdiColor(color, 235), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
+            frame.SetLineJoin(Gdiplus::LineJoinMiter);
+            Gdiplus::RectF box{
+                static_cast<Gdiplus::REAL>(left) + S(0.5f),
+                static_cast<Gdiplus::REAL>(top) + S(0.5f),
+                static_cast<Gdiplus::REAL>(size) - S(1.0f),
+                static_cast<Gdiplus::REAL>(size) - S(1.0f) };
+            g.DrawRectangle(&frame, box.X, box.Y, box.Width, box.Height);
+
+            Gdiplus::SolidBrush palette(GdiColor(MixColor(color, T().muted, 0.25), 210));
+            Gdiplus::GraphicsPath pal;
+            float px = box.X + box.Width * 0.24f;
+            float py = box.Y + box.Height * 0.24f;
+            float pw = box.Width * 0.58f;
+            float ph = box.Height * 0.58f;
+            pal.AddEllipse(px, py, pw, ph);
+            g.FillPath(&palette, &pal);
+            Gdiplus::SolidBrush cut(GdiColor(T().paper, 255));
+            g.FillEllipse(&cut, px + pw * 0.58f, py + ph * 0.58f, pw * 0.36f, ph * 0.36f);
+            float dot = std::max(1.0f, S(1.8f));
+            g.FillEllipse(&cut, px + pw * 0.30f, py + ph * 0.24f, dot, dot);
+            g.FillEllipse(&cut, px + pw * 0.54f, py + ph * 0.18f, dot, dot);
+            g.FillEllipse(&cut, px + pw * 0.66f, py + ph * 0.42f, dot, dot);
+            DrawDownCaret(dc, left + S(21), cy, color);
             return;
         }
         case StatusIcon::View:
         {
-            int left = r.left + S(5);
-            int top = cy - S(5);
-            square(left, top, S(10));
-            MoveToEx(dc, left + S(3), cy, nullptr);
-            LineTo(dc, left + S(7), cy);
+            int size = S(13);
+            int left = r.left + S(4);
+            int top = cy - size / 2;
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(pen);
-            DrawDownCaret(dc, left + S(19), cy, color);
+
+            Gdiplus::Graphics g(dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+            Gdiplus::Pen aaPen(GdiColor(color, 235), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
+            aaPen.SetStartCap(Gdiplus::LineCapRound);
+            aaPen.SetEndCap(Gdiplus::LineCapRound);
+            aaPen.SetLineJoin(Gdiplus::LineJoinRound);
+            Gdiplus::RectF box{
+                static_cast<Gdiplus::REAL>(left) + S(0.5f),
+                static_cast<Gdiplus::REAL>(top) + S(0.5f),
+                static_cast<Gdiplus::REAL>(size) - S(1.0f),
+                static_cast<Gdiplus::REAL>(size) - S(1.0f) };
+            g.DrawRectangle(&aaPen, box.X, box.Y, box.Width, box.Height);
+
+            float ix = box.X + S(3.0f);
+            float iy = box.Y + S(3.0f);
+            float iw = std::max(1.0f, box.Width - S(6.0f));
+            float ih = std::max(1.0f, box.Height - S(6.0f));
+            if (g_continuousRead)
+            {
+                g.DrawLine(&aaPen, ix, iy, ix + iw, iy);
+                g.DrawLine(&aaPen, ix, iy + ih * 0.5f, ix + iw, iy + ih * 0.5f);
+                g.DrawLine(&aaPen, ix, iy + ih, ix + iw, iy + ih);
+            }
+            else if (g_viewMode == 1)
+            {
+                float mid = box.X + box.Width * 0.5f;
+                g.DrawLine(&aaPen, mid, box.Y + S(2.0f), mid, box.GetBottom() - S(2.0f));
+                g.DrawLine(&aaPen, box.X + S(2.6f), iy + ih * 0.5f, mid - S(1.5f), iy + ih * 0.5f);
+                g.DrawLine(&aaPen, mid + S(1.5f), iy + ih * 0.5f, box.GetRight() - S(2.6f), iy + ih * 0.5f);
+            }
+            else if (g_viewMode == 2)
+            {
+                float mid = box.X + box.Width * 0.5f;
+                g.DrawLine(&aaPen, mid, box.Y + S(2.0f), mid, box.GetBottom() - S(2.0f));
+                g.DrawLine(&aaPen, box.X + S(2.2f), box.Y + S(3.0f), mid - S(1.2f), box.Y + S(4.0f));
+                g.DrawLine(&aaPen, mid + S(1.2f), box.Y + S(4.0f), box.GetRight() - S(2.2f), box.Y + S(3.0f));
+                g.DrawLine(&aaPen, box.X + S(2.2f), box.GetBottom() - S(3.0f), mid - S(1.2f), box.GetBottom() - S(2.0f));
+                g.DrawLine(&aaPen, mid + S(1.2f), box.GetBottom() - S(2.0f), box.GetRight() - S(2.2f), box.GetBottom() - S(3.0f));
+            }
+            else
+            {
+                g.DrawLine(&aaPen, ix, iy + ih * 0.5f, ix + iw, iy + ih * 0.5f);
+            }
+            DrawDownCaret(dc, left + S(21), cy, color);
             return;
         }
         case StatusIcon::Actual:
@@ -2777,9 +2843,10 @@ namespace
         case StatusIcon::FitContent:
         case StatusIcon::CustomZoom:
         {
+            int size = S(13);
             int left = r.left + S(4);
-            int top = cy - S(6);
-            RECT iconBox{ left, top, left + S(12), top + S(12) };
+            int top = cy - size / 2;
+            RECT iconBox{ left, top, left + size, top + size };
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(pen);
@@ -2832,7 +2899,7 @@ namespace
                 g.DrawLine(&aaPen, mx + S(3.1f), my + S(3.1f), mx + S(7.0f), my + S(7.0f));
                 g.DrawLine(&aaPen, mx - S(2.6f), my, mx + S(2.6f), my);
             }
-            DrawDownCaret(dc, left + S(20), cy, color);
+            DrawDownCaret(dc, left + S(21), cy, color);
             return;
         }
         case StatusIcon::ZoomOut:
