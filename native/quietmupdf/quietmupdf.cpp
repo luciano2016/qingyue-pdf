@@ -1,11 +1,59 @@
 #include "mupdf/fitz.h"
 #include "mupdf/pdf.h"
+#define NOMINMAX
+#include <windows.h>
 #include <ctime>
 #include <cstring>
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
 #include <vector>
+namespace
+{
+    struct quiet_lock_table
+    {
+        CRITICAL_SECTION locks[FZ_LOCK_MAX];
+        fz_locks_context context{};
+
+        quiet_lock_table()
+        {
+            for (int i = 0; i < FZ_LOCK_MAX; ++i)
+                InitializeCriticalSection(&locks[i]);
+            context.user = this;
+            context.lock = [](void* user, int lock)
+            {
+                EnterCriticalSection(&static_cast<quiet_lock_table*>(user)->locks[lock]);
+            };
+            context.unlock = [](void* user, int lock)
+            {
+                LeaveCriticalSection(&static_cast<quiet_lock_table*>(user)->locks[lock]);
+            };
+        }
+
+        ~quiet_lock_table()
+        {
+            for (int i = 0; i < FZ_LOCK_MAX; ++i)
+                DeleteCriticalSection(&locks[i]);
+        }
+    };
+
+    quiet_lock_table& quiet_shared_locks()
+    {
+        static quiet_lock_table table;
+        return table;
+    }
+}
+
+extern "C" fz_context* quiet_new_shared_context(size_t max_store)
+{
+    quiet_lock_table& table = quiet_shared_locks();
+    return fz_new_context(nullptr, &table.context, max_store);
+}
+
+extern "C" fz_context* quiet_clone_context(fz_context* ctx)
+{
+    return ctx ? fz_clone_context(ctx) : nullptr;
+}
 
 struct quiet_pdf_annotation
 {

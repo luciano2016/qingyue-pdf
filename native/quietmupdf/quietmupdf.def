@@ -1,5 +1,7 @@
 LIBRARY quietmupdf
 EXPORTS
+    quiet_new_shared_context
+    quiet_clone_context
     fz_new_context_imp
     fz_drop_context
     fz_register_document_handlers

@@ -13,4 +13,4 @@ if not exist "%VCVARS%" (
 call "%VCVARS%" >nul
 if errorlevel 1 exit /b %errorlevel%
 
-dumpbin /exports "%ROOT%\build\x64\Release\quietmupdf.dll" | findstr "fz_new_context_imp fz_open_document fz_register_document_handlers fz_new_pixmap_from_page_number fz_drop_context quiet_pdf_get_text_char_boxes"
+dumpbin /exports "%ROOT%\build\x64\Release\quietmupdf.dll" | findstr "quiet_new_shared_context quiet_clone_context fz_new_context_imp fz_open_document fz_register_document_handlers fz_new_pixmap_from_page_number fz_drop_context quiet_pdf_get_text_char_boxes"

@@ -330,6 +330,8 @@ namespace
         bool hasChildren{};
     };
 
+    struct PageRenderSession;
+
     struct PdfTab
     {
         fz_context* ctx{};
@@ -369,6 +371,7 @@ namespace
         bool hasFileStamp{};
         bool dirty{};
         unsigned long renderVersion{};
+        std::shared_ptr<PageRenderSession> renderSession;
     };
 
     struct RecentItem
@@ -979,6 +982,8 @@ namespace
     {
     public:
         using NewContextFn = fz_context*(__cdecl*)(const fz_alloc_context*, const fz_locks_context*, size_t, const char*);
+        using SharedContextFn = fz_context*(__cdecl*)(size_t);
+        using CloneContextFn = fz_context*(__cdecl*)(fz_context*);
         using DropContextFn = void(__cdecl*)(fz_context*);
         using RegisterHandlersFn = void(__cdecl*)(fz_context*);
         using OpenDocumentFn = fz_document*(__cdecl*)(fz_context*, const char*);
@@ -1014,6 +1019,8 @@ namespace
             if (!module) throw std::runtime_error("quietmupdf.dll not found beside the exe.");
             Get(newContext, "fz_new_context_imp");
             Get(dropContext, "fz_drop_context");
+            Get(newSharedContext, "quiet_new_shared_context");
+            Get(cloneContext, "quiet_clone_context");
             Get(registerHandlers, "fz_register_document_handlers");
             Get(openDocument, "fz_open_document");
             Get(countPages, "fz_count_pages");
@@ -1048,6 +1055,8 @@ namespace
         HMODULE module{};
         NewContextFn newContext{};
         DropContextFn dropContext{};
+        SharedContextFn newSharedContext{};
+        CloneContextFn cloneContext{};
         RegisterHandlersFn registerHandlers{};
         OpenDocumentFn openDocument{};
         CountPagesFn countPages{};
@@ -1112,7 +1121,61 @@ namespace
         PageImage image;
     };
 
+    struct PageRenderSession
+    {
+        fz_context* uiContext{};
+        fz_context* renderContext{};
+        fz_document* document{};
+        std::recursive_mutex documentMutex;
+
+        ~PageRenderSession();
+    };
+
+    constexpr size_t PdfResourceStoreLimit = 256ull * 1024ull * 1024ull;
+
     MuPdf g_pdf;
+
+    PageRenderSession::~PageRenderSession()
+    {
+        if (document && uiContext) g_pdf.dropDocument(uiContext, document);
+        if (renderContext) g_pdf.dropContext(renderContext);
+        if (uiContext) g_pdf.dropContext(uiContext);
+    }
+
+    std::recursive_mutex g_unsharedPdfMutex;
+
+    class PdfDocumentLock
+    {
+    public:
+        explicit PdfDocumentLock(PdfTab const& tab)
+            : lock_(tab.renderSession ? tab.renderSession->documentMutex : g_unsharedPdfMutex)
+        {
+        }
+
+    private:
+        std::unique_lock<std::recursive_mutex> lock_;
+    };
+
+    std::shared_ptr<PageRenderSession> CreatePageRenderSession(const std::wstring& path)
+    {
+        auto session = std::make_shared<PageRenderSession>();
+        session->uiContext = g_pdf.newSharedContext(PdfResourceStoreLimit);
+        if (!session->uiContext)
+            throw std::runtime_error("MuPDF shared context creation failed.");
+        g_pdf.setAaLevel(session->uiContext, 8);
+        g_pdf.registerHandlers(session->uiContext);
+
+        std::string utf8 = ToUtf8(path);
+        session->document = g_pdf.openDocument(session->uiContext, utf8.c_str());
+        if (!session->document)
+            throw std::runtime_error("MuPDF document open failed.");
+
+        session->renderContext = g_pdf.cloneContext(session->uiContext);
+        if (!session->renderContext)
+            throw std::runtime_error("MuPDF render context clone failed.");
+        g_pdf.setAaLevel(session->renderContext, 8);
+        return session;
+    }
     HWND g_hwnd{};
     unsigned g_dpi{ 96 };
     std::vector<std::unique_ptr<PdfTab>> g_tabs;
@@ -1153,6 +1216,7 @@ namespace
     {
         unsigned long long serial{};
         unsigned long documentVersion{};
+        std::shared_ptr<PageRenderSession> session;
         HWND target{};
         std::wstring path;
         int page{};
@@ -3615,8 +3679,13 @@ namespace
     {
         tab.textBoxes.clear();
         tab.textBoxesReady.clear();
-        if (tab.doc) g_pdf.dropDocument(tab.ctx, tab.doc);
-        if (tab.ctx) g_pdf.dropContext(tab.ctx);
+        if (tab.renderSession)
+            tab.renderSession.reset();
+        else
+        {
+            if (tab.doc) g_pdf.dropDocument(tab.ctx, tab.doc);
+            if (tab.ctx) g_pdf.dropContext(tab.ctx);
+        }
         tab.doc = nullptr;
         tab.ctx = nullptr;
     }
@@ -4261,27 +4330,30 @@ namespace
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
-        if (g_pdf.newPixmapFromPageNumberClip)
         {
-            fz_page* page = g_pdf.loadPage(tab.ctx, tab.doc, index);
-            fz_rect bounds = g_pdf.boundPage(tab.ctx, page);
-            g_pdf.dropPage(tab.ctx, page);
-            int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
-            int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
-            pixmap = g_pdf.newPixmapFromPageNumberClip(
-                tab.ctx,
-                tab.doc,
-                index,
-                matrix,
-                g_pdf.deviceRgb(tab.ctx),
-                0,
-                0,
-                0,
-                widthPx,
-                heightPx);
+            PdfDocumentLock pdfLock(tab);
+            if (g_pdf.newPixmapFromPageNumberClip)
+            {
+                fz_page* page = g_pdf.loadPage(tab.ctx, tab.doc, index);
+                fz_rect bounds = g_pdf.boundPage(tab.ctx, page);
+                g_pdf.dropPage(tab.ctx, page);
+                int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
+                int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
+                pixmap = g_pdf.newPixmapFromPageNumberClip(
+                    tab.ctx,
+                    tab.doc,
+                    index,
+                    matrix,
+                    g_pdf.deviceRgb(tab.ctx),
+                    0,
+                    0,
+                    0,
+                    widthPx,
+                    heightPx);
+            }
+            if (!pixmap)
+                pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceRgb(tab.ctx), 0);
         }
-        if (!pixmap)
-            pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceRgb(tab.ctx), 0);
         PageImage image;
         image.width = g_pdf.pixmapWidth(tab.ctx, pixmap);
         image.height = g_pdf.pixmapHeight(tab.ctx, pixmap);
@@ -4443,17 +4515,21 @@ namespace
     PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme, bool renderToDib = false)
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
-        fz_pixmap* pixmap = g_pdf.newPixmapFromPageNumberClip(
-            tab.ctx,
-            tab.doc,
-            index,
-            matrix,
-            g_pdf.deviceRgb(tab.ctx),
-            0,
-            tile.left,
-            tile.top,
-            tile.right,
-            tile.bottom);
+        fz_pixmap* pixmap = nullptr;
+        {
+            PdfDocumentLock pdfLock(tab);
+            pixmap = g_pdf.newPixmapFromPageNumberClip(
+                tab.ctx,
+                tab.doc,
+                index,
+                matrix,
+                g_pdf.deviceRgb(tab.ctx),
+                0,
+                tile.left,
+                tile.top,
+                tile.right,
+                tile.bottom);
+        }
         PageImage image = PixmapToImageFor(tab, pixmap, renderTheme, renderToDib);
         if (pixmap) g_pdf.dropPixmap(tab.ctx, pixmap);
         return image;
@@ -4689,19 +4765,6 @@ namespace
 
     void PageRenderWorkerMain()
     {
-        fz_context* workerCtx = nullptr;
-        fz_document* workerDoc = nullptr;
-        std::wstring workerPath;
-        unsigned long workerVersion = 0;
-
-        auto closeWorkerDocument = [&]()
-        {
-            if (workerDoc) g_pdf.dropDocument(workerCtx, workerDoc);
-            workerDoc = nullptr;
-            workerPath.clear();
-            workerVersion = 0;
-        };
-
         for (;;)
         {
             PageRenderRequest request;
@@ -4719,24 +4782,13 @@ namespace
             result->request = request;
             try
             {
-                if (!workerCtx)
-                {
-                    workerCtx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
-                    g_pdf.setAaLevel(workerCtx, 8);
-                    g_pdf.registerHandlers(workerCtx);
-                }
-                if (!workerDoc || workerVersion != request.documentVersion || _wcsicmp(workerPath.c_str(), request.path.c_str()) != 0)
-                {
-                    closeWorkerDocument();
-                    std::string utf8 = ToUtf8(request.path);
-                    workerDoc = g_pdf.openDocument(workerCtx, utf8.c_str());
-                    workerPath = request.path;
-                    workerVersion = request.documentVersion;
-                }
+                if (!request.session || !request.session->renderContext || !request.session->document)
+                    throw std::runtime_error("Missing PDF render session.");
 
                 PdfTab renderTab;
-                renderTab.ctx = workerCtx;
-                renderTab.doc = workerDoc;
+                renderTab.ctx = request.session->renderContext;
+                renderTab.doc = request.session->document;
+                renderTab.renderSession = request.session;
                 renderTab.zoom = request.zoom;
                 double renderZoom = request.renderZoom > 0.0 ? request.renderZoom : request.zoom;
                 double renderScale = renderZoom * static_cast<double>(request.dpi) / 72.0;
@@ -4752,9 +4804,6 @@ namespace
             }
             catch (...)
             {
-                closeWorkerDocument();
-                if (workerCtx) g_pdf.dropContext(workerCtx);
-                workerCtx = nullptr;
                 result->image = {};
             }
 
@@ -4773,9 +4822,6 @@ namespace
                 result.release();
             }
         }
-
-        closeWorkerDocument();
-        if (workerCtx) g_pdf.dropContext(workerCtx);
     }
 
     void EnsurePageRenderWorker()
@@ -4859,6 +4905,7 @@ namespace
         EnsurePageRenderWorker();
         PageRenderRequest request;
         request.documentVersion = tab.renderVersion;
+        request.session = tab.renderSession;
         request.target = hwnd;
         request.path = tab.path;
         request.page = page;
@@ -4926,6 +4973,7 @@ namespace
         EnsurePageRenderWorker();
         PageRenderRequest request;
         request.documentVersion = tab.renderVersion;
+        request.session = tab.renderSession;
         request.target = hwnd;
         request.path = tab.path;
         request.page = page;
@@ -5145,6 +5193,7 @@ namespace
 
         PageRenderRequest request;
         request.documentVersion = tab.renderVersion;
+        request.session = tab.renderSession;
         request.target = hwnd;
         request.path = tab.path;
         request.page = key.page;
@@ -5754,6 +5803,7 @@ namespace
         if (page < 0 || page >= tab.pageCount || !g_pdf.textCharBoxes)
             return nullptr;
 
+        PdfDocumentLock pdfLock(tab);
         if (tab.textBoxesReady.find(page) == tab.textBoxesReady.end())
         {
             tab.textBoxesReady.insert(page);
@@ -5781,6 +5831,7 @@ namespace
         if (page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
             return false;
 
+        PdfDocumentLock pdfLock(tab);
         double pageW = std::max<int>(1, pageRect.right - pageRect.left);
         double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
         float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
@@ -6146,6 +6197,7 @@ namespace
         if (!g_pdf.selectText || g_selectionPage < 0 || g_selectionPage >= tab.pageCount)
             return false;
 
+        PdfDocumentLock pdfLock(tab);
         fz_point start = NormalizeSelectionPoint(g_selectionPageRect, g_selectionStart);
         fz_point end = NormalizeSelectionPoint(g_selectionPageRect, g_selectionEnd);
         if (std::abs(start.x - end.x) < 0.001f && std::abs(start.y - end.y) < 0.001f)
@@ -6180,6 +6232,7 @@ namespace
         if (!g_pdf.findImageAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
             return false;
 
+        PdfDocumentLock pdfLock(tab);
         double pageW = std::max<int>(1, pageRect.right - pageRect.left);
         double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
         float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
@@ -7378,6 +7431,7 @@ namespace
         if (!g_pdf.selectWordAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
             return false;
 
+        PdfDocumentLock pdfLock(tab);
         double pageW = std::max<int>(1, pageRect.right - pageRect.left);
         double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
         float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
@@ -7826,6 +7880,7 @@ namespace
             return;
         }
 
+        PdfDocumentLock pdfLock(*tab);
         std::string needle = ToUtf8(g_searchQuery);
         int totalHits = 0;
         for (int page = 0; page < tab->pageCount; ++page)
@@ -7882,11 +7937,9 @@ namespace
         g_pdf.Load();
         auto tab = std::make_unique<PdfTab>();
         tab->renderVersion = ++g_nextRenderVersion;
-        tab->ctx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
-        g_pdf.setAaLevel(tab->ctx, 8);
-        g_pdf.registerHandlers(tab->ctx);
-        auto utf8 = ToUtf8(path);
-        tab->doc = g_pdf.openDocument(tab->ctx, utf8.c_str());
+        tab->renderSession = CreatePageRenderSession(path);
+        tab->ctx = tab->renderSession->uiContext;
+        tab->doc = tab->renderSession->document;
         tab->pageCount = g_pdf.countPages(tab->ctx, tab->doc);
         tab->path = path;
         tab->name = std::filesystem::path(path).filename().wstring();
@@ -12504,6 +12557,7 @@ namespace
         tab.annotations.clear();
         if (!g_pdf.loadAnnotations || !tab.ctx || !tab.doc || tab.pageCount <= 0) return;
 
+        PdfDocumentLock pdfLock(tab);
         constexpr int MaxPdfAnnotations = 4096;
         std::vector<QuietPdfAnnotationInfo> items(MaxPdfAnnotations);
         int count = g_pdf.loadAnnotations(tab.ctx, tab.doc, items.data(), static_cast<int>(items.size()));
@@ -12558,11 +12612,9 @@ namespace
         try
         {
             g_pdf.Load();
-            tab.ctx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
-            g_pdf.setAaLevel(tab.ctx, 8);
-            g_pdf.registerHandlers(tab.ctx);
-            auto utf8 = ToUtf8(path);
-            tab.doc = g_pdf.openDocument(tab.ctx, utf8.c_str());
+            tab.renderSession = CreatePageRenderSession(path);
+            tab.ctx = tab.renderSession->uiContext;
+            tab.doc = tab.renderSession->document;
             int newPageCount = g_pdf.countPages(tab.ctx, tab.doc);
             if (oldPageCount > 0 && newPageCount != oldPageCount)
             {
@@ -12604,11 +12656,9 @@ namespace
         try
         {
             g_pdf.Load();
-            tab.ctx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
-            g_pdf.setAaLevel(tab.ctx, 8);
-            g_pdf.registerHandlers(tab.ctx);
-            auto utf8 = ToUtf8(path);
-            tab.doc = g_pdf.openDocument(tab.ctx, utf8.c_str());
+            tab.renderSession = CreatePageRenderSession(path);
+            tab.ctx = tab.renderSession->uiContext;
+            tab.doc = tab.renderSession->document;
             tab.pageCount = g_pdf.countPages(tab.ctx, tab.doc);
             tab.path = path;
             tab.name = std::filesystem::path(path).filename().wstring();
@@ -12713,7 +12763,11 @@ namespace
         }
 
         std::string tempUtf8 = ToUtf8(temp.wstring());
-        int saved = g_pdf.saveAnnotations(tab.ctx, tab.doc, tempUtf8.c_str(), annotations.empty() ? nullptr : annotations.data(), static_cast<int>(annotations.size()));
+        int saved = 0;
+        {
+            PdfDocumentLock pdfLock(tab);
+            saved = g_pdf.saveAnnotations(tab.ctx, tab.doc, tempUtf8.c_str(), annotations.empty() ? nullptr : annotations.data(), static_cast<int>(annotations.size()));
+        }
         if (!saved || !std::filesystem::exists(temp))
         {
             try { std::filesystem::remove(temp); } catch (...) {}
