@@ -117,6 +117,74 @@ extern "C" const char* quiet_pdf_last_error()
     return quiet_last_error;
 }
 
+extern "C" int quiet_pdf_get_page_bounds(
+    fz_context* ctx,
+    fz_document* fzdoc,
+    fz_rect* out,
+    int max_pages)
+{
+    quiet_set_last_error("");
+    if (!ctx || !fzdoc || !out || max_pages <= 0)
+    {
+        quiet_set_last_error("invalid quiet_pdf_get_page_bounds arguments");
+        return 0;
+    }
+
+    int count = 0;
+    fz_try(ctx)
+    {
+        pdf_document* doc = pdf_specifics(ctx, fzdoc);
+        if (!doc)
+            fz_throw(ctx, FZ_ERROR_FORMAT, "document is not a PDF");
+
+        count = std::min(pdf_count_pages(ctx, doc), max_pages);
+        for (int page_index = 0; page_index < count; ++page_index)
+        {
+            fz_rect bounds = fz_make_rect(0, 0, 612, 792);
+            fz_try(ctx)
+            {
+                pdf_obj* page_obj = pdf_lookup_page_obj(ctx, doc, page_index);
+                fz_rect box{};
+                fz_matrix transform{};
+                pdf_page_obj_transform(ctx, page_obj, &box, &transform);
+                fz_rect candidate = fz_transform_rect(box, transform);
+                if (std::isfinite(candidate.x0) && std::isfinite(candidate.y0) &&
+                    std::isfinite(candidate.x1) && std::isfinite(candidate.y1) &&
+                    candidate.x1 - candidate.x0 >= 1 && candidate.y1 - candidate.y0 >= 1)
+                    bounds = candidate;
+            }
+            fz_catch(ctx)
+            {
+                // Keep a standard page fallback for a malformed individual page.
+            }
+            out[page_index] = bounds;
+        }
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        count = 0;
+    }
+    return count;
+}
+
+static bool quiet_page_has_supported_markup(fz_context* ctx, pdf_document* doc, int page_index)
+{
+    pdf_obj* page_obj = pdf_lookup_page_obj(ctx, doc, page_index);
+    pdf_obj* annots = pdf_dict_get(ctx, page_obj, PDF_NAME(Annots));
+    int annot_count = pdf_array_len(ctx, annots);
+    for (int i = 0; i < annot_count; ++i)
+    {
+        pdf_obj* annot = pdf_array_get(ctx, annots, i);
+        pdf_obj* subtype = pdf_dict_get(ctx, annot, PDF_NAME(Subtype));
+        if (pdf_name_eq(ctx, subtype, PDF_NAME(Highlight)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Underline)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(StrikeOut)))
+            return true;
+    }
+    return false;
+}
+
 extern "C" int quietmupdf_anchor()
 {
     return 0;
@@ -357,6 +425,8 @@ extern "C" int quiet_pdf_load_annotations(
         int page_count = pdf_count_pages(ctx, doc);
         for (int page_index = 0; page_index < page_count && count < max_annotations; ++page_index)
         {
+            if (!quiet_page_has_supported_markup(ctx, doc, page_index))
+                continue;
             pdf_page* page = nullptr;
             fz_try(ctx)
             {

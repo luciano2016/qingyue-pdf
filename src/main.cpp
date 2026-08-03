@@ -1004,6 +1004,7 @@ namespace
         using MatchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
+        using PageBoundsFn = int(__cdecl*)(fz_context*, fz_document*, fz_rect*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
         using SelectWordAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_quad*, int, char*, int);
         using TextCharBoxesFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_rect*, int);
@@ -1040,6 +1041,7 @@ namespace
             GetOptional(matchPageNumber, "fz_match_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(loadAnnotations, "quiet_pdf_load_annotations");
+            Get(pageBounds, "quiet_pdf_get_page_bounds");
             Get(selectText, "quiet_pdf_select_text");
             GetOptional(selectWordAtPoint, "quiet_pdf_select_word_at_point");
             GetOptional(textCharBoxes, "quiet_pdf_get_text_char_boxes");
@@ -1076,6 +1078,7 @@ namespace
         MatchPageNumberFn matchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
         LoadAnnotationsFn loadAnnotations{};
+        PageBoundsFn pageBounds{};
         SelectTextFn selectText{};
         SelectWordAtPointFn selectWordAtPoint{};
         TextCharBoxesFn textCharBoxes{};
@@ -7932,6 +7935,41 @@ namespace
         return total;
     }
 
+    void LoadPageGeometry(PdfTab& tab)
+    {
+        tab.pages.assign(static_cast<size_t>(std::max(0, tab.pageCount)), PageInfo{ 612.0, 792.0 });
+        if (tab.pageCount <= 0)
+            return;
+
+        std::vector<fz_rect> bounds(static_cast<size_t>(tab.pageCount));
+        int loaded = g_pdf.pageBounds(tab.ctx, tab.doc, bounds.data(), tab.pageCount);
+        if (loaded <= 0)
+        {
+            fz_page* page = g_pdf.loadPage(tab.ctx, tab.doc, 0);
+            fz_rect first = g_pdf.boundPage(tab.ctx, page);
+            g_pdf.dropPage(tab.ctx, page);
+            PageInfo fallback{
+                std::max(1.0, static_cast<double>(first.x1 - first.x0)),
+                std::max(1.0, static_cast<double>(first.y1 - first.y0))
+            };
+            std::fill(tab.pages.begin(), tab.pages.end(), fallback);
+            return;
+        }
+
+        PageInfo fallback{ 612.0, 792.0 };
+        for (int i = 0; i < tab.pageCount; ++i)
+        {
+            if (i < loaded)
+            {
+                fz_rect const& bound = bounds[static_cast<size_t>(i)];
+                double width = static_cast<double>(bound.x1 - bound.x0);
+                double height = static_cast<double>(bound.y1 - bound.y0);
+                if (std::isfinite(width) && std::isfinite(height) && width >= 1.0 && height >= 1.0)
+                    fallback = PageInfo{ width, height };
+            }
+            tab.pages[static_cast<size_t>(i)] = fallback;
+        }
+    }
     void OpenPdf(HWND hwnd, const std::wstring& path)
     {
         g_pdf.Load();
@@ -7945,16 +7983,7 @@ namespace
         tab->name = std::filesystem::path(path).filename().wstring();
         UpdateTabFileStamp(*tab);
         int restorePage = RecentPageForPath(path);
-        tab->pages.resize(static_cast<size_t>(tab->pageCount));
-        int probe = std::min(tab->pageCount, 1000);
-        for (int i = 0; i < probe; ++i)
-        {
-            fz_page* page = g_pdf.loadPage(tab->ctx, tab->doc, i);
-            fz_rect b = g_pdf.boundPage(tab->ctx, page);
-            tab->pages[static_cast<size_t>(i)] = PageInfo{ std::max(1.0, static_cast<double>(b.x1 - b.x0)), std::max(1.0, static_cast<double>(b.y1 - b.y0)) };
-            g_pdf.dropPage(tab->ctx, page);
-        }
-        for (int i = probe; i < tab->pageCount; ++i) tab->pages[static_cast<size_t>(i)] = tab->pages[0];
+        LoadPageGeometry(*tab);
         fz_outline* outline = g_pdf.loadOutline(tab->ctx, tab->doc);
         if (outline)
         {
@@ -7995,6 +8024,17 @@ namespace
                 return i;
         }
         return -1;
+    }
+
+    void OpenOrActivatePdf(HWND hwnd, std::wstring const& path)
+    {
+        int existing = FindOpenTabByPath(path);
+        if (existing >= 0)
+        {
+            ActivateTab(hwnd, existing);
+            return;
+        }
+        OpenPdf(hwnd, path);
     }
 
     void ApplySessionPosition(PdfTab& tab, LastSessionItem const& item)
@@ -8047,11 +8087,11 @@ namespace
         return false;
     }
 
-    void RestoreLastSessionAndOpenLaunchFiles(HWND hwnd, std::vector<std::wstring> const& launchFiles)
+    void RestoreLastSessionAndOpenLaunchFiles(HWND hwnd, std::vector<std::wstring> const& launchFiles, bool restoreSavedSession)
     {
         std::vector<int> restoredIndices;
-        std::vector<LastSessionItem> savedTabs = g_lastSessionTabs;
-        int savedActive = g_lastSessionActive;
+        std::vector<LastSessionItem> savedTabs = restoreSavedSession ? g_lastSessionTabs : std::vector<LastSessionItem>{};
+        int savedActive = restoreSavedSession ? g_lastSessionActive : -1;
 
         for (auto const& item : savedTabs)
         {
@@ -8105,7 +8145,7 @@ namespace
         ofn.nMaxFile = MAX_PATH;
         ofn.lpstrFilter = L"PDF \u6587\u4ef6 (*.pdf)\0*.pdf\0\u6240\u6709\u6587\u4ef6 (*.*)\0*.*\0";
         ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-        if (GetOpenFileNameW(&ofn)) OpenPdf(hwnd, file);
+        if (GetOpenFileNameW(&ofn)) OpenOrActivatePdf(hwnd, file);
     }
 
     void DisableNativeScrollbars(HWND hwnd)
@@ -12665,16 +12705,7 @@ namespace
             UpdateTabFileStamp(tab);
             tab.currentPage = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
             tab.zoom = zoom;
-            tab.pages.resize(static_cast<size_t>(tab.pageCount));
-            int probe = std::min(tab.pageCount, 1000);
-            for (int i = 0; i < probe; ++i)
-            {
-                fz_page* pdfPage = g_pdf.loadPage(tab.ctx, tab.doc, i);
-                fz_rect b = g_pdf.boundPage(tab.ctx, pdfPage);
-                tab.pages[static_cast<size_t>(i)] = PageInfo{ std::max(1.0, static_cast<double>(b.x1 - b.x0)), std::max(1.0, static_cast<double>(b.y1 - b.y0)) };
-                g_pdf.dropPage(tab.ctx, pdfPage);
-            }
-            for (int i = probe; i < tab.pageCount; ++i) tab.pages[static_cast<size_t>(i)] = tab.pages[0];
+            LoadPageGeometry(tab);
             fz_outline* outline = g_pdf.loadOutline(tab.ctx, tab.doc);
             if (outline)
             {
@@ -13164,6 +13195,13 @@ namespace
     {
         switch (action)
         {
+        case HomeAction::Open:
+            if (recentIndex >= 0 && recentIndex < static_cast<int>(g_recent.size()) &&
+                std::filesystem::exists(g_recent[static_cast<size_t>(recentIndex)].path))
+            {
+                OpenOrActivatePdf(hwnd, g_recent[static_cast<size_t>(recentIndex)].path);
+            }
+            return true;
         case HomeAction::Pin:
             ToggleRecentPinned(recentIndex);
             return true;
@@ -13969,7 +14007,7 @@ namespace
                 wchar_t path[MAX_PATH]{};
                 if (DragQueryFileW(drop, i, path, MAX_PATH))
                 {
-                    try { if (_wcsicmp(std::filesystem::path(path).extension().c_str(), L".pdf") == 0) OpenPdf(hwnd, path); }
+                    try { if (_wcsicmp(std::filesystem::path(path).extension().c_str(), L".pdf") == 0) OpenOrActivatePdf(hwnd, path); }
                     catch (std::exception const& e) { MessageBoxA(hwnd, e.what(), "QingYuePDF", MB_ICONERROR); }
                 }
             }
@@ -14477,7 +14515,7 @@ namespace
                     if (recentIndex >= 0 && recentIndex < static_cast<int>(g_recent.size()) &&
                         std::filesystem::exists(g_recent[static_cast<size_t>(recentIndex)].path))
                     {
-                        OpenPdf(hwnd, g_recent[static_cast<size_t>(recentIndex)].path);
+                        OpenOrActivatePdf(hwnd, g_recent[static_cast<size_t>(recentIndex)].path);
                     }
                 }
                 return 0;
@@ -15812,7 +15850,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
             CW_USEDEFAULT, CW_USEDEFAULT, 1180, 840, nullptr, nullptr, instance, nullptr);
         if (!g_hwnd) return 1;
         ApplyWindowChrome();
-        RestoreLastSessionAndOpenLaunchFiles(g_hwnd, launchFiles);
+        RestoreLastSessionAndOpenLaunchFiles(g_hwnd, launchFiles, !forceNewWindow);
         ShowWindow(g_hwnd, show == SW_SHOWMINIMIZED ? show : SW_SHOWMAXIMIZED);
         UpdateWindow(g_hwnd);
         MSG msg{};
