@@ -13,6 +13,7 @@
 #include <wincrypt.h>
 #include <imm.h>
 #include <oleauto.h>
+#include <oleacc.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1365,6 +1366,8 @@ namespace
     std::wstring g_selectionText;
     class QuietPdfUiaProvider;
     QuietPdfUiaProvider* g_uiaProvider{};
+    class QuietPdfAccessible;
+    QuietPdfAccessible* g_accessibleProvider{};
     void NotifyUiaSelectionChanged();
     void NotifyUiaFocusChanged();
     bool HasUiaTextSelection();
@@ -6722,6 +6725,209 @@ namespace
         volatile LONG m_ref;
     };
 
+    class QuietPdfAccessible final : public IAccessible
+    {
+    public:
+        QuietPdfAccessible() : m_ref(1) {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
+        {
+            if (!ppvObject) return E_POINTER;
+            *ppvObject = nullptr;
+            if (riid == IID_IUnknown || riid == IID_IDispatch || riid == IID_IAccessible)
+                *ppvObject = static_cast<IAccessible*>(this);
+            else
+                return E_NOINTERFACE;
+            AddRef();
+            return S_OK;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_ref)); }
+
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+            if (!ref) delete this;
+            return ref;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* pctinfo) override
+        {
+            if (!pctinfo) return E_POINTER;
+            *pctinfo = 0;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo**) override { return E_NOTIMPL; }
+        HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID, LPOLESTR*, UINT, LCID, DISPID*) override { return E_NOTIMPL; }
+        HRESULT STDMETHODCALLTYPE Invoke(DISPID, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*) override { return E_NOTIMPL; }
+
+        HRESULT STDMETHODCALLTYPE get_accParent(IDispatch** ppdispParent) override
+        {
+            if (!ppdispParent) return E_POINTER;
+            *ppdispParent = nullptr;
+            return S_FALSE;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accChildCount(long* pcountChildren) override
+        {
+            if (!pcountChildren) return E_POINTER;
+            *pcountChildren = 0;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch** ppdispChild) override
+        {
+            if (!ppdispChild) return E_POINTER;
+            *ppdispChild = nullptr;
+            return S_FALSE;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accName(VARIANT varChild, BSTR* pszName) override
+        {
+            if (!pszName) return E_POINTER;
+            *pszName = nullptr;
+            if (!IsSelf(varChild)) return E_INVALIDARG;
+            std::wstring text = AccessibleText();
+            *pszName = SysAllocString(text.c_str());
+            return *pszName ? S_OK : E_OUTOFMEMORY;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accValue(VARIANT varChild, BSTR* pszValue) override
+        {
+            if (!pszValue) return E_POINTER;
+            *pszValue = nullptr;
+            if (!IsSelf(varChild)) return E_INVALIDARG;
+            std::wstring text = AccessibleText();
+            *pszValue = SysAllocString(text.c_str());
+            return *pszValue ? S_OK : E_OUTOFMEMORY;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accDescription(VARIANT, BSTR* pszDescription) override
+        {
+            if (!pszDescription) return E_POINTER;
+            *pszDescription = SysAllocString(L"PDF document text selection");
+            return *pszDescription ? S_OK : E_OUTOFMEMORY;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accRole(VARIANT varChild, VARIANT* pvarRole) override
+        {
+            if (!pvarRole) return E_POINTER;
+            if (!IsSelf(varChild)) return E_INVALIDARG;
+            VariantInit(pvarRole);
+            pvarRole->vt = VT_I4;
+            pvarRole->lVal = ROLE_SYSTEM_TEXT;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accState(VARIANT varChild, VARIANT* pvarState) override
+        {
+            if (!pvarState) return E_POINTER;
+            if (!IsSelf(varChild)) return E_INVALIDARG;
+            VariantInit(pvarState);
+            pvarState->vt = VT_I4;
+            pvarState->lVal = STATE_SYSTEM_FOCUSABLE;
+            if (::GetFocus() == g_hwnd) pvarState->lVal |= STATE_SYSTEM_FOCUSED;
+            if (HasUiaTextSelection()) pvarState->lVal |= STATE_SYSTEM_SELECTED;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR* pszHelp) override { if (!pszHelp) return E_POINTER; *pszHelp = nullptr; return S_FALSE; }
+        HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR* pszHelpFile, VARIANT, long* pidTopic) override { if (!pszHelpFile || !pidTopic) return E_POINTER; *pszHelpFile = nullptr; *pidTopic = 0; return S_FALSE; }
+        HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT, BSTR* pszKeyboardShortcut) override { if (!pszKeyboardShortcut) return E_POINTER; *pszKeyboardShortcut = nullptr; return S_FALSE; }
+
+        HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT* pvarChild) override
+        {
+            if (!pvarChild) return E_POINTER;
+            VariantInit(pvarChild);
+            pvarChild->vt = VT_I4;
+            pvarChild->lVal = CHILDID_SELF;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT* pvarChildren) override
+        {
+            if (!pvarChildren) return E_POINTER;
+            VariantInit(pvarChildren);
+            if (!HasUiaTextSelection()) return S_FALSE;
+            pvarChildren->vt = VT_I4;
+            pvarChildren->lVal = CHILDID_SELF;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT, BSTR* pszDefaultAction) override { if (!pszDefaultAction) return E_POINTER; *pszDefaultAction = nullptr; return S_FALSE; }
+        HRESULT STDMETHODCALLTYPE accSelect(long, VARIANT) override { return S_FALSE; }
+
+        HRESULT STDMETHODCALLTYPE accLocation(long* pxLeft, long* pyTop, long* pcxWidth, long* pcyHeight, VARIANT varChild) override
+        {
+            if (!pxLeft || !pyTop || !pcxWidth || !pcyHeight) return E_POINTER;
+            if (!IsSelf(varChild)) return E_INVALIDARG;
+            UiaSelectionSnapshot snapshot = BuildUiaSelectionSnapshot();
+            RECT r{};
+            if (!snapshot.screenRects.empty())
+            {
+                r = snapshot.screenRects.front();
+                for (RECT const& item : snapshot.screenRects)
+                    UnionRect(&r, &r, &item);
+            }
+            else
+            {
+                GetWindowRect(g_hwnd, &r);
+            }
+            *pxLeft = r.left;
+            *pyTop = r.top;
+            *pcxWidth = std::max<LONG>(0, r.right - r.left);
+            *pcyHeight = std::max<LONG>(0, r.bottom - r.top);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE accNavigate(long, VARIANT, VARIANT* pvarEndUpAt) override { if (!pvarEndUpAt) return E_POINTER; VariantInit(pvarEndUpAt); return S_FALSE; }
+
+        HRESULT STDMETHODCALLTYPE accHitTest(long xLeft, long yTop, VARIANT* pvarChild) override
+        {
+            if (!pvarChild) return E_POINTER;
+            VariantInit(pvarChild);
+            RECT r{};
+            GetWindowRect(g_hwnd, &r);
+            POINT pt{ xLeft, yTop };
+            if (!PtInRect(&r, pt)) return S_FALSE;
+            pvarChild->vt = VT_I4;
+            pvarChild->lVal = CHILDID_SELF;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE accDoDefaultAction(VARIANT) override { return S_FALSE; }
+        HRESULT STDMETHODCALLTYPE put_accName(VARIANT, BSTR) override { return E_NOTIMPL; }
+        HRESULT STDMETHODCALLTYPE put_accValue(VARIANT, BSTR) override { return E_NOTIMPL; }
+
+    private:
+        static bool IsSelf(VARIANT const& child)
+        {
+            return child.vt == VT_EMPTY || (child.vt == VT_I4 && child.lVal == CHILDID_SELF);
+        }
+
+        static std::wstring AccessibleText()
+        {
+            if (HasUiaTextSelection()) return g_selectionText;
+            if (PdfTab* tab = Active(); tab && !tab->name.empty()) return tab->name;
+            return AppName;
+        }
+
+        volatile LONG m_ref;
+    };
+
+    QuietPdfAccessible* EnsureAccessibleProvider()
+    {
+        if (!g_accessibleProvider) g_accessibleProvider = new QuietPdfAccessible();
+        return g_accessibleProvider;
+    }
+
+    void ReleaseAccessibleProvider()
+    {
+        QuietPdfAccessible* provider = g_accessibleProvider;
+        g_accessibleProvider = nullptr;
+        if (provider) provider->Release();
+    }
     QuietPdfUiaProvider* EnsureUiaProvider()
     {
         if (!g_uiaProvider) g_uiaProvider = new QuietPdfUiaProvider();
@@ -6740,7 +6946,14 @@ namespace
         if (!g_hwnd) return;
         QuietPdfUiaProvider* provider = EnsureUiaProvider();
         if (!provider) return;
+        EnsureAccessibleProvider();
         UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_Text_TextSelectionChangedEventId);
+        NotifyWinEvent(EVENT_OBJECT_FOCUS, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
+        NotifyWinEvent(EVENT_OBJECT_SELECTION, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
+        NotifyWinEvent(EVENT_OBJECT_SELECTIONWITHIN, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
+        NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
+        NotifyWinEvent(EVENT_OBJECT_VALUECHANGE, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
+        NotifyWinEvent(EVENT_OBJECT_LOCATIONCHANGE, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
         NotifyWinEvent(EVENT_OBJECT_TEXTSELECTIONCHANGED, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
     }
 
@@ -6749,7 +6962,9 @@ namespace
         if (!g_hwnd) return;
         QuietPdfUiaProvider* provider = EnsureUiaProvider();
         if (!provider) return;
+        EnsureAccessibleProvider();
         UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_AutomationFocusChangedEventId);
+        NotifyWinEvent(EVENT_OBJECT_FOCUS, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
     }
     void ScrollToPage(PdfTab& tab, int page);
     void LoadAnnotationsFromPdf(PdfTab& tab);
@@ -13060,6 +13275,8 @@ namespace
         switch (msg)
         {
         case WM_GETOBJECT:
+            if (static_cast<LONG>(lParam) == OBJID_CLIENT)
+                return LresultFromObject(IID_IAccessible, wParam, EnsureAccessibleProvider());
             return UiaReturnRawElementProvider(hwnd, wParam, lParam, EnsureUiaProvider());
         case WM_CREATE:
             g_hwnd = hwnd;
@@ -13231,7 +13448,26 @@ namespace
             DisableNativeScrollbars(hwnd);
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             return 0;
+        case WM_GETTEXTLENGTH:
+            if (HasUiaTextSelection()) return static_cast<LRESULT>(g_selectionText.size());
+            break;
+        case WM_GETTEXT:
+            if (HasUiaTextSelection() && lParam && wParam > 0)
+            {
+                wchar_t* buffer = reinterpret_cast<wchar_t*>(lParam);
+                size_t capacity = static_cast<size_t>(wParam);
+                size_t count = std::min(capacity - 1, g_selectionText.size());
+                if (count > 0) std::memcpy(buffer, g_selectionText.data(), count * sizeof(wchar_t));
+                buffer[count] = L'\0';
+                return static_cast<LRESULT>(count);
+            }
+            break;
         case WM_COMMAND:
+            if (LOWORD(wParam) == 0xE122 && g_hasContentSelection)
+            {
+                CopyCurrentSelectionToClipboard(hwnd);
+                return 0;
+            }
             Command(hwnd, LOWORD(wParam));
             return 0;
         case WM_MEASUREITEM:
@@ -13262,6 +13498,13 @@ namespace
             }
             break;
         }
+        case WM_COPY:
+            if (g_hasContentSelection)
+            {
+                CopyCurrentSelectionToClipboard(hwnd);
+                return 0;
+            }
+            break;
         case WM_COPYDATA:
             OpenFilesFromCopyData(hwnd, reinterpret_cast<COPYDATASTRUCT const*>(lParam));
             return TRUE;
@@ -15018,6 +15261,7 @@ namespace
             ReleasePaintBuffer();
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
             ReleaseUiaProvider();
+            ReleaseAccessibleProvider();
             SaveState();
             PostQuitMessage(0);
             return 0;
