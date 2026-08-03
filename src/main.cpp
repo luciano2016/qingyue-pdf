@@ -1000,6 +1000,10 @@ namespace
         using DeviceRgbFn = fz_colorspace*(__cdecl*)(fz_context*);
         using NewPixmapFromPageNumberFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int);
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
+        using NewPixmapFromPageNumberClipCookieFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int, void*);
+        using NewRenderCookieFn = void*(__cdecl*)();
+        using AbortRenderCookieFn = void(__cdecl*)(void*);
+        using DropRenderCookieFn = void(__cdecl*)(void*);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
         using MatchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
@@ -1037,6 +1041,10 @@ namespace
             Get(deviceRgb, "fz_device_rgb");
             Get(newPixmapFromPageNumber, "fz_new_pixmap_from_page_number");
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
+            Get(newPixmapFromPageNumberClipCookie, "quiet_new_pixmap_from_page_number_clip_cookie");
+            Get(newRenderCookie, "quiet_new_render_cookie");
+            Get(abortRenderCookie, "quiet_abort_render_cookie");
+            Get(dropRenderCookie, "quiet_drop_render_cookie");
             Get(searchPageNumber, "fz_search_page_number");
             GetOptional(matchPageNumber, "fz_match_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
@@ -1074,6 +1082,10 @@ namespace
         DeviceRgbFn deviceRgb{};
         NewPixmapFromPageNumberFn newPixmapFromPageNumber{};
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
+        NewPixmapFromPageNumberClipCookieFn newPixmapFromPageNumberClipCookie{};
+        NewRenderCookieFn newRenderCookie{};
+        AbortRenderCookieFn abortRenderCookie{};
+        DropRenderCookieFn dropRenderCookie{};
         SearchPageNumberFn searchPageNumber{};
         MatchPageNumberFn matchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
@@ -1250,6 +1262,8 @@ namespace
     std::thread g_pageRenderThread;
     std::deque<PageRenderRequest> g_pageRenderQueue;
     PageRenderRequest g_pageRenderActiveRequest;
+    void* g_pageRenderActiveCookie{};
+    unsigned long long g_pageRenderCanceledSerial{};
     bool g_pageRenderActive{};
     bool g_pageRenderStop{};
     unsigned long long g_pageRenderSerial{};
@@ -4331,7 +4345,7 @@ namespace
     int SinglePageContentHeight(PdfTab const& tab);
     int SinglePageMaxScroll(PdfTab const& tab);
 
-    PageImage RenderPageAtScale(PdfTab& tab, int index, double renderScale, bool applyTheme, int renderTheme = -1, bool renderToDib = false)
+    PageImage RenderPageAtScale(PdfTab& tab, int index, double renderScale, bool applyTheme, int renderTheme = -1, bool renderToDib = false, void* renderCookie = nullptr)
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
@@ -4344,19 +4358,37 @@ namespace
                 g_pdf.dropPage(tab.ctx, page);
                 int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
                 int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
-                pixmap = g_pdf.newPixmapFromPageNumberClip(
-                    tab.ctx,
-                    tab.doc,
-                    index,
-                    matrix,
-                    g_pdf.deviceRgb(tab.ctx),
-                    0,
-                    0,
-                    0,
-                    widthPx,
-                    heightPx);
+                if (renderCookie)
+                {
+                    pixmap = g_pdf.newPixmapFromPageNumberClipCookie(
+                        tab.ctx,
+                        tab.doc,
+                        index,
+                        matrix,
+                        g_pdf.deviceRgb(tab.ctx),
+                        0,
+                        0,
+                        0,
+                        widthPx,
+                        heightPx,
+                        renderCookie);
+                }
+                else
+                {
+                    pixmap = g_pdf.newPixmapFromPageNumberClip(
+                        tab.ctx,
+                        tab.doc,
+                        index,
+                        matrix,
+                        g_pdf.deviceRgb(tab.ctx),
+                        0,
+                        0,
+                        0,
+                        widthPx,
+                        heightPx);
+                }
             }
-            if (!pixmap)
+            if (!pixmap && !renderCookie)
                 pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceRgb(tab.ctx), 0);
         }
         PageImage image;
@@ -4526,23 +4558,41 @@ namespace
         return PixmapToImageFor(tab, pixmap, PdfRenderTheme());
     }
 
-    PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme, bool renderToDib = false)
+    PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme, bool renderToDib = false, void* renderCookie = nullptr)
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
         {
             PdfDocumentLock pdfLock(tab);
-            pixmap = g_pdf.newPixmapFromPageNumberClip(
-                tab.ctx,
-                tab.doc,
-                index,
-                matrix,
-                g_pdf.deviceRgb(tab.ctx),
-                0,
-                tile.left,
-                tile.top,
-                tile.right,
-                tile.bottom);
+            if (renderCookie)
+            {
+                pixmap = g_pdf.newPixmapFromPageNumberClipCookie(
+                    tab.ctx,
+                    tab.doc,
+                    index,
+                    matrix,
+                    g_pdf.deviceRgb(tab.ctx),
+                    0,
+                    tile.left,
+                    tile.top,
+                    tile.right,
+                    tile.bottom,
+                    renderCookie);
+            }
+            else
+            {
+                pixmap = g_pdf.newPixmapFromPageNumberClip(
+                    tab.ctx,
+                    tab.doc,
+                    index,
+                    matrix,
+                    g_pdf.deviceRgb(tab.ctx),
+                    0,
+                    tile.left,
+                    tile.top,
+                    tile.right,
+                    tile.bottom);
+            }
         }
         PageImage image = PixmapToImageFor(tab, pixmap, renderTheme, renderToDib);
         if (pixmap) g_pdf.dropPixmap(tab.ctx, pixmap);
@@ -4782,6 +4832,7 @@ namespace
         for (;;)
         {
             PageRenderRequest request;
+            void* renderCookie{};
             {
                 std::unique_lock<std::mutex> lock(g_pageRenderMutex);
                 g_pageRenderCv.wait(lock, [] { return g_pageRenderStop || !g_pageRenderQueue.empty(); });
@@ -4789,6 +4840,8 @@ namespace
                 request = g_pageRenderQueue.front();
                 g_pageRenderQueue.pop_front();
                 g_pageRenderActiveRequest = request;
+                renderCookie = g_pdf.newRenderCookie();
+                g_pageRenderActiveCookie = renderCookie;
                 g_pageRenderActive = true;
             }
 
@@ -4809,11 +4862,11 @@ namespace
                 if (request.tile)
                 {
                     RECT tile{ request.x, request.y, request.x + request.w, request.y + request.h };
-                    result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme, true);
+                    result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme, true, renderCookie);
                 }
                 else
                 {
-                    result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme, true);
+                    result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme, true, renderCookie);
                 }
             }
             catch (...)
@@ -4825,8 +4878,12 @@ namespace
             {
                 std::lock_guard<std::mutex> lock(g_pageRenderMutex);
                 g_pageRenderActive = false;
-                stale = g_pageRenderStop;
+                stale = g_pageRenderStop || g_pageRenderCanceledSerial == request.serial;
+                if (g_pageRenderCanceledSerial == request.serial)
+                    g_pageRenderCanceledSerial = 0;
+                g_pageRenderActiveCookie = nullptr;
             }
+            g_pdf.dropRenderCookie(renderCookie);
             if (!stale && (result->image.dib || !result->image.bgra.empty()) && IsWindow(request.target))
             {
                 if (!result->image.bgra.empty())
@@ -4850,12 +4907,21 @@ namespace
         g_pageRenderThread = std::thread(PageRenderWorkerMain);
     }
 
+    void AbortActivePageRenderLocked()
+    {
+        if (!g_pageRenderActive) return;
+        g_pageRenderCanceledSerial = g_pageRenderActiveRequest.serial;
+        if (g_pageRenderActiveCookie)
+            g_pdf.abortRenderCookie(g_pageRenderActiveCookie);
+    }
+
     void StopPageRenderWorker()
     {
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             g_pageRenderStop = true;
             g_pageRenderQueue.clear();
+            AbortActivePageRenderLocked();
             ++g_pageRenderSerial;
         }
         g_pageRenderCv.notify_all();
@@ -4866,7 +4932,29 @@ namespace
     {
         std::lock_guard<std::mutex> lock(g_pageRenderMutex);
         g_pageRenderQueue.clear();
+        AbortActivePageRenderLocked();
         ++g_pageRenderSerial;
+    }
+
+    void CancelObsoletePageRendersForZoom(PdfTab const& tab)
+    {
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        g_pageRenderQueue.erase(
+            std::remove_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& request)
+                {
+                    return request.documentVersion == tab.renderVersion &&
+                        _wcsicmp(request.path.c_str(), tab.path.c_str()) == 0;
+                }),
+            g_pageRenderQueue.end());
+        if (g_pageRenderActive &&
+            g_pageRenderActiveRequest.documentVersion == tab.renderVersion &&
+            _wcsicmp(g_pageRenderActiveRequest.path.c_str(), tab.path.c_str()) == 0)
+        {
+            AbortActivePageRenderLocked();
+        }
     }
 
     void HomeThumbWorkerMain()
@@ -4959,7 +5047,8 @@ namespace
             auto insertAt = std::find_if(
                 g_pageRenderQueue.begin(),
                 g_pageRenderQueue.end(),
-                [&](PageRenderRequest const& queued) { return queued.priority > priority; });
+                [&](PageRenderRequest const& queued)
+                { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
             g_pageRenderQueue.insert(insertAt, request);
             constexpr size_t maxQueuedPageRenders = 6;
             while (g_pageRenderQueue.size() > maxQueuedPageRenders)
@@ -5026,7 +5115,8 @@ namespace
             auto insertAt = std::find_if(
                 g_pageRenderQueue.begin(),
                 g_pageRenderQueue.end(),
-                [&](PageRenderRequest const& queued) { return queued.priority > priority; });
+                [&](PageRenderRequest const& queued)
+                { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
             g_pageRenderQueue.insert(insertAt, request);
             constexpr size_t maxQueuedPreviewRenders = 2;
             auto isQueuedPreview = [](PageRenderRequest const& queued)
@@ -5252,7 +5342,8 @@ namespace
             auto insertAt = std::find_if(
                 g_pageRenderQueue.begin(),
                 g_pageRenderQueue.end(),
-                [&](PageRenderRequest const& queued) { return queued.priority > priority; });
+                [&](PageRenderRequest const& queued)
+                { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
             g_pageRenderQueue.insert(insertAt, request);
             constexpr size_t maxQueuedTileRenders = 40;
             while (g_pageRenderQueue.size() > maxQueuedTileRenders)
@@ -8907,6 +8998,7 @@ namespace
             tab.zoomFallbackUntil = GetTickCount64() + 1400;
         }
 
+        CancelObsoletePageRendersForZoom(tab);
         tab.zoom = clampedZoom;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;

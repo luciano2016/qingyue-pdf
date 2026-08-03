@@ -190,7 +190,7 @@ extern "C" int quietmupdf_anchor()
     return 0;
 }
 
-extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
+static fz_pixmap* quiet_new_pixmap_from_page_number_clip_impl(
     fz_context* ctx,
     fz_document* doc,
     int number,
@@ -200,7 +200,8 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
     int x0,
     int y0,
     int x1,
-    int y1)
+    int y1,
+    fz_cookie* cookie)
 {
     fz_page* page = nullptr;
     fz_pixmap* pix = nullptr;
@@ -213,7 +214,7 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
         pix = fz_new_pixmap_with_bbox(ctx, cs, bbox, nullptr, alpha);
         fz_clear_pixmap_with_value(ctx, pix, alpha ? 0 : 255);
         dev = fz_new_draw_device(ctx, ctm, pix);
-        fz_run_page_contents(ctx, page, dev, fz_identity, nullptr);
+        fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
         fz_close_device(ctx, dev);
     }
     fz_always(ctx)
@@ -228,6 +229,53 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
     }
 
     return pix;
+}
+
+extern "C" fz_cookie* quiet_new_render_cookie()
+{
+    return static_cast<fz_cookie*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(fz_cookie)));
+}
+
+extern "C" void quiet_abort_render_cookie(fz_cookie* cookie)
+{
+    if (cookie)
+        InterlockedExchange(reinterpret_cast<volatile LONG*>(&cookie->abort), 1);
+}
+
+extern "C" void quiet_drop_render_cookie(fz_cookie* cookie)
+{
+    if (cookie) HeapFree(GetProcessHeap(), 0, cookie);
+}
+
+extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip(
+    fz_context* ctx,
+    fz_document* doc,
+    int number,
+    fz_matrix ctm,
+    fz_colorspace* cs,
+    int alpha,
+    int x0,
+    int y0,
+    int x1,
+    int y1)
+{
+    return quiet_new_pixmap_from_page_number_clip_impl(ctx, doc, number, ctm, cs, alpha, x0, y0, x1, y1, nullptr);
+}
+
+extern "C" fz_pixmap* quiet_new_pixmap_from_page_number_clip_cookie(
+    fz_context* ctx,
+    fz_document* doc,
+    int number,
+    fz_matrix ctm,
+    fz_colorspace* cs,
+    int alpha,
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    fz_cookie* cookie)
+{
+    return quiet_new_pixmap_from_page_number_clip_impl(ctx, doc, number, ctm, cs, alpha, x0, y0, x1, y1, cookie);
 }
 
 static bool quiet_is_supported_markup(enum pdf_annot_type type)

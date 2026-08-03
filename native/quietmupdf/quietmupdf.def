@@ -28,6 +28,10 @@ EXPORTS
     quiet_pdf_get_page_bounds
     fz_drop_pixmap
     quiet_new_pixmap_from_page_number_clip
+    quiet_new_render_cookie
+    quiet_abort_render_cookie
+    quiet_drop_render_cookie
+    quiet_new_pixmap_from_page_number_clip_cookie
     quiet_pdf_save_annotations
     quiet_pdf_load_annotations
     quiet_pdf_last_error
