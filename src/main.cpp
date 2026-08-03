@@ -15187,6 +15187,13 @@ namespace
                     return 0;
                 }
             }
+            if (g_selectingContent && HasCopyableTextSelection() && (wParam == 'C' || wParam == VK_INSERT))
+            {
+                // Manggo injects the copy key from its low-level mouse hook;
+                // the Ctrl key state can still be absent when this message arrives.
+                CopyCurrentSelectionToClipboard(hwnd);
+                return 0;
+            }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && (g_hasContentSelection || HasCopyableTextSelection()))
             {
                 if (wParam == 'C' || wParam == VK_INSERT)
