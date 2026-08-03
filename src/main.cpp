@@ -5427,33 +5427,33 @@ namespace
         if (tab.pageCount <= 0) return;
         PreparePageCache(tab);
         bool rapidScroll = MainScrollDragRecentlyMoved() || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int budget = rapidScroll ? 5 : 12;
+        int visibleBudget = rapidScroll ? 8 : 12;
+        int predictiveBudget = rapidScroll ? 3 : 4;
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         RECT visible = g_stage;
-        int backwardPad = rapidScroll ? S(96) : S(128);
-        int forwardPad = rapidScroll ? std::max(S(420), stageH / 2) : std::max(S(220), stageH / 4);
-        if (rapidScroll)
-        {
-            backwardPad = 0;
-            forwardPad = 0;
-        }
-        if (!rapidScroll && g_stageScrollDirection < 0)
+        int backwardPad = rapidScroll ? S(48) : S(128);
+        int forwardPad = rapidScroll ? std::max(S(260), stageH / 3) : std::max(S(220), stageH / 4);
+        if (g_stageScrollDirection < 0)
         {
             visible.top -= forwardPad;
             visible.bottom += backwardPad;
         }
-        else if (!rapidScroll && g_stageScrollDirection > 0)
+        else if (g_stageScrollDirection > 0)
         {
             visible.top -= backwardPad;
             visible.bottom += forwardPad;
         }
-        else if (!rapidScroll)
+        else
         {
             visible.top -= S(96);
             visible.bottom += S(160);
         }
 
-        auto queueSpreads = [&](RECT const& clip, int basePriority)
+        RECT predictive = visible;
+        if (g_stageScrollDirection < 0) predictive.bottom = g_stage.top;
+        else predictive.top = g_stage.bottom;
+
+        auto queueSpreads = [&](RECT const& clip, int basePriority, int& budget)
         {
             int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
             int startAt = firstVisible;
@@ -5487,9 +5487,9 @@ namespace
             }
         };
 
-        queueSpreads(g_stage, rapidScroll ? -16 : -12);
-        if (!rapidScroll)
-            queueSpreads(visible, 0);
+        queueSpreads(g_stage, rapidScroll ? -16 : -12, visibleBudget);
+        if (predictive.bottom > predictive.top)
+            queueSpreads(predictive, rapidScroll ? -4 : 0, predictiveBudget);
 
         if (!rapidScroll)
         {
@@ -5543,6 +5543,22 @@ namespace
         if (!BuildSpreadPageRect(tab, start, y, request.page, pageRect)) return false;
         InflateRect(&pageRect, S(3), S(3));
         return IntersectRect(&out, &pageRect, &g_stage) != FALSE;
+    }
+
+    void CancelDistantActiveTileRenderForScroll(PdfTab const& tab)
+    {
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        if (!g_pageRenderActive || !g_pageRenderActiveRequest.tile ||
+            g_pageRenderActiveRequest.documentVersion != tab.renderVersion ||
+            _wcsicmp(g_pageRenderActiveRequest.path.c_str(), tab.path.c_str()) != 0)
+        {
+            return;
+        }
+
+        PageRenderRequest const& request = g_pageRenderActiveRequest;
+        TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level, request.x, request.y, request.w, request.h };
+        if (!TileVisibleNearby(tab, key, 0.55))
+            AbortActivePageRenderLocked();
     }
 
     PageImage& EnsurePage(PdfTab& tab, int index)
@@ -8790,8 +8806,15 @@ namespace
         }
         UpdateVertScrollBar(hwnd);
         RedrawMainScrollBarNow(hwnd);
-        if (!StageScrollPaintInProgress())
+        if (tab && tab->zoom >= TileRenderZoomThreshold)
+        {
+            CancelDistantActiveTileRenderForScroll(*tab);
+            ScheduleVisibleTilePrefetch(hwnd, *tab);
+        }
+        else if (!StageScrollPaintInProgress())
+        {
             SchedulePagePrefetch(hwnd);
+        }
     }
 
     void CommitMainScrollDragTarget(HWND hwnd)
@@ -11248,24 +11271,15 @@ namespace
                                 }
                             }
                         }
-                        bool targetMissing = false;
-                        bool targetPainted = false;
-                        if (fallbackPainted && !TileLevelFullyCached(tab, i, pageRect, drawRect, 0))
+                        bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
+                        bool ignoredMissing = false;
+                        bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                        if (targetMissing)
                         {
-                            targetMissing = true;
                             int queueBudget = stageScrolling ? 4 : 12;
                             QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                        }
-                        else
-                        {
-                            targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, true, targetMissing);
-                            if (targetMissing)
-                            {
-                                int queueBudget = stageScrolling ? 4 : 12;
-                                QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                                if (!fallback && !stageScrolling)
-                                    QueueZoomPreviewRender(g_hwnd, tab, i, 10);
-                            }
+                            if (!fallback && !stageScrolling)
+                                QueueZoomPreviewRender(g_hwnd, tab, i, 10);
                         }
                         if (fallbackPainted || coarsePainted || targetPainted) paintedRenderable = true;
                         if (targetMissing && !fallbackPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
