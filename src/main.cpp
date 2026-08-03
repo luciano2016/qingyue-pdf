@@ -6181,8 +6181,8 @@ namespace
         if (!GetCursorPos(&cursor)) return false;
         ScreenToClient(hwnd, &cursor);
         g_selectionEnd = POINT{
-            static_cast<LONG>(std::clamp(cursor.x, static_cast<int>(g_selectionPageRect.left), static_cast<int>(g_selectionPageRect.right))),
-            static_cast<LONG>(std::clamp(cursor.y, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom)))
+            static_cast<LONG>(std::clamp<LONG>(static_cast<LONG>(cursor.x), g_selectionPageRect.left, g_selectionPageRect.right)),
+            static_cast<LONG>(std::clamp<LONG>(static_cast<LONG>(cursor.y), g_selectionPageRect.top, g_selectionPageRect.bottom))
         };
         PdfTab* tab = Active();
         if (!tab) return false;
