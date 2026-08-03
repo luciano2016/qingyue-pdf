@@ -8,8 +8,11 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <sddl.h>
+#include <uiautomationcore.h>
+#include <UIAutomationCoreApi.h>
 #include <wincrypt.h>
 #include <imm.h>
+#include <oleauto.h>
 
 #include <algorithm>
 #include <atomic>
@@ -69,6 +72,14 @@ namespace
     };
 
     constexpr wchar_t const* AppName = L"\u8f7b\u9605PDF";
+    constexpr long UIA_TextPatternId = 10014;
+    constexpr long UIA_Text_TextSelectionChangedEventId = 20014;
+    constexpr long UIA_ControlTypePropertyId = 30003;
+    constexpr long UIA_LocalizedControlTypePropertyId = 30004;
+    constexpr long UIA_NamePropertyId = 30005;
+    constexpr long UIA_NativeWindowHandlePropertyId = 30020;
+    constexpr long UIA_IsTextPatternAvailablePropertyId = 30040;
+    constexpr long UIA_DocumentControlTypeId = 50030;
 
     struct Theme
     {
@@ -1344,6 +1355,10 @@ namespace
     fz_rect g_selectionNorm{};
     std::vector<fz_quad> g_selectionQuads;
     std::wstring g_selectionText;
+    class QuietPdfUiaProvider;
+    QuietPdfUiaProvider* g_uiaProvider{};
+    void NotifyUiaSelectionChanged();
+    bool HasUiaTextSelection();
     bool g_selectionHadTextDuringDrag{};
     POINT g_lastDragSelectionStart{};
     POINT g_lastDragSelectionEnd{};
@@ -6159,8 +6174,425 @@ namespace
         g_selectionQuads.clear();
         g_selectionText.clear();
         ResetDragSelectionLatch();
+        NotifyUiaSelectionChanged();
     }
 
+    struct UiaSelectionSnapshot
+    {
+        std::wstring text;
+        std::vector<RECT> screenRects;
+    };
+
+    bool HasUiaTextSelection()
+    {
+        return g_hasContentSelection && !g_selectionQuads.empty() && !g_selectionText.empty() && g_selectionPage >= 0;
+    }
+
+    UiaSelectionSnapshot BuildUiaSelectionSnapshot()
+    {
+        UiaSelectionSnapshot snapshot;
+        if (!HasUiaTextSelection()) return snapshot;
+
+        PdfTab* tab = Active();
+        if (!tab) return snapshot;
+
+        RECT pageRect{};
+        if (!PageRectForPage(*tab, g_selectionPage, pageRect))
+            pageRect = g_selectionPageRect;
+
+        snapshot.text = g_selectionText;
+        snapshot.screenRects.reserve(g_selectionQuads.size());
+        for (fz_quad const& quad : g_selectionQuads)
+        {
+            RECT r = QuadToRect(quad, pageRect);
+            RECT clipped{};
+            RECT visiblePage{};
+            if (!IntersectRect(&visiblePage, &pageRect, &g_stage)) continue;
+            if (!IntersectRect(&clipped, &r, &visiblePage)) continue;
+            if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) continue;
+
+            POINT tl{ clipped.left, clipped.top };
+            POINT br{ clipped.right, clipped.bottom };
+            ClientToScreen(g_hwnd, &tl);
+            ClientToScreen(g_hwnd, &br);
+            snapshot.screenRects.push_back(RECT{ tl.x, tl.y, br.x, br.y });
+        }
+        return snapshot;
+    }
+
+    SAFEARRAY* EmptyUnknownSafeArray()
+    {
+        return SafeArrayCreateVector(VT_UNKNOWN, 0, 0);
+    }
+
+    class QuietPdfUiaTextRange final : public ITextRangeProvider
+    {
+    public:
+        QuietPdfUiaTextRange(IRawElementProviderSimple* owner, UiaSelectionSnapshot snapshot)
+            : m_ref(1), m_owner(owner), m_snapshot(std::move(snapshot))
+        {
+            if (m_owner) m_owner->AddRef();
+        }
+
+        ~QuietPdfUiaTextRange()
+        {
+            if (m_owner) m_owner->Release();
+        }
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
+        {
+            if (!ppvObject) return E_POINTER;
+            *ppvObject = nullptr;
+            if (riid == IID_IUnknown || riid == __uuidof(ITextRangeProvider))
+                *ppvObject = static_cast<ITextRangeProvider*>(this);
+            else
+                return E_NOINTERFACE;
+            AddRef();
+            return S_OK;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override
+        {
+            return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+        }
+
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+            if (!ref) delete this;
+            return ref;
+        }
+
+        HRESULT STDMETHODCALLTYPE Clone(ITextRangeProvider** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = new QuietPdfUiaTextRange(m_owner, m_snapshot);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE Compare(ITextRangeProvider* range, BOOL* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = (range == static_cast<ITextRangeProvider*>(this)) ? TRUE : FALSE;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE CompareEndpoints(TextPatternRangeEndpoint, ITextRangeProvider*, TextPatternRangeEndpoint, int* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = 0;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE ExpandToEnclosingUnit(TextUnit) override { return S_OK; }
+
+        HRESULT STDMETHODCALLTYPE FindAttribute(TEXTATTRIBUTEID, VARIANT, BOOL, ITextRangeProvider** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE FindText(BSTR, BOOL, BOOL, ITextRangeProvider** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetAttributeValue(TEXTATTRIBUTEID, VARIANT* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            VariantInit(pRetVal);
+            IUnknown* notSupported = nullptr;
+            if (SUCCEEDED(UiaGetReservedNotSupportedValue(&notSupported)) && notSupported)
+            {
+                pRetVal->vt = VT_UNKNOWN;
+                pRetVal->punkVal = notSupported;
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetBoundingRectangles(SAFEARRAY** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            SAFEARRAY* array = SafeArrayCreateVector(VT_R8, 0, static_cast<ULONG>(m_snapshot.screenRects.size() * 4));
+            if (!array) return E_OUTOFMEMORY;
+
+            LONG index = 0;
+            for (RECT const& r : m_snapshot.screenRects)
+            {
+                double values[4]{
+                    static_cast<double>(r.left),
+                    static_cast<double>(r.top),
+                    static_cast<double>(r.right - r.left),
+                    static_cast<double>(r.bottom - r.top)
+                };
+                for (double value : values)
+                {
+                    HRESULT hr = SafeArrayPutElement(array, &index, &value);
+                    if (FAILED(hr))
+                    {
+                        SafeArrayDestroy(array);
+                        return hr;
+                    }
+                    ++index;
+                }
+            }
+            *pRetVal = array;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetEnclosingElement(IRawElementProviderSimple** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = m_owner;
+            if (*pRetVal) (*pRetVal)->AddRef();
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetText(int maxLength, BSTR* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            std::wstring text = m_snapshot.text;
+            if (maxLength >= 0 && static_cast<size_t>(maxLength) < text.size())
+                text.resize(static_cast<size_t>(maxLength));
+            *pRetVal = SysAllocStringLen(text.data(), static_cast<UINT>(text.size()));
+            return *pRetVal || text.empty() ? S_OK : E_OUTOFMEMORY;
+        }
+
+        HRESULT STDMETHODCALLTYPE Move(TextUnit, int, int* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = 0;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE MoveEndpointByUnit(TextPatternRangeEndpoint, TextUnit, int, int* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = 0;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE MoveEndpointByRange(TextPatternRangeEndpoint, ITextRangeProvider*, TextPatternRangeEndpoint) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE Select() override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE AddToSelection() override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE RemoveFromSelection() override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE ScrollIntoView(BOOL) override { return S_OK; }
+
+        HRESULT STDMETHODCALLTYPE GetChildren(SAFEARRAY** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = EmptyUnknownSafeArray();
+            return *pRetVal ? S_OK : E_OUTOFMEMORY;
+        }
+
+    private:
+        volatile LONG m_ref;
+        IRawElementProviderSimple* m_owner{};
+        UiaSelectionSnapshot m_snapshot;
+    };
+
+    class QuietPdfUiaProvider final : public IRawElementProviderSimple, public ITextProvider
+    {
+    public:
+        QuietPdfUiaProvider() : m_ref(1) {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override
+        {
+            if (!ppvObject) return E_POINTER;
+            *ppvObject = nullptr;
+            if (riid == IID_IUnknown || riid == __uuidof(IRawElementProviderSimple))
+                *ppvObject = static_cast<IRawElementProviderSimple*>(this);
+            else if (riid == __uuidof(ITextProvider))
+                *ppvObject = static_cast<ITextProvider*>(this);
+            else
+                return E_NOINTERFACE;
+            AddRef();
+            return S_OK;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override
+        {
+            return static_cast<ULONG>(InterlockedIncrement(&m_ref));
+        }
+
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            ULONG ref = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+            if (!ref) delete this;
+            return ref;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_ProviderOptions(ProviderOptions* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = ProviderOptions_ServerSideProvider;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID patternId, IUnknown** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            if (patternId == UIA_TextPatternId)
+            {
+                *pRetVal = static_cast<ITextProvider*>(this);
+                AddRef();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID propertyId, VARIANT* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            VariantInit(pRetVal);
+            if (propertyId == UIA_ControlTypePropertyId)
+            {
+                pRetVal->vt = VT_I4;
+                pRetVal->lVal = UIA_DocumentControlTypeId;
+            }
+            else if (propertyId == UIA_NamePropertyId)
+            {
+                std::wstring name = AppName;
+                if (PdfTab* tab = Active(); tab && !tab->name.empty()) name = tab->name;
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = SysAllocString(name.c_str());
+            }
+            else if (propertyId == UIA_LocalizedControlTypePropertyId)
+            {
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = SysAllocString(L"document");
+            }
+            else if (propertyId == UIA_IsTextPatternAvailablePropertyId)
+            {
+                pRetVal->vt = VT_BOOL;
+                pRetVal->boolVal = VARIANT_TRUE;
+            }
+            else if (propertyId == UIA_NativeWindowHandlePropertyId)
+            {
+                pRetVal->vt = VT_I4;
+                pRetVal->lVal = static_cast<LONG>(reinterpret_cast<LONG_PTR>(g_hwnd));
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            return UiaHostProviderFromHwnd(g_hwnd, pRetVal);
+        }
+
+        HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            UiaSelectionSnapshot snapshot = BuildUiaSelectionSnapshot();
+            SAFEARRAY* array = SafeArrayCreateVector(VT_UNKNOWN, 0, snapshot.text.empty() ? 0 : 1);
+            if (!array) return E_OUTOFMEMORY;
+            if (!snapshot.text.empty())
+            {
+                ITextRangeProvider* range = new QuietPdfUiaTextRange(static_cast<IRawElementProviderSimple*>(this), std::move(snapshot));
+                LONG index = 0;
+                HRESULT hr = SafeArrayPutElement(array, &index, range);
+                range->Release();
+                if (FAILED(hr))
+                {
+                    SafeArrayDestroy(array);
+                    return hr;
+                }
+            }
+            *pRetVal = array;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetVisibleRanges(SAFEARRAY** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            UiaSelectionSnapshot snapshot = BuildUiaSelectionSnapshot();
+            SAFEARRAY* array = SafeArrayCreateVector(VT_UNKNOWN, 0, snapshot.text.empty() ? 0 : 1);
+            if (!array) return E_OUTOFMEMORY;
+            if (!snapshot.text.empty())
+            {
+                ITextRangeProvider* range = new QuietPdfUiaTextRange(static_cast<IRawElementProviderSimple*>(this), std::move(snapshot));
+                LONG index = 0;
+                HRESULT hr = SafeArrayPutElement(array, &index, range);
+                range->Release();
+                if (FAILED(hr))
+                {
+                    SafeArrayDestroy(array);
+                    return hr;
+                }
+            }
+            *pRetVal = array;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE RangeFromChild(IRawElementProviderSimple*, ITextRangeProvider** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE RangeFromPoint(UiaPoint point, ITextRangeProvider** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            UiaSelectionSnapshot snapshot = BuildUiaSelectionSnapshot();
+            if (snapshot.text.empty()) return S_OK;
+            POINT pt{ static_cast<LONG>(point.x), static_cast<LONG>(point.y) };
+            bool inside = false;
+            for (RECT const& r : snapshot.screenRects)
+            {
+                if (PtInRect(&r, pt)) { inside = true; break; }
+            }
+            if (!inside && !snapshot.screenRects.empty()) return S_OK;
+            *pRetVal = new QuietPdfUiaTextRange(static_cast<IRawElementProviderSimple*>(this), std::move(snapshot));
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_DocumentRange(ITextRangeProvider** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = new QuietPdfUiaTextRange(static_cast<IRawElementProviderSimple*>(this), BuildUiaSelectionSnapshot());
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_SupportedTextSelection(SupportedTextSelection* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = SupportedTextSelection_Single;
+            return S_OK;
+        }
+
+    private:
+        volatile LONG m_ref;
+    };
+
+    QuietPdfUiaProvider* EnsureUiaProvider()
+    {
+        if (!g_uiaProvider) g_uiaProvider = new QuietPdfUiaProvider();
+        return g_uiaProvider;
+    }
+
+    void ReleaseUiaProvider()
+    {
+        QuietPdfUiaProvider* provider = g_uiaProvider;
+        g_uiaProvider = nullptr;
+        if (provider) provider->Release();
+    }
+
+    void NotifyUiaSelectionChanged()
+    {
+        if (!g_hwnd) return;
+        QuietPdfUiaProvider* provider = EnsureUiaProvider();
+        if (!provider) return;
+        UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_Text_TextSelectionChangedEventId);
+    }
     void ScrollToPage(PdfTab& tab, int page);
     void LoadAnnotationsFromPdf(PdfTab& tab);
 
@@ -12469,6 +12901,10 @@ namespace
     {
         switch (msg)
         {
+        case WM_GETOBJECT:
+            if (static_cast<LONG>(lParam) == UiaRootObjectId || static_cast<LONG>(lParam) == OBJID_CLIENT)
+                return UiaReturnRawElementProvider(hwnd, wParam, lParam, EnsureUiaProvider());
+            break;
         case WM_CREATE:
             g_hwnd = hwnd;
             g_dpi = GetDpiForWindow(hwnd);
@@ -13677,6 +14113,7 @@ namespace
                         }
                     }
                 }
+                NotifyUiaSelectionChanged();
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
@@ -14041,7 +14478,6 @@ namespace
         }
         case WM_VSCROLL:
         {
-            PdfTab* tab = Active();
             int code = LOWORD(wParam);
             int newScroll = g_scrollY;
             if (code == SB_THUMBTRACK || code == SB_THUMBPOSITION)
@@ -14415,6 +14851,7 @@ namespace
             for (auto& tab : g_tabs) DropTab(*tab);
             ReleasePaintBuffer();
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
+            ReleaseUiaProvider();
             SaveState();
             PostQuitMessage(0);
             return 0;
