@@ -73,6 +73,7 @@ namespace
 
     constexpr wchar_t const* AppName = L"\u8f7b\u9605PDF";
     constexpr long UIA_TextPatternId = 10014;
+    constexpr long UIA_AutomationFocusChangedEventId = 20005;
     constexpr long UIA_Text_TextSelectionChangedEventId = 20014;
     constexpr long UIA_BoundingRectanglePropertyId = 30001;
     constexpr long UIA_ProcessIdPropertyId = 30002;
@@ -1365,6 +1366,7 @@ namespace
     class QuietPdfUiaProvider;
     QuietPdfUiaProvider* g_uiaProvider{};
     void NotifyUiaSelectionChanged();
+    void NotifyUiaFocusChanged();
     bool HasUiaTextSelection();
     bool g_selectionHadTextDuringDrag{};
     POINT g_lastDragSelectionStart{};
@@ -6739,6 +6741,15 @@ namespace
         QuietPdfUiaProvider* provider = EnsureUiaProvider();
         if (!provider) return;
         UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_Text_TextSelectionChangedEventId);
+        NotifyWinEvent(EVENT_OBJECT_TEXTSELECTIONCHANGED, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
+    }
+
+    void NotifyUiaFocusChanged()
+    {
+        if (!g_hwnd) return;
+        QuietPdfUiaProvider* provider = EnsureUiaProvider();
+        if (!provider) return;
+        UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_AutomationFocusChangedEventId);
     }
     void ScrollToPage(PdfTab& tab, int page);
     void LoadAnnotationsFromPdf(PdfTab& tab);
@@ -13049,9 +13060,7 @@ namespace
         switch (msg)
         {
         case WM_GETOBJECT:
-            if (static_cast<LONG>(lParam) == UiaRootObjectId || static_cast<LONG>(lParam) == OBJID_CLIENT)
-                return UiaReturnRawElementProvider(hwnd, wParam, lParam, EnsureUiaProvider());
-            break;
+            return UiaReturnRawElementProvider(hwnd, wParam, lParam, EnsureUiaProvider());
         case WM_CREATE:
             g_hwnd = hwnd;
             g_dpi = GetDpiForWindow(hwnd);
@@ -13308,6 +13317,11 @@ namespace
         }
         case WM_LBUTTONDOWN:
         {
+            if (::GetFocus() != hwnd)
+            {
+                ::SetFocus(hwnd);
+                NotifyUiaFocusChanged();
+            }
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             if (g_autoScrollActive)
@@ -13853,6 +13867,11 @@ namespace
         }
         case WM_RBUTTONDOWN:
         {
+            if (::GetFocus() != hwnd)
+            {
+                ::SetFocus(hwnd);
+                NotifyUiaFocusChanged();
+            }
             if (g_autoScrollActive)
             {
                 StopAutoScroll(hwnd);
