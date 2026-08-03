@@ -50,6 +50,7 @@ namespace
     struct fz_locks_context;
     struct fz_page;
     struct fz_pixmap;
+    struct fz_display_list;
 
     struct fz_matrix { float a, b, c, d, e, f; };
     struct fz_rect { float x0, y0, x1, y1; };
@@ -1002,7 +1003,11 @@ namespace
         using NewPixmapFromPageNumberClipFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int);
         using NewPixmapFromPageNumberClipCookieFn = fz_pixmap*(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int, void*);
         using NewRenderCookieFn = void*(__cdecl*)();
+        using NewPageContentsDisplayListCookieFn = fz_display_list*(__cdecl*)(fz_context*, fz_document*, int, void*);
+        using DropDisplayListFn = void(__cdecl*)(fz_context*, fz_display_list*);
+        using NewPixmapFromDisplayListClipCookieFn = fz_pixmap*(__cdecl*)(fz_context*, fz_display_list*, fz_matrix, fz_colorspace*, int, int, int, int, int, void*);
         using AbortRenderCookieFn = void(__cdecl*)(void*);
+
         using DropRenderCookieFn = void(__cdecl*)(void*);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
         using MatchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int);
@@ -1039,11 +1044,16 @@ namespace
             Get(boundPage, "fz_bound_page");
             Get(dropPage, "fz_drop_page");
             Get(deviceRgb, "fz_device_rgb");
+            Get(deviceBgr, "fz_device_bgr");
             Get(newPixmapFromPageNumber, "fz_new_pixmap_from_page_number");
             Get(newPixmapFromPageNumberClip, "quiet_new_pixmap_from_page_number_clip");
             Get(newPixmapFromPageNumberClipCookie, "quiet_new_pixmap_from_page_number_clip_cookie");
             Get(newRenderCookie, "quiet_new_render_cookie");
+            Get(newPageContentsDisplayListCookie, "quiet_new_page_contents_display_list_cookie");
+            Get(dropDisplayList, "quiet_drop_display_list");
+            Get(newPixmapFromDisplayListClipCookie, "quiet_new_pixmap_from_display_list_clip_cookie");
             Get(abortRenderCookie, "quiet_abort_render_cookie");
+
             Get(dropRenderCookie, "quiet_drop_render_cookie");
             Get(searchPageNumber, "fz_search_page_number");
             GetOptional(matchPageNumber, "fz_match_page_number");
@@ -1080,11 +1090,16 @@ namespace
         BoundPageFn boundPage{};
         DropPageFn dropPage{};
         DeviceRgbFn deviceRgb{};
+        DeviceRgbFn deviceBgr{};
         NewPixmapFromPageNumberFn newPixmapFromPageNumber{};
         NewPixmapFromPageNumberClipFn newPixmapFromPageNumberClip{};
         NewPixmapFromPageNumberClipCookieFn newPixmapFromPageNumberClipCookie{};
         NewRenderCookieFn newRenderCookie{};
+        NewPageContentsDisplayListCookieFn newPageContentsDisplayListCookie{};
+        DropDisplayListFn dropDisplayList{};
+        NewPixmapFromDisplayListClipCookieFn newPixmapFromDisplayListClipCookie{};
         AbortRenderCookieFn abortRenderCookie{};
+
         DropRenderCookieFn dropRenderCookie{};
         SearchPageNumberFn searchPageNumber{};
         MatchPageNumberFn matchPageNumber{};
@@ -1142,6 +1157,9 @@ namespace
         fz_context* renderContext{};
         fz_document* document{};
         std::recursive_mutex documentMutex;
+        std::map<int, fz_display_list*> displayLists;
+        std::deque<int> displayListLru;
+        size_t maxDisplayLists{ 8 };
 
         ~PageRenderSession();
     };
@@ -1152,6 +1170,11 @@ namespace
 
     PageRenderSession::~PageRenderSession()
     {
+        for (auto const& entry : displayLists)
+            if (entry.second && renderContext) g_pdf.dropDisplayList(renderContext, entry.second);
+        displayLists.clear();
+        displayListLru.clear();
+
         if (document && uiContext) g_pdf.dropDocument(uiContext, document);
         if (renderContext) g_pdf.dropContext(renderContext);
         if (uiContext) g_pdf.dropContext(uiContext);
@@ -1410,6 +1433,7 @@ namespace
     ULONGLONG g_lastTouchFollowPaintMs{};
     ULONGLONG g_lastMainScrollDragMoveMs{};
     ULONGLONG g_stageLightPaintUntil{};
+    ULONGLONG g_zoomRenderDeferUntil{};
     ULONGLONG g_sidebarAnimationStartMs{};
     HBITMAP g_glassBackdrop{};
     HDC g_paintBufferDc{};
@@ -1527,7 +1551,15 @@ namespace
     RECT g_zoomDialogInputRect{};
     RECT g_zoomDialogConfirmRect{};
     RECT g_zoomDialogCancelRect{};
-    constexpr int TileSize = 512;
+    int TileSize()
+    {
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        int viewportTile = std::clamp(std::max(stageW, stageH), 640, 1280);
+        int size = 512;
+        while (size < viewportTile) size <<= 1;
+        return std::min(size, 1024);
+    }
     constexpr double TileRenderZoomThreshold = 1.50;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
@@ -4345,6 +4377,39 @@ namespace
     int SinglePageContentHeight(PdfTab const& tab);
     int SinglePageMaxScroll(PdfTab const& tab);
 
+    fz_display_list* CachedPageDisplayListLocked(PdfTab& tab, int index, void* renderCookie)
+    {
+        if (!tab.renderSession || !g_pdf.newPageContentsDisplayListCookie ||
+            !g_pdf.newPixmapFromDisplayListClipCookie)
+            return nullptr;
+        auto& session = *tab.renderSession;
+        auto found = session.displayLists.find(index);
+        if (found != session.displayLists.end())
+        {
+            session.displayListLru.erase(
+                std::remove(session.displayListLru.begin(), session.displayListLru.end(), index),
+                session.displayListLru.end());
+            session.displayListLru.push_back(index);
+            return found->second;
+        }
+
+        fz_display_list* list = g_pdf.newPageContentsDisplayListCookie(tab.ctx, tab.doc, index, renderCookie);
+        if (!list) return nullptr;
+        session.displayLists.emplace(index, list);
+        session.displayListLru.push_back(index);
+        while (session.displayLists.size() > session.maxDisplayLists && !session.displayListLru.empty())
+        {
+            int victim = session.displayListLru.front();
+            session.displayListLru.pop_front();
+            if (victim == index) continue;
+            auto entry = session.displayLists.find(victim);
+            if (entry == session.displayLists.end()) continue;
+            g_pdf.dropDisplayList(tab.ctx, entry->second);
+            session.displayLists.erase(entry);
+        }
+        return list;
+    }
+
     PageImage RenderPageAtScale(PdfTab& tab, int index, double renderScale, bool applyTheme, int renderTheme = -1, bool renderToDib = false, void* renderCookie = nullptr)
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
@@ -4354,19 +4419,35 @@ namespace
             if (g_pdf.newPixmapFromPageNumberClip)
             {
                 fz_page* page = g_pdf.loadPage(tab.ctx, tab.doc, index);
+
                 fz_rect bounds = g_pdf.boundPage(tab.ctx, page);
                 g_pdf.dropPage(tab.ctx, page);
                 int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
                 int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
-                if (renderCookie)
+                fz_display_list* list = CachedPageDisplayListLocked(tab, index, renderCookie);
+                if (list)
+                {
+                    pixmap = g_pdf.newPixmapFromDisplayListClipCookie(
+                        tab.ctx,
+                        list,
+                        matrix,
+                        g_pdf.deviceBgr(tab.ctx),
+                        1,
+                        0,
+                        0,
+                        widthPx,
+                        heightPx,
+                        renderCookie);
+                }
+                else if (renderCookie && !tab.renderSession)
                 {
                     pixmap = g_pdf.newPixmapFromPageNumberClipCookie(
                         tab.ctx,
                         tab.doc,
                         index,
                         matrix,
-                        g_pdf.deviceRgb(tab.ctx),
-                        0,
+                        g_pdf.deviceBgr(tab.ctx),
+                        1,
                         0,
                         0,
                         widthPx,
@@ -4380,8 +4461,8 @@ namespace
                         tab.doc,
                         index,
                         matrix,
-                        g_pdf.deviceRgb(tab.ctx),
-                        0,
+                        g_pdf.deviceBgr(tab.ctx),
+                        1,
                         0,
                         0,
                         widthPx,
@@ -4389,17 +4470,27 @@ namespace
                 }
             }
             if (!pixmap && !renderCookie)
-                pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceRgb(tab.ctx), 0);
+                pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceBgr(tab.ctx), 1);
         }
         PageImage image;
+        if (!pixmap) return image;
         image.width = g_pdf.pixmapWidth(tab.ctx, pixmap);
         image.height = g_pdf.pixmapHeight(tab.ctx, pixmap);
         int components = g_pdf.pixmapComponents(tab.ctx, pixmap);
         int stride = g_pdf.pixmapStride(tab.ctx, pixmap);
         auto* samples = g_pdf.pixmapSamples(tab.ctx, pixmap);
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
+        int effectiveTheme = renderTheme >= 0 ? renderTheme : PdfRenderTheme();
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
+        if (components == 4 && (!applyTheme || effectiveTheme != 2))
+        {
+            for (int y = 0; y < image.height; ++y)
+                std::memcpy((dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4,
+                    samples + static_cast<size_t>(y) * stride, static_cast<size_t>(image.width) * 4);
+            g_pdf.dropPixmap(tab.ctx, pixmap);
+            return image;
+        }
         for (int y = 0; y < image.height; ++y)
         {
             auto* dst = (dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4;
@@ -4407,10 +4498,10 @@ namespace
             for (int x = 0; x < image.width; ++x)
             {
                 auto* px = src + static_cast<size_t>(x) * components;
-                std::uint8_t b = components >= 3 ? px[2] : px[0];
+                std::uint8_t b = px[0];
                 std::uint8_t g = components >= 3 ? px[1] : px[0];
-                std::uint8_t r = px[0];
-                if (applyTheme) ApplyPdfThemeFor(renderTheme >= 0 ? renderTheme : PdfRenderTheme(), b, g, r);
+                std::uint8_t r = components >= 3 ? px[2] : px[0];
+                if (applyTheme) ApplyPdfThemeFor(effectiveTheme, b, g, r);
                 dst[x * 4 + 0] = b;
                 dst[x * 4 + 1] = g;
                 dst[x * 4 + 2] = r;
@@ -4533,6 +4624,13 @@ namespace
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
+        if (components == 4 && renderTheme != 2)
+        {
+            for (int y = 0; y < image.height; ++y)
+                std::memcpy((dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4,
+                    samples + static_cast<size_t>(y) * stride, static_cast<size_t>(image.width) * 4);
+            return image;
+        }
         for (int y = 0; y < image.height; ++y)
         {
             auto* dst = (dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4;
@@ -4540,9 +4638,9 @@ namespace
             for (int x = 0; x < image.width; ++x)
             {
                 auto* px = src + static_cast<size_t>(x) * components;
-                std::uint8_t b = components >= 3 ? px[2] : px[0];
+                std::uint8_t b = px[0];
                 std::uint8_t g = components >= 3 ? px[1] : px[0];
-                std::uint8_t r = px[0];
+                std::uint8_t r = components >= 3 ? px[2] : px[0];
                 ApplyPdfThemeFor(renderTheme, b, g, r);
                 dst[x * 4 + 0] = b;
                 dst[x * 4 + 1] = g;
@@ -4564,15 +4662,30 @@ namespace
         fz_pixmap* pixmap = nullptr;
         {
             PdfDocumentLock pdfLock(tab);
-            if (renderCookie)
+            fz_display_list* list = CachedPageDisplayListLocked(tab, index, renderCookie);
+            if (list)
+            {
+                pixmap = g_pdf.newPixmapFromDisplayListClipCookie(
+                    tab.ctx,
+                    list,
+                    matrix,
+                    g_pdf.deviceBgr(tab.ctx),
+                    1,
+                    tile.left,
+                    tile.top,
+                    tile.right,
+                    tile.bottom,
+                    renderCookie);
+            }
+            else if (renderCookie && !tab.renderSession)
             {
                 pixmap = g_pdf.newPixmapFromPageNumberClipCookie(
                     tab.ctx,
                     tab.doc,
                     index,
                     matrix,
-                    g_pdf.deviceRgb(tab.ctx),
-                    0,
+                    g_pdf.deviceBgr(tab.ctx),
+                    1,
                     tile.left,
                     tile.top,
                     tile.right,
@@ -4586,8 +4699,8 @@ namespace
                     tab.doc,
                     index,
                     matrix,
-                    g_pdf.deviceRgb(tab.ctx),
-                    0,
+                    g_pdf.deviceBgr(tab.ctx),
+                    1,
                     tile.left,
                     tile.top,
                     tile.right,
@@ -4610,7 +4723,9 @@ namespace
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme())
         {
             tab.cache.clear();
-            tab.tileCache.clear();
+            // Old-zoom tiles remain available inside the existing byte budget.
+            if (tab.cachedDpi != 0 && (tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme()))
+                tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = PdfRenderTheme();
@@ -4667,7 +4782,9 @@ namespace
         if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme())
         {
             tab.cache.clear();
-            tab.tileCache.clear();
+            // Old-zoom tiles remain available inside the existing byte budget.
+            if (tab.cachedDpi != 0 && (tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme()))
+                tab.tileCache.clear();
             tab.cachedZoom = tab.zoom;
             tab.cachedDpi = g_dpi;
             tab.cachedTheme = PdfRenderTheme();
@@ -5145,15 +5262,19 @@ namespace
 
     int TileLevelForPage(PdfTab const& tab, int page, int pageW, int pageH)
     {
+        UNREFERENCED_PARAMETER(tab);
         UNREFERENCED_PARAMETER(page);
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-        int longest = std::max(pageW, pageH);
-        int viewportLongest = std::max(stageW, stageH);
+        double widthFactor = static_cast<double>(pageW) / (stageW + 1);
+        double heightFactor = static_cast<double>(pageH) / (stageH + 1);
+        double areaFactor = std::sqrt(std::max(0.0, widthFactor * heightFactor));
         int level = 0;
-        while (level < 3 && longest / TileLevelScale(level) > viewportLongest * 2)
+        while (level < 6 && areaFactor > 1.5)
+        {
             ++level;
-        if (tab.zoom < 3.0) level = std::min(level, 1);
+            areaFactor *= 0.5;
+        }
         return level;
     }
 
@@ -5240,6 +5361,7 @@ namespace
             tab->zoomFallbackCache.erase(victim);
         }
         TrimBackgroundRenderCaches();
+
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
     void ScheduleIdleCacheTrim(HWND hwnd)
@@ -5258,9 +5380,9 @@ namespace
 
         size_t maxTileBytes = DynamicTileCacheByteLimit();
         size_t maxTiles = std::clamp<size_t>((static_cast<size_t>(std::max<int>(1, g_stage.right - g_stage.left)) /
-            static_cast<size_t>(TileSize) + 3ull) *
+            static_cast<size_t>(TileSize()) + 3ull) *
             (static_cast<size_t>(std::max<int>(1, g_stage.bottom - g_stage.top)) /
-                static_cast<size_t>(TileSize) + 3ull), 40ull, 96ull);
+                static_cast<size_t>(TileSize()) + 3ull), 24ull, 64ull);
         while (tab.tileCache.size() > maxTiles || cacheBytes() > maxTileBytes)
         {
             auto victim = tab.tileCache.end();
@@ -5323,37 +5445,41 @@ namespace
         request.priority = priority;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
-            g_pageRenderQueue.erase(
-                std::remove_if(
-                    g_pageRenderQueue.begin(),
-                    g_pageRenderQueue.end(),
-                    [&](PageRenderRequest const& queued)
-                    {
-                        return queued.tile && queued.viewportGeneration + 1 < g_viewportGeneration &&
-                            queued.documentVersion == tab.renderVersion && _wcsicmp(queued.path.c_str(), tab.path.c_str()) == 0;
-                    }),
-                g_pageRenderQueue.end());
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
-            for (auto const& queued : g_pageRenderQueue)
+            auto existing = std::find_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& queued) { return SamePageRenderRequest(queued, request); });
+            if (existing != g_pageRenderQueue.end())
             {
-                if (SamePageRenderRequest(queued, request)) return;
+                if (priority >= existing->priority) return;
+                request.serial = existing->serial;
+                g_pageRenderQueue.erase(existing);
             }
-            request.serial = ++g_pageRenderSerial;
+            else
+            {
+                request.serial = ++g_pageRenderSerial;
+            }
             auto insertAt = std::find_if(
                 g_pageRenderQueue.begin(),
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& queued)
                 { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedTileRenders = 40;
-            while (g_pageRenderQueue.size() > maxQueuedTileRenders)
+            constexpr size_t maxQueuedTileRenders = 8;
+            auto queuedTileCount = [&]()
+            {
+                return static_cast<size_t>(std::count_if(
+                    g_pageRenderQueue.begin(), g_pageRenderQueue.end(), [](PageRenderRequest const& queued) { return queued.tile; }));
+            };
+            while (queuedTileCount() > maxQueuedTileRenders)
             {
                 auto victim = std::find_if(
                     g_pageRenderQueue.rbegin(),
                     g_pageRenderQueue.rend(),
-                    [](PageRenderRequest const& queued) { return queued.priority > 0; });
-                if (victim == g_pageRenderQueue.rend()) g_pageRenderQueue.pop_back();
-                else g_pageRenderQueue.erase(std::next(victim).base());
+                    [](PageRenderRequest const& queued) { return queued.tile; });
+                if (victim == g_pageRenderQueue.rend()) break;
+                g_pageRenderQueue.erase(std::next(victim).base());
             }
         }
         g_pageRenderCv.notify_one();
@@ -5377,15 +5503,16 @@ namespace
         int levelTop = TileCoordAtLevel(localTop, level);
         int levelRight = std::clamp<int>((localRight + scale - 1) / scale, levelLeft + 1, levelPageW);
         int levelBottom = std::clamp<int>((localBottom + scale - 1) / scale, levelTop + 1, levelPageH);
-        int tileLeft = (levelLeft / TileSize) * TileSize;
-        int tileTop = (levelTop / TileSize) * TileSize;
+        int tileSize = TileSize();
+        int tileLeft = (levelLeft / tileSize) * tileSize;
+        int tileTop = (levelTop / tileSize) * tileSize;
         auto queueRow = [&](int ty)
         {
-            int h = std::min(TileSize, levelPageH - ty);
+            int h = std::min(tileSize, levelPageH - ty);
             if (h <= 0) return;
-            for (int tx = tileLeft; tx < levelRight && budget > 0; tx += TileSize)
+            for (int tx = tileLeft; tx < levelRight && budget > 0; tx += tileSize)
             {
-                int w = std::min(TileSize, levelPageW - tx);
+                int w = std::min(tileSize, levelPageW - tx);
                 if (w <= 0) continue;
                 TileKey key{ page, TileZoomKey(tab.zoom), PdfRenderTheme(), level, tx, ty, w, h };
                 if (!FindCachedTile(tab, key))
@@ -5397,23 +5524,20 @@ namespace
         };
         if (g_stageScrollDirection > 0)
         {
-            int bottomRow = ((levelBottom - 1) / TileSize) * TileSize;
-            for (int ty = bottomRow; ty >= tileTop && budget > 0; ty -= TileSize)
+            int bottomRow = ((levelBottom - 1) / tileSize) * tileSize;
+            for (int ty = bottomRow; ty >= tileTop && budget > 0; ty -= tileSize)
                 queueRow(ty);
         }
         else
         {
-            for (int ty = tileTop; ty < levelBottom && budget > 0; ty += TileSize)
+            for (int ty = tileTop; ty < levelBottom && budget > 0; ty += tileSize)
                 queueRow(ty);
         }
     }
 
     void QueueVisibleTilesForPage(HWND hwnd, PdfTab& tab, int page, RECT pageRect, RECT clip, int priority, int& budget)
     {
-        int targetLevel = TileLevelForPage(tab, page, std::max<int>(1, pageRect.right - pageRect.left), std::max<int>(1, pageRect.bottom - pageRect.top));
         QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, 0, priority, budget);
-        if (targetLevel > 0)
-            QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, clip, targetLevel, priority + 2, budget);
     }
 
     bool MainScrollDragRecentlyMoved()
@@ -5427,8 +5551,29 @@ namespace
         if (tab.pageCount <= 0) return;
         PreparePageCache(tab);
         bool rapidScroll = MainScrollDragRecentlyMoved() || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int visibleBudget = rapidScroll ? 8 : 12;
-        int predictiveBudget = rapidScroll ? 3 : 4;
+        if (rapidScroll)
+        {
+            int visibleBudget = 6;
+            int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) :
+                FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+            for (int start = firstVisible; start < tab.pageCount && visibleBudget > 0; start = NextSpreadStart(tab, start))
+            {
+                int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+                if (g_continuousRead && y > g_stage.bottom) break;
+                int count = SpreadPageCount(tab, start);
+                for (int j = 0; j < count && visibleBudget > 0; ++j)
+                {
+                    int page = start + j;
+                    RECT pageRect{};
+                    if (BuildSpreadPageRect(tab, start, y, page, pageRect))
+                        QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, g_stage, 0, -16, visibleBudget);
+                }
+                if (!g_continuousRead) break;
+            }
+            return;
+        }
+        int visibleBudget = 12;
+        int predictiveBudget = 4;
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         RECT visible = g_stage;
         int backwardPad = rapidScroll ? S(48) : S(128);
@@ -5491,25 +5636,7 @@ namespace
         if (predictive.bottom > predictive.top)
             queueSpreads(predictive, rapidScroll ? -4 : 0, predictiveBudget);
 
-        if (!rapidScroll)
-        {
-            int previewBudget = 2;
-            int firstVisible = g_continuousRead ? FirstVisibleSpreadStart(tab) : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
-            for (int start = firstVisible; start < tab.pageCount && previewBudget > 0; start = NextSpreadStart(tab, start))
-            {
-                int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
-                RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
-                if (g_continuousRead && spreadRect.top > visible.bottom) break;
-                if (!Intersects(spreadRect, visible) && (g_continuousRead || start != firstVisible)) continue;
-                int count = SpreadPageCount(tab, start);
-                for (int j = 0; j < count && previewBudget > 0; ++j)
-                {
-                    QueueZoomPreviewRender(hwnd, tab, start + j, 10);
-                    --previewBudget;
-                }
-                if (!g_continuousRead) break;
-            }
-        }
+
     }
     bool TileRequestScreenRect(PdfTab const& tab, PageRenderRequest const& request, RECT& out)
     {
@@ -5545,20 +5672,36 @@ namespace
         return IntersectRect(&out, &pageRect, &g_stage) != FALSE;
     }
 
-    void CancelDistantActiveTileRenderForScroll(PdfTab const& tab)
+    void MaintainVisibleTileRenderQueueForScroll(PdfTab const& tab)
     {
         std::lock_guard<std::mutex> lock(g_pageRenderMutex);
-        if (!g_pageRenderActive || !g_pageRenderActiveRequest.tile ||
-            g_pageRenderActiveRequest.documentVersion != tab.renderVersion ||
-            _wcsicmp(g_pageRenderActiveRequest.path.c_str(), tab.path.c_str()) != 0)
+        if (g_pageRenderActive && g_pageRenderActiveRequest.tile &&
+            g_pageRenderActiveRequest.documentVersion == tab.renderVersion &&
+            _wcsicmp(g_pageRenderActiveRequest.path.c_str(), tab.path.c_str()) == 0)
         {
-            return;
+            PageRenderRequest const& request = g_pageRenderActiveRequest;
+            TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level,
+                request.x, request.y, request.w, request.h };
+            if (!TileVisibleNearby(tab, key, 0.55))
+                AbortActivePageRenderLocked();
         }
 
-        PageRenderRequest const& request = g_pageRenderActiveRequest;
-        TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level, request.x, request.y, request.w, request.h };
-        if (!TileVisibleNearby(tab, key, 0.55))
-            AbortActivePageRenderLocked();
+        g_pageRenderQueue.erase(
+            std::remove_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& request)
+                {
+                    if (!request.tile || request.documentVersion != tab.renderVersion ||
+                        _wcsicmp(request.path.c_str(), tab.path.c_str()) != 0)
+                    {
+                        return false;
+                    }
+                    TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level,
+                        request.x, request.y, request.w, request.h };
+                    return !TileVisibleNearby(tab, key, 0.55);
+                }),
+            g_pageRenderQueue.end());
     }
 
     PageImage& EnsurePage(PdfTab& tab, int index)
@@ -5608,8 +5751,11 @@ namespace
         return it->second;
     }
 
+    bool ZoomRenderDeferred();
+
     void SchedulePagePrefetch(HWND hwnd)
     {
+        if (ZoomRenderDeferred()) return;
         PdfTab* tab = Active();
         if (!tab || tab->pageCount <= 0) return;
         bool scrolling = (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil) ||
@@ -8534,6 +8680,11 @@ namespace
         }
     }
 
+    bool ZoomRenderDeferred()
+    {
+        return g_zoomRenderDeferUntil != 0 && GetTickCount64() < g_zoomRenderDeferUntil;
+    }
+
     bool StageLightPaintActive()
     {
         if (g_hasContentSelection || g_selectingContent || g_annotationToolbarOpen || g_annotationNoteOpen)
@@ -8808,8 +8959,7 @@ namespace
         RedrawMainScrollBarNow(hwnd);
         if (tab && tab->zoom >= TileRenderZoomThreshold)
         {
-            CancelDistantActiveTileRenderForScroll(*tab);
-            ScheduleVisibleTilePrefetch(hwnd, *tab);
+            MaintainVisibleTileRenderQueueForScroll(*tab);
         }
         else if (!StageScrollPaintInProgress())
         {
@@ -9022,6 +9172,9 @@ namespace
         }
 
         CancelObsoletePageRendersForZoom(tab);
+        g_zoomRenderDeferUntil = GetTickCount64() + 140;
+        KillTimer(hwnd, 21);
+        SetTimer(hwnd, 21, 140, nullptr);
         tab.zoom = clampedZoom;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
@@ -9067,25 +9220,10 @@ namespace
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
 
-        WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
+        if (tab.zoom < TileRenderZoomThreshold)
+            WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
         UpdateVertScrollBar(hwnd);
-        if (tab.zoom >= TileRenderZoomThreshold)
-        {
-            g_stageScrollDirection = 0;
-            int zoomTileBudget = 18;
-            RECT zoomPrefetch = g_stage;
-            InflateRect(&zoomPrefetch, S(48), S(48));
-            int start = FirstPageInSpread(anchorPage);
-            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
-            int count = SpreadPageCount(tab, start);
-            for (int j = 0; j < count && zoomTileBudget > 0; ++j)
-            {
-                int page = start + j;
-                RECT newPageRect{};
-                if (BuildSpreadPageRect(tab, start, y, page, newPageRect))
-                    QueueVisibleTilesForPageLevel(hwnd, tab, page, newPageRect, zoomPrefetch, 0, -16, zoomTileBudget);
-            }
-        }
+
         if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
         if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
         InvalidateRect(hwnd, &g_stage, FALSE);
@@ -11070,6 +11208,62 @@ namespace
     {
         return DrawCachedImagePart(dc, image, dest, 0, 0, image.width, image.height);
     }
+    bool DrawOldZoomTiles(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect)
+    {
+        int currentZoom = TileZoomKey(tab.zoom);
+        int fallbackZoom = 0;
+        int bestDistance = std::numeric_limits<int>::max();
+        for (auto const& entry : tab.tileCache)
+        {
+            TileKey const& key = entry.first;
+            if (key.page != page || key.theme != PdfRenderTheme() || key.zoom == currentZoom) continue;
+            int distance = std::abs(key.zoom - currentZoom);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                fallbackZoom = key.zoom;
+            }
+        }
+        if (fallbackZoom == 0) return false;
+
+        double oldZoom = fallbackZoom / 10000.0;
+        double oldPageW = tab.pages[static_cast<size_t>(page)].widthPt * static_cast<double>(g_dpi) / 72.0 * oldZoom;
+        double oldPageH = tab.pages[static_cast<size_t>(page)].heightPt * static_cast<double>(g_dpi) / 72.0 * oldZoom;
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        bool painted = false;
+        for (auto& entry : tab.tileCache)
+        {
+            TileKey const& key = entry.first;
+            PageImage& image = entry.second;
+            if (key.page != page || key.theme != PdfRenderTheme() || key.zoom != fallbackZoom ||
+                (!image.dib && image.bgra.empty()) || image.width <= 0 || image.height <= 0)
+                continue;
+
+            int scale = TileLevelScale(key.level);
+            double leftNorm = key.x * static_cast<double>(scale) / std::max(1.0, oldPageW);
+            double topNorm = key.y * static_cast<double>(scale) / std::max(1.0, oldPageH);
+            double rightNorm = (key.x + key.w) * static_cast<double>(scale) / std::max(1.0, oldPageW);
+            double bottomNorm = (key.y + key.h) * static_cast<double>(scale) / std::max(1.0, oldPageH);
+            RECT dest{
+                pageRect.left + static_cast<int>(std::floor(leftNorm * pageW)),
+                pageRect.top + static_cast<int>(std::floor(topNorm * pageH)),
+                pageRect.left + static_cast<int>(std::ceil(rightNorm * pageW)),
+                pageRect.top + static_cast<int>(std::ceil(bottomNorm * pageH))
+            };
+            RECT clipped{};
+            if (!IntersectRect(&clipped, &dest, &drawRect)) continue;
+            int destW = std::max<int>(1, dest.right - dest.left);
+            int destH = std::max<int>(1, dest.bottom - dest.top);
+            int sx = std::clamp<int>(MulDiv(clipped.left - dest.left, image.width, destW), 0, image.width - 1);
+            int sy = std::clamp<int>(MulDiv(clipped.top - dest.top, image.height, destH), 0, image.height - 1);
+            int ex = std::clamp<int>(MulDiv(clipped.right - dest.left, image.width, destW), sx + 1, image.width);
+            int ey = std::clamp<int>(MulDiv(clipped.bottom - dest.top, image.height, destH), sy + 1, image.height);
+            painted |= DrawCachedImagePart(dc, image, clipped, sx, sy, ex - sx, ey - sy);
+        }
+        return painted;
+    }
+
     bool TileLevelFullyCached(PdfTab& tab, int page, RECT pageRect, RECT drawRect, int level)
     {
         int pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -11085,15 +11279,16 @@ namespace
         int levelTop = TileCoordAtLevel(localTop, level);
         int levelRight = std::clamp<int>((localRight + scale - 1) / scale, levelLeft + 1, levelPageW);
         int levelBottom = std::clamp<int>((localBottom + scale - 1) / scale, levelTop + 1, levelPageH);
-        int tileLeft = (levelLeft / TileSize) * TileSize;
-        int tileTop = (levelTop / TileSize) * TileSize;
-        for (int ty = tileTop; ty < levelBottom; ty += TileSize)
+        int tileSize = TileSize();
+        int tileLeft = (levelLeft / tileSize) * tileSize;
+        int tileTop = (levelTop / tileSize) * tileSize;
+        for (int ty = tileTop; ty < levelBottom; ty += tileSize)
         {
-            int h = std::min(TileSize, levelPageH - ty);
+            int h = std::min(tileSize, levelPageH - ty);
             if (h <= 0) continue;
-            for (int tx = tileLeft; tx < levelRight; tx += TileSize)
+            for (int tx = tileLeft; tx < levelRight; tx += tileSize)
             {
-                int w = std::min(TileSize, levelPageW - tx);
+                int w = std::min(tileSize, levelPageW - tx);
                 if (w <= 0) continue;
                 TileKey key{ page, TileZoomKey(tab.zoom), PdfRenderTheme(), level, tx, ty, w, h };
                 PageImage* image = FindCachedTile(tab, key);
@@ -11118,16 +11313,17 @@ namespace
         int levelTop = TileCoordAtLevel(localTop, level);
         int levelRight = std::clamp<int>((localRight + scale - 1) / scale, levelLeft + 1, levelPageW);
         int levelBottom = std::clamp<int>((localBottom + scale - 1) / scale, levelTop + 1, levelPageH);
-        int tileLeft = (levelLeft / TileSize) * TileSize;
-        int tileTop = (levelTop / TileSize) * TileSize;
+        int tileSize = TileSize();
+        int tileLeft = (levelLeft / tileSize) * tileSize;
+        int tileTop = (levelTop / tileSize) * tileSize;
         bool painted = false;
-        for (int ty = tileTop; ty < levelBottom; ty += TileSize)
+        for (int ty = tileTop; ty < levelBottom; ty += tileSize)
         {
-            int h = std::min(TileSize, levelPageH - ty);
+            int h = std::min(tileSize, levelPageH - ty);
             if (h <= 0) continue;
-            for (int tx = tileLeft; tx < levelRight; tx += TileSize)
+            for (int tx = tileLeft; tx < levelRight; tx += tileSize)
             {
-                int w = std::min(TileSize, levelPageW - tx);
+                int w = std::min(tileSize, levelPageW - tx);
                 if (w <= 0) continue;
                 TileKey key{ page, TileZoomKey(tab.zoom), PdfRenderTheme(), level, tx, ty, w, h };
                 PageImage* image = FindCachedTile(tab, key);
@@ -11223,7 +11419,7 @@ namespace
                         {
                             image = FindZoomFallbackPage(tab, i);
                             usingZoomFallback = image != nullptr;
-                            QueuePageRender(g_hwnd, tab, i, 0);
+                            if (!ZoomRenderDeferred()) QueuePageRender(g_hwnd, tab, i, 0);
                         }
                         Fill(dc, drawRect, RGB(255, 255, 255));
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
@@ -11235,7 +11431,7 @@ namespace
                             if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy))
                             {
                                 paintedRenderable = true;
-                                if (usingZoomFallback) QueuePageRender(g_hwnd, tab, i, 0);
+                                if (usingZoomFallback && !ZoomRenderDeferred()) QueuePageRender(g_hwnd, tab, i, 0);
                             }
                         }
                         else
@@ -11257,32 +11453,31 @@ namespace
                             fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
                         }
                         int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
+                        bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
+                        bool coarseComplete = false;
+                        for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
+                            coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
+                        bool oldZoomPainted = false;
+                        if (!fallbackPainted && targetMissing && !coarseComplete)
+                            oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
                         bool coarsePainted = false;
-                        if (!fallbackPainted)
+                        if (targetMissing)
                         {
                             for (int level = targetLevel; level >= 1; --level)
                             {
-                                if (!TileLevelFullyCached(tab, i, pageRect, drawRect, level)) continue;
                                 bool ignoredMissing = false;
-                                if (DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing))
-                                {
-                                    coarsePainted = true;
-                                    break;
-                                }
+                                coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
                             }
                         }
-                        bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
                         bool ignoredMissing = false;
                         bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
-                        if (targetMissing)
+                        if (targetMissing && !ZoomRenderDeferred())
                         {
                             int queueBudget = stageScrolling ? 4 : 12;
                             QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                            if (!fallback && !stageScrolling)
-                                QueueZoomPreviewRender(g_hwnd, tab, i, 10);
                         }
-                        if (fallbackPainted || coarsePainted || targetPainted) paintedRenderable = true;
-                        if (targetMissing && !fallbackPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
+                        if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
+                        if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                     }
                     if (IsDarkTheme())
                     {
@@ -13995,15 +14190,14 @@ namespace
                     if (request.tile)
                     {
                         ULONGLONG now = GetTickCount64();
-                        bool currentTile = request.level == 0 && !IsRectEmpty(&dirtyRect);
-                        if (StageScrollPaintInProgress() && currentTile)
+                        bool visibleTile = !IsRectEmpty(&dirtyRect);
+                        if (StageScrollPaintInProgress() && visibleTile)
                         {
                             g_stageIdleRefreshPending = true;
-                            if (now - g_lastTileRepaintMs >= 24)
+                            if (now - g_lastTileRepaintMs >= 32)
                             {
                                 g_lastTileRepaintMs = now;
-                                if (!IsRectEmpty(&dirtyRect))
-                                    InvalidateRect(hwnd, &dirtyRect, FALSE);
+                                InvalidateRect(hwnd, &dirtyRect, FALSE);
                             }
                         }
                         else if (StageScrollPaintInProgress())
@@ -15460,7 +15654,22 @@ namespace
             if (wParam == 20)
             {
                 KillTimer(hwnd, 20);
-                if (!StageScrollPaintInProgress()) TrimIdleRenderCaches(hwnd);
+                if (!StageScrollPaintInProgress() && !ZoomRenderDeferred()) TrimIdleRenderCaches(hwnd);
+                return 0;
+            }
+            if (wParam == 21)
+            {
+                ULONGLONG now = GetTickCount64();
+                if (now < g_zoomRenderDeferUntil)
+                {
+                    SetTimer(hwnd, 21, static_cast<UINT>(std::max<ULONGLONG>(10, g_zoomRenderDeferUntil - now)), nullptr);
+                    return 0;
+                }
+                KillTimer(hwnd, 21);
+                g_zoomRenderDeferUntil = 0;
+                InvalidateRect(hwnd, &g_stage, FALSE);
+                SchedulePagePrefetch(hwnd);
+                ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
             break;

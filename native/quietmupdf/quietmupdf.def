@@ -15,6 +15,7 @@ EXPORTS
     fz_scale
     fz_load_page
     fz_bound_page
+    fz_device_bgr
     fz_drop_page
     fz_device_rgb
     fz_new_pixmap_from_page_number
@@ -30,6 +31,10 @@ EXPORTS
     quiet_new_pixmap_from_page_number_clip
     quiet_new_render_cookie
     quiet_abort_render_cookie
+
+    quiet_new_page_contents_display_list_cookie
+    quiet_drop_display_list
+    quiet_new_pixmap_from_display_list_clip_cookie
     quiet_drop_render_cookie
     quiet_new_pixmap_from_page_number_clip_cookie
     quiet_pdf_save_annotations

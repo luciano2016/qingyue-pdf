@@ -212,7 +212,7 @@ static fz_pixmap* quiet_new_pixmap_from_page_number_clip_impl(
     {
         page = fz_load_page(ctx, doc, number);
         pix = fz_new_pixmap_with_bbox(ctx, cs, bbox, nullptr, alpha);
-        fz_clear_pixmap_with_value(ctx, pix, alpha ? 0 : 255);
+        fz_clear_pixmap_with_value(ctx, pix, 255);
         dev = fz_new_draw_device(ctx, ctm, pix);
         fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
         fz_close_device(ctx, dev);
@@ -228,6 +228,93 @@ static fz_pixmap* quiet_new_pixmap_from_page_number_clip_impl(
         pix = nullptr;
     }
 
+    return pix;
+}
+extern "C" fz_display_list* quiet_new_page_contents_display_list_cookie(
+    fz_context* ctx,
+    fz_document* doc,
+    int number,
+    fz_cookie* cookie)
+{
+    fz_page* page = nullptr;
+    fz_display_list* list = nullptr;
+    fz_device* dev = nullptr;
+
+    fz_try(ctx)
+    {
+        page = fz_load_page(ctx, doc, number);
+        list = fz_new_display_list(ctx, fz_bound_page(ctx, page));
+        dev = fz_new_list_device(ctx, list);
+        fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
+        fz_close_device(ctx, dev);
+    }
+    fz_always(ctx)
+    {
+        if (dev) fz_drop_device(ctx, dev);
+        if (page) fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx)
+    {
+        if (list) fz_drop_display_list(ctx, list);
+        list = nullptr;
+    }
+
+    if (cookie && cookie->abort && list)
+    {
+        fz_drop_display_list(ctx, list);
+        list = nullptr;
+    }
+    return list;
+}
+
+extern "C" void quiet_drop_display_list(fz_context* ctx, fz_display_list* list)
+{
+    if (ctx && list) fz_drop_display_list(ctx, list);
+}
+
+extern "C" fz_pixmap* quiet_new_pixmap_from_display_list_clip_cookie(
+    fz_context* ctx,
+    fz_display_list* list,
+    fz_matrix ctm,
+    fz_colorspace* cs,
+    int alpha,
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    fz_cookie* cookie)
+{
+    if (!ctx || !list) return nullptr;
+    fz_pixmap* pix = nullptr;
+    fz_device* dev = nullptr;
+    fz_irect bbox{ x0, y0, x1, y1 };
+
+    fz_try(ctx)
+    {
+        fz_rect scissor = fz_transform_rect(
+            fz_make_rect(static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(x1), static_cast<float>(y1)),
+            fz_invert_matrix(ctm));
+        pix = fz_new_pixmap_with_bbox(ctx, cs, bbox, nullptr, alpha);
+        fz_clear_pixmap_with_value(ctx, pix, 255);
+        dev = fz_new_draw_device(ctx, ctm, pix);
+        fz_run_display_list(ctx, list, dev, fz_identity, scissor, cookie);
+        fz_close_device(ctx, dev);
+    }
+    fz_always(ctx)
+    {
+        if (dev) fz_drop_device(ctx, dev);
+    }
+    fz_catch(ctx)
+    {
+        if (pix) fz_drop_pixmap(ctx, pix);
+        pix = nullptr;
+    }
+
+    if (cookie && cookie->abort && pix)
+    {
+        fz_drop_pixmap(ctx, pix);
+        pix = nullptr;
+    }
     return pix;
 }
 
