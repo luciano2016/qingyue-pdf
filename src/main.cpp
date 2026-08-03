@@ -1186,6 +1186,7 @@ namespace
     std::vector<LastSessionItem> g_lastSessionTabs;
     std::map<std::wstring, PageImage> g_homeThumbCache;
     std::map<std::wstring, ULONGLONG> g_homeThumbLastUsed;
+    std::map<std::wstring, std::filesystem::file_time_type> g_homeThumbFailedStamp;
     std::set<std::wstring> g_homeThumbProtectedKeys;
     std::mutex g_homeThumbMutex;
     std::condition_variable g_homeThumbCv;
@@ -3850,6 +3851,7 @@ namespace
     {
         g_homeThumbCache.clear();
         g_homeThumbLastUsed.clear();
+        g_homeThumbFailedStamp.clear();
         g_homeThumbProtectedKeys.clear();
     }
 
@@ -4452,6 +4454,8 @@ namespace
     PageImage* LoadHomeThumb(const RecentItem& item, int targetWidth)
     {
         if (targetWidth <= 0 || item.path.empty()) return nullptr;
+        std::error_code stampError;
+        if (!std::filesystem::exists(item.path, stampError) || stampError) return nullptr;
         if (g_homeThumbWidth != targetWidth)
         {
             ClearHomeThumbCacheState();
@@ -4464,6 +4468,13 @@ namespace
         int renderTheme = PdfRenderTheme();
         std::wstring key = HomeThumbKey(item, targetWidth, renderTheme);
         TouchHomeThumb(key);
+        auto failed = g_homeThumbFailedStamp.find(key);
+        if (failed != g_homeThumbFailedStamp.end())
+        {
+            auto currentStamp = std::filesystem::last_write_time(item.path, stampError);
+            if (!stampError && currentStamp == failed->second) return nullptr;
+            g_homeThumbFailedStamp.erase(failed);
+        }
         auto found = g_homeThumbCache.find(key);
         if (found != g_homeThumbCache.end()) return &found->second;
 
@@ -4851,8 +4862,16 @@ namespace
         if (g_pageRenderThread.joinable()) g_pageRenderThread.join();
     }
 
+    void CancelQueuedPageRenders()
+    {
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        g_pageRenderQueue.clear();
+        ++g_pageRenderSerial;
+    }
+
     void HomeThumbWorkerMain()
     {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;)
         {
             HomeThumbRequest request;
@@ -13142,6 +13161,11 @@ namespace
             }
             else ++it;
         }
+        for (auto it = g_homeThumbFailedStamp.begin(); it != g_homeThumbFailedStamp.end(); )
+        {
+            if (it->first.rfind(path + L"#", 0) == 0) it = g_homeThumbFailedStamp.erase(it);
+            else ++it;
+        }
     }
 
     void RemoveRecentAt(int index)
@@ -13379,7 +13403,16 @@ namespace
 
         switch (id)
         {
-        case CmdHome: g_active = -1; g_tabListOpen = false; SetTitle(); StartActiveFileWatcher(hwnd); InvalidateRect(hwnd, nullptr, FALSE); break;
+        case CmdHome:
+            g_active = -1;
+            g_tabListOpen = false;
+            CancelQueuedPageRenders();
+            TrimBackgroundRenderCaches();
+            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+            SetTitle();
+            StartActiveFileWatcher(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            break;
         case CmdOpen: OpenDialog(hwnd); break;
         case CmdTabNavPrev:
             if (g_active > 0) ActivateTab(hwnd, g_active - 1);
@@ -13900,17 +13933,26 @@ namespace
             {
                 return 0;
             }
+            bool repaint = false;
             if (!result->image.bgra.empty())
             {
+                g_homeThumbFailedStamp.erase(result->key);
                 SaveHomeThumbToDisk(result->item, result->targetWidth, result->renderTheme, result->image);
                 if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
                 {
                     TouchHomeThumb(result->key);
                     g_homeThumbCache.emplace(result->key, std::move(result->image));
                     TrimHomeThumbCache();
+                    repaint = true;
                 }
             }
-            if (!Active())
+            else
+            {
+                std::error_code stampError;
+                auto stamp = std::filesystem::last_write_time(result->item.path, stampError);
+                if (!stampError) g_homeThumbFailedStamp[result->key] = stamp;
+            }
+            if (repaint && !Active())
             {
                 RECT client{};
                 GetClientRect(hwnd, &client);
