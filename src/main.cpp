@@ -5673,6 +5673,21 @@ namespace
         return false;
     }
 
+    bool IsTextAtPoint(PdfTab const& tab, int page, RECT pageRect, POINT clientPt)
+    {
+        if (!g_pdf.selectWordAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
+            return false;
+
+        double pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
+        float y = std::clamp(static_cast<float>((clientPt.y - pageRect.top) / pageH), 0.0f, 1.0f);
+
+        fz_quad quad{};
+        char hitText[8]{};
+        return g_pdf.selectWordAtPoint(tab.ctx, tab.doc, page, x, y, &quad, 1, hitText, sizeof(hitText)) > 0;
+    }
+
     fz_rect NormalizeSelectionRect(RECT pageRect, POINT a, POINT b)
     {
         double pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -13746,6 +13761,17 @@ namespace
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return TRUE;
+                }
+                if (PdfTab* tab = Active())
+                {
+                    int page = -1;
+                    RECT pageRect{};
+                    if (PageRectAtPoint(*tab, pt.x, pt.y, page, pageRect) &&
+                        IsTextAtPoint(*tab, page, pageRect, pt))
+                    {
+                        SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                        return TRUE;
+                    }
                 }
             }
             break;
