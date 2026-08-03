@@ -182,6 +182,30 @@ namespace
         {
             std::vector<std::uint8_t>().swap(bgra);
         }
+
+        std::uint8_t* AllocateDibPixels()
+        {
+            ResetDib();
+            if (width <= 0 || height <= 0) return nullptr;
+
+            BITMAPINFO info{};
+            info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+
+            void* bits = nullptr;
+            dib = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+            if (!dib || !bits)
+            {
+                ResetDib();
+                return nullptr;
+            }
+            return static_cast<std::uint8_t*>(bits);
+        }
+
     };
 
     struct TileKey
@@ -1151,6 +1175,7 @@ namespace
         PageRenderRequest request;
         PageImage image;
     };
+    bool EnsureImageDib(PageImage& image);
 
     std::mutex g_pageRenderMutex;
     std::condition_variable g_pageRenderCv;
@@ -4232,7 +4257,7 @@ namespace
     int SinglePageContentHeight(PdfTab const& tab);
     int SinglePageMaxScroll(PdfTab const& tab);
 
-    PageImage RenderPageAtScale(PdfTab& tab, int index, double renderScale, bool applyTheme, int renderTheme = -1)
+    PageImage RenderPageAtScale(PdfTab& tab, int index, double renderScale, bool applyTheme, int renderTheme = -1, bool renderToDib = false)
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
@@ -4263,10 +4288,12 @@ namespace
         int components = g_pdf.pixmapComponents(tab.ctx, pixmap);
         int stride = g_pdf.pixmapStride(tab.ctx, pixmap);
         auto* samples = g_pdf.pixmapSamples(tab.ctx, pixmap);
-        image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
+        auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
+        if (!dibPixels)
+            image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
         for (int y = 0; y < image.height; ++y)
         {
-            auto* dst = image.bgra.data() + static_cast<size_t>(y) * image.width * 4;
+            auto* dst = (dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4;
             auto* src = samples + static_cast<size_t>(y) * stride;
             for (int x = 0; x < image.width; ++x)
             {
@@ -4376,7 +4403,7 @@ namespace
         QueueHomeThumb(item, targetWidth, key, renderTheme, g_dpi, g_hwnd);
         return nullptr;
     }
-    PageImage PixmapToImageFor(PdfTab& tab, fz_pixmap* pixmap, int renderTheme)
+    PageImage PixmapToImageFor(PdfTab& tab, fz_pixmap* pixmap, int renderTheme, bool renderToDib = false)
     {
         PageImage image;
         if (!pixmap) return image;
@@ -4385,10 +4412,12 @@ namespace
         int components = g_pdf.pixmapComponents(tab.ctx, pixmap);
         int stride = g_pdf.pixmapStride(tab.ctx, pixmap);
         auto* samples = g_pdf.pixmapSamples(tab.ctx, pixmap);
-        image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
+        auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
+        if (!dibPixels)
+            image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
         for (int y = 0; y < image.height; ++y)
         {
-            auto* dst = image.bgra.data() + static_cast<size_t>(y) * image.width * 4;
+            auto* dst = (dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4;
             auto* src = samples + static_cast<size_t>(y) * stride;
             for (int x = 0; x < image.width; ++x)
             {
@@ -4411,7 +4440,7 @@ namespace
         return PixmapToImageFor(tab, pixmap, PdfRenderTheme());
     }
 
-    PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme)
+    PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme, bool renderToDib = false)
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = g_pdf.newPixmapFromPageNumberClip(
@@ -4425,7 +4454,7 @@ namespace
             tile.top,
             tile.right,
             tile.bottom);
-        PageImage image = PixmapToImageFor(tab, pixmap, renderTheme);
+        PageImage image = PixmapToImageFor(tab, pixmap, renderTheme, renderToDib);
         if (pixmap) g_pdf.dropPixmap(tab.ctx, pixmap);
         return image;
     }
@@ -4608,7 +4637,7 @@ namespace
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
         size_t target = visibleBytes * 2ull + 10ull * 1024ull * 1024ull;
-        return std::clamp<size_t>(target, 16ull * 1024ull * 1024ull, 32ull * 1024ull * 1024ull);
+        return std::clamp<size_t>(target, 16ull * 1024ull * 1024ull, 28ull * 1024ull * 1024ull);
     }
 
     void TrimPageCache(PdfTab& tab, int protectedPage)
@@ -4714,11 +4743,11 @@ namespace
                 if (request.tile)
                 {
                     RECT tile{ request.x, request.y, request.x + request.w, request.y + request.h };
-                    result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme);
+                    result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme, true);
                 }
                 else
                 {
-                    result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme);
+                    result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme, true);
                 }
             }
             catch (...)
@@ -4735,8 +4764,10 @@ namespace
                 g_pageRenderActive = false;
                 stale = g_pageRenderStop;
             }
-            if (!stale && !result->image.bgra.empty() && IsWindow(request.target))
+            if (!stale && (result->image.dib || !result->image.bgra.empty()) && IsWindow(request.target))
             {
+                if (!result->image.bgra.empty())
+                    EnsureImageDib(result->image);
                 if (!PostMessageW(request.target, WM_QUIETPDF_PAGE_RENDERED, 0, reinterpret_cast<LPARAM>(result.get())))
                     continue;
                 result.release();
@@ -4832,11 +4863,24 @@ namespace
         request.path = tab.path;
         request.page = page;
         request.zoom = tab.zoom;
+        request.viewportGeneration = g_viewportGeneration;
         request.dpi = g_dpi;
         request.theme = PdfRenderTheme();
         request.priority = priority;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            g_pageRenderQueue.erase(
+                std::remove_if(
+                    g_pageRenderQueue.begin(),
+                    g_pageRenderQueue.end(),
+                    [&](PageRenderRequest const& queued)
+                    {
+                        return !queued.tile && queued.renderZoom <= 0.0 &&
+                            queued.viewportGeneration + 1 < g_viewportGeneration &&
+                            queued.documentVersion == tab.renderVersion &&
+                            _wcsicmp(queued.path.c_str(), tab.path.c_str()) == 0;
+                    }),
+                g_pageRenderQueue.end());
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
             for (auto const& queued : g_pageRenderQueue)
             {
@@ -7838,7 +7882,7 @@ namespace
         g_pdf.Load();
         auto tab = std::make_unique<PdfTab>();
         tab->renderVersion = ++g_nextRenderVersion;
-        tab->ctx = g_pdf.newContext(nullptr, nullptr, 24 << 20, "1.28.0");
+        tab->ctx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
         g_pdf.setAaLevel(tab->ctx, 8);
         g_pdf.registerHandlers(tab->ctx);
         auto utf8 = ToUtf8(path);
@@ -8543,7 +8587,8 @@ namespace
         }
         UpdateVertScrollBar(hwnd);
         RedrawMainScrollBarNow(hwnd);
-        SchedulePagePrefetch(hwnd);
+        if (!StageScrollPaintInProgress())
+            SchedulePagePrefetch(hwnd);
     }
 
     void CommitMainScrollDragTarget(HWND hwnd)
@@ -12513,7 +12558,7 @@ namespace
         try
         {
             g_pdf.Load();
-            tab.ctx = g_pdf.newContext(nullptr, nullptr, 24 << 20, "1.28.0");
+            tab.ctx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
             g_pdf.setAaLevel(tab.ctx, 8);
             g_pdf.registerHandlers(tab.ctx);
             auto utf8 = ToUtf8(path);
@@ -12559,7 +12604,7 @@ namespace
         try
         {
             g_pdf.Load();
-            tab.ctx = g_pdf.newContext(nullptr, nullptr, 24 << 20, "1.28.0");
+            tab.ctx = g_pdf.newContext(nullptr, nullptr, 16 << 20, "1.28.0");
             g_pdf.setAaLevel(tab.ctx, 8);
             g_pdf.registerHandlers(tab.ctx);
             auto utf8 = ToUtf8(path);
