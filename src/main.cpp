@@ -6174,10 +6174,34 @@ namespace
         return !g_selectionText.empty() || (g_selectingContent && !g_lastDragSelectionText.empty());
     }
 
+    bool CompleteSelectionForExternalReader(HWND hwnd)
+    {
+        if (!g_selectingContent || g_selectionPage < 0 || IsRectEmpty(&g_selectionPageRect)) return false;
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) return false;
+        ScreenToClient(hwnd, &cursor);
+        g_selectionEnd = POINT{
+            static_cast<LONG>(std::clamp(cursor.x, static_cast<int>(g_selectionPageRect.left), static_cast<int>(g_selectionPageRect.right))),
+            static_cast<LONG>(std::clamp(cursor.y, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom)))
+        };
+        PdfTab* tab = Active();
+        if (!tab) return false;
+        if (RefreshTextSelection(*tab))
+        {
+            RememberDragTextSelection();
+            g_hasContentSelection = true;
+            g_selectionIsImage = false;
+            return true;
+        }
+        return RestoreLastDragTextSelection();
+    }
+
     bool CopyCurrentSelectionToClipboard(HWND hwnd)
     {
-        // A low-level selection hook can request copy before WM_LBUTTONUP restores
-        // the last valid text range after the pointer ends in trailing whitespace.
+        // A low-level selection hook can request the text before WM_LBUTTONUP
+        // is dispatched. Complete the range from the current pointer first.
+        if (g_selectingContent && g_selectionText.empty())
+            CompleteSelectionForExternalReader(hwnd);
         std::wstring const& text = !g_selectionText.empty() ? g_selectionText : g_lastDragSelectionText;
         bool hasTextSelection = !text.empty();
         if (!g_hasContentSelection && !hasTextSelection) return false;
