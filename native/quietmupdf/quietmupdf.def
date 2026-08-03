@@ -30,5 +30,6 @@ EXPORTS
     quiet_pdf_last_error
     quiet_pdf_select_text
     quiet_pdf_search_page_number
+    quiet_pdf_get_text_char_boxes
     quiet_pdf_select_word_at_point
     quiet_pdf_find_image_at_point

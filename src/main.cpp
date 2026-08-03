@@ -324,6 +324,8 @@ namespace
         std::map<int, PageImage> zoomFallbackCache;
         std::map<TileKey, PageImage> tileCache;
         std::map<int, PageImage> thumbCache;
+        std::map<int, std::vector<fz_rect>> textBoxes;
+        std::set<int> textBoxesReady;
         std::vector<PdfAnnotation> annotations;
         std::vector<OutlineLayoutRow> outlineLayout;
         int outlineLayoutWidth{};
@@ -975,6 +977,7 @@ namespace
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
         using SelectWordAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_quad*, int, char*, int);
+        using TextCharBoxesFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_rect*, int);
         using FindImageAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_rect*);
         using PixmapIntFn = int(__cdecl*)(fz_context*, fz_pixmap*);
         using PixmapSamplesFn = unsigned char*(__cdecl*)(fz_context*, fz_pixmap*);
@@ -1008,6 +1011,7 @@ namespace
             Get(loadAnnotations, "quiet_pdf_load_annotations");
             Get(selectText, "quiet_pdf_select_text");
             GetOptional(selectWordAtPoint, "quiet_pdf_select_word_at_point");
+            GetOptional(textCharBoxes, "quiet_pdf_get_text_char_boxes");
             GetOptional(findImageAtPoint, "quiet_pdf_find_image_at_point");
             Get(pixmapWidth, "fz_pixmap_width");
             Get(pixmapHeight, "fz_pixmap_height");
@@ -1041,6 +1045,7 @@ namespace
         LoadAnnotationsFn loadAnnotations{};
         SelectTextFn selectText{};
         SelectWordAtPointFn selectWordAtPoint{};
+        TextCharBoxesFn textCharBoxes{};
         FindImageAtPointFn findImageAtPoint{};
         PixmapIntFn pixmapWidth{};
         PixmapIntFn pixmapHeight{};
@@ -3583,6 +3588,8 @@ namespace
 
     void DropTab(PdfTab& tab)
     {
+        tab.textBoxes.clear();
+        tab.textBoxesReady.clear();
         if (tab.doc) g_pdf.dropDocument(tab.ctx, tab.doc);
         if (tab.ctx) g_pdf.dropContext(tab.ctx);
         tab.doc = nullptr;
@@ -5673,9 +5680,61 @@ namespace
         return false;
     }
 
-    bool IsTextAtPoint(PdfTab const& tab, int page, RECT pageRect, POINT clientPt)
+    void TrimTextBoxCache(PdfTab& tab, int protectedPage)
     {
-        if (!g_pdf.selectWordAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
+        constexpr size_t kMaxTextBoxPages = 12;
+        while (tab.textBoxesReady.size() > kMaxTextBoxPages)
+        {
+            int victim = -1;
+            int farthest = -1;
+            for (int page : tab.textBoxesReady)
+            {
+                if (page == protectedPage)
+                    continue;
+                int distance = std::abs(page - tab.currentPage);
+                if (distance > farthest)
+                {
+                    farthest = distance;
+                    victim = page;
+                }
+            }
+            if (victim < 0)
+                break;
+            tab.textBoxesReady.erase(victim);
+            tab.textBoxes.erase(victim);
+        }
+    }
+
+    std::vector<fz_rect> const* TextBoxesForPage(PdfTab& tab, int page)
+    {
+        if (page < 0 || page >= tab.pageCount || !g_pdf.textCharBoxes)
+            return nullptr;
+
+        if (tab.textBoxesReady.find(page) == tab.textBoxesReady.end())
+        {
+            tab.textBoxesReady.insert(page);
+            std::vector<fz_rect> boxes(8192);
+            int count = g_pdf.textCharBoxes(tab.ctx, tab.doc, page, boxes.data(), static_cast<int>(boxes.size()));
+            if (count > static_cast<int>(boxes.size()) && count <= 1000000)
+            {
+                boxes.resize(static_cast<size_t>(count));
+                count = g_pdf.textCharBoxes(tab.ctx, tab.doc, page, boxes.data(), count);
+            }
+            if (count > 0)
+            {
+                boxes.resize(static_cast<size_t>(std::min<int>(count, static_cast<int>(boxes.size()))));
+                tab.textBoxes.emplace(page, std::move(boxes));
+            }
+            TrimTextBoxCache(tab, page);
+        }
+
+        auto found = tab.textBoxes.find(page);
+        return found == tab.textBoxes.end() ? nullptr : &found->second;
+    }
+
+    bool IsTextAtPoint(PdfTab& tab, int page, RECT pageRect, POINT clientPt)
+    {
+        if (page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
             return false;
 
         double pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -5683,9 +5742,25 @@ namespace
         float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
         float y = std::clamp(static_cast<float>((clientPt.y - pageRect.top) / pageH), 0.0f, 1.0f);
 
-        fz_quad quad{};
-        char hitText[8]{};
-        return g_pdf.selectWordAtPoint(tab.ctx, tab.doc, page, x, y, &quad, 1, hitText, sizeof(hitText)) > 0;
+        if (!g_pdf.textCharBoxes)
+        {
+            if (!g_pdf.selectWordAtPoint)
+                return false;
+            fz_quad quad{};
+            char hitText[8]{};
+            return g_pdf.selectWordAtPoint(tab.ctx, tab.doc, page, x, y, &quad, 1, hitText, sizeof(hitText)) > 0;
+        }
+
+        std::vector<fz_rect> const* boxes = TextBoxesForPage(tab, page);
+        if (!boxes)
+            return false;
+
+        for (fz_rect const& box : *boxes)
+        {
+            if (x >= box.x0 && x <= box.x1 && y >= box.y0 && y <= box.y1)
+                return true;
+        }
+        return false;
     }
 
     fz_rect NormalizeSelectionRect(RECT pageRect, POINT a, POINT b)

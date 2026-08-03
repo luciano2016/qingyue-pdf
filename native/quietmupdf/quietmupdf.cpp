@@ -625,6 +625,77 @@ static void quiet_normalize_quad(fz_quad& q, fz_rect bounds)
     q.lr.y = (q.lr.y - bounds.y0) / height;
 }
 
+extern "C" int quiet_pdf_get_text_char_boxes(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    fz_rect* boxes,
+    int max_boxes)
+{
+    quiet_set_last_error("");
+    if (!ctx || !doc || page_number < 0 || max_boxes < 0 || (max_boxes > 0 && !boxes))
+    {
+        quiet_set_last_error("invalid quiet_pdf_get_text_char_boxes arguments");
+        return 0;
+    }
+
+    fz_stext_page* stext = nullptr;
+    int count = 0;
+    fz_try(ctx)
+    {
+        int page_count = fz_count_pages(ctx, doc);
+        if (page_number >= page_count)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "page out of range");
+
+        fz_page* page = fz_load_page(ctx, doc, page_number);
+        fz_rect bounds = fz_bound_page(ctx, page);
+        fz_drop_page(ctx, page);
+
+        fz_stext_options opts{};
+        opts.flags = FZ_STEXT_DEHYPHENATE;
+        stext = fz_new_stext_page_from_page_number(ctx, doc, page_number, &opts);
+
+        float width = std::max(0.0001f, bounds.x1 - bounds.x0);
+        float height = std::max(0.0001f, bounds.y1 - bounds.y0);
+        for (fz_stext_block* block = stext ? stext->first_block : nullptr; block; block = block->next)
+        {
+            if (block->type != FZ_STEXT_BLOCK_TEXT)
+                continue;
+            for (fz_stext_line* line = block->u.t.first_line; line; line = line->next)
+            {
+                for (fz_stext_char* ch = line->first_char; ch; ch = ch->next)
+                {
+                    if (ch->c == 0 || ch->c == '\r' || ch->c == '\n')
+                        continue;
+                    fz_rect rect = quiet_rect_from_quad(ch->quad);
+                    if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                        continue;
+                    if (boxes && count < max_boxes)
+                    {
+                        boxes[count] = fz_rect{
+                            (rect.x0 - bounds.x0) / width,
+                            (rect.y0 - bounds.y0) / height,
+                            (rect.x1 - bounds.x0) / width,
+                            (rect.y1 - bounds.y0) / height
+                        };
+                    }
+                    ++count;
+                }
+            }
+        }
+    }
+    fz_always(ctx)
+    {
+        if (stext) fz_drop_stext_page(ctx, stext);
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        count = 0;
+    }
+
+    return count;
+}
 extern "C" int quiet_pdf_select_word_at_point(
     fz_context* ctx,
     fz_document* doc,
