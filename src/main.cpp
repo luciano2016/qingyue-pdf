@@ -74,10 +74,17 @@ namespace
     constexpr wchar_t const* AppName = L"\u8f7b\u9605PDF";
     constexpr long UIA_TextPatternId = 10014;
     constexpr long UIA_Text_TextSelectionChangedEventId = 20014;
+    constexpr long UIA_BoundingRectanglePropertyId = 30001;
+    constexpr long UIA_ProcessIdPropertyId = 30002;
     constexpr long UIA_ControlTypePropertyId = 30003;
     constexpr long UIA_LocalizedControlTypePropertyId = 30004;
     constexpr long UIA_NamePropertyId = 30005;
+    constexpr long UIA_HasKeyboardFocusPropertyId = 30008;
+    constexpr long UIA_IsKeyboardFocusablePropertyId = 30009;
+    constexpr long UIA_AutomationIdPropertyId = 30011;
+    constexpr long UIA_ClassNamePropertyId = 30012;
     constexpr long UIA_NativeWindowHandlePropertyId = 30020;
+    constexpr long UIA_FrameworkIdPropertyId = 30024;
     constexpr long UIA_IsTextPatternAvailablePropertyId = 30040;
     constexpr long UIA_DocumentControlTypeId = 50030;
 
@@ -6395,7 +6402,7 @@ namespace
         UiaSelectionSnapshot m_snapshot;
     };
 
-    class QuietPdfUiaProvider final : public IRawElementProviderSimple, public ITextProvider
+    class QuietPdfUiaProvider final : public IRawElementProviderSimple, public IRawElementProviderFragment, public IRawElementProviderFragmentRoot, public ITextProvider
     {
     public:
         QuietPdfUiaProvider() : m_ref(1) {}
@@ -6406,6 +6413,10 @@ namespace
             *ppvObject = nullptr;
             if (riid == IID_IUnknown || riid == __uuidof(IRawElementProviderSimple))
                 *ppvObject = static_cast<IRawElementProviderSimple*>(this);
+            else if (riid == __uuidof(IRawElementProviderFragment))
+                *ppvObject = static_cast<IRawElementProviderFragment*>(this);
+            else if (riid == __uuidof(IRawElementProviderFragmentRoot))
+                *ppvObject = static_cast<IRawElementProviderFragmentRoot*>(this);
             else if (riid == __uuidof(ITextProvider))
                 *ppvObject = static_cast<ITextProvider*>(this);
             else
@@ -6466,6 +6477,55 @@ namespace
                 pRetVal->vt = VT_BSTR;
                 pRetVal->bstrVal = SysAllocString(L"document");
             }
+            else if (propertyId == UIA_HasKeyboardFocusPropertyId)
+            {
+                pRetVal->vt = VT_BOOL;
+                pRetVal->boolVal = (::GetFocus() == g_hwnd) ? VARIANT_TRUE : VARIANT_FALSE;
+            }
+            else if (propertyId == UIA_IsKeyboardFocusablePropertyId)
+            {
+                pRetVal->vt = VT_BOOL;
+                pRetVal->boolVal = VARIANT_TRUE;
+            }
+            else if (propertyId == UIA_AutomationIdPropertyId)
+            {
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = SysAllocString(L"QingYuePdfDocument");
+            }
+            else if (propertyId == UIA_ClassNamePropertyId)
+            {
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = SysAllocString(L"QuietPDF.Win32");
+            }
+            else if (propertyId == UIA_FrameworkIdPropertyId)
+            {
+                pRetVal->vt = VT_BSTR;
+                pRetVal->bstrVal = SysAllocString(L"Win32");
+            }
+            else if (propertyId == UIA_ProcessIdPropertyId)
+            {
+                pRetVal->vt = VT_I4;
+                pRetVal->lVal = static_cast<LONG>(GetCurrentProcessId());
+            }
+            else if (propertyId == UIA_BoundingRectanglePropertyId)
+            {
+                SAFEARRAY* array = SafeArrayCreateVector(VT_R8, 0, 4);
+                if (!array) return E_OUTOFMEMORY;
+                RECT r{};
+                GetWindowRect(g_hwnd, &r);
+                double values[4]{ static_cast<double>(r.left), static_cast<double>(r.top), static_cast<double>(r.right - r.left), static_cast<double>(r.bottom - r.top) };
+                for (LONG i = 0; i < 4; ++i)
+                {
+                    HRESULT hr = SafeArrayPutElement(array, &i, &values[i]);
+                    if (FAILED(hr))
+                    {
+                        SafeArrayDestroy(array);
+                        return hr;
+                    }
+                }
+                pRetVal->vt = VT_R8 | VT_ARRAY;
+                pRetVal->parray = array;
+            }
             else if (propertyId == UIA_IsTextPatternAvailablePropertyId)
             {
                 pRetVal->vt = VT_BOOL;
@@ -6485,6 +6545,93 @@ namespace
             return UiaHostProviderFromHwnd(g_hwnd, pRetVal);
         }
 
+        HRESULT STDMETHODCALLTYPE Navigate(NavigateDirection direction, IRawElementProviderFragment** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            UNREFERENCED_PARAMETER(direction);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            SAFEARRAY* array = SafeArrayCreateVector(VT_I4, 0, 2);
+            if (!array) return E_OUTOFMEMORY;
+            LONG values[2]{ UiaAppendRuntimeId, static_cast<LONG>(reinterpret_cast<LONG_PTR>(g_hwnd) & 0x7fffffff) };
+            for (LONG i = 0; i < 2; ++i)
+            {
+                HRESULT hr = SafeArrayPutElement(array, &i, &values[i]);
+                if (FAILED(hr))
+                {
+                    SafeArrayDestroy(array);
+                    return hr;
+                }
+            }
+            *pRetVal = array;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            RECT r{};
+            GetWindowRect(g_hwnd, &r);
+            pRetVal->left = static_cast<double>(r.left);
+            pRetVal->top = static_cast<double>(r.top);
+            pRetVal->width = static_cast<double>(std::max<LONG>(0, r.right - r.left));
+            pRetVal->height = static_cast<double>(std::max<LONG>(0, r.bottom - r.top));
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = EmptyUnknownSafeArray();
+            return *pRetVal ? S_OK : E_OUTOFMEMORY;
+        }
+
+        HRESULT STDMETHODCALLTYPE SetFocus() override
+        {
+            if (g_hwnd) ::SetFocus(g_hwnd);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = static_cast<IRawElementProviderFragmentRoot*>(this);
+            AddRef();
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE ElementProviderFromPoint(double x, double y, IRawElementProviderFragment** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            POINT pt{ static_cast<LONG>(x), static_cast<LONG>(y) };
+            RECT r{};
+            GetWindowRect(g_hwnd, &r);
+            if (PtInRect(&r, pt))
+            {
+                *pRetVal = static_cast<IRawElementProviderFragment*>(this);
+                AddRef();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment** pRetVal) override
+        {
+            if (!pRetVal) return E_POINTER;
+            *pRetVal = nullptr;
+            if (::GetFocus() == g_hwnd || GetActiveWindow() == g_hwnd)
+            {
+                *pRetVal = static_cast<IRawElementProviderFragment*>(this);
+                AddRef();
+            }
+            return S_OK;
+        }
         HRESULT STDMETHODCALLTYPE GetSelection(SAFEARRAY** pRetVal) override
         {
             if (!pRetVal) return E_POINTER;
