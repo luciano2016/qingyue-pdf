@@ -3217,29 +3217,34 @@ namespace
         }
         case SideTabIcon::Notes:
         {
-            float l = cx - S(8.4f);
-            float t = cy - S(8.2f);
-            float rr = cx + S(8.3f);
-            float b = cy + S(8.3f);
-            float r2 = S(2.0f);
-            g.DrawLine(&pen, l + r2, t, cx + S(4.2f), t);
-            g.DrawLine(&pen, rr, cy - S(2.7f), rr, b - r2);
-            g.DrawArc(&pen, rr - r2 * 2.0f, b - r2 * 2.0f, r2 * 2.0f, r2 * 2.0f, 0.0f, 90.0f);
-            g.DrawLine(&pen, rr - r2, b, l + r2, b);
-            g.DrawArc(&pen, l, b - r2 * 2.0f, r2 * 2.0f, r2 * 2.0f, 90.0f, 90.0f);
-            g.DrawLine(&pen, l, b - r2, l, t + r2);
-            g.DrawArc(&pen, l, t, r2 * 2.0f, r2 * 2.0f, 180.0f, 90.0f);
+            float l = cx - S(8.8f);
+            float t = cy - S(8.3f);
+            float rr = cx + S(8.7f);
+            float b = cy + S(8.7f);
+            float corner = S(2.0f);
 
+            Gdiplus::GraphicsPath noteFrame;
+            noteFrame.StartFigure();
+            noteFrame.AddLine(cx - S(3.6f), t, l + corner, t);
+            noteFrame.AddBezier(l + corner, t, l + S(0.9f), t, l, t + S(0.9f), l, t + corner);
+            noteFrame.AddLine(l, t + corner, l, b - corner);
+            noteFrame.AddBezier(l, b - corner, l, b - S(0.9f), l + S(0.9f), b, l + corner, b);
+            noteFrame.AddLine(l + corner, b, rr - corner, b);
+            noteFrame.AddBezier(rr - corner, b, rr - S(0.9f), b, rr, b - S(0.9f), rr, b - corner);
+            noteFrame.AddLine(rr, b - corner, rr, cy + S(1.8f));
+            g.DrawPath(&pen, &noteFrame);
+
+            // Points on each side mirror across the 45-degree pencil axis.
             Gdiplus::PointF pencil[] = {
-                Gdiplus::PointF(cx - S(2.8f), cy + S(3.8f)),
-                Gdiplus::PointF(cx - S(1.8f), cy + S(0.1f)),
-                Gdiplus::PointF(cx + S(7.4f), cy - S(9.1f)),
-                Gdiplus::PointF(cx + S(9.7f), cy - S(6.8f)),
-                Gdiplus::PointF(cx + S(0.5f), cy + S(2.4f))
+                Gdiplus::PointF(cx - S(5.8f), cy + S(5.8f)),
+                Gdiplus::PointF(cx - S(4.2f), cy + S(0.4f)),
+                Gdiplus::PointF(cx + S(4.6f), cy - S(8.4f)),
+                Gdiplus::PointF(cx + S(8.4f), cy - S(4.6f)),
+                Gdiplus::PointF(cx - S(0.4f), cy + S(4.2f))
             };
             Gdiplus::GraphicsPath pencilPath;
             pencilPath.AddPolygon(pencil, static_cast<INT>(std::size(pencil)));
-            g.FillPath(&brush, &pencilPath);
+            g.DrawPath(&pen, &pencilPath);
             break;
         }
         }
