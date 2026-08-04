@@ -1527,7 +1527,12 @@ namespace
     bool g_annotationToolbarOpen{};
     bool g_annotationNoteOpen{};
     bool g_annotationNoteFocused{};
-    bool g_annotationNoteCaretVisible{ true };
+    HWND g_annotationNoteEdit{};
+    HFONT g_annotationNoteEditFont{};
+    HBRUSH g_annotationNoteEditBrush{};
+    COLORREF g_annotationNoteEditBrushColor{ CLR_INVALID };
+    bool g_syncingAnnotationNoteEdit{};
+    int g_annotationNoteEditAnnotation{ -1 };
     RECT g_annotationHitRect{};
     RECT g_annotationToolbarRect{};
     RECT g_annotationCopyRect{};
@@ -1856,6 +1861,20 @@ namespace
         lf.lfWeight = weight;
         lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
         wcscpy_s(lf.lfFaceName, L"Segoe UI Variable Text");
+        return CreateFontIndirectW(&lf);
+    }
+
+    HFONT SystemUiFont(int pt)
+    {
+        NONCLIENTMETRICSW metrics{ sizeof(metrics) };
+        LOGFONTW lf{};
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+            lf = metrics.lfMessageFont;
+        else
+            wcscpy_s(lf.lfFaceName, L"Segoe UI");
+        lf.lfHeight = -MulDiv(pt, static_cast<int>(g_dpi), 72);
+        lf.lfWeight = FW_NORMAL;
+        lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
         return CreateFontIndirectW(&lf);
     }
 
@@ -3236,8 +3255,8 @@ namespace
             noteFrame.AddLine(rr, b - corner, rr, cy + scaled(1.8f));
             g.DrawPath(&pen, &noteFrame);
 
-            float pencilCx = cx + S(2.0f);
-            float pencilCy = cy - S(2.0f);
+            float pencilCx = cx + S(1.0f);
+            float pencilCy = cy - S(1.0f);
             // Points on each side mirror across the 45-degree pencil axis.
             Gdiplus::PointF pencil[] = {
                 Gdiplus::PointF(pencilCx - scaled(5.8f), pencilCy + scaled(5.8f)),
@@ -7704,6 +7723,8 @@ namespace
         g_annotationToolbarOpen = false;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
+        g_annotationNoteEditAnnotation = -1;
+        if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
         g_annotationHitRect = RECT{};
         g_annotationToolbarRect = RECT{};
         g_annotationCopyRect = RECT{};
@@ -10926,11 +10947,30 @@ namespace
                         g_sidebarRowRects.push_back(pageRow);
                         g_sidebarRowIds.push_back(-100000 - annotation.page);
                         bool collapsed = g_collapsedAnnotationPages.find(annotation.page) != g_collapsedAnnotationPages.end();
-                        bool hovered = Hit(pageRow, g_mousePos.x, g_mousePos.y);
-                        if (hovered) RoundFill(dc, pageRow, S(6), T().panel2, T().line);
-                        RECT twist{ pageRow.left + S(2), pageRow.top + S(7), pageRow.left + S(18), pageRow.bottom - S(7) };
-                        Text(dc, collapsed ? L"+" : L"-", twist, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
-                        RECT pageText{ pageRow.left + S(24), pageRow.top, pageRow.right, pageRow.bottom };
+                        RECT twist{
+                            pageRow.left,
+                            pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2,
+                            pageRow.left + S(24),
+                            pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2 + S(24)
+                        };
+                        bool twistHovered = Hit(twist, g_mousePos.x, g_mousePos.y);
+                        bool twistPressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &twist);
+                        if (twistHovered || twistPressed)
+                        {
+                            COLORREF feedback = twistPressed ? T().line : SidebarHoverFill();
+                            RoundFill(dc, twist, S(5), feedback, feedback);
+                        }
+                        Gdiplus::Graphics twistGraphics(dc);
+                        twistGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                        twistGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+                        Gdiplus::Pen twistPen(GdiColor(twistPressed ? T().text : T().muted), std::max<Gdiplus::REAL>(1.2f, S(1.25f)));
+                        float twistCx = (twist.left + twist.right) * 0.5f;
+                        float twistCy = (pageRow.top + pageRow.bottom) * 0.5f;
+                        float halfLine = S(5.5f);
+                        twistGraphics.DrawLine(&twistPen, twistCx - halfLine, twistCy, twistCx + halfLine, twistCy);
+                        if (collapsed)
+                            twistGraphics.DrawLine(&twistPen, twistCx, twistCy - halfLine, twistCx, twistCy + halfLine);
+                        RECT pageText{ pageRow.left + S(28), pageRow.top, pageRow.right, pageRow.bottom };
                         Text(dc, L"\u7b2c " + std::to_wstring(annotation.page + 1) + L" \u9875", pageText, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
                     }
                     y += S(32);
@@ -10938,7 +10978,7 @@ namespace
                 }
                 if (g_collapsedAnnotationPages.find(annotation.page) != g_collapsedAnnotationPages.end()) continue;
 
-                RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(86) };
+                RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(76) };
                 if (visible(row))
                 {
                     g_sidebarRowPages.push_back(annotation.page);
@@ -10966,8 +11006,8 @@ namespace
                     std::wstring body = !annotation.note.empty() ? annotation.note : annotation.text;
                     Text(dc, body.empty() ? L"\u65e0\u6587\u672c\u5185\u5bb9" : ElideText(body, 48), preview, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS, T().muted);
                 }
-                y += S(92);
-                content += S(92);
+                y += S(80);
+                content += S(80);
             }
             if (tab.annotations.empty())
             {
@@ -11629,6 +11669,69 @@ namespace
         return text.substr(0, maxChars - 1) + L"...";
     }
 
+    void EnsureAnnotationNoteEdit(HWND hwnd)
+    {
+        if (!g_annotationNoteEdit)
+        {
+            g_annotationNoteEdit = CreateWindowExW(
+                0,
+                L"EDIT",
+                L"",
+                WS_CHILD | WS_TABSTOP | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
+                0, 0, 0, 0,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(0x7F10)),
+                GetModuleHandleW(nullptr),
+                nullptr);
+            if (!g_annotationNoteEdit) return;
+            SendMessageW(g_annotationNoteEdit, EM_SETLIMITTEXT, 1000, 0);
+            SendMessageW(g_annotationNoteEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(2), S(2)));
+            SendMessageW(g_annotationNoteEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"点击输入注释..."));
+        }
+        if (!g_annotationNoteEditFont)
+            g_annotationNoteEditFont = SystemUiFont(11);
+        SendMessageW(g_annotationNoteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_annotationNoteEditFont), TRUE);
+    }
+
+    void SyncAnnotationNoteEdit(HWND hwnd, PdfAnnotation const& annotation)
+    {
+        EnsureAnnotationNoteEdit(hwnd);
+        if (!g_annotationNoteEdit) return;
+
+        if (g_annotationNoteEditAnnotation != g_activeAnnotation)
+        {
+            g_syncingAnnotationNoteEdit = true;
+            SetWindowTextW(g_annotationNoteEdit, annotation.note.c_str());
+            g_syncingAnnotationNoteEdit = false;
+            g_annotationNoteEditAnnotation = g_activeAnnotation;
+            SendMessageW(g_annotationNoteEdit, EM_SETSEL, annotation.note.size(), annotation.note.size());
+        }
+
+        RECT editRect{
+            g_annotationNoteInputRect.left + S(8),
+            g_annotationNoteInputRect.top + S(7),
+            g_annotationNoteInputRect.right - S(8),
+            g_annotationNoteInputRect.bottom - S(7)
+        };
+        RECT currentRect{};
+        GetWindowRect(g_annotationNoteEdit, &currentRect);
+        MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&currentRect), 2);
+        if (!EqualRect(&currentRect, &editRect))
+        {
+            MoveWindow(
+                g_annotationNoteEdit,
+                editRect.left,
+                editRect.top,
+                std::max(1L, editRect.right - editRect.left),
+                std::max(1L, editRect.bottom - editRect.top),
+                TRUE);
+        }
+        if (!IsWindowVisible(g_annotationNoteEdit))
+            ShowWindow(g_annotationNoteEdit, SW_SHOW);
+        if (g_annotationNoteFocused && GetFocus() != g_annotationNoteEdit)
+            SetFocus(g_annotationNoteEdit);
+    }
+
     void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client)
     {
         g_annotationToolbarRect = {};
@@ -11640,10 +11743,18 @@ namespace
         g_annotationNotePanelRect = {};
         g_annotationNoteInputRect = {};
         g_annotationColorRects.clear();
-        if (!g_annotationToolbarOpen) return;
+        if (!g_annotationToolbarOpen)
+        {
+            if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
+            return;
+        }
 
         PdfAnnotation* annotation = nullptr;
-        if (!ActiveAnnotation(tab, annotation)) return;
+        if (!ActiveAnnotation(tab, annotation))
+        {
+            if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
+            return;
+        }
 
         RECT pageRect{};
         if (!PageRectForPage(tab, annotation->page, pageRect)) return;
@@ -11702,7 +11813,11 @@ namespace
         SelectObject(dc, oldFont);
         DeleteObject(f);
 
-        if (!g_annotationNoteOpen) return;
+        if (!g_annotationNoteOpen)
+        {
+            if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
+            return;
+        }
         int panelW = S(260);
         int panelH = S(214);
         int panelLeft = std::min<int>(static_cast<int>(g_annotationToolbarRect.right) - panelW, static_cast<int>(client.right) - panelW - S(14));
@@ -11732,21 +11847,7 @@ namespace
 
         g_annotationNoteInputRect = RECT{ panelLeft + S(14), panelTop + S(64), panelLeft + panelW - S(14), panelTop + panelH - S(14) };
         RoundFill(dc, g_annotationNoteInputRect, S(8), T().paper, g_annotationNoteFocused ? T().accent : T().line);
-        RECT noteText{ g_annotationNoteInputRect.left + S(10), g_annotationNoteInputRect.top + S(8), g_annotationNoteInputRect.right - S(10), g_annotationNoteInputRect.bottom - S(8) };
-        std::wstring note = annotation->note.empty() ? L"\u70b9\u51fb\u8f93\u5165\u6ce8\u91ca..." : annotation->note;
-        Text(dc, note, noteText, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, annotation->note.empty() ? T().muted : T().text);
-        if (g_annotationNoteFocused && g_annotationNoteCaretVisible)
-        {
-            SIZE size{};
-            HFONT noteFont = Font(9);
-            oldFont = SelectObject(dc, noteFont);
-            GetTextExtentPoint32W(dc, annotation->note.c_str(), static_cast<int>(annotation->note.size()), &size);
-            SelectObject(dc, oldFont);
-            DeleteObject(noteFont);
-            int caretX = std::min(noteText.right - S(2), noteText.left + size.cx + S(1));
-            RECT caret{ caretX, noteText.top + S(2), caretX + std::max(1, S(1)), noteText.top + S(18) };
-            Fill(dc, caret, T().accent);
-        }
+        SyncAnnotationNoteEdit(g_hwnd, *annotation);
     }
 
     void DrawSidebarPanelToggleGlyph(HDC dc, RECT r, bool open, COLORREF color)
@@ -14310,6 +14411,11 @@ namespace
         }
         case WM_DPICHANGED:
             g_dpi = HIWORD(wParam);
+            if (g_annotationNoteEditFont)
+            {
+                DeleteObject(g_annotationNoteEditFont);
+                g_annotationNoteEditFont = nullptr;
+            }
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             return 0;
         case WM_SIZE:
@@ -14331,6 +14437,45 @@ namespace
             }
             break;
         case WM_COMMAND:
+            if (LOWORD(wParam) == 0x7F10)
+            {
+                if (HIWORD(wParam) == EN_SETFOCUS)
+                {
+                    g_annotationNoteFocused = true;
+                    InvalidateRect(hwnd, &g_annotationNoteInputRect, FALSE);
+                    return 0;
+                }
+                if (HIWORD(wParam) == EN_KILLFOCUS)
+                {
+                    g_annotationNoteFocused = false;
+                    InvalidateRect(hwnd, &g_annotationNoteInputRect, FALSE);
+                    return 0;
+                }
+                if (HIWORD(wParam) == EN_CHANGE && !g_syncingAnnotationNoteEdit)
+                {
+                    PdfTab* tab = Active();
+                    PdfAnnotation* annotation = nullptr;
+                    if (tab && ActiveAnnotation(*tab, annotation) && g_annotationNoteEdit)
+                    {
+                        int length = GetWindowTextLengthW(g_annotationNoteEdit);
+                        std::wstring value(static_cast<size_t>(length), L' ');
+                        if (length > 0)
+                        {
+                            std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1);
+                            GetWindowTextW(g_annotationNoteEdit, buffer.data(), length + 1);
+                            value.assign(buffer.data(), static_cast<size_t>(length));
+                        }
+                        if (annotation->note != value)
+                        {
+                            annotation->note = std::move(value);
+                            tab->dirty = true;
+                            InvalidateRect(hwnd, &g_sidebar, FALSE);
+                            SetTitle();
+                        }
+                    }
+                    return 0;
+                }
+            }
             if (LOWORD(wParam) == 0xE122 && (g_hasContentSelection || HasCopyableTextSelection()))
             {
                 CopyCurrentSelectionToClipboard(hwnd);
@@ -14338,6 +14483,22 @@ namespace
             }
             Command(hwnd, LOWORD(wParam));
             return 0;
+        case WM_CTLCOLOREDIT:
+            if (reinterpret_cast<HWND>(lParam) == g_annotationNoteEdit)
+            {
+                HDC editDc = reinterpret_cast<HDC>(wParam);
+                COLORREF background = T().paper;
+                SetTextColor(editDc, T().text);
+                SetBkColor(editDc, background);
+                if (!g_annotationNoteEditBrush || g_annotationNoteEditBrushColor != background)
+                {
+                    if (g_annotationNoteEditBrush) DeleteObject(g_annotationNoteEditBrush);
+                    g_annotationNoteEditBrush = CreateSolidBrush(background);
+                    g_annotationNoteEditBrushColor = background;
+                }
+                return reinterpret_cast<LRESULT>(g_annotationNoteEditBrush);
+            }
+            break;
         case WM_MEASUREITEM:
             if (MeasureThemedMenuItem(reinterpret_cast<MEASUREITEMSTRUCT*>(lParam))) return TRUE;
             break;
@@ -14585,7 +14746,7 @@ namespace
                     {
                         g_annotationNoteOpen = true;
                         g_annotationNoteFocused = true;
-                        SetTimer(hwnd, 13, 500, nullptr);
+                        g_annotationNoteEditAnnotation = -1;
                         InvalidateRect(hwnd, nullptr, FALSE);
                         return 0;
                     }
@@ -14610,13 +14771,16 @@ namespace
                         {
                             g_annotationNoteOpen = false;
                             g_annotationNoteFocused = false;
+                            g_annotationNoteEditAnnotation = -1;
+                            if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
+                            SetFocus(hwnd);
                             InvalidateRect(hwnd, nullptr, FALSE);
                             return 0;
                         }
                         if (Hit(g_annotationNoteInputRect, x, y))
                         {
                             g_annotationNoteFocused = true;
-                            SetTimer(hwnd, 13, 500, nullptr);
+                            if (g_annotationNoteEdit) SetFocus(g_annotationNoteEdit);
                             InvalidateRect(hwnd, nullptr, FALSE);
                             return 0;
                         }
@@ -14957,6 +15121,16 @@ namespace
                             int rowId = g_sidebarRowIds[i];
                             if (rowId <= -100000)
                             {
+                                RECT pageRow = g_sidebarRowRects[i];
+                                RECT twist{
+                                    pageRow.left,
+                                    pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2,
+                                    pageRow.left + S(24),
+                                    pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2 + S(24)
+                                };
+                                g_pressedButtonRect = twist;
+                                g_hasPressedButton = true;
+                                SetTimer(hwnd, 2, 90, nullptr);
                                 int notePage = -100000 - rowId;
                                 if (g_collapsedAnnotationPages.find(notePage) != g_collapsedAnnotationPages.end()) g_collapsedAnnotationPages.erase(notePage);
                                 else g_collapsedAnnotationPages.insert(notePage);
@@ -15647,18 +15821,6 @@ namespace
                 InvalidateRect(hwnd, &g_searchInputRect, FALSE);
                 return 0;
             }
-            if (wParam == 13)
-            {
-                if (!g_annotationNoteFocused)
-                {
-                    g_annotationNoteCaretVisible = true;
-                    KillTimer(hwnd, 13);
-                    return 0;
-                }
-                g_annotationNoteCaretVisible = !g_annotationNoteCaretVisible;
-                InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
-                return 0;
-            }
             if (wParam == 15)
             {
                 if (!g_homeSearchFocused || Active())
@@ -16018,46 +16180,6 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (g_annotationNoteFocused)
-            {
-                PdfTab* tab = Active();
-                PdfAnnotation* annotation = nullptr;
-                if (!tab || !ActiveAnnotation(*tab, annotation))
-                {
-                    g_annotationNoteFocused = false;
-                    return 0;
-                }
-                bool changed = false;
-                if (wParam == VK_BACK)
-                {
-                    if (!annotation->note.empty())
-                    {
-                        annotation->note.pop_back();
-                        changed = true;
-                    }
-                }
-                else if (wParam == VK_RETURN)
-                {
-                    if (annotation->note.size() < 1000)
-                    {
-                        annotation->note.push_back(L'\n');
-                        changed = true;
-                    }
-                }
-                else if (wParam >= 32 && annotation->note.size() < 1000)
-                {
-                    annotation->note.push_back(static_cast<wchar_t>(wParam));
-                    changed = true;
-                }
-                if (changed)
-                {
-                    tab->dirty = true;
-                    g_annotationNoteCaretVisible = true;
-                    SetTimer(hwnd, 13, 500, nullptr);
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                }
-                return 0;
-            }
             if (g_pageInputFocused)
             {
                 g_pageCaretIndex = std::clamp(g_pageCaretIndex, 0, static_cast<int>(g_pageInputText.size()));
@@ -16173,6 +16295,8 @@ namespace
             for (auto& tab : g_tabs) DropTab(*tab);
             ReleasePaintBuffer();
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
+            if (g_annotationNoteEditFont) DeleteObject(g_annotationNoteEditFont);
+            if (g_annotationNoteEditBrush) DeleteObject(g_annotationNoteEditBrush);
             ReleaseUiaProvider();
             ReleaseUiaRootProvider();
             ReleaseAccessibleProvider();
