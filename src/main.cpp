@@ -1555,9 +1555,15 @@ namespace
     bool g_homeSearchFocused{};
     bool g_homeSearchCaretVisible{ true };
     bool g_confirmClearRecent{};
+    bool g_confirmDeleteAllAnnotations{};
     RECT g_clearDialogConfirmRect{};
     RECT g_clearDialogCancelRect{};
     RECT g_clearDialogCloseRect{};
+
+    bool ConfirmationDialogOpen()
+    {
+        return g_confirmClearRecent || g_confirmDeleteAllAnnotations;
+    }
     RECT g_zoomDialogRect{};
     RECT g_zoomDialogInputRect{};
     RECT g_zoomDialogConfirmRect{};
@@ -10526,7 +10532,7 @@ namespace
 
     void PaintClearRecentDialog(HDC dc, RECT client)
     {
-        if (!g_confirmClearRecent) return;
+        if (!ConfirmationDialogOpen()) return;
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         Gdiplus::SolidBrush scrim(GdiColor(RGB(20, 24, 28), IsDarkTheme() ? 128 : 82));
@@ -10558,20 +10564,25 @@ namespace
         HFONT titleFont = Font(8, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
         RECT title{ panel.left + S(112), panel.top + S(60), panel.right - S(34), panel.top + S(92) };
-        Text(dc, L"\u786e\u5b9a\u8981\u6e05\u7a7a\u6700\u8fd1\u4f7f\u7528\u8bb0\u5f55\u5417\uff1f", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        const wchar_t* dialogTitle = g_confirmDeleteAllAnnotations ? L"确定要删除所有注释吗？" : L"确定要清空最近使用记录吗？";
+        Text(dc, dialogTitle, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
         HFONT bodyFont = Font(9);
         oldFont = SelectObject(dc, bodyFont);
         RECT body{ panel.left + S(112), panel.top + S(92), panel.right - S(34), panel.top + S(130) };
-        Text(dc, L"\u8fd9\u4f1a\u5220\u9664\u9996\u9875\u8bb0\u5f55\u3001\u9605\u8bfb\u8fdb\u5ea6\u548c\u5c01\u9762\u7f13\u5b58\uff0c\u4e0d\u4f1a\u5220\u9664 PDF \u6587\u4ef6\u3002", body, DT_LEFT | DT_WORDBREAK, T().muted);
+        const wchar_t* dialogBody = g_confirmDeleteAllAnnotations
+            ? L"这会删除当前文档中的全部注释。保存 PDF 后，此操作无法撤销。"
+            : L"这会删除首页记录、阅读进度和封面缓存，不会删除 PDF 文件。";
+        Text(dc, dialogBody, body, DT_LEFT | DT_WORDBREAK, T().muted);
 
         g_clearDialogConfirmRect = RECT{ panel.right - S(198), panel.bottom - S(58), panel.right - S(106), panel.bottom - S(24) };
         g_clearDialogCancelRect = RECT{ panel.right - S(94), panel.bottom - S(58), panel.right - S(24), panel.bottom - S(24) };
         bool confirmHover = Hit(g_clearDialogConfirmRect, g_mousePos.x, g_mousePos.y);
         bool cancelHover = Hit(g_clearDialogCancelRect, g_mousePos.x, g_mousePos.y);
-        RoundFill(dc, g_clearDialogConfirmRect, S(8), confirmHover ? MixColor(T().accent, RGB(255, 255, 255), 0.16) : T().accent, T().accent);
-        Text(dc, L"\u786e\u5b9a", g_clearDialogConfirmRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, ForegroundOn(T().accent));
+        COLORREF confirmColor = g_confirmDeleteAllAnnotations ? RGB(210, 67, 67) : T().accent;
+        RoundFill(dc, g_clearDialogConfirmRect, S(8), confirmHover ? MixColor(confirmColor, RGB(255, 255, 255), 0.16) : confirmColor, confirmColor);
+        Text(dc, g_confirmDeleteAllAnnotations ? L"删除" : L"确定", g_clearDialogConfirmRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, ForegroundOn(confirmColor));
         RoundFill(dc, g_clearDialogCancelRect, S(8), cancelHover ? SidebarHoverFill() : T().panel2, T().line);
         Text(dc, L"\u53d6\u6d88", g_clearDialogCancelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         SelectObject(dc, oldFont);
@@ -14224,12 +14235,9 @@ namespace
             if (tab && g_activeAnnotation >= 0) DeleteAnnotation(hwnd, *tab, g_activeAnnotation);
             break;
         case CmdNoteDeleteAll:
-            if (tab)
+            if (tab && !tab->annotations.empty())
             {
-                tab->annotations.clear();
-                tab->dirty = true;
-                ClearAnnotationFocus();
-                g_collapsedAnnotationPages.clear();
+                g_confirmDeleteAllAnnotations = true;
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             break;
@@ -14639,6 +14647,7 @@ namespace
             }
             break;
         case WM_COMMAND:
+            if (ConfirmationDialogOpen()) return 0;
             if (LOWORD(wParam) == 0x7F10)
             {
                 if (HIWORD(wParam) == EN_SETFOCUS)
@@ -14716,6 +14725,13 @@ namespace
                 POINT pt{};
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
+                if (ConfirmationDialogOpen())
+                {
+                    bool clickable = Hit(g_clearDialogConfirmRect, pt.x, pt.y) ||
+                        Hit(g_clearDialogCancelRect, pt.x, pt.y) || Hit(g_clearDialogCloseRect, pt.x, pt.y);
+                    SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
                 if (g_autoScrollActive)
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
@@ -14773,6 +14789,7 @@ namespace
         }
         case WM_MBUTTONDOWN:
         {
+            if (ConfirmationDialogOpen()) return 0;
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             ToggleAutoScroll(hwnd, POINT{ x, y });
@@ -14783,7 +14800,7 @@ namespace
         {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
-            if (g_customZoomOpen || g_confirmClearRecent)
+            if (g_customZoomOpen || ConfirmationDialogOpen())
                 return 0;
             if (PdfTab* tab = Active())
             {
@@ -14851,17 +14868,34 @@ namespace
                 }
                 return 0;
             }
-            if (g_confirmClearRecent)
+            if (ConfirmationDialogOpen())
             {
                 if (Hit(g_clearDialogConfirmRect, x, y))
                 {
-                    g_confirmClearRecent = false;
-                    ClearRecentRecords();
+                    if (g_confirmDeleteAllAnnotations)
+                    {
+                        g_confirmDeleteAllAnnotations = false;
+                        if (PdfTab* tab = Active(); tab && !tab->annotations.empty())
+                        {
+                            tab->annotations.clear();
+                            tab->dirty = true;
+                            ClearAnnotationFocus();
+                            g_collapsedAnnotationPages.clear();
+                            SetTitle();
+                        }
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    else
+                    {
+                        g_confirmClearRecent = false;
+                        ClearRecentRecords();
+                    }
                     return 0;
                 }
                 if (Hit(g_clearDialogCancelRect, x, y) || Hit(g_clearDialogCloseRect, x, y))
                 {
                     g_confirmClearRecent = false;
+                    g_confirmDeleteAllAnnotations = false;
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -15383,6 +15417,7 @@ namespace
         }
         case WM_RBUTTONDOWN:
         {
+            if (ConfirmationDialogOpen()) return 0;
             if (::GetFocus() != hwnd)
             {
                 ::SetFocus(hwnd);
@@ -15449,7 +15484,7 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (g_confirmClearRecent)
+            if (ConfirmationDialogOpen())
             {
                 g_hasHoverTip = false;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -16147,6 +16182,7 @@ namespace
             break;
         case WM_MOUSEWHEEL:
         {
+            if (ConfirmationDialogOpen()) return 0;
             StopAutoScroll(hwnd);
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -16156,6 +16192,7 @@ namespace
         }
         case WM_MOUSEHWHEEL:
         {
+            if (ConfirmationDialogOpen()) return 0;
             StopAutoScroll(hwnd);
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             int pixels = WheelPixels(delta, S(64), g_stageHWheelRemainder);
@@ -16164,6 +16201,11 @@ namespace
         }
         case WM_GESTURE:
         {
+            if (ConfirmationDialogOpen())
+            {
+                CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(lParam));
+                return 0;
+            }
             GESTUREINFO info{};
             info.cbSize = sizeof(info);
             if (!GetGestureInfo(reinterpret_cast<HGESTUREINFO>(lParam), &info))
@@ -16216,6 +16258,7 @@ namespace
         }
         case WM_VSCROLL:
         {
+            if (ConfirmationDialogOpen()) return 0;
             int code = LOWORD(wParam);
             int newScroll = g_scrollY;
             if (code == SB_THUMBTRACK || code == SB_THUMBPOSITION)
@@ -16243,6 +16286,7 @@ namespace
         }
         case WM_HSCROLL:
         {
+            if (ConfirmationDialogOpen()) return 0;
             int code = LOWORD(wParam);
             int newScroll = g_scrollX;
             if (code == SB_THUMBTRACK || code == SB_THUMBPOSITION)
@@ -16263,6 +16307,14 @@ namespace
             return 0;
         }
         case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE && (g_confirmClearRecent || g_confirmDeleteAllAnnotations))
+            {
+                g_confirmClearRecent = false;
+                g_confirmDeleteAllAnnotations = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (ConfirmationDialogOpen()) return 0;
             if (wParam == VK_F11) { ApplyImmersiveWindow(hwnd, !g_immersive); return 0; }
             if (wParam == VK_ESCAPE && g_autoScrollActive) { StopAutoScroll(hwnd); return 0; }
             if (g_customZoomOpen)
@@ -16416,6 +16468,7 @@ namespace
             }
             break;
         case WM_CHAR:
+            if (ConfirmationDialogOpen()) return 0;
             if (g_customZoomOpen && g_customZoomFocused)
             {
                 if (wParam == VK_BACK)
