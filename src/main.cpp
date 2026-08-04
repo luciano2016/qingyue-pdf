@@ -278,6 +278,8 @@ namespace
         double y1{};
         AnnotationKind kind{ AnnotationKind::Highlight };
         int colorIndex{};
+        bool hasCustomColor{};
+        COLORREF customColor{};
         long long createdAt{};
         bool persisted{};
         std::vector<AnnotationSegment> segments;
@@ -1542,7 +1544,10 @@ namespace
     RECT g_annotationNoteCloseRect{};
     RECT g_annotationNotePanelRect{};
     RECT g_annotationNoteInputRect{};
+    RECT g_annotationCustomColorRect{};
     std::vector<RECT> g_annotationColorRects;
+    int g_pressedAnnotationPage{ -1 };
+    COLORREF g_annotationCustomColors[16]{};
     std::set<int> g_collapsedAnnotationPages;
     bool g_continuousRead{ true };
     bool g_homeListView{};
@@ -1728,8 +1733,26 @@ namespace
 
     COLORREF AnnotationColor(PdfAnnotation const& annotation)
     {
+        if (annotation.hasCustomColor) return annotation.customColor;
         int index = std::clamp(annotation.colorIndex, 0, static_cast<int>(std::size(AnnotationPalette)) - 1);
         return AnnotationPalette[index];
+    }
+
+    bool ExactAnnotationPaletteColor(float r, float g, float b, int& index)
+    {
+        int rr = std::clamp<int>(static_cast<int>(r * 255.0f + 0.5f), 0, 255);
+        int gg = std::clamp<int>(static_cast<int>(g * 255.0f + 0.5f), 0, 255);
+        int bb = std::clamp<int>(static_cast<int>(b * 255.0f + 0.5f), 0, 255);
+        for (int i = 0; i < static_cast<int>(std::size(AnnotationPalette)); ++i)
+        {
+            COLORREF color = AnnotationPalette[i];
+            if (GetRValue(color) == rr && GetGValue(color) == gg && GetBValue(color) == bb)
+            {
+                index = i;
+                return true;
+            }
+        }
+        return false;
     }
 
     int AnnotationColorIndexFromRgb(float r, float g, float b)
@@ -6423,7 +6446,8 @@ namespace
 
     bool NearlySameAnnotation(PdfAnnotation const& a, PdfAnnotation const& b)
     {
-        if (a.page != b.page || a.kind != b.kind || a.colorIndex != b.colorIndex)
+        if (a.page != b.page || a.kind != b.kind || a.colorIndex != b.colorIndex ||
+            a.hasCustomColor != b.hasCustomColor || (a.hasCustomColor && a.customColor != b.customColor))
             return false;
         AnnotationSegment as{ a.x0, a.y0, a.x1, a.y1 };
         AnnotationSegment bs{ b.x0, b.y0, b.x1, b.y1 };
@@ -6435,6 +6459,8 @@ namespace
         return existing.page == incoming.page &&
             existing.kind == incoming.kind &&
             existing.colorIndex == incoming.colorIndex &&
+            existing.hasCustomColor == incoming.hasCustomColor &&
+            (!existing.hasCustomColor || existing.customColor == incoming.customColor) &&
             existing.createdAt == incoming.createdAt &&
             existing.author == incoming.author &&
             existing.note == incoming.note;
@@ -7734,6 +7760,7 @@ namespace
         g_annotationNoteCloseRect = RECT{};
         g_annotationNotePanelRect = RECT{};
         g_annotationNoteInputRect = RECT{};
+        g_annotationCustomColorRect = RECT{};
         g_annotationColorRects.clear();
     }
 
@@ -11732,6 +11759,58 @@ namespace
             SetFocus(g_annotationNoteEdit);
     }
 
+    bool ChooseAnnotationCustomColor(HWND hwnd, PdfTab& tab, PdfAnnotation& annotation)
+    {
+        CHOOSECOLORW choose{ sizeof(choose) };
+        choose.hwndOwner = hwnd;
+        choose.rgbResult = AnnotationColor(annotation);
+        choose.lpCustColors = g_annotationCustomColors;
+        choose.Flags = CC_FULLOPEN | CC_RGBINIT;
+        if (!ChooseColorW(&choose)) return false;
+        annotation.customColor = choose.rgbResult;
+        annotation.hasCustomColor = true;
+        tab.dirty = true;
+        SetTitle();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
+    }
+
+    bool AnnotationPageToggleAt(POINT pt, RECT* result = nullptr)
+    {
+        if (g_sideMode != 3) return false;
+        for (size_t i = 0; i < g_sidebarRowRects.size() && i < g_sidebarRowIds.size(); ++i)
+        {
+            if (g_sidebarRowIds[i] > -100000) continue;
+            RECT pageRow = g_sidebarRowRects[i];
+            RECT twist{
+                pageRow.left,
+                pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2,
+                pageRow.left + S(24),
+                pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2 + S(24)
+            };
+            if (Hit(twist, pt.x, pt.y))
+            {
+                if (result) *result = twist;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool AnnotationToolbarClickableAt(POINT pt)
+    {
+        if (!g_annotationToolbarOpen) return false;
+        if (Hit(g_annotationCopyRect, pt.x, pt.y) ||
+            Hit(g_annotationNoteRect, pt.x, pt.y) ||
+            Hit(g_annotationDeleteRect, pt.x, pt.y) ||
+            Hit(g_annotationNoteCloseRect, pt.x, pt.y) ||
+            Hit(g_annotationCustomColorRect, pt.x, pt.y))
+            return true;
+        for (RECT const& rect : g_annotationColorRects)
+            if (Hit(rect, pt.x, pt.y)) return true;
+        return false;
+    }
+
     void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client)
     {
         g_annotationToolbarRect = {};
@@ -11742,6 +11821,7 @@ namespace
         g_annotationNoteCloseRect = {};
         g_annotationNotePanelRect = {};
         g_annotationNoteInputRect = {};
+        g_annotationCustomColorRect = {};
         g_annotationColorRects.clear();
         if (!g_annotationToolbarOpen)
         {
@@ -11761,7 +11841,7 @@ namespace
         RECT mark = DenormalizeAnnotationRect(*annotation, pageRect);
         g_annotationHitRect = mark;
 
-        int width = S(360);
+        int width = S(382);
         int height = S(42);
         int left = std::clamp(mark.left, g_stage.left + S(10), std::max(g_stage.left + S(10), g_stage.right - width - S(10)));
         int top = mark.top - height - S(10);
@@ -11793,22 +11873,62 @@ namespace
         drawTool(g_annotationDeleteRect, L"\u5220\u9664");
         x += S(50);
 
+        auto drawColorRing = [&](Gdiplus::Graphics& graphics, RECT swatch, bool selected, bool hovered)
+        {
+            if (!selected && !hovered) return;
+            Gdiplus::RectF ring{
+                static_cast<Gdiplus::REAL>(swatch.left - S(4)),
+                static_cast<Gdiplus::REAL>(swatch.top - S(4)),
+                static_cast<Gdiplus::REAL>(swatch.right - swatch.left + S(8)),
+                static_cast<Gdiplus::REAL>(swatch.bottom - swatch.top + S(8))
+            };
+            Gdiplus::SolidBrush ringFill(GdiColor(selected ? MixColor(T().panel2, T().accent, 0.18) : T().panel2));
+            Gdiplus::Pen ringLine(GdiColor(selected ? T().accent : T().line), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+            FillGdiRoundRect(graphics, ringFill, ring, S(10.0f));
+            DrawGdiRoundRect(graphics, ringLine, ring, S(10.0f));
+        };
+
+        Gdiplus::Graphics colorGraphics(dc);
+        colorGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        colorGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
         for (int i = 0; i < static_cast<int>(std::size(AnnotationPalette)); ++i)
         {
             RECT swatch{ x, y + S(6), x + S(16), y + S(22) };
             g_annotationColorRects.push_back(swatch);
-            bool selected = i == annotation->colorIndex;
-            bool hover = Hit(swatch, g_mousePos.x, g_mousePos.y);
-            if (selected || hover)
-            {
-                RECT ring{ swatch.left - S(4), swatch.top - S(4), swatch.right + S(4), swatch.bottom + S(4) };
-                RoundFill(dc, ring, S(10), selected ? MixColor(T().panel2, T().accent, 0.18) : T().panel2, selected ? T().accent : T().line);
-            }
-            Gdiplus::Graphics g(dc);
-            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            bool selected = !annotation->hasCustomColor && i == annotation->colorIndex;
+            bool hovered = Hit(swatch, g_mousePos.x, g_mousePos.y);
+            drawColorRing(colorGraphics, swatch, selected, hovered);
             Gdiplus::SolidBrush brush(GdiColor(AnnotationPalette[i]));
-            g.FillEllipse(&brush, static_cast<float>(swatch.left), static_cast<float>(swatch.top), static_cast<float>(swatch.right - swatch.left), static_cast<float>(swatch.bottom - swatch.top));
+            colorGraphics.FillEllipse(&brush, Rf(swatch));
             x += S(22);
+        }
+
+        g_annotationCustomColorRect = RECT{ x, y + S(6), x + S(16), y + S(22) };
+        bool customHovered = Hit(g_annotationCustomColorRect, g_mousePos.x, g_mousePos.y);
+        drawColorRing(colorGraphics, g_annotationCustomColorRect, annotation->hasCustomColor, customHovered);
+        if (annotation->hasCustomColor)
+        {
+            Gdiplus::SolidBrush customBrush(GdiColor(annotation->customColor));
+            colorGraphics.FillEllipse(&customBrush, Rf(g_annotationCustomColorRect));
+        }
+        else
+        {
+            Gdiplus::RectF customCircle = Rf(g_annotationCustomColorRect);
+            Gdiplus::GraphicsPath clipPath;
+            clipPath.AddEllipse(customCircle);
+            Gdiplus::Region oldClip;
+            colorGraphics.GetClip(&oldClip);
+            colorGraphics.SetClip(&clipPath);
+            Gdiplus::SolidBrush red(GdiColor(RGB(244, 97, 142)));
+            Gdiplus::SolidBrush yellow(GdiColor(RGB(255, 206, 55)));
+            Gdiplus::SolidBrush green(GdiColor(RGB(49, 211, 110)));
+            Gdiplus::SolidBrush blue(GdiColor(RGB(82, 174, 232)));
+            float half = customCircle.Width * 0.5f;
+            colorGraphics.FillRectangle(&red, customCircle.X, customCircle.Y, half, half);
+            colorGraphics.FillRectangle(&yellow, customCircle.X + half, customCircle.Y, half, half);
+            colorGraphics.FillRectangle(&green, customCircle.X, customCircle.Y + half, half, half);
+            colorGraphics.FillRectangle(&blue, customCircle.X + half, customCircle.Y + half, half, half);
+            colorGraphics.SetClip(&oldClip, Gdiplus::CombineModeReplace);
         }
         SelectObject(dc, oldFont);
         DeleteObject(f);
@@ -13083,6 +13203,13 @@ namespace
             annotation.y1 = std::clamp<double>(item.y1, 0.0, 1.0);
             annotation.kind = item.kind == 1 ? AnnotationKind::Underline : (item.kind == 2 ? AnnotationKind::Strikeout : AnnotationKind::Highlight);
             annotation.colorIndex = AnnotationColorIndexFromRgb(item.colorR, item.colorG, item.colorB);
+            int exactColorIndex = annotation.colorIndex;
+            annotation.hasCustomColor = !ExactAnnotationPaletteColor(item.colorR, item.colorG, item.colorB, exactColorIndex);
+            annotation.colorIndex = exactColorIndex;
+            annotation.customColor = RGB(
+                std::clamp<int>(static_cast<int>(item.colorR * 255.0f + 0.5f), 0, 255),
+                std::clamp<int>(static_cast<int>(item.colorG * 255.0f + 0.5f), 0, 255),
+                std::clamp<int>(static_cast<int>(item.colorB * 255.0f + 0.5f), 0, 255));
             annotation.createdAt = item.createdAtMs;
             annotation.persisted = true;
             AppendUniqueSegment(annotation.segments, AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
@@ -14524,6 +14651,11 @@ namespace
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
+                if (AnnotationToolbarClickableAt(pt) || AnnotationPageToggleAt(pt))
+                {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
                 if (PdfTab* tab = Active())
                 {
                     int page = -1;
@@ -14760,10 +14892,17 @@ namespace
                         if (Hit(g_annotationColorRects[i], x, y))
                         {
                             annotation->colorIndex = static_cast<int>(i);
+                            annotation->hasCustomColor = false;
                             tab->dirty = true;
+                            SetTitle();
                             InvalidateRect(hwnd, nullptr, FALSE);
                             return 0;
                         }
+                    }
+                    if (Hit(g_annotationCustomColorRect, x, y))
+                    {
+                        ChooseAnnotationCustomColor(hwnd, *tab, *annotation);
+                        return 0;
                     }
                     if (g_annotationNoteOpen)
                     {
@@ -15128,9 +15267,15 @@ namespace
                                     pageRow.left + S(24),
                                     pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2 + S(24)
                                 };
-                                g_pressedButtonRect = twist;
-                                g_hasPressedButton = true;
-                                SetTimer(hwnd, 2, 90, nullptr);
+                                if (Hit(twist, x, y))
+                                {
+                                    g_pressedAnnotationPage = -100000 - rowId;
+                                    g_pressedButtonRect = twist;
+                                    g_hasPressedButton = true;
+                                    SetCapture(hwnd);
+                                    InvalidateRect(hwnd, &twist, FALSE);
+                                    return 0;
+                                }
                                 int notePage = -100000 - rowId;
                                 if (g_collapsedAnnotationPages.find(notePage) != g_collapsedAnnotationPages.end()) g_collapsedAnnotationPages.erase(notePage);
                                 else g_collapsedAnnotationPages.insert(notePage);
@@ -15199,7 +15344,30 @@ namespace
         {
             int mx = GET_X_LPARAM(lParam);
             int my = GET_Y_LPARAM(lParam);
-            g_mousePos = POINT{ mx, my };
+            POINT oldMousePos = g_mousePos;
+            POINT newMousePos{ mx, my };
+            bool oldAnnotationToolHover = AnnotationToolbarClickableAt(oldMousePos);
+            bool newAnnotationToolHover = AnnotationToolbarClickableAt(newMousePos);
+            RECT oldToggleRect{};
+            RECT newToggleRect{};
+            bool oldAnnotationToggleHover = AnnotationPageToggleAt(oldMousePos, &oldToggleRect);
+            bool newAnnotationToggleHover = AnnotationPageToggleAt(newMousePos, &newToggleRect);
+            g_mousePos = newMousePos;
+            if (oldAnnotationToolHover != newAnnotationToolHover ||
+                (g_annotationToolbarOpen && (Hit(g_annotationToolbarRect, oldMousePos.x, oldMousePos.y) ||
+                    Hit(g_annotationToolbarRect, newMousePos.x, newMousePos.y) ||
+                    Hit(g_annotationNoteCloseRect, oldMousePos.x, oldMousePos.y) ||
+                    Hit(g_annotationNoteCloseRect, newMousePos.x, newMousePos.y))))
+            {
+                InvalidateRect(hwnd, &g_annotationToolbarRect, FALSE);
+                if (g_annotationNoteOpen) InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
+            }
+            if (oldAnnotationToggleHover != newAnnotationToggleHover ||
+                (oldAnnotationToggleHover && newAnnotationToggleHover && !EqualRect(&oldToggleRect, &newToggleRect)))
+            {
+                if (oldAnnotationToggleHover) InvalidateRect(hwnd, &oldToggleRect, FALSE);
+                if (newAnnotationToggleHover) InvalidateRect(hwnd, &newToggleRect, FALSE);
+            }
             if (g_customZoomOpen)
             {
                 g_hasHoverTip = false;
@@ -15525,6 +15693,24 @@ namespace
             break;
         }
         case WM_LBUTTONUP:
+            if (g_pressedAnnotationPage >= 0)
+            {
+                int page = g_pressedAnnotationPage;
+                RECT pressedRect = g_pressedButtonRect;
+                bool activate = Hit(pressedRect, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                g_pressedAnnotationPage = -1;
+                g_hasPressedButton = false;
+                ReleaseCapture();
+                if (activate)
+                {
+                    if (g_collapsedAnnotationPages.find(page) != g_collapsedAnnotationPages.end())
+                        g_collapsedAnnotationPages.erase(page);
+                    else
+                        g_collapsedAnnotationPages.insert(page);
+                }
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
+                return 0;
+            }
             if (g_draggingTab)
             {
                 int index = g_draggingTabIndex;
