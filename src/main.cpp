@@ -4766,7 +4766,9 @@ namespace
     void PruneZoomFallbackCache(PdfTab& tab)
     {
         if (tab.zoomFallbackCache.empty()) return;
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme() || GetTickCount64() > tab.zoomFallbackUntil)
+        // Keep the compact page preview across zoom gestures. Expiring it by time
+        // exposed the white page while high-resolution tiles were being replaced.
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
         {
             tab.zoomFallbackCache.clear();
             tab.zoomFallbackZoom = 0.0;
@@ -11211,59 +11213,73 @@ namespace
     bool DrawOldZoomTiles(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect)
     {
         int currentZoom = TileZoomKey(tab.zoom);
-        int fallbackZoom = 0;
-        int bestDistance = std::numeric_limits<int>::max();
+        std::vector<int> fallbackZooms;
         for (auto const& entry : tab.tileCache)
         {
             TileKey const& key = entry.first;
             if (key.page != page || key.theme != PdfRenderTheme() || key.zoom == currentZoom) continue;
-            int distance = std::abs(key.zoom - currentZoom);
-            if (distance < bestDistance)
-            {
-                bestDistance = distance;
-                fallbackZoom = key.zoom;
-            }
+            if (std::find(fallbackZooms.begin(), fallbackZooms.end(), key.zoom) == fallbackZooms.end())
+                fallbackZooms.push_back(key.zoom);
         }
-        if (fallbackZoom == 0) return false;
+        if (fallbackZooms.empty()) return false;
 
-        double oldZoom = fallbackZoom / 10000.0;
-        double oldPageW = tab.pages[static_cast<size_t>(page)].widthPt * static_cast<double>(g_dpi) / 72.0 * oldZoom;
-        double oldPageH = tab.pages[static_cast<size_t>(page)].heightPt * static_cast<double>(g_dpi) / 72.0 * oldZoom;
+        // Paint distant generations first and the closest generation last. A
+        // partial zoom can complement coverage retained from earlier zoom levels.
+        std::sort(fallbackZooms.begin(), fallbackZooms.end(), [&](int left, int right)
+        {
+            return std::abs(left - currentZoom) > std::abs(right - currentZoom);
+        });
+
         int pageW = std::max<int>(1, pageRect.right - pageRect.left);
         int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
         bool painted = false;
-        for (auto& entry : tab.tileCache)
+        for (int fallbackZoom : fallbackZooms)
         {
-            TileKey const& key = entry.first;
-            PageImage& image = entry.second;
-            if (key.page != page || key.theme != PdfRenderTheme() || key.zoom != fallbackZoom ||
-                (!image.dib && image.bgra.empty()) || image.width <= 0 || image.height <= 0)
-                continue;
-
-            int scale = TileLevelScale(key.level);
-            double leftNorm = key.x * static_cast<double>(scale) / std::max(1.0, oldPageW);
-            double topNorm = key.y * static_cast<double>(scale) / std::max(1.0, oldPageH);
-            double rightNorm = (key.x + key.w) * static_cast<double>(scale) / std::max(1.0, oldPageW);
-            double bottomNorm = (key.y + key.h) * static_cast<double>(scale) / std::max(1.0, oldPageH);
-            RECT dest{
-                pageRect.left + static_cast<int>(std::floor(leftNorm * pageW)),
-                pageRect.top + static_cast<int>(std::floor(topNorm * pageH)),
-                pageRect.left + static_cast<int>(std::ceil(rightNorm * pageW)),
-                pageRect.top + static_cast<int>(std::ceil(bottomNorm * pageH))
-            };
-            RECT clipped{};
-            if (!IntersectRect(&clipped, &dest, &drawRect)) continue;
-            int destW = std::max<int>(1, dest.right - dest.left);
-            int destH = std::max<int>(1, dest.bottom - dest.top);
-            int sx = std::clamp<int>(MulDiv(clipped.left - dest.left, image.width, destW), 0, image.width - 1);
-            int sy = std::clamp<int>(MulDiv(clipped.top - dest.top, image.height, destH), 0, image.height - 1);
-            int ex = std::clamp<int>(MulDiv(clipped.right - dest.left, image.width, destW), sx + 1, image.width);
-            int ey = std::clamp<int>(MulDiv(clipped.bottom - dest.top, image.height, destH), sy + 1, image.height);
-            painted |= DrawCachedImagePart(dc, image, clipped, sx, sy, ex - sx, ey - sy);
+            double oldZoom = fallbackZoom / 10000.0;
+            double oldPageW = tab.pages[static_cast<size_t>(page)].widthPt * static_cast<double>(g_dpi) / 72.0 * oldZoom;
+            double oldPageH = tab.pages[static_cast<size_t>(page)].heightPt * static_cast<double>(g_dpi) / 72.0 * oldZoom;
+            std::vector<std::pair<TileKey const*, PageImage*>> generation;
+            for (auto& entry : tab.tileCache)
+            {
+                TileKey const& key = entry.first;
+                PageImage& image = entry.second;
+                if (key.page != page || key.theme != PdfRenderTheme() || key.zoom != fallbackZoom ||
+                    (!image.dib && image.bgra.empty()) || image.width <= 0 || image.height <= 0)
+                    continue;
+                generation.emplace_back(&key, &image);
+            }
+            std::sort(generation.begin(), generation.end(), [](auto const& left, auto const& right)
+            {
+                return left.first->level > right.first->level;
+            });
+            for (auto const& cached : generation)
+            {
+                TileKey const& key = *cached.first;
+                PageImage& image = *cached.second;
+                int scale = TileLevelScale(key.level);
+                double leftNorm = key.x * static_cast<double>(scale) / std::max(1.0, oldPageW);
+                double topNorm = key.y * static_cast<double>(scale) / std::max(1.0, oldPageH);
+                double rightNorm = (key.x + key.w) * static_cast<double>(scale) / std::max(1.0, oldPageW);
+                double bottomNorm = (key.y + key.h) * static_cast<double>(scale) / std::max(1.0, oldPageH);
+                RECT dest{
+                    pageRect.left + static_cast<int>(std::floor(leftNorm * pageW)),
+                    pageRect.top + static_cast<int>(std::floor(topNorm * pageH)),
+                    pageRect.left + static_cast<int>(std::ceil(rightNorm * pageW)),
+                    pageRect.top + static_cast<int>(std::ceil(bottomNorm * pageH))
+                };
+                RECT clipped{};
+                if (!IntersectRect(&clipped, &dest, &drawRect)) continue;
+                int destW = std::max<int>(1, dest.right - dest.left);
+                int destH = std::max<int>(1, dest.bottom - dest.top);
+                int sx = std::clamp<int>(MulDiv(clipped.left - dest.left, image.width, destW), 0, image.width - 1);
+                int sy = std::clamp<int>(MulDiv(clipped.top - dest.top, image.height, destH), 0, image.height - 1);
+                int ex = std::clamp<int>(MulDiv(clipped.right - dest.left, image.width, destW), sx + 1, image.width);
+                int ey = std::clamp<int>(MulDiv(clipped.bottom - dest.top, image.height, destH), sy + 1, image.height);
+                painted |= DrawCachedImagePart(dc, image, clipped, sx, sy, ex - sx, ey - sy);
+            }
         }
         return painted;
     }
-
     bool TileLevelFullyCached(PdfTab& tab, int page, RECT pageRect, RECT drawRect, int level)
     {
         int pageW = std::max<int>(1, pageRect.right - pageRect.left);
@@ -11456,14 +11472,18 @@ namespace
                         }
                         int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
                         bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
+                        bool paintTiles = !ZoomRenderDeferred() || !fallbackPainted;
                         bool coarseComplete = false;
-                        for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
-                            coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
+                        if (paintTiles)
+                        {
+                            for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
+                                coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
+                        }
                         bool oldZoomPainted = false;
-                        if (!fallbackPainted && targetMissing && !coarseComplete)
+                        if (paintTiles && !fallbackPainted && targetMissing && !coarseComplete)
                             oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
                         bool coarsePainted = false;
-                        if (targetMissing)
+                        if (paintTiles && targetMissing)
                         {
                             for (int level = targetLevel; level >= 1; --level)
                             {
@@ -11471,8 +11491,12 @@ namespace
                                 coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
                             }
                         }
-                        bool ignoredMissing = false;
-                        bool targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                        bool targetPainted = false;
+                        if (paintTiles)
+                        {
+                            bool ignoredMissing = false;
+                            targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                        }
                         if (targetMissing && !ZoomRenderDeferred())
                         {
                             int queueBudget = stageScrolling ? 4 : 12;
@@ -15669,6 +15693,9 @@ namespace
                 }
                 KillTimer(hwnd, 21);
                 g_zoomRenderDeferUntil = 0;
+                // Reveal any already-cached final tiles once after the gesture.
+                // Subsequent render completions repaint only their own rectangles.
+                InvalidateRect(hwnd, &g_stage, FALSE);
                 SchedulePagePrefetch(hwnd);
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
