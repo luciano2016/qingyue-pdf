@@ -11559,10 +11559,12 @@ namespace
                             if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
                             if (annotation.kind == AnnotationKind::Highlight)
                             {
-                                int h = std::max<int>(1, visibleMark.bottom - visibleMark.top);
-                                int trim = std::clamp<int>(h / 10, 0, S(3));
-                                RECT fillMark{ visibleMark.left, visibleMark.top + trim, visibleMark.right, visibleMark.bottom - trim };
-                                if (fillMark.bottom <= fillMark.top) fillMark = visibleMark;
+                                RECT fillMark{
+                                    visibleMark.left,
+                                    std::max(pageRect.top, visibleMark.top - S(1)),
+                                    visibleMark.right,
+                                    std::min(pageRect.bottom, visibleMark.bottom + S(1))
+                                };
                                 MultiplyHighlightFill(dc, fillMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 88 : 122);
                             }
                             else
@@ -11570,7 +11572,7 @@ namespace
                                 int lineY = annotation.kind == AnnotationKind::Underline ?
                                     std::min(pageRect.bottom - 1, visibleMark.bottom + S(1)) :
                                     (visibleMark.top + visibleMark.bottom) / 2;
-                                HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(annotation.kind == AnnotationKind::Underline ? 1 : 2)), annotationColor);
+                                HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(1)), annotationColor);
                                 HGDIOBJ oldMarkPen = SelectObject(dc, markPen);
                                 MoveToEx(dc, visibleMark.left, lineY, nullptr);
                                 LineTo(dc, visibleMark.right, lineY);
