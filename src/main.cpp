@@ -9158,7 +9158,7 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() &&
-            tab.zoom < TileRenderZoomThreshold && clampedZoom < 3.25 && !tab.cache.empty())
+            tab.zoom < TileRenderZoomThreshold && !tab.cache.empty())
         {
             tab.zoomFallbackCache = std::move(tab.cache);
             tab.zoomFallbackZoom = tab.cachedZoom;
@@ -11436,7 +11436,9 @@ namespace
                         }
                         else
                         {
-                            missingVisiblePage = true;
+                            bool oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
+                            if (oldZoomPainted) paintedRenderable = true;
+                            else missingVisiblePage = true;
                         }
                     }
                     else
@@ -14204,9 +14206,9 @@ namespace
                         {
                             g_stageIdleRefreshPending = true;
                         }
-                        else
+                        else if (visibleTile)
                         {
-                            RequestStageRepaint(hwnd, false);
+                            InvalidateRect(hwnd, &dirtyRect, FALSE);
                         }
                     }
                     else
@@ -15667,7 +15669,6 @@ namespace
                 }
                 KillTimer(hwnd, 21);
                 g_zoomRenderDeferUntil = 0;
-                InvalidateRect(hwnd, &g_stage, FALSE);
                 SchedulePagePrefetch(hwnd);
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
