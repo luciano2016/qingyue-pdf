@@ -1548,6 +1548,7 @@ namespace
     std::vector<RECT> g_annotationColorRects;
     int g_pressedAnnotationPage{ -1 };
     COLORREF g_annotationCustomColors[16]{};
+    RECT g_annotationColorDialogAnchor{};
     std::set<int> g_collapsedAnnotationPages;
     bool g_continuousRead{ true };
     bool g_homeListView{};
@@ -1726,9 +1727,38 @@ namespace
         return MixColor(T().muted, T().text, IsDarkTheme() ? 0.18 : 0.10);
     }
 
+    COLORREF HueColor(double hue)
+    {
+        hue -= std::floor(hue);
+        double scaled = hue * 6.0;
+        int sector = static_cast<int>(std::floor(scaled));
+        double fraction = scaled - sector;
+        constexpr double saturation = 0.82;
+        constexpr double value = 0.92;
+        double p = value * (1.0 - saturation);
+        double q = value * (1.0 - saturation * fraction);
+        double t = value * (1.0 - saturation * (1.0 - fraction));
+        double r = value;
+        double g = t;
+        double b = p;
+        switch (sector % 6)
+        {
+        case 1: r = q; g = value; b = p; break;
+        case 2: r = p; g = value; b = t; break;
+        case 3: r = p; g = q; b = value; break;
+        case 4: r = t; g = p; b = value; break;
+        case 5: r = value; g = p; b = q; break;
+        default: break;
+        }
+        return RGB(
+            static_cast<int>(r * 255.0 + 0.5),
+            static_cast<int>(g * 255.0 + 0.5),
+            static_cast<int>(b * 255.0 + 0.5));
+    }
+
     constexpr COLORREF AnnotationPalette[] = {
-        RGB(255, 236, 0), RGB(49, 211, 68), RGB(82, 174, 232), RGB(244, 97, 142),
-        RGB(156, 120, 229), RGB(255, 157, 50), RGB(20, 211, 214), RGB(235, 82, 207)
+        RGB(255, 236, 0), RGB(49, 211, 68), RGB(82, 174, 232),
+        RGB(244, 97, 142), RGB(156, 120, 229), RGB(255, 157, 50)
     };
 
     COLORREF AnnotationColor(PdfAnnotation const& annotation)
@@ -11759,14 +11789,48 @@ namespace
             SetFocus(g_annotationNoteEdit);
     }
 
+    UINT_PTR CALLBACK AnnotationColorDialogHook(HWND dialog, UINT message, WPARAM, LPARAM)
+    {
+        if (message != WM_INITDIALOG || IsRectEmpty(&g_annotationColorDialogAnchor))
+            return 0;
+
+        RECT dialogRect{};
+        GetWindowRect(dialog, &dialogRect);
+        LONG width = dialogRect.right - dialogRect.left;
+        LONG height = dialogRect.bottom - dialogRect.top;
+
+        HMONITOR monitor = MonitorFromRect(&g_annotationColorDialogAnchor, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info{ sizeof(info) };
+        if (!GetMonitorInfoW(monitor, &info)) return 0;
+
+        LONG anchorWidth = g_annotationColorDialogAnchor.right - g_annotationColorDialogAnchor.left;
+        LONG x = g_annotationColorDialogAnchor.left + (anchorWidth - width) / 2;
+        LONG y = g_annotationColorDialogAnchor.bottom + S(8);
+        if (y + height > info.rcWork.bottom)
+            y = g_annotationColorDialogAnchor.top - height - S(8);
+        x = std::clamp<LONG>(x, info.rcWork.left, std::max<LONG>(info.rcWork.left, info.rcWork.right - width));
+        y = std::clamp<LONG>(y, info.rcWork.top, std::max<LONG>(info.rcWork.top, info.rcWork.bottom - height));
+
+        SetWindowPos(dialog, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return 0;
+    }
+
     bool ChooseAnnotationCustomColor(HWND hwnd, PdfTab& tab, PdfAnnotation& annotation)
     {
         CHOOSECOLORW choose{ sizeof(choose) };
         choose.hwndOwner = hwnd;
         choose.rgbResult = AnnotationColor(annotation);
         choose.lpCustColors = g_annotationCustomColors;
-        choose.Flags = CC_FULLOPEN | CC_RGBINIT;
-        if (!ChooseColorW(&choose)) return false;
+        g_annotationColorDialogAnchor = g_annotationToolbarRect;
+        MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&g_annotationColorDialogAnchor), 2);
+        choose.Flags = CC_FULLOPEN | CC_RGBINIT | CC_ENABLEHOOK;
+        choose.lpfnHook = AnnotationColorDialogHook;
+        if (!ChooseColorW(&choose))
+        {
+            g_annotationColorDialogAnchor = {};
+            return false;
+        }
+        g_annotationColorDialogAnchor = {};
         annotation.customColor = choose.rgbResult;
         annotation.hasCustomColor = true;
         tab.dirty = true;
@@ -11841,7 +11905,7 @@ namespace
         RECT mark = DenormalizeAnnotationRect(*annotation, pageRect);
         g_annotationHitRect = mark;
 
-        int width = S(382);
+        int width = S(312);
         int height = S(42);
         int left = std::clamp(mark.left, g_stage.left + S(10), std::max(g_stage.left + S(10), g_stage.right - width - S(10)));
         int top = mark.top - height - S(10);
@@ -11906,31 +11970,42 @@ namespace
         g_annotationCustomColorRect = RECT{ x, y + S(6), x + S(16), y + S(22) };
         bool customHovered = Hit(g_annotationCustomColorRect, g_mousePos.x, g_mousePos.y);
         drawColorRing(colorGraphics, g_annotationCustomColorRect, annotation->hasCustomColor, customHovered);
-        if (annotation->hasCustomColor)
+
+        Gdiplus::RectF wheel = Rf(g_annotationCustomColorRect);
+        float wheelCx = wheel.X + wheel.Width * 0.5f;
+        float wheelCy = wheel.Y + wheel.Height * 0.5f;
+        float outerRadius = wheel.Width * 0.5f;
+        Gdiplus::PointF center{ wheelCx, wheelCy };
+        constexpr int wheelSegments = 48;
+        for (int i = 0; i < wheelSegments; ++i)
         {
-            Gdiplus::SolidBrush customBrush(GdiColor(annotation->customColor));
-            colorGraphics.FillEllipse(&customBrush, Rf(g_annotationCustomColorRect));
+            float a0 = static_cast<float>(i) * 360.0f / wheelSegments;
+            float a1 = static_cast<float>(i + 1) * 360.0f / wheelSegments + 0.8f;
+            float r0 = a0 * 3.14159265f / 180.0f;
+            float r1 = a1 * 3.14159265f / 180.0f;
+            Gdiplus::PointF points[] = {
+                center,
+                Gdiplus::PointF(wheelCx + std::cos(r0) * outerRadius, wheelCy + std::sin(r0) * outerRadius),
+                Gdiplus::PointF(wheelCx + std::cos(r1) * outerRadius, wheelCy + std::sin(r1) * outerRadius)
+            };
+            Gdiplus::Color color;
+            color.SetFromCOLORREF(HueColor(static_cast<double>(i) / wheelSegments));
+            Gdiplus::SolidBrush segmentBrush(color);
+            colorGraphics.FillPolygon(&segmentBrush, points, static_cast<INT>(std::size(points)));
         }
-        else
-        {
-            Gdiplus::RectF customCircle = Rf(g_annotationCustomColorRect);
-            Gdiplus::GraphicsPath clipPath;
-            clipPath.AddEllipse(customCircle);
-            Gdiplus::Region oldClip;
-            colorGraphics.GetClip(&oldClip);
-            colorGraphics.SetClip(&clipPath);
-            Gdiplus::SolidBrush red(GdiColor(RGB(244, 97, 142)));
-            Gdiplus::SolidBrush yellow(GdiColor(RGB(255, 206, 55)));
-            Gdiplus::SolidBrush green(GdiColor(RGB(49, 211, 110)));
-            Gdiplus::SolidBrush blue(GdiColor(RGB(82, 174, 232)));
-            float half = customCircle.Width * 0.5f;
-            colorGraphics.FillRectangle(&red, customCircle.X, customCircle.Y, half, half);
-            colorGraphics.FillRectangle(&yellow, customCircle.X + half, customCircle.Y, half, half);
-            colorGraphics.FillRectangle(&green, customCircle.X, customCircle.Y + half, half, half);
-            colorGraphics.FillRectangle(&blue, customCircle.X + half, customCircle.Y + half, half, half);
-            colorGraphics.SetClip(&oldClip, Gdiplus::CombineModeReplace);
-        }
-        SelectObject(dc, oldFont);
+
+        float innerDiameter = S(7.0f);
+        Gdiplus::RectF centerDot{
+            wheelCx - innerDiameter * 0.5f,
+            wheelCy - innerDiameter * 0.5f,
+            innerDiameter,
+            innerDiameter
+        };
+        COLORREF centerColor = annotation->hasCustomColor ? annotation->customColor : T().paper;
+        Gdiplus::SolidBrush centerBrush(GdiColor(centerColor));
+        Gdiplus::Pen centerBorder(GdiColor(IsDarkTheme() ? RGB(225, 229, 235) : RGB(255, 255, 255)), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+        colorGraphics.FillEllipse(&centerBrush, centerDot);
+        colorGraphics.DrawEllipse(&centerBorder, centerDot);        SelectObject(dc, oldFont);
         DeleteObject(f);
 
         if (!g_annotationNoteOpen)

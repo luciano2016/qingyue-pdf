@@ -399,6 +399,69 @@ static bool quiet_is_user_comment_annot(enum pdf_annot_type type)
     }
 }
 
+static void quiet_set_rectangular_highlight_appearance(
+    fz_context* ctx,
+    pdf_document* doc,
+    pdf_annot* annot,
+    const quiet_pdf_annotation& input)
+{
+    fz_buffer* contents = nullptr;
+    pdf_obj* resources = nullptr;
+    fz_try(ctx)
+    {
+        pdf_obj* annotObj = pdf_annot_obj(ctx, annot);
+        pdf_obj* points = pdf_dict_get(ctx, annotObj, PDF_NAME(QuadPoints));
+        if (pdf_array_len(ctx, points) < 8)
+            fz_throw(ctx, FZ_ERROR_FORMAT, "highlight annotation has no quad points");
+
+        fz_rect rect = fz_empty_rect;
+        for (int i = 0; i + 1 < pdf_array_len(ctx, points); i += 2)
+        {
+            float x = pdf_array_get_real(ctx, points, i);
+            float y = pdf_array_get_real(ctx, points, i + 1);
+            rect.x0 = fz_min(rect.x0, x);
+            rect.y0 = fz_min(rect.y0, y);
+            rect.x1 = fz_max(rect.x1, x);
+            rect.y1 = fz_max(rect.y1, y);
+        }
+        if (fz_is_empty_rect(rect))
+            fz_throw(ctx, FZ_ERROR_FORMAT, "highlight annotation has empty quad points");
+
+        float opacity = fz_clamp(input.opacity, 0.12f, 1.0f);
+        resources = pdf_new_dict(ctx, doc, 1);
+        pdf_obj* states = pdf_dict_put_dict(ctx, resources, PDF_NAME(ExtGState), 1);
+        pdf_obj* highlight = pdf_dict_put_dict(ctx, states, PDF_NAME(H), 4);
+        pdf_dict_put(ctx, highlight, PDF_NAME(Type), PDF_NAME(ExtGState));
+        pdf_dict_put(ctx, highlight, PDF_NAME(BM), PDF_NAME(Multiply));
+        pdf_dict_put_real(ctx, highlight, PDF_NAME(CA), opacity);
+        pdf_dict_put_real(ctx, highlight, PDF_NAME(ca), opacity);
+
+        contents = fz_new_buffer(ctx, 96);
+        fz_append_printf(
+            ctx,
+            contents,
+            "q\n/H gs\n%g %g %g rg\n%g %g %g %g re\nf\nQ\n",
+            input.color_r,
+            input.color_g,
+            input.color_b,
+            rect.x0,
+            rect.y0,
+            rect.x1 - rect.x0,
+            rect.y1 - rect.y0);
+
+        pdf_dict_put_rect(ctx, annotObj, PDF_NAME(Rect), rect);
+        pdf_set_annot_appearance(ctx, annot, "N", nullptr, fz_identity, rect, resources, contents);
+    }
+    fz_always(ctx)
+    {
+        pdf_drop_obj(ctx, resources);
+        fz_drop_buffer(ctx, contents);
+    }
+    fz_catch(ctx)
+    {
+        fz_rethrow(ctx);
+    }
+}
 extern "C" int quiet_pdf_save_annotations(
     fz_context* ctx,
     fz_document* fzdoc,
@@ -503,6 +566,8 @@ extern "C" int quiet_pdf_save_annotations(
                     }
 
                     pdf_update_annot(ctx, annot);
+                    if (type == PDF_ANNOT_HIGHLIGHT)
+                        quiet_set_rectangular_highlight_appearance(ctx, doc, annot, input);
                 }
             }
             fz_always(ctx)
