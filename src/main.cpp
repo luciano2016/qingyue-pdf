@@ -3199,7 +3199,7 @@ namespace
         case SideTabIcon::Thumbnails:
         {
             float s = S(6.8f);
-            float gap = S(2.0f);
+            float gap = S(1.3f);
             DrawGdiRoundRect(g, pen, { cx - gap - s, cy - gap - s, s, s }, S(2.2f));
             DrawGdiRoundRect(g, pen, { cx + gap, cy - gap - s, s, s }, S(2.2f));
             DrawGdiRoundRect(g, pen, { cx - gap - s, cy + gap, s, s }, S(2.2f));
@@ -3217,30 +3217,34 @@ namespace
         }
         case SideTabIcon::Notes:
         {
-            float l = cx - S(8.8f);
-            float t = cy - S(8.3f);
-            float rr = cx + S(8.7f);
-            float b = cy + S(8.7f);
-            float corner = S(2.0f);
+            constexpr float iconScale = 0.96f;
+            auto scaled = [&](float value) { return S(value * iconScale); };
+            float l = cx - scaled(8.8f);
+            float t = cy - scaled(8.3f);
+            float rr = cx + scaled(8.7f);
+            float b = cy + scaled(8.7f);
+            float corner = scaled(2.0f);
 
             Gdiplus::GraphicsPath noteFrame;
             noteFrame.StartFigure();
-            noteFrame.AddLine(cx - S(3.6f), t, l + corner, t);
-            noteFrame.AddBezier(l + corner, t, l + S(0.9f), t, l, t + S(0.9f), l, t + corner);
+            noteFrame.AddLine(cx - scaled(3.6f), t, l + corner, t);
+            noteFrame.AddBezier(l + corner, t, l + scaled(0.9f), t, l, t + scaled(0.9f), l, t + corner);
             noteFrame.AddLine(l, t + corner, l, b - corner);
-            noteFrame.AddBezier(l, b - corner, l, b - S(0.9f), l + S(0.9f), b, l + corner, b);
+            noteFrame.AddBezier(l, b - corner, l, b - scaled(0.9f), l + scaled(0.9f), b, l + corner, b);
             noteFrame.AddLine(l + corner, b, rr - corner, b);
-            noteFrame.AddBezier(rr - corner, b, rr - S(0.9f), b, rr, b - S(0.9f), rr, b - corner);
-            noteFrame.AddLine(rr, b - corner, rr, cy + S(1.8f));
+            noteFrame.AddBezier(rr - corner, b, rr - scaled(0.9f), b, rr, b - scaled(0.9f), rr, b - corner);
+            noteFrame.AddLine(rr, b - corner, rr, cy + scaled(1.8f));
             g.DrawPath(&pen, &noteFrame);
 
+            float pencilCx = cx + S(2.0f);
+            float pencilCy = cy - S(2.0f);
             // Points on each side mirror across the 45-degree pencil axis.
             Gdiplus::PointF pencil[] = {
-                Gdiplus::PointF(cx - S(5.8f), cy + S(5.8f)),
-                Gdiplus::PointF(cx - S(4.2f), cy + S(0.4f)),
-                Gdiplus::PointF(cx + S(4.6f), cy - S(8.4f)),
-                Gdiplus::PointF(cx + S(8.4f), cy - S(4.6f)),
-                Gdiplus::PointF(cx - S(0.4f), cy + S(4.2f))
+                Gdiplus::PointF(pencilCx - scaled(5.8f), pencilCy + scaled(5.8f)),
+                Gdiplus::PointF(pencilCx - scaled(4.2f), pencilCy + scaled(0.4f)),
+                Gdiplus::PointF(pencilCx + scaled(4.6f), pencilCy - scaled(8.4f)),
+                Gdiplus::PointF(pencilCx + scaled(8.4f), pencilCy - scaled(4.6f)),
+                Gdiplus::PointF(pencilCx - scaled(0.4f), pencilCy + scaled(4.2f))
             };
             Gdiplus::GraphicsPath pencilPath;
             pencilPath.AddPolygon(pencil, static_cast<INT>(std::size(pencil)));
@@ -3477,17 +3481,21 @@ namespace
     {
         bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &r);
         bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
+        bool primary = id == CmdSearchRun;
+        COLORREF idleFill = primary ? MixColor(T().paper, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.10 : 0.055) : T().paper;
         COLORREF fill = pressed
             ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.14)
-            : (hovered ? MixColor(T().panel2, T().paper, IsDarkTheme() || IsAuroraTheme() ? 0.18 : 0.50) : T().paper);
-        COLORREF line = pressed ? MixColor(T().line, T().accent, 0.42) : (hovered ? MixColor(T().line, T().text, 0.12) : T().line);
-        RoundFill(dc, r, S(7), fill, line);
-        HFONT f = Font(10);
+            : (hovered ? MixColor(idleFill, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.10 : 0.06) : idleFill);
+        COLORREF line = pressed
+            ? MixColor(T().line, T().accent, 0.38)
+            : (hovered || primary ? MixColor(T().line, T().accent, primary ? 0.16 : 0.10) : T().line);
+        RoundFill(dc, r, S(6), fill, line);
+        HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
-        Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, pressed ? T().accent : T().text);
+        COLORREF textColor = pressed || primary ? MixColor(T().text, T().accent, primary ? 0.32 : 0.18) : T().text;
+        Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, textColor);
         SelectObject(dc, oldFont);
         DeleteObject(f);
-        (void)id;
     }
 
     void DrawHighlightedSnippet(HDC dc, SearchResult const& result, RECT textRect, COLORREF textColor)
@@ -10744,7 +10752,12 @@ namespace
                     g_sidebarRowPages.push_back(i);
                     g_sidebarRowRects.push_back(item);
                     g_sidebarRowIds.push_back(-1);
-                    if (i == tab.currentPage) RoundFill(dc, item, S(6), T().panel2, T().accent);
+                    if (i == tab.currentPage)
+                    {
+                        const double selectedTint = IsDarkTheme() || IsAuroraTheme() ? 0.08 : 0.035;
+                        COLORREF selectedFill = MixColor(T().panel, T().accent, selectedTint);
+                        RoundFill(dc, item, S(6), selectedFill, T().accent);
+                    }
                     RECT imageRect{ item.left + (boxW - thumbW) / 2, item.top + S(14), item.left + (boxW + thumbW) / 2, item.top + S(14) + thumbH };
                     DrawContactShadow(dc, imageRect, 16);
                     DrawRoundedShadow(dc, imageRect, S(3.0f), S(1), S(2), S(2), 12);
@@ -10761,9 +10774,10 @@ namespace
         else if (g_sideMode == 2)
         {
             g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(48) };
+            constexpr int searchInputRadius = 11;
             if (g_searchInputFocused)
-                DrawSoftGlowRect(dc, g_searchInputRect, 8, T().accent, IsDarkTheme() || IsAuroraTheme() ? 84 : 70);
-            RoundFill(dc, g_searchInputRect, S(8), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
+                DrawSoftGlowRect(dc, g_searchInputRect, searchInputRadius, T().accent, IsDarkTheme() || IsAuroraTheme() ? 84 : 70);
+            RoundFill(dc, g_searchInputRect, S(searchInputRadius), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
             RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
             RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
@@ -10784,18 +10798,18 @@ namespace
             }
             SelectObject(dc, oldSearchFont);
             DeleteObject(searchFont);
-            RECT clearRect{ g_searchInputRect.right - S(77), g_searchInputRect.top + S(6), g_searchInputRect.right - S(49), g_searchInputRect.bottom - S(6) };
+            RECT clearRect{ g_searchInputRect.right - S(74), g_searchInputRect.top + S(6), g_searchInputRect.right - S(46), g_searchInputRect.bottom - S(6) };
             DrawSearchIconButton(dc, CmdSearchClear, clearRect, clearRect, DrawCloseGlyph, L"清除");
-            RECT gearRect{ g_searchInputRect.right - S(38), g_searchInputRect.top + S(8), g_searchInputRect.right - S(14), g_searchInputRect.bottom - S(8) };
+            RECT gearRect{ g_searchInputRect.right - S(35), g_searchInputRect.top + S(8), g_searchInputRect.right - S(11), g_searchInputRect.bottom - S(8) };
             RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
             g_searchOptionsButtonRect = gearHotRect;
             DrawSearchIconButton(dc, CmdSearchOptions, gearHotRect, gearRect, DrawGearGlyph, L"搜索设置");
 
-            int rowLeft = g_sidebar.left + S(14);
-            int rowRight = g_sidebar.right - S(14);
-            int gap = S(8);
+            int rowLeft = g_sidebar.left + S(18);
+            int rowRight = g_sidebar.right - S(18);
+            int gap = S(7);
             int btnW = std::max(1, (rowRight - rowLeft - gap * 2) / 3);
-            RECT prev{ rowLeft, g_sidebar.top + S(60), rowLeft + btnW, g_sidebar.top + S(94) };
+            RECT prev{ rowLeft, g_sidebar.top + S(62), rowLeft + btnW, g_sidebar.top + S(92) };
             RECT next{ prev.right + gap, prev.top, prev.right + gap + btnW, prev.bottom };
             RECT run{ next.right + gap, prev.top, rowRight, prev.bottom };
             AddButton(CmdSearchPrev, prev, L"\u4e0a\u4e00\u9875");
@@ -10805,7 +10819,7 @@ namespace
             DrawSearchActionButton(dc, CmdSearchNext, next, L"\u4e0b\u4e00\u9875");
             DrawSearchActionButton(dc, CmdSearchRun, run, L"\u67e5\u627e");
 
-            RECT summary{ g_sidebar.left + S(14), g_sidebar.top + S(108), g_sidebar.right - S(14), g_sidebar.top + S(138) };
+            RECT summary{ g_searchInputRect.left, g_sidebar.top + S(108), g_searchInputRect.right, g_sidebar.top + S(138) };
             std::wstring summaryText = g_searchHasRun ? (L"\u7cbe\u786e\u67e5\u627e (" + std::to_wstring(SearchHitTotal()) + L")") : L"\u8f93\u5165\u5173\u952e\u8bcd\u540e\u70b9\u51fb\u67e5\u627e";
             Text(dc, summaryText, summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
 
@@ -14772,8 +14786,8 @@ namespace
             }
             if (g_sideMode == 2 && Hit(g_searchInputRect, x, y))
             {
-                RECT clearRect{ g_searchInputRect.right - S(77), g_searchInputRect.top + S(6), g_searchInputRect.right - S(49), g_searchInputRect.bottom - S(6) };
-                RECT gearRect{ g_searchInputRect.right - S(38), g_searchInputRect.top + S(8), g_searchInputRect.right - S(14), g_searchInputRect.bottom - S(8) };
+                RECT clearRect{ g_searchInputRect.right - S(74), g_searchInputRect.top + S(6), g_searchInputRect.right - S(46), g_searchInputRect.bottom - S(6) };
+                RECT gearRect{ g_searchInputRect.right - S(35), g_searchInputRect.top + S(8), g_searchInputRect.right - S(11), g_searchInputRect.bottom - S(8) };
                 RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
                 if (Hit(gearHotRect, x, y))
                 {
