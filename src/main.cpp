@@ -342,6 +342,9 @@ namespace
         int pageCount{};
         int currentPage{};
         int savedScrollY{};
+        int sidebarScrollY[4]{};
+        int selectedOutlineRow{ -1 };
+        std::set<int> collapsedOutlineRows;
         double zoom{ 1.0 };
         double cachedZoom{};
         unsigned cachedDpi{};
@@ -3638,6 +3641,7 @@ namespace
     void SaveActiveTabProgress();
     void RestoreActiveTabPosition(HWND hwnd);
     void ActivateTab(HWND hwnd, int index);
+    void RestoreActiveTabSidebarState(HWND hwnd);
 
     std::filesystem::path StatePath()
     {
@@ -8362,6 +8366,7 @@ namespace
             g_pdf.dropOutline(tab->ctx, outline);
         }
         LoadAnnotationsFromPdf(*tab);
+        SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
         EnsureTabWindowVisible(g_active);
@@ -8374,7 +8379,7 @@ namespace
         {
             g_scrollY = 0;
         }
-        g_selectedOutlineRow = -1;
+        RestoreActiveTabSidebarState(hwnd);
         UpdateRecent(*Active());
         SetTitle();
         StartActiveFileWatcher(hwnd);
@@ -8487,6 +8492,7 @@ namespace
             int restoredActive = std::clamp(savedActive, 0, static_cast<int>(restoredIndices.size()) - 1);
             g_active = restoredIndices[static_cast<size_t>(restoredActive)];
             RestoreActiveTabPosition(hwnd);
+            RestoreActiveTabSidebarState(hwnd);
         }
 
         for (auto const& path : launchFiles)
@@ -9692,6 +9698,18 @@ namespace
         return std::clamp(value, 0, maxScroll);
     }
 
+    int ActiveSidebarModeIndex()
+    {
+        return std::clamp(g_sideMode, 0, 3);
+    }
+
+    void SaveActiveTabSidebarState(PdfTab& tab)
+    {
+        tab.sidebarScrollY[ActiveSidebarModeIndex()] = std::max(0, g_sidebarScrollY);
+        tab.selectedOutlineRow = g_selectedOutlineRow;
+        tab.collapsedOutlineRows = g_collapsedOutlineRows;
+    }
+
     void SaveActiveTabProgress()
     {
         PdfTab* tab = Active();
@@ -9699,7 +9717,49 @@ namespace
         tab->savedScrollY = g_scrollY;
         if (g_continuousRead)
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
+        SaveActiveTabSidebarState(*tab);
         TouchRecentProgress(*tab, false);
+    }
+
+    void RestoreActiveTabSidebarState(HWND hwnd)
+    {
+        KillTimer(hwnd, 5);
+        g_smoothSidebarScroll = false;
+        g_draggingSidebarScroll = false;
+
+        PdfTab* tab = Active();
+        if (!tab)
+        {
+            g_sidebarScrollY = 0;
+            g_sidebarScrollTargetY = 0;
+            g_selectedOutlineRow = -1;
+            g_collapsedOutlineRows.clear();
+            ++g_outlineCollapseVersion;
+            return;
+        }
+
+        int mode = ActiveSidebarModeIndex();
+        g_sidebarScrollY = std::max(0, tab->sidebarScrollY[mode]);
+        g_sidebarScrollTargetY = g_sidebarScrollY;
+        g_selectedOutlineRow = tab->selectedOutlineRow;
+        g_collapsedOutlineRows = tab->collapsedOutlineRows;
+        ++g_outlineCollapseVersion;
+
+        if (g_sideMode == 0 && !tab->outline.empty())
+        {
+            if (g_selectedOutlineRow < 0 || g_selectedOutlineRow >= static_cast<int>(tab->outline.size()))
+                g_selectedOutlineRow = OutlineRowFromScroll(*tab, g_scrollY);
+            tab->selectedOutlineRow = g_selectedOutlineRow;
+        }
+    }
+
+    void SwitchSidebarMode(HWND hwnd, int mode)
+    {
+        mode = std::clamp(mode, 0, 3);
+        if (mode == g_sideMode) return;
+        if (PdfTab* tab = Active()) SaveActiveTabSidebarState(*tab);
+        g_sideMode = mode;
+        RestoreActiveTabSidebarState(hwnd);
     }
 
     void RestoreActiveTabPosition(HWND hwnd)
@@ -9730,13 +9790,18 @@ namespace
     {
         if (index < 0 || index >= static_cast<int>(g_tabs.size()))
             return;
-        if (g_active != index)
-            SaveActiveTabProgress();
+        if (g_active == index)
+        {
+            EnsureTabWindowVisible(g_active);
+            g_tabListOpen = false;
+            return;
+        }
+        SaveActiveTabProgress();
         g_active = index;
         EnsureTabWindowVisible(g_active);
         g_tabListOpen = false;
-        g_selectedOutlineRow = -1;
         RestoreActiveTabPosition(hwnd);
+        RestoreActiveTabSidebarState(hwnd);
         SetTitle();
         StartActiveFileWatcher(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -13678,8 +13743,10 @@ namespace
     bool CloseTab(int index)
     {
         if (index < 0 || index >= static_cast<int>(g_tabs.size())) return false;
+        bool closingActive = index == g_active;
         PdfTab& tab = *g_tabs[static_cast<size_t>(index)];
         if (!ConfirmCloseDirtyTab(g_hwnd, tab)) return false;
+        if (closingActive) SaveActiveTabProgress();
         TouchRecentProgress(tab, true);
         DropTab(tab);
         g_tabs.erase(g_tabs.begin() + index);
@@ -13687,7 +13754,11 @@ namespace
         else g_active = std::clamp(g_active >= index ? g_active - 1 : g_active, 0, static_cast<int>(g_tabs.size()) - 1);
         EnsureTabWindowVisible(g_active);
         if (g_tabs.empty()) g_tabListOpen = false;
-        RestoreActiveTabPosition(g_hwnd);
+        if (closingActive || g_tabs.empty())
+        {
+            RestoreActiveTabPosition(g_hwnd);
+            RestoreActiveTabSidebarState(g_hwnd);
+        }
         SetTitle();
         StartActiveFileWatcher(g_hwnd);
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -14066,6 +14137,7 @@ namespace
         switch (id)
         {
         case CmdHome:
+            SaveActiveTabProgress();
             g_active = -1;
             g_tabListOpen = false;
             CancelQueuedPageRenders();
@@ -14134,7 +14206,7 @@ namespace
                 g_lastImmersiveSidebarOpen = true;
                 SaveState();
             }
-            g_sideMode = 2;
+            SwitchSidebarMode(hwnd, 2);
             g_searchInputFocused = true;
             g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
             g_searchCaretVisible = true;
@@ -14145,7 +14217,7 @@ namespace
             if (g_sidebarOpen && g_sideMode == 0) StartSidebarPanelAnimation(hwnd, false);
             else
             {
-                g_sideMode = 0;
+                SwitchSidebarMode(hwnd, 0);
                 if (g_immersive)
                 {
                     g_sidebarOpen = true;
@@ -15162,8 +15234,7 @@ namespace
             {
                 if (Hit(g_sideTabRects[i], x, y))
                 {
-                    g_sideMode = static_cast<int>(i);
-                    g_sidebarScrollY = 0;
+                    SwitchSidebarMode(hwnd, static_cast<int>(i));
                     g_searchInputFocused = g_sideMode == 2;
                     if (g_searchInputFocused)
                     {
@@ -16375,7 +16446,7 @@ namespace
                     return 0;
                 }
                 g_sidebarOpen = true;
-                g_sideMode = 2;
+                SwitchSidebarMode(hwnd, 2);
                 g_searchInputFocused = true;
                 g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
                 g_searchCaretVisible = true;
