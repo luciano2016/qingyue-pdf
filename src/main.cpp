@@ -1157,6 +1157,7 @@ namespace
         int targetWidth{};
         int renderTheme{};
         PageImage image;
+        bool loadedFromDisk{};
     };
 
     struct PageRenderSession
@@ -1228,7 +1229,7 @@ namespace
     std::vector<LastSessionItem> g_lastSessionTabs;
     std::map<std::wstring, PageImage> g_homeThumbCache;
     std::map<std::wstring, ULONGLONG> g_homeThumbLastUsed;
-    std::map<std::wstring, std::filesystem::file_time_type> g_homeThumbFailedStamp;
+    std::map<std::wstring, ULONGLONG> g_homeThumbFailedUntil;
     std::set<std::wstring> g_homeThumbProtectedKeys;
     std::mutex g_homeThumbMutex;
     std::condition_variable g_homeThumbCv;
@@ -1378,6 +1379,7 @@ namespace
     bool g_lastImmersiveSidebarOpen{};
     bool g_hasPreImmersivePlacement{};
     bool g_resizingSidebar{};
+    int g_sidebarResizeStageLeft{};
     bool g_draggingThumbSlider{};
     bool g_draggingTab{};
     bool g_tabDetachArmed{};
@@ -1452,6 +1454,7 @@ namespace
     int g_glassBackdropTheme{ -1 };
     int g_paintBufferW{};
     int g_paintBufferH{};
+    bool g_paintBufferReady{};
     int g_statusOffset{};
     int g_statusTargetOffset{};
     int g_pageWheelDeltaAccum{};
@@ -3849,21 +3852,25 @@ namespace
 
     std::filesystem::path HomeThumbCacheDir()
     {
-        PWSTR appData = nullptr;
-        std::filesystem::path dir;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData)))
+        static const std::filesystem::path dir = []
         {
-            dir = appData;
-            CoTaskMemFree(appData);
-        }
-        else
-        {
-            dir = std::filesystem::current_path();
-        }
-        dir /= L"QingYuePDF";
-        dir /= L"thumbs";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
+            PWSTR appData = nullptr;
+            std::filesystem::path value;
+            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData)))
+            {
+                value = appData;
+                CoTaskMemFree(appData);
+            }
+            else
+            {
+                value = std::filesystem::current_path();
+            }
+            value /= L"QingYuePDF";
+            value /= L"thumbs";
+            std::error_code ec;
+            std::filesystem::create_directories(value, ec);
+            return value;
+        }();
         return dir;
     }
 
@@ -3994,7 +4001,7 @@ namespace
     {
         g_homeThumbCache.clear();
         g_homeThumbLastUsed.clear();
-        g_homeThumbFailedStamp.clear();
+        g_homeThumbFailedUntil.clear();
         g_homeThumbProtectedKeys.clear();
     }
 
@@ -4388,9 +4395,16 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int spreadW = SpreadWidth(tab, start);
         int maxSpreadW = MaxSpreadWidth(tab);
-        if (maxSpreadW + S(56) <= stageW)
-            return g_stage.left + (stageW - spreadW) / 2;
-        return g_stage.left + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
+        int stageLeft = g_stage.left;
+        int layoutStageW = stageW;
+        if (g_resizingSidebar && g_sidebarResizeStageLeft > 0)
+        {
+            layoutStageW = std::max<int>(1, g_stage.right - g_sidebarResizeStageLeft);
+            stageLeft = g_sidebarResizeStageLeft;
+        }
+        if (maxSpreadW + S(56) <= layoutStageW)
+            return stageLeft + (layoutStageW - spreadW) / 2;
+        return stageLeft + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
     }
 
     int SpreadTopScroll(PdfTab const& tab, int targetPage)
@@ -4673,8 +4687,6 @@ namespace
     PageImage* LoadHomeThumb(const RecentItem& item, int targetWidth)
     {
         if (targetWidth <= 0 || item.path.empty()) return nullptr;
-        std::error_code stampError;
-        if (!std::filesystem::exists(item.path, stampError) || stampError) return nullptr;
         if (g_homeThumbWidth != targetWidth)
         {
             ClearHomeThumbCacheState();
@@ -4687,24 +4699,16 @@ namespace
         int renderTheme = PdfRenderTheme();
         std::wstring key = HomeThumbKey(item, targetWidth, renderTheme);
         TouchHomeThumb(key);
-        auto failed = g_homeThumbFailedStamp.find(key);
-        if (failed != g_homeThumbFailedStamp.end())
-        {
-            auto currentStamp = std::filesystem::last_write_time(item.path, stampError);
-            if (!stampError && currentStamp == failed->second) return nullptr;
-            g_homeThumbFailedStamp.erase(failed);
-        }
         auto found = g_homeThumbCache.find(key);
         if (found != g_homeThumbCache.end()) return &found->second;
-
-        PageImage diskImage;
-        if (LoadHomeThumbFromDisk(item, targetWidth, renderTheme, diskImage))
+        auto failed = g_homeThumbFailedUntil.find(key);
+        if (failed != g_homeThumbFailedUntil.end())
         {
-            auto inserted = g_homeThumbCache.emplace(key, std::move(diskImage)).first;
-            TrimHomeThumbCache();
-            return &inserted->second;
+            if (GetTickCount64() < failed->second) return nullptr;
+            g_homeThumbFailedUntil.erase(failed);
         }
 
+        // Disk validation, PNG decoding and PDF rendering all stay off the UI thread.
         QueueHomeThumb(item, targetWidth, key, renderTheme, g_dpi, g_hwnd);
         return nullptr;
     }
@@ -5191,7 +5195,15 @@ namespace
             result->key = request.key;
             result->targetWidth = request.targetWidth;
             result->renderTheme = request.renderTheme;
-            result->image = RenderHomeThumbSync(request.item, request.targetWidth, request.renderTheme, request.dpi);
+            result->loadedFromDisk = LoadHomeThumbFromDisk(
+                request.item, request.targetWidth, request.renderTheme, result->image);
+            if (!result->loadedFromDisk)
+            {
+                result->image = RenderHomeThumbSync(
+                    request.item, request.targetWidth, request.renderTheme, request.dpi);
+                if (!result->image.bgra.empty())
+                    SaveHomeThumbToDisk(request.item, request.targetWidth, request.renderTheme, result->image);
+            }
             if (!IsWindow(request.target) || !PostMessageW(request.target, WM_QUIETPDF_HOME_THUMB_READY, 0, reinterpret_cast<LPARAM>(result.get())))
             {
                 std::lock_guard<std::mutex> lock(g_homeThumbMutex);
@@ -7988,9 +8000,28 @@ namespace
         int clamped = ClampHomeScrollValue(client, value);
         if (clamped == g_homeScrollY) return;
         RECT oldTrack = g_homeScrollTrackRect;
-        g_homeScrollY = clamped;
         RECT viewport = HomeContentViewportRect(client);
-        InvalidateRect(hwnd, &viewport, FALSE);
+        int delta = g_homeScrollY - clamped;
+        g_homeScrollY = clamped;
+
+        int viewportH = std::max<int>(1, viewport.bottom - viewport.top);
+        if (g_paintBufferReady && std::abs(delta) < viewportH)
+        {
+            RECT contentViewport = viewport;
+            if (!IsRectEmpty(&oldTrack))
+                contentViewport.right = std::min(contentViewport.right, oldTrack.left);
+            ScrollWindowEx(hwnd, 0, delta, &contentViewport, &contentViewport, nullptr, nullptr, 0);
+            ScrollDC(g_paintBufferDc, 0, delta, &contentViewport, &contentViewport, nullptr, nullptr);
+            RECT exposed = contentViewport;
+            if (delta < 0) exposed.top = std::max(exposed.top, exposed.bottom + delta);
+            else exposed.bottom = std::min(exposed.bottom, exposed.top + delta);
+            if (!IsRectEmpty(&exposed)) InvalidateRect(hwnd, &exposed, FALSE);
+        }
+        else
+        {
+            InvalidateRect(hwnd, &viewport, FALSE);
+        }
+
         UpdateHomeScrollRects(client);
         RECT scrollDirty = oldTrack;
         if (!IsRectEmpty(&scrollDirty)) UnionRect(&scrollDirty, &scrollDirty, &g_homeScrollTrackRect);
@@ -8550,7 +8581,7 @@ namespace
         int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
         int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
         g_scrollY = std::clamp(g_scrollY, 0, maxScroll);
-        g_scrollX = std::clamp(g_scrollX, 0, maxScrollX);
+        if (!g_resizingSidebar) g_scrollX = std::clamp(g_scrollX, 0, maxScrollX);
         if (tab && g_continuousRead)
         {
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
@@ -8622,7 +8653,6 @@ namespace
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
         RECT dirty{ 0, top, client.right, client.bottom - bottom };
-        InvalidateRect(hwnd, &dirty, FALSE);
         InvalidateRect(hwnd, &dirty, FALSE);
     }
 
@@ -13896,9 +13926,9 @@ namespace
             }
             else ++it;
         }
-        for (auto it = g_homeThumbFailedStamp.begin(); it != g_homeThumbFailedStamp.end(); )
+        for (auto it = g_homeThumbFailedUntil.begin(); it != g_homeThumbFailedUntil.end(); )
         {
-            if (it->first.rfind(path + L"#", 0) == 0) it = g_homeThumbFailedStamp.erase(it);
+            if (it->first.rfind(path + L"#", 0) == 0) it = g_homeThumbFailedUntil.erase(it);
             else ++it;
         }
     }
@@ -14143,8 +14173,6 @@ namespace
             g_active = -1;
             g_tabListOpen = false;
             CancelQueuedPageRenders();
-            TrimBackgroundRenderCaches();
-            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
             SetTitle();
             StartActiveFileWatcher(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -14418,6 +14446,7 @@ namespace
             DeleteObject(previous);
 
         g_paintBufferBitmap = bitmap;
+        g_paintBufferReady = false;
         g_paintBufferW = width;
         g_paintBufferH = height;
         return true;
@@ -14438,6 +14467,7 @@ namespace
         g_paintBufferOldBitmap = nullptr;
         g_paintBufferW = 0;
         g_paintBufferH = 0;
+        g_paintBufferReady = false;
         if (g_imageDrawDc)
         {
             DeleteDC(g_imageDrawDc);
@@ -14457,10 +14487,13 @@ namespace
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
         if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
         {
+            g_paintBufferReady = false;
             EndPaint(hwnd, &ps);
             return;
         }
         HDC mem = g_paintBufferDc;
+        int paintState = SaveDC(mem);
+        IntersectClipRect(mem, dirty.left, dirty.top, dirty.right, dirty.bottom);
         if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty);
         else Fill(mem, dirty, T().bg);
         RECT toolbarRect{ 0, 0, client.right, S(38) };
@@ -14512,6 +14545,8 @@ namespace
             flushRect(g_sidebarPanelToggleRect);
 
         }
+        RestoreDC(mem, paintState);
+        g_paintBufferReady = true;
         EndPaint(hwnd, &ps);
     }
 
@@ -14668,8 +14703,7 @@ namespace
             bool repaint = false;
             if (!result->image.bgra.empty())
             {
-                g_homeThumbFailedStamp.erase(result->key);
-                SaveHomeThumbToDisk(result->item, result->targetWidth, result->renderTheme, result->image);
+                g_homeThumbFailedUntil.erase(result->key);
                 if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
                 {
                     TouchHomeThumb(result->key);
@@ -14680,9 +14714,9 @@ namespace
             }
             else
             {
-                std::error_code stampError;
-                auto stamp = std::filesystem::last_write_time(result->item.path, stampError);
-                if (!stampError) g_homeThumbFailedStamp[result->key] = stamp;
+                // Avoid an immediate retry loop while still allowing removable or
+                // temporarily unavailable files to recover without restarting.
+                g_homeThumbFailedUntil[result->key] = GetTickCount64() + 5000;
             }
             if (repaint && !Active())
             {
@@ -15153,6 +15187,7 @@ namespace
             {
                 g_resizingSidebar = true;
                 g_sidebarTargetWidth = g_sidebarWidth;
+                g_sidebarResizeStageLeft = g_stage.left;
                 SetCapture(hwnd);
                 return 0;
             }
@@ -16007,6 +16042,7 @@ namespace
             if (g_resizingSidebar)
             {
                 g_resizingSidebar = false;
+                g_sidebarResizeStageLeft = 0;
                 ReleaseCapture();
                 ResizeSidebarNow(hwnd, g_sidebarTargetWidth, true);
                 SaveState();
