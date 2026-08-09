@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+
+extern "C" void install_load_windows_font_funcs(fz_context* ctx);
+
 namespace
 {
     struct quiet_lock_table
@@ -47,7 +50,9 @@ namespace
 extern "C" fz_context* quiet_new_shared_context(size_t max_store)
 {
     quiet_lock_table& table = quiet_shared_locks();
-    return fz_new_context(nullptr, &table.context, max_store);
+    fz_context* ctx = fz_new_context(nullptr, &table.context, max_store);
+    if (ctx) install_load_windows_font_funcs(ctx);
+    return ctx;
 }
 
 extern "C" fz_context* quiet_clone_context(fz_context* ctx)

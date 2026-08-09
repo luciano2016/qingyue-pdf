@@ -4628,7 +4628,7 @@ namespace
         {
             if (!std::filesystem::exists(item.path)) return result;
             g_pdf.Load();
-            temp.ctx = g_pdf.newContext(nullptr, nullptr, 8 << 20, "1.28.0");
+            temp.ctx = g_pdf.newSharedContext(8 << 20);
             g_pdf.setAaLevel(temp.ctx, 8);
             g_pdf.registerHandlers(temp.ctx);
             temp.doc = g_pdf.openDocumentShared(temp.ctx, item.path.c_str());
