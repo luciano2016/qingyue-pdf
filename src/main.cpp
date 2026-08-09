@@ -376,6 +376,7 @@ namespace
         std::filesystem::file_time_type fileStamp{};
         bool hasFileStamp{};
         bool dirty{};
+        bool initialStoreTrimPending{ true };
         unsigned long renderVersion{};
         std::shared_ptr<PageRenderSession> renderSession;
     };
@@ -990,6 +991,7 @@ namespace
         using NewContextFn = fz_context*(__cdecl*)(const fz_alloc_context*, const fz_locks_context*, size_t, const char*);
         using SharedContextFn = fz_context*(__cdecl*)(size_t);
         using CloneContextFn = fz_context*(__cdecl*)(fz_context*);
+        using ShrinkStoreFn = int(__cdecl*)(fz_context*, unsigned int);
         using DropContextFn = void(__cdecl*)(fz_context*);
         using RegisterHandlersFn = void(__cdecl*)(fz_context*);
         using OpenDocumentFn = fz_document*(__cdecl*)(fz_context*, const char*);
@@ -1037,6 +1039,7 @@ namespace
             Get(dropContext, "fz_drop_context");
             Get(newSharedContext, "quiet_new_shared_context");
             Get(cloneContext, "quiet_clone_context");
+            GetOptional(shrinkStore, "quiet_shrink_store");
             Get(registerHandlers, "fz_register_document_handlers");
             Get(openDocument, "fz_open_document");
             Get(openDocumentShared, "quiet_open_document_shared_w");
@@ -1084,6 +1087,7 @@ namespace
         DropContextFn dropContext{};
         SharedContextFn newSharedContext{};
         CloneContextFn cloneContext{};
+        ShrinkStoreFn shrinkStore{};
         RegisterHandlersFn registerHandlers{};
         OpenDocumentFn openDocument{};
         OpenDocumentSharedFn openDocumentShared{};
@@ -1168,7 +1172,7 @@ namespace
         std::recursive_mutex documentMutex;
         std::map<int, fz_display_list*> displayLists;
         std::deque<int> displayListLru;
-        size_t maxDisplayLists{ 4 };
+        size_t maxDisplayLists{ 3 };
 
         ~PageRenderSession();
     };
@@ -1258,6 +1262,7 @@ namespace
     constexpr UINT WM_QUIETPDF_DRAG_SCROLL = WM_APP + 42;
     constexpr UINT WM_QUIETPDF_PAGE_RENDERED = WM_APP + 43;
     constexpr UINT WM_QUIETPDF_HOME_THUMB_READY = WM_APP + 44;
+    constexpr UINT WM_QUIETPDF_HOME_SCROLL_FRAME = WM_APP + 45;
 
     struct PageRenderRequest
     {
@@ -1287,6 +1292,8 @@ namespace
         PageImage image;
     };
     bool EnsureImageDib(PageImage& image);
+    bool DrawCachedImagePart(HDC dc, PageImage& image, RECT dest, int sx, int sy, int sw, int sh);
+    bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
 
     std::mutex g_pageRenderMutex;
     std::condition_variable g_pageRenderCv;
@@ -1419,6 +1426,11 @@ namespace
     bool g_mainScrollHover{};
     bool g_mainHScrollHover{};
     bool g_homeScrollHover{};
+    bool g_homeScrollFramePosted{};
+    bool g_homeScrollLightPaint{};
+    bool g_homeScrollFullRefreshPending{};
+    ULONGLONG g_lastHomeScrollPresentMs{};
+    int g_homePresentedScrollY{};
     bool g_sidebarScrollHover{};
     bool g_sidebarPanelToggleHover{};
     bool g_stageRepaintPending{};
@@ -1583,7 +1595,7 @@ namespace
         while (size < viewportTile) size <<= 1;
         return std::min(size, 1024);
     }
-    constexpr double TileRenderZoomThreshold = 1.50;
+    constexpr double TileRenderZoomThreshold = 1.25;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -2057,7 +2069,7 @@ namespace
         DeleteDC(mem);
     }
 
-    void PaintGlassBackdrop(HDC dc, RECT r)
+    void PaintGlassBackdrop(HDC dc, RECT r, bool lightPaint = false)
     {
         RECT client{};
         if (g_hwnd) GetClientRect(g_hwnd, &client);
@@ -2078,15 +2090,37 @@ namespace
             return;
         }
 
-        for (int y = r.top; y < r.bottom; ++y)
+        auto backdropColorAt = [&](int y)
         {
-            double ty = static_cast<double>(y - client.top) / static_cast<double>(fullH);
+            double ty = std::clamp(static_cast<double>(y - client.top) / static_cast<double>(fullH), 0.0, 1.0);
             COLORREF color = MixColor(RGB(247, 250, 252), RGB(232, 239, 246), ty);
             if (ty < 0.44) color = MixColor(color, RGB(255, 248, 241), 0.20);
             else if (ty > 0.58) color = MixColor(color, RGB(229, 242, 253), 0.24);
-            RECT line{ r.left, y, r.right, y + 1 };
-            Fill(dc, line, color);
-        }
+            return color;
+        };
+        auto fillGradientPart = [&](int top, int bottom)
+        {
+            if (bottom <= top) return;
+            COLORREF topColor = backdropColorAt(top);
+            COLORREF bottomColor = backdropColorAt(bottom);
+            TRIVERTEX vertices[2]{};
+            vertices[0] = { r.left, top,
+                static_cast<COLOR16>(GetRValue(topColor) << 8),
+                static_cast<COLOR16>(GetGValue(topColor) << 8),
+                static_cast<COLOR16>(GetBValue(topColor) << 8), 0xffff };
+            vertices[1] = { r.right, bottom,
+                static_cast<COLOR16>(GetRValue(bottomColor) << 8),
+                static_cast<COLOR16>(GetGValue(bottomColor) << 8),
+                static_cast<COLOR16>(GetBValue(bottomColor) << 8), 0xffff };
+            GRADIENT_RECT gradient{ 0, 1 };
+            GradientFill(dc, vertices, 2, &gradient, 1, GRADIENT_FILL_RECT_V);
+        };
+        int warmEnd = client.top + static_cast<int>(fullH * 0.44);
+        int coolStart = client.top + static_cast<int>(fullH * 0.58);
+        fillGradientPart(r.top, std::min<int>(r.bottom, warmEnd));
+        fillGradientPart(std::max<int>(r.top, warmEnd), std::min<int>(r.bottom, coolStart));
+        fillGradientPart(std::max<int>(r.top, coolStart), r.bottom);
+        if (lightPaint) return;
 
         int clientW = static_cast<int>(client.right - client.left);
         RECT leftWash{ client.left, client.top, client.left + std::max<int>(1, clientW / 3), client.bottom };
@@ -2547,9 +2581,9 @@ namespace
         ReleaseDC(hwnd, dc);
         return std::clamp(index, 0, static_cast<int>(text.size()));
     }
-    void DrawImageFit(HDC dc, const PageImage& image, RECT box)
+    void DrawImageFit(HDC dc, PageImage& image, RECT box)
     {
-        if (image.bgra.empty() || image.width <= 0 || image.height <= 0) return;
+        if ((!image.dib && image.bgra.empty()) || image.width <= 0 || image.height <= 0) return;
 
         int boxW = std::max<int>(1, box.right - box.left);
         int boxH = std::max<int>(1, box.bottom - box.top);
@@ -2564,22 +2598,18 @@ namespace
             box.left + (boxW - w) / 2 + w,
             box.top + (boxH - h) / 2 + h
         };
-
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = image.width;
-        info.bmiHeader.biHeight = -image.height;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-        int oldMode = SetStretchBltMode(dc, HALFTONE);
-        POINT oldBrush{};
-        SetBrushOrgEx(dc, 0, 0, &oldBrush);
-        StretchDIBits(dc, dest.left, dest.top, w, h, 0, 0, image.width, image.height, image.bgra.data(), &info, DIB_RGB_COLORS, SRCCOPY);
-        SetBrushOrgEx(dc, oldBrush.x, oldBrush.y, nullptr);
-        SetStretchBltMode(dc, oldMode);
+        RECT clip{};
+        if (GetClipBox(dc, &clip) == ERROR) return;
+        RECT clipped{};
+        if (!IntersectRect(&clipped, &dest, &clip)) return;
+        int destW = std::max<int>(1, dest.right - dest.left);
+        int destH = std::max<int>(1, dest.bottom - dest.top);
+        int sx = std::clamp(MulDiv(clipped.left - dest.left, image.width, destW), 0, image.width - 1);
+        int sy = std::clamp(MulDiv(clipped.top - dest.top, image.height, destH), 0, image.height - 1);
+        int ex = std::clamp(MulDiv(clipped.right - dest.left, image.width, destW), sx + 1, image.width);
+        int ey = std::clamp(MulDiv(clipped.bottom - dest.top, image.height, destH), sy + 1, image.height);
+        DrawCachedImagePart(dc, image, clipped, sx, sy, ex - sx, ey - sy);
     }
-
     int MeasureTextHeight(HDC dc, const std::wstring& s, int width, UINT flags)
     {
         RECT r{ 0, 0, std::max<int>(1, width), 0 };
@@ -5231,6 +5261,10 @@ namespace
                 if (!result->image.bgra.empty())
                     SaveHomeThumbToDisk(request.item, request.targetWidth, request.renderTheme, result->image);
             }
+            // Convert once on the low-priority worker. Scrolling can then blit the
+            // cached DIB without copying every cover on the UI thread.
+            if (!result->image.bgra.empty())
+                EnsureImageDib(result->image);
             if (!IsWindow(request.target) || !PostMessageW(request.target, WM_QUIETPDF_HOME_THUMB_READY, 0, reinterpret_cast<LPARAM>(result.get())))
             {
                 std::lock_guard<std::mutex> lock(g_homeThumbMutex);
@@ -5463,6 +5497,19 @@ namespace
         return std::clamp<size_t>(target, 14ull * 1024ull * 1024ull, 28ull * 1024ull * 1024ull);
     }
 
+    bool PageVisibleInStage(PdfTab const& tab, int page)
+    {
+        if (page < 0 || page >= tab.pageCount) return false;
+        int start = FirstPageInSpread(page);
+        if (!g_continuousRead)
+        {
+            int currentStart = FirstPageInSpread(std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1)));
+            if (start != currentStart) return false;
+        }
+        int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+        RECT pageRect{};
+        return BuildSpreadPageRect(tab, start, y, page, pageRect) && Intersects(pageRect, g_stage);
+    }
     void TrimIdleRenderCaches(HWND hwnd)
     {
         UNREFERENCED_PARAMETER(hwnd);
@@ -5477,7 +5524,7 @@ namespace
 
         for (auto it = tab->cache.begin(); it != tab->cache.end(); )
         {
-            if (std::abs(it->first - tab->currentPage) > 1) it = tab->cache.erase(it);
+            if (!PageVisibleInStage(*tab, it->first)) it = tab->cache.erase(it);
             else ++it;
         }
         for (auto it = tab->tileCache.begin(); it != tab->tileCache.end(); )
@@ -5503,8 +5550,15 @@ namespace
         }
         TrimBackgroundRenderCaches();
 
-        TrimDisplayLists(*tab, 1);
-        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+        // Keep the current page parsed so the first input after an idle trim
+        // does not have to rebuild its display list on the UI-visible path.
+        TrimDisplayLists(*tab, 0);
+        if (tab->initialStoreTrimPending && g_pdf.shrinkStore && tab->ctx)
+        {
+            g_pdf.shrinkStore(tab->ctx, 0);
+            tab->initialStoreTrimPending = false;
+        }
+
     }
     void ScheduleIdleCacheTrim(HWND hwnd)
     {
@@ -5945,19 +5999,13 @@ namespace
 
         if (scrolling) return;
 
-        int center = std::clamp(tab->currentPage, 0, tab->pageCount - 1);
-        bool rapidScroll = MainScrollDragRecentlyMoved() || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
-        int forward = rapidScroll ? 2 : 2;
-        int backward = rapidScroll ? 1 : 1;
         int nextStart = NextSpreadStart(*tab, lastVisible);
-        for (int start = nextStart, n = 0; start < tab->pageCount && n < forward; start = NextSpreadStart(*tab, start), ++n)
+        if (nextStart < tab->pageCount)
         {
-            int count = SpreadPageCount(*tab, start);
+            int count = SpreadPageCount(*tab, nextStart);
             for (int j = 0; j < count; ++j)
-                enqueue(start + j, 1 + n);
+                enqueue(nextStart + j, 1);
         }
-        for (int page = center - 1, n = 0; page >= 0 && n < backward; --page, ++n)
-            enqueue(page, 2 + n);
     }
 
     bool PrefetchOnePage()
@@ -8025,24 +8073,76 @@ namespace
         return std::clamp(value, 0, maxScroll);
     }
 
+    void PresentHomeScrollFrame(HWND hwnd)
+    {
+        if (Active()) return;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        RECT viewport = HomeContentViewportRect(client);
+        RECT content = viewport;
+        content.right = std::max<int>(content.left, content.right - S(14));
+        int delta = g_homeScrollY - g_homePresentedScrollY;
+        bool canShift = g_paintBufferDc && g_paintBufferBitmap &&
+            g_paintBufferW == client.right && g_paintBufferH == client.bottom &&
+            delta != 0 && std::abs(delta) < content.bottom - content.top;
+
+        RECT dirty = viewport;
+        if (canShift)
+        {
+            RECT exposed{};
+            ScrollDC(g_paintBufferDc, 0, -delta, &content, &content, nullptr, &exposed);
+            InflateRect(&exposed, S(12), S(12));
+            IntersectRect(&dirty, &exposed, &viewport);
+            RECT scrollStrip{ content.right, viewport.top, viewport.right, viewport.bottom };
+            RECT combined{};
+            UnionRect(&combined, &dirty, &scrollStrip);
+            dirty = combined;
+        }
+
+        g_homePresentedScrollY = g_homeScrollY;
+        UpdateHomeScrollRects(client);
+        g_homeScrollLightPaint = true;
+        RedrawWindow(hwnd, &dirty, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        g_homeScrollLightPaint = false;
+
+        // The moved pixels and the exposed strip now belong to the same back
+        // buffer generation. Present them together so the viewport cannot wave.
+        if (canShift)
+        {
+            HDC dc = GetDC(hwnd);
+            if (dc)
+            {
+                BitBlt(dc, content.left, content.top, content.right - content.left,
+                    content.bottom - content.top, g_paintBufferDc, content.left, content.top, SRCCOPY);
+                ReleaseDC(hwnd, dc);
+            }
+        }
+
+        g_homeScrollFullRefreshPending = true;
+        SetTimer(hwnd, 22, 90, nullptr);
+        g_lastHomeScrollPresentMs = GetTickCount64();
+    }
     void ScrollHomeTo(HWND hwnd, int value)
     {
         RECT client{};
         GetClientRect(hwnd, &client);
         int clamped = ClampHomeScrollValue(client, value);
         if (clamped == g_homeScrollY) return;
-        RECT oldTrack = g_homeScrollTrackRect;
-        RECT viewport = HomeContentViewportRect(client);
         g_homeScrollY = clamped;
-        InvalidateRect(hwnd, &viewport, FALSE);
-
         UpdateHomeScrollRects(client);
-        RECT scrollDirty = oldTrack;
-        if (!IsRectEmpty(&scrollDirty)) UnionRect(&scrollDirty, &scrollDirty, &g_homeScrollTrackRect);
-        else scrollDirty = g_homeScrollTrackRect;
-        if (!IsRectEmpty(&scrollDirty)) InvalidateRect(hwnd, &scrollDirty, FALSE);
-    }
 
+        ULONGLONG now = GetTickCount64();
+        if (now - g_lastHomeScrollPresentMs >= 8)
+        {
+            PresentHomeScrollFrame(hwnd);
+            return;
+        }
+        if (!g_homeScrollFramePosted)
+        {
+            g_homeScrollFramePosted = true;
+            PostMessageW(hwnd, WM_QUIETPDF_HOME_SCROLL_FRAME, 0, 0);
+        }
+    }
     void EnsureTabWindowVisible(int index)
     {
         int total = static_cast<int>(g_tabs.size());
@@ -10479,23 +10579,26 @@ namespace
 
         int saved = SaveDC(dc);
         IntersectClipRect(dc, viewport.left, viewport.top, viewport.right, viewport.bottom);
+        RECT activeClip{};
+        GetClipBox(dc, &activeClip);
 
         RECT openTile{ x, y, x + tileW, y + tileH };
         g_recentRects.push_back(openTile);
         RECT openCover{ openTile.left, openTile.top, openTile.right, openTile.top + coverH };
-        drawCoverFrame(openCover, false);
-        HFONT plusFont = Font(30, FW_LIGHT);
-        HGDIOBJ oldPlus = SelectObject(dc, plusFont);
+        bool drawOpenTile = Intersects(openTile, activeClip);
+        if (drawOpenTile) drawCoverFrame(openCover, false);
+        HFONT plusFont = drawOpenTile ? Font(30, FW_LIGHT) : nullptr;
+        HGDIOBJ oldPlus = plusFont ? SelectObject(dc, plusFont) : nullptr;
         RECT plus{ openCover.left, openCover.top + S(42), openCover.right, openCover.top + S(92) };
-        Text(dc, L"+", plus, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().accent);
-        SelectObject(dc, oldPlus);
-        DeleteObject(plusFont);
+        if (drawOpenTile) Text(dc, L"+", plus, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().accent);
+        if (oldPlus) SelectObject(dc, oldPlus);
+        if (plusFont) DeleteObject(plusFont);
         RECT openMain{ openCover.left + S(10), openCover.top + S(100), openCover.right - S(10), openCover.top + S(128) };
-        Text(dc, L"\u6253\u5f00 PDF", openMain, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
+        if (drawOpenTile) Text(dc, L"\u6253\u5f00 PDF", openMain, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
         RECT openSub{ openCover.left + S(14), openCover.top + S(132), openCover.right - S(14), openCover.bottom - S(18) };
-        Text(dc, L"\u62d6\u5165\u6587\u4ef6\u6216\u70b9\u51fb\u6253\u5f00", openSub, DT_CENTER | DT_WORDBREAK, T().muted);
+        if (drawOpenTile) Text(dc, L"\u62d6\u5165\u6587\u4ef6\u6216\u70b9\u51fb\u6253\u5f00", openSub, DT_CENTER | DT_WORDBREAK, T().muted);
         RECT openName{ openTile.left, openCover.bottom + S(8), openTile.right, openTile.bottom };
-        Text(dc, L"\u6253\u5f00\u6587\u6863", openName, DT_CENTER | DT_TOP | DT_SINGLELINE, T().muted);
+        if (drawOpenTile) Text(dc, L"\u6253\u5f00\u6587\u6863", openName, DT_CENTER | DT_TOP | DT_SINGLELINE, T().muted);
         lastBottom = std::max(lastBottom, static_cast<int>(openTile.bottom));
         advance();
 
@@ -10514,15 +10617,19 @@ namespace
                 continue;
             }
             RECT cover{ tile.left, tile.top, tile.right, tile.top + coverH };
+            bool drawTile = Intersects(tile, activeClip);
             bool hovered = Hit(cover, g_mousePos.x, g_mousePos.y);
-            drawCoverFrame(cover, hovered || item.pinned);
+            if (drawTile && g_homeScrollLightPaint)
+                RoundFill(dc, cover, S(5), T().paper, hovered || item.pinned ? T().accent : T().line);
+            else if (drawTile)
+                drawCoverFrame(cover, hovered || item.pinned);
             RECT inner{ cover.left + S(7), cover.top + S(7), cover.right - S(7), cover.bottom - S(7) };
             RECT preload{ viewport.left, viewport.top - S(260), viewport.right, viewport.bottom + S(260) };
             bool nearViewport = Intersects(tile, preload);
             if (nearViewport) g_homeThumbProtectedKeys.insert(HomeThumbKey(item, inner.right - inner.left, PdfRenderTheme()));
             PageImage* thumb = nearViewport ? LoadHomeThumb(item, inner.right - inner.left) : nullptr;
-            if (thumb && !thumb->bgra.empty()) DrawImageFit(dc, *thumb, inner);
-            else
+            if (drawTile && thumb && (thumb->dib || !thumb->bgra.empty())) DrawImageFit(dc, *thumb, inner);
+            else if (drawTile)
             {
                 HFONT pdfFont = Font(18, FW_SEMIBOLD);
                 HGDIOBJ oldPdfFont = SelectObject(dc, pdfFont);
@@ -10533,12 +10640,15 @@ namespace
 
             RECT starHot{ cover.right - S(39), cover.top + S(9), cover.right - S(9), cover.top + S(39) };
             AddHomeHit(starHot, recentIndex, HomeAction::Favorite, item.favorite ? L"\u53d6\u6d88\u6536\u85cf" : L"\u6536\u85cf");
-            DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered, 5, false);
+            if (drawTile) DrawHomeIconButton(dc, starHot, HomeAction::Favorite, item.favorite, g_homeHits.size() - 1, hovered, 5, false);
 
             RECT dock{ cover.left + S(17), cover.bottom - S(45), cover.left + S(120), cover.bottom - S(13) };
-            if (hovered || item.pinned)
+            if (drawTile && (hovered || item.pinned))
             {
-                GlassRoundedSurface(dc, dock, IsDarkTheme() || IsAuroraTheme() ? 196 : 208, S(11.0f));
+                if (drawTile && g_homeScrollLightPaint)
+                    RoundFill(dc, dock, S(11), MixColor(T().panel, T().paper, 0.36), MixColor(T().line, T().paper, 0.18));
+                else
+                    GlassRoundedSurface(dc, dock, IsDarkTheme() || IsAuroraTheme() ? 196 : 208, S(11.0f));
             }
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
             const wchar_t* tips[] = { item.pinned ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u7f6e\u9876", L"\u6253\u5f00\u6587\u4ef6\u5939", L"\u5220\u9664\u8bb0\u5f55" };
@@ -10546,11 +10656,11 @@ namespace
             {
                 RECT hot{ dock.left + S(5) + a * S(32), dock.top + S(3), dock.left + S(5) + a * S(32) + S(26), dock.top + S(29) };
                 AddHomeHit(hot, recentIndex, actions[a], tips[a]);
-                DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered, 4, false);
+                if (drawTile) DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered, 4, false);
             }
 
             RECT name{ tile.left, cover.bottom + S(8), tile.right, tile.bottom };
-            Text(dc, item.name, name, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, T().text);
+            if (drawTile) Text(dc, item.name, name, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, T().text);
             lastBottom = std::max(lastBottom, static_cast<int>(tile.bottom));
             advance();
         }
@@ -12381,6 +12491,7 @@ namespace
             g_sideTabRects.clear();
             g_searchResultRects.clear();
             g_searchResultIds.clear();
+            g_homePresentedScrollY = g_homeScrollY;
             if (g_homeListView) PaintHomeList(dc, client);
             else PaintHomeGrid(dc, client);
             PaintHomeScrollBar(dc, client, paintClip);
@@ -14506,7 +14617,7 @@ namespace
         HDC mem = g_paintBufferDc;
         int paintState = SaveDC(mem);
         IntersectClipRect(mem, dirty.left, dirty.top, dirty.right, dirty.bottom);
-        if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty);
+        if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty, g_homeScrollLightPaint);
         else Fill(mem, dirty, T().bg);
         RECT toolbarRect{ 0, 0, client.right, S(38) };
         RECT tabsRect{ 0, S(38), client.right, S(76) };
@@ -14608,6 +14719,10 @@ namespace
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
             }
             return 0;
+        case WM_QUIETPDF_HOME_SCROLL_FRAME:
+            g_homeScrollFramePosted = false;
+            PresentHomeScrollFrame(hwnd);
+            return 0;
         case WM_QUIETPDF_PAGE_RENDERED:
         {
             std::unique_ptr<PageRenderResult> result(reinterpret_cast<PageRenderResult*>(lParam));
@@ -14662,7 +14777,11 @@ namespace
                     inserted = true;
                     PageRenderRequestScreenRect(tab, request, dirtyRect);
                 }
-                if (inserted) TrimBackgroundRenderCaches();
+                if (inserted)
+                {
+                    TrimBackgroundRenderCaches();
+                    if (i == g_active) ScheduleIdleCacheTrim(hwnd);
+                }
                 if (inserted && i == g_active)
                 {
                     if (request.tile)
@@ -14712,7 +14831,7 @@ namespace
                 return 0;
             }
             bool repaint = false;
-            if (!result->image.bgra.empty())
+            if (result->image.dib || !result->image.bgra.empty())
             {
                 g_homeThumbFailedUntil.erase(result->key);
                 if (g_homeThumbCache.find(result->key) == g_homeThumbCache.end())
@@ -14729,7 +14848,7 @@ namespace
                 // temporarily unavailable files to recover without restarting.
                 g_homeThumbFailedUntil[result->key] = GetTickCount64() + 5000;
             }
-            if (repaint && !Active())
+            if (repaint && !Active() && !g_homeScrollFullRefreshPending)
             {
                 RECT client{};
                 GetClientRect(hwnd, &client);
@@ -16286,6 +16405,19 @@ namespace
                     SetTimer(hwnd, 20, 250, nullptr);
                 else if (!StageScrollPaintInProgress() && !ZoomRenderDeferred())
                     TrimIdleRenderCaches(hwnd);
+                return 0;
+            }
+            if (wParam == 22)
+            {
+                KillTimer(hwnd, 22);
+                if (g_homeScrollFullRefreshPending && !Active())
+                {
+                    g_homeScrollFullRefreshPending = false;
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
+                    RECT viewport = HomeContentViewportRect(client);
+                    InvalidateRect(hwnd, &viewport, FALSE);
+                }
                 return 0;
             }
             if (wParam == 21)

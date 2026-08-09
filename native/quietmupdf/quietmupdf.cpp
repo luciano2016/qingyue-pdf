@@ -59,6 +59,12 @@ extern "C" fz_context* quiet_clone_context(fz_context* ctx)
 {
     return ctx ? fz_clone_context(ctx) : nullptr;
 }
+extern "C" int quiet_shrink_store(fz_context* ctx, unsigned int percent)
+{
+    if (!ctx) return 0;
+    return fz_shrink_store(ctx, std::min(percent, 100u));
+}
+
 
 static void quiet_set_last_error(const char* message);
 
