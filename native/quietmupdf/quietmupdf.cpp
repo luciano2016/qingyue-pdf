@@ -55,6 +55,101 @@ extern "C" fz_context* quiet_clone_context(fz_context* ctx)
     return ctx ? fz_clone_context(ctx) : nullptr;
 }
 
+static void quiet_set_last_error(const char* message);
+
+namespace
+{
+    struct quiet_win32_stream
+    {
+        HANDLE file{ INVALID_HANDLE_VALUE };
+        unsigned char buffer[4096]{};
+    };
+
+    int quiet_win32_stream_next(fz_context* ctx, fz_stream* stream, size_t)
+    {
+        auto* state = static_cast<quiet_win32_stream*>(stream->state);
+        DWORD bytesRead = 0;
+        if (!ReadFile(state->file, state->buffer, static_cast<DWORD>(sizeof(state->buffer)), &bytesRead, nullptr))
+            fz_throw(ctx, FZ_ERROR_SYSTEM, "cannot read shared PDF stream: Windows error %lu", GetLastError());
+        stream->rp = state->buffer;
+        stream->wp = state->buffer + bytesRead;
+        stream->pos += static_cast<int64_t>(bytesRead);
+        return bytesRead == 0 ? EOF : *stream->rp++;
+    }
+
+    void quiet_win32_stream_seek(fz_context* ctx, fz_stream* stream, int64_t offset, int whence)
+    {
+        auto* state = static_cast<quiet_win32_stream*>(stream->state);
+        LARGE_INTEGER distance{};
+        LARGE_INTEGER position{};
+        distance.QuadPart = offset;
+        DWORD method = whence == SEEK_SET ? FILE_BEGIN : (whence == SEEK_CUR ? FILE_CURRENT : FILE_END);
+        if (!SetFilePointerEx(state->file, distance, &position, method))
+            fz_throw(ctx, FZ_ERROR_SYSTEM, "cannot seek shared PDF stream: Windows error %lu", GetLastError());
+        stream->pos = position.QuadPart;
+        stream->rp = state->buffer;
+        stream->wp = state->buffer;
+    }
+
+    void quiet_win32_stream_drop(fz_context* ctx, void* opaque)
+    {
+        auto* state = static_cast<quiet_win32_stream*>(opaque);
+        if (!state) return;
+        if (state->file != INVALID_HANDLE_VALUE) CloseHandle(state->file);
+        fz_free(ctx, state);
+    }
+
+    fz_stream* quiet_open_shared_stream(fz_context* ctx, const wchar_t* path)
+    {
+        HANDLE file = CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            fz_throw(ctx, FZ_ERROR_SYSTEM, "cannot open shared PDF stream: Windows error %lu", GetLastError());
+
+        quiet_win32_stream* state = nullptr;
+        fz_try(ctx)
+        {
+            state = fz_malloc_struct(ctx, quiet_win32_stream);
+        }
+        fz_catch(ctx)
+        {
+            CloseHandle(file);
+            fz_rethrow(ctx);
+        }
+        state->file = file;
+        fz_stream* stream = fz_new_stream(ctx, state, quiet_win32_stream_next, quiet_win32_stream_drop);
+        stream->seek = quiet_win32_stream_seek;
+        return stream;
+    }
+}
+
+extern "C" fz_document* quiet_open_document_shared_w(fz_context* ctx, const wchar_t* path)
+{
+    if (!ctx || !path || !*path) return nullptr;
+    fz_stream* stream = nullptr;
+    fz_document* document = nullptr;
+    fz_try(ctx)
+    {
+        stream = quiet_open_shared_stream(ctx, path);
+        document = fz_open_document_with_stream(ctx, "application/pdf", stream);
+    }
+    fz_always(ctx)
+    {
+        fz_drop_stream(ctx, stream);
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        document = nullptr;
+    }
+    return document;
+}
 struct quiet_pdf_annotation
 {
     int page;

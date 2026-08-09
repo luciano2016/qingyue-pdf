@@ -993,6 +993,7 @@ namespace
         using DropContextFn = void(__cdecl*)(fz_context*);
         using RegisterHandlersFn = void(__cdecl*)(fz_context*);
         using OpenDocumentFn = fz_document*(__cdecl*)(fz_context*, const char*);
+        using OpenDocumentSharedFn = fz_document*(__cdecl*)(fz_context*, const wchar_t*);
         using CountPagesFn = int(__cdecl*)(fz_context*, fz_document*);
         using DropDocumentFn = void(__cdecl*)(fz_context*, fz_document*);
         using LoadOutlineFn = fz_outline*(__cdecl*)(fz_context*, fz_document*);
@@ -1038,6 +1039,7 @@ namespace
             Get(cloneContext, "quiet_clone_context");
             Get(registerHandlers, "fz_register_document_handlers");
             Get(openDocument, "fz_open_document");
+            Get(openDocumentShared, "quiet_open_document_shared_w");
             Get(countPages, "fz_count_pages");
             Get(dropDocument, "fz_drop_document");
             Get(loadOutline, "fz_load_outline");
@@ -1084,6 +1086,7 @@ namespace
         CloneContextFn cloneContext{};
         RegisterHandlersFn registerHandlers{};
         OpenDocumentFn openDocument{};
+        OpenDocumentSharedFn openDocumentShared{};
         CountPagesFn countPages{};
         DropDocumentFn dropDocument{};
         LoadOutlineFn loadOutline{};
@@ -1208,8 +1211,7 @@ namespace
         g_pdf.setAaLevel(session->uiContext, 8);
         g_pdf.registerHandlers(session->uiContext);
 
-        std::string utf8 = ToUtf8(path);
-        session->document = g_pdf.openDocument(session->uiContext, utf8.c_str());
+        session->document = g_pdf.openDocumentShared(session->uiContext, path.c_str());
         if (!session->document)
             throw std::runtime_error("MuPDF document open failed.");
 
@@ -4629,8 +4631,7 @@ namespace
             temp.ctx = g_pdf.newContext(nullptr, nullptr, 8 << 20, "1.28.0");
             g_pdf.setAaLevel(temp.ctx, 8);
             g_pdf.registerHandlers(temp.ctx);
-            auto utf8 = ToUtf8(item.path);
-            temp.doc = g_pdf.openDocument(temp.ctx, utf8.c_str());
+            temp.doc = g_pdf.openDocumentShared(temp.ctx, item.path.c_str());
             temp.pageCount = g_pdf.countPages(temp.ctx, temp.doc);
             if (temp.pageCount <= 0)
             {
@@ -13423,51 +13424,52 @@ namespace
     }
     bool ReloadPdfTab(PdfTab& tab, const std::wstring& path, int page, double zoom)
     {
-        tab.renderVersion = ++g_nextRenderVersion;
-        DropTab(tab);
-        tab.pages.clear();
-        tab.outline.clear();
-        tab.cache.clear();
-        tab.zoomFallbackCache.clear();
-        tab.tileCache.clear();
-        tab.thumbCache.clear();
-        tab.annotations.clear();
-        tab.outlineLayout.clear();
-        tab.outlineLayoutWidth = 0;
-        tab.outlineLayoutFont = 0;
-        tab.outlineLayoutRows = 0;
-        tab.outlineLayoutContentHeight = 0;
-        tab.dirty = false;
+        PdfTab replacement;
+        replacement.renderVersion = ++g_nextRenderVersion;
+        replacement.sidebarScrollY[0] = tab.sidebarScrollY[0];
+        replacement.sidebarScrollY[1] = tab.sidebarScrollY[1];
+        replacement.sidebarScrollY[2] = tab.sidebarScrollY[2];
+        replacement.sidebarScrollY[3] = tab.sidebarScrollY[3];
+        replacement.selectedOutlineRow = tab.selectedOutlineRow;
+        replacement.collapsedOutlineRows = tab.collapsedOutlineRows;
+        replacement.savedScrollY = tab.savedScrollY;
 
         try
         {
             g_pdf.Load();
-            tab.renderSession = CreatePageRenderSession(path);
-            tab.ctx = tab.renderSession->uiContext;
-            tab.doc = tab.renderSession->document;
-            tab.pageCount = g_pdf.countPages(tab.ctx, tab.doc);
-            tab.path = path;
-            tab.name = std::filesystem::path(path).filename().wstring();
-            UpdateTabFileStamp(tab);
-            tab.currentPage = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
-            tab.zoom = zoom;
-            LoadPageGeometry(tab);
-            fz_outline* outline = g_pdf.loadOutline(tab.ctx, tab.doc);
+            replacement.renderSession = CreatePageRenderSession(path);
+            replacement.ctx = replacement.renderSession->uiContext;
+            replacement.doc = replacement.renderSession->document;
+            replacement.pageCount = g_pdf.countPages(replacement.ctx, replacement.doc);
+            if (replacement.pageCount <= 0)
+                throw std::runtime_error("PDF contains no pages.");
+            replacement.path = path;
+            replacement.name = std::filesystem::path(path).filename().wstring();
+            UpdateTabFileStamp(replacement);
+            replacement.currentPage = std::clamp(page, 0, replacement.pageCount - 1);
+            replacement.zoom = zoom;
+            LoadPageGeometry(replacement);
+            fz_outline* outline = g_pdf.loadOutline(replacement.ctx, replacement.doc);
             if (outline)
             {
-                CollectOutline(tab, outline, 0);
-                g_pdf.dropOutline(tab.ctx, outline);
+                CollectOutline(replacement, outline, 0);
+                g_pdf.dropOutline(replacement.ctx, outline);
             }
-            LoadAnnotationsFromPdf(tab);
-            if (g_continuousRead) ScrollToPage(tab, tab.currentPage);
-            else g_scrollY = 0;
-            return true;
+            LoadAnnotationsFromPdf(replacement);
         }
         catch (...)
         {
-            DropTab(tab);
+            DropTab(replacement);
             return false;
         }
+
+        CancelObsoletePageRendersForZoom(tab);
+        PdfTab old = std::move(tab);
+        tab = std::move(replacement);
+        DropTab(old);
+        if (g_continuousRead) ScrollToPage(tab, tab.currentPage);
+        else g_scrollY = 0;
+        return true;
     }
 
     void RestoreScrollAfterReload(HWND hwnd, PdfTab& tab, int oldScroll)
