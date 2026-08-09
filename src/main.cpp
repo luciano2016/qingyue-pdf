@@ -10484,7 +10484,7 @@ namespace
     {
         HFONT titleFont = Font(22, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
-        RECT title{ S(42), S(112), client.right - S(42), S(154) };
+        RECT title{ S(42), S(104), client.right - S(42), S(146) };
         Text(dc, L"\u6700\u8fd1\u9605\u8bfb", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
@@ -10556,11 +10556,16 @@ namespace
         int tileH = coverH + nameH + S(10);
         int gapX = S(28);
         int gapY = S(28);
-        int startX = S(42);
+        int gridLeft = S(42);
+        int gridRight = std::max<int>(gridLeft + tileW, client.right - S(42));
+        int availableW = std::max<int>(tileW, gridRight - gridLeft);
+        int columns = std::max<int>(1, (availableW + gapX) / (tileW + gapX));
+        int gridW = columns * tileW + std::max(0, columns - 1) * gapX;
+        int startX = gridLeft + std::max(0, (availableW - gridW) / 2);
         int x = startX;
         int y = viewport.top + S(16) - g_homeScrollY;
         int lastBottom = y;
-        int maxRight = std::max<int>(startX + tileW, client.right - S(42));
+        int maxRight = startX + gridW;
         auto advance = [&]()
         {
             x += tileW + gapX;
