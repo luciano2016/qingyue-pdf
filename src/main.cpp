@@ -1168,7 +1168,7 @@ namespace
         std::recursive_mutex documentMutex;
         std::map<int, fz_display_list*> displayLists;
         std::deque<int> displayListLru;
-        size_t maxDisplayLists{ 8 };
+        size_t maxDisplayLists{ 4 };
 
         ~PageRenderSession();
     };
@@ -1379,7 +1379,6 @@ namespace
     bool g_lastImmersiveSidebarOpen{};
     bool g_hasPreImmersivePlacement{};
     bool g_resizingSidebar{};
-    int g_sidebarResizeStageLeft{};
     bool g_draggingThumbSlider{};
     bool g_draggingTab{};
     bool g_tabDetachArmed{};
@@ -1454,7 +1453,6 @@ namespace
     int g_glassBackdropTheme{ -1 };
     int g_paintBufferW{};
     int g_paintBufferH{};
-    bool g_paintBufferReady{};
     int g_statusOffset{};
     int g_statusTargetOffset{};
     int g_pageWheelDeltaAccum{};
@@ -4043,6 +4041,42 @@ namespace
         TrimHomeThumbCache();
     }
 
+    void TrimDisplayLists(PdfTab& tab, int keepDistance)
+    {
+        if (!tab.renderSession) return;
+        auto& session = *tab.renderSession;
+        std::lock_guard<std::recursive_mutex> lock(session.documentMutex);
+        for (auto it = session.displayLists.begin(); it != session.displayLists.end(); )
+        {
+            if (keepDistance >= 0 && std::abs(it->first - tab.currentPage) <= keepDistance)
+            {
+                ++it;
+                continue;
+            }
+            if (it->second && session.renderContext)
+                g_pdf.dropDisplayList(session.renderContext, it->second);
+            int page = it->first;
+            it = session.displayLists.erase(it);
+            session.displayListLru.erase(
+                std::remove(session.displayListLru.begin(), session.displayListLru.end(), page),
+                session.displayListLru.end());
+        }
+    }
+
+    void TrimHomeDocumentCaches()
+    {
+        for (auto& ownedTab : g_tabs)
+        {
+            PdfTab& tab = *ownedTab;
+            tab.cache.clear();
+            tab.zoomFallbackCache.clear();
+            tab.tileCache.clear();
+            tab.thumbCache.clear();
+            TrimDisplayLists(tab, -1);
+        }
+        TrimHomeThumbCache();
+    }
+
     bool ReadFileStamp(const std::wstring& path, std::filesystem::file_time_type& stamp)
     {
         try
@@ -4395,16 +4429,9 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int spreadW = SpreadWidth(tab, start);
         int maxSpreadW = MaxSpreadWidth(tab);
-        int stageLeft = g_stage.left;
-        int layoutStageW = stageW;
-        if (g_resizingSidebar && g_sidebarResizeStageLeft > 0)
-        {
-            layoutStageW = std::max<int>(1, g_stage.right - g_sidebarResizeStageLeft);
-            stageLeft = g_sidebarResizeStageLeft;
-        }
-        if (maxSpreadW + S(56) <= layoutStageW)
-            return stageLeft + (layoutStageW - spreadW) / 2;
-        return stageLeft + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
+        if (maxSpreadW + S(56) <= stageW)
+            return g_stage.left + (stageW - spreadW) / 2;
+        return g_stage.left + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
     }
 
     int SpreadTopScroll(PdfTab const& tab, int targetPage)
@@ -5440,7 +5467,11 @@ namespace
     {
         UNREFERENCED_PARAMETER(hwnd);
         PdfTab* tab = Active();
-        if (!tab) return;
+        if (!tab)
+        {
+            TrimHomeDocumentCaches();
+            return;
+        }
         PreparePageCache(*tab);
         PruneZoomFallbackCache(*tab);
 
@@ -5472,6 +5503,7 @@ namespace
         }
         TrimBackgroundRenderCaches();
 
+        TrimDisplayLists(*tab, 1);
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
     void ScheduleIdleCacheTrim(HWND hwnd)
@@ -8001,26 +8033,8 @@ namespace
         if (clamped == g_homeScrollY) return;
         RECT oldTrack = g_homeScrollTrackRect;
         RECT viewport = HomeContentViewportRect(client);
-        int delta = g_homeScrollY - clamped;
         g_homeScrollY = clamped;
-
-        int viewportH = std::max<int>(1, viewport.bottom - viewport.top);
-        if (g_paintBufferReady && std::abs(delta) < viewportH)
-        {
-            RECT contentViewport = viewport;
-            if (!IsRectEmpty(&oldTrack))
-                contentViewport.right = std::min(contentViewport.right, oldTrack.left);
-            ScrollWindowEx(hwnd, 0, delta, &contentViewport, &contentViewport, nullptr, nullptr, 0);
-            ScrollDC(g_paintBufferDc, 0, delta, &contentViewport, &contentViewport, nullptr, nullptr);
-            RECT exposed = contentViewport;
-            if (delta < 0) exposed.top = std::max(exposed.top, exposed.bottom + delta);
-            else exposed.bottom = std::min(exposed.bottom, exposed.top + delta);
-            if (!IsRectEmpty(&exposed)) InvalidateRect(hwnd, &exposed, FALSE);
-        }
-        else
-        {
-            InvalidateRect(hwnd, &viewport, FALSE);
-        }
+        InvalidateRect(hwnd, &viewport, FALSE);
 
         UpdateHomeScrollRects(client);
         RECT scrollDirty = oldTrack;
@@ -8581,7 +8595,7 @@ namespace
         int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
         int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
         g_scrollY = std::clamp(g_scrollY, 0, maxScroll);
-        if (!g_resizingSidebar) g_scrollX = std::clamp(g_scrollX, 0, maxScrollX);
+        g_scrollX = std::clamp(g_scrollX, 0, maxScrollX);
         if (tab && g_continuousRead)
         {
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
@@ -14176,6 +14190,7 @@ namespace
             SetTitle();
             StartActiveFileWatcher(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
+            ScheduleIdleCacheTrim(hwnd);
             break;
         case CmdOpen: OpenDialog(hwnd); break;
         case CmdTabNavPrev:
@@ -14446,7 +14461,6 @@ namespace
             DeleteObject(previous);
 
         g_paintBufferBitmap = bitmap;
-        g_paintBufferReady = false;
         g_paintBufferW = width;
         g_paintBufferH = height;
         return true;
@@ -14467,7 +14481,6 @@ namespace
         g_paintBufferOldBitmap = nullptr;
         g_paintBufferW = 0;
         g_paintBufferH = 0;
-        g_paintBufferReady = false;
         if (g_imageDrawDc)
         {
             DeleteDC(g_imageDrawDc);
@@ -14487,7 +14500,6 @@ namespace
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
         if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
         {
-            g_paintBufferReady = false;
             EndPaint(hwnd, &ps);
             return;
         }
@@ -14546,7 +14558,6 @@ namespace
 
         }
         RestoreDC(mem, paintState);
-        g_paintBufferReady = true;
         EndPaint(hwnd, &ps);
     }
 
@@ -15187,7 +15198,6 @@ namespace
             {
                 g_resizingSidebar = true;
                 g_sidebarTargetWidth = g_sidebarWidth;
-                g_sidebarResizeStageLeft = g_stage.left;
                 SetCapture(hwnd);
                 return 0;
             }
@@ -16042,7 +16052,6 @@ namespace
             if (g_resizingSidebar)
             {
                 g_resizingSidebar = false;
-                g_sidebarResizeStageLeft = 0;
                 ReleaseCapture();
                 ResizeSidebarNow(hwnd, g_sidebarTargetWidth, true);
                 SaveState();
@@ -16268,7 +16277,15 @@ namespace
             if (wParam == 20)
             {
                 KillTimer(hwnd, 20);
-                if (!StageScrollPaintInProgress() && !ZoomRenderDeferred()) TrimIdleRenderCaches(hwnd);
+                bool renderBusy = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+                    renderBusy = g_pageRenderActive;
+                }
+                if (renderBusy)
+                    SetTimer(hwnd, 20, 250, nullptr);
+                else if (!StageScrollPaintInProgress() && !ZoomRenderDeferred())
+                    TrimIdleRenderCaches(hwnd);
                 return 0;
             }
             if (wParam == 21)
