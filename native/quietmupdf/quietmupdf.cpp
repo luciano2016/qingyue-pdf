@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <mutex>
 
 extern "C" void install_load_windows_font_funcs(fz_context* ctx);
 
@@ -45,14 +46,32 @@ namespace
         static quiet_lock_table table;
         return table;
     }
+
+    std::mutex& quiet_context_mutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    fz_context*& quiet_shared_root()
+    {
+        static fz_context* root{};
+        return root;
+    }
 }
 
 extern "C" fz_context* quiet_new_shared_context(size_t max_store)
 {
     quiet_lock_table& table = quiet_shared_locks();
-    fz_context* ctx = fz_new_context(nullptr, &table.context, max_store);
-    if (ctx) install_load_windows_font_funcs(ctx);
-    return ctx;
+    std::lock_guard<std::mutex> guard(quiet_context_mutex());
+    fz_context*& root = quiet_shared_root();
+    if (!root)
+    {
+        size_t storeLimit = std::max<size_t>(max_store, 256ull * 1024ull * 1024ull);
+        root = fz_new_context(nullptr, &table.context, storeLimit);
+        if (root) install_load_windows_font_funcs(root);
+    }
+    return root ? fz_clone_context(root) : nullptr;
 }
 
 extern "C" fz_context* quiet_clone_context(fz_context* ctx)

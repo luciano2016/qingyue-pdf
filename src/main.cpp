@@ -1595,7 +1595,7 @@ namespace
         while (size < viewportTile) size <<= 1;
         return std::min(size, 1024);
     }
-    constexpr double TileRenderZoomThreshold = 1.25;
+    constexpr double TileRenderZoomThreshold = 1.50;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -5517,6 +5517,7 @@ namespace
         if (!tab)
         {
             TrimHomeDocumentCaches();
+            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
             return;
         }
         PreparePageCache(*tab);
@@ -5558,7 +5559,7 @@ namespace
             g_pdf.shrinkStore(tab->ctx, 0);
             tab->initialStoreTrimPending = false;
         }
-
+        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
     void ScheduleIdleCacheTrim(HWND hwnd)
     {
