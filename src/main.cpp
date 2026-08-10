@@ -10482,16 +10482,26 @@ namespace
     }
     void PaintHomeHeader(HDC dc, RECT client)
     {
+        int tileW = S(152);
+        int gapX = S(28);
+        int boundaryLeft = S(42);
+        int boundaryRight = std::max<int>(boundaryLeft + tileW, client.right - S(42));
+        int availableW = std::max<int>(tileW, boundaryRight - boundaryLeft);
+        int columns = std::max<int>(1, (availableW + gapX) / (tileW + gapX));
+        int contentW = columns * tileW + std::max(0, columns - 1) * gapX;
+        int contentLeft = boundaryLeft + std::max(0, (availableW - contentW) / 2);
+        int contentRight = contentLeft + contentW;
+
         HFONT titleFont = Font(22, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
-        RECT title{ S(42), S(104), client.right - S(42), S(146) };
+        RECT title{ contentLeft, S(104), contentRight, S(146) };
         Text(dc, L"\u6700\u8fd1\u9605\u8bfb", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
 
         HFONT f = Font(9);
         oldFont = SelectObject(dc, f);
-        g_homeSearchRect = RECT{ S(42), S(158), std::min<int>(client.right - S(42), S(560)), S(204) };
+        g_homeSearchRect = RECT{ contentLeft, S(158), std::min<int>(contentRight, contentLeft + S(518)), S(204) };
         RoundFill(dc, g_homeSearchRect, S(10), T().paper, g_homeSearchFocused ? T().accent : T().line);
         RECT searchIcon{ g_homeSearchRect.left + S(14), g_homeSearchRect.top + S(13), g_homeSearchRect.left + S(31), g_homeSearchRect.bottom - S(13) };
         DrawSideTabIcon(dc, searchIcon, SideTabIcon::Search, MixColor(T().muted, T().text, 0.06));
@@ -10523,7 +10533,7 @@ namespace
         SelectObject(dc, oldSearchFont);
         DeleteObject(searchFont);
 
-        int right = client.right - S(54);
+        int right = contentRight;
         RECT clear{ right - S(112), S(168), right, S(200) };
         AddHomeHit(clear, -1, HomeAction::ClearAll, L"\u6e05\u9664\u8bb0\u5f55");
         size_t clearIndex = g_homeHits.size() - 1;
@@ -10692,10 +10702,19 @@ namespace
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
-        int left = S(54);
+        int tileW = S(152);
+        int gapX = S(28);
+        int boundaryLeft = S(42);
+        int boundaryRight = std::max<int>(boundaryLeft + tileW, client.right - S(42));
+        int availableW = std::max<int>(tileW, boundaryRight - boundaryLeft);
+        int columns = std::max<int>(1, (availableW + gapX) / (tileW + gapX));
+        int contentW = columns * tileW + std::max(0, columns - 1) * gapX;
+        int contentLeft = boundaryLeft + std::max(0, (availableW - contentW) / 2);
+        int contentRight = contentLeft + contentW;
+        int left = contentLeft + S(10);
         int headerTop = viewport.top + S(8);
         int rowH = S(48);
-        int actionX = client.right - S(188);
+        int actionX = contentRight - S(144);
         int sizeX = actionX - S(126);
         int nameW = std::max<int>(S(300), (sizeX - left) * 34 / 100);
         int dateX = left + nameW;
@@ -10715,7 +10734,7 @@ namespace
         {
             int recentIndex = g_homeRecentIds[displayIndex];
             RecentItem const& item = g_recent[static_cast<size_t>(recentIndex)];
-            RECT row{ left - S(10), y, client.right - S(44), y + rowH };
+            RECT row{ contentLeft, y, contentRight, y + rowH };
             g_recentRects.push_back(row);
             bool visibleRow = Intersects(row, rowPaintWindow);
             if (!visibleRow)
@@ -10746,7 +10765,7 @@ namespace
         }
         if (!g_homeSearchQuery.empty() && g_homeRecentIds.empty())
         {
-            RECT empty{ left, rowsViewport.top + S(8) - g_homeScrollY, client.right - S(54), rowsViewport.top + S(64) - g_homeScrollY };
+            RECT empty{ left, rowsViewport.top + S(8) - g_homeScrollY, contentRight, rowsViewport.top + S(64) - g_homeScrollY };
             Text(dc, L"\u6ca1\u6709\u627e\u5230\u5339\u914d\u7684\u6587\u6863", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             lastBottom = std::max(lastBottom, static_cast<int>(empty.bottom));
         }
