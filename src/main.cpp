@@ -4960,7 +4960,8 @@ namespace
 
     void TrimZoomFallbackCache(PdfTab& tab, int protectedPage)
     {
-        while (tab.zoomFallbackCache.size() > 2)
+        size_t maxFallbackPages = static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab), 1, 2));
+        while (tab.zoomFallbackCache.size() > maxFallbackPages)
         {
             auto victim = tab.zoomFallbackCache.end();
             int worstDistance = -1;
@@ -5023,7 +5024,8 @@ namespace
             std::max(0, FirstVisibleSpreadStart(tab)) :
             FirstPageInSpread(std::clamp(anchorPage, 0, tab.pageCount - 1));
         int warmed = 0;
-        for (int start = firstVisible; start < tab.pageCount && warmed < 4; start = NextSpreadStart(tab, start))
+        int warmLimit = std::clamp(VisiblePageCountForCache(tab), 1, 2);
+        for (int start = firstVisible; start < tab.pageCount && warmed < warmLimit; start = NextSpreadStart(tab, start))
         {
             int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
             RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
@@ -5031,7 +5033,7 @@ namespace
             if (!Intersects(spreadRect, view) && (g_continuousRead || start != firstVisible)) continue;
 
             int count = SpreadPageCount(tab, start);
-            for (int j = 0; j < count && warmed < 4; ++j)
+            for (int j = 0; j < count && warmed < warmLimit; ++j)
             {
                 int page = start + j;
                 RECT pageRect{};
@@ -5048,12 +5050,12 @@ namespace
 
     size_t DynamicPageCacheByteLimit(PdfTab const& tab)
     {
-        if (tab.zoom >= TileRenderZoomThreshold) return 6ull * 1024ull * 1024ull;
+        if (tab.zoom >= TileRenderZoomThreshold) return 4ull * 1024ull * 1024ull;
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
-        size_t target = visibleBytes * 2ull + 10ull * 1024ull * 1024ull;
-        return std::clamp<size_t>(target, 16ull * 1024ull * 1024ull, 28ull * 1024ull * 1024ull);
+        size_t target = visibleBytes + 6ull * 1024ull * 1024ull;
+        return std::clamp<size_t>(target, 12ull * 1024ull * 1024ull, 20ull * 1024ull * 1024ull);
     }
 
     void TrimPageCache(PdfTab& tab, int protectedPage)
@@ -5065,7 +5067,7 @@ namespace
             return total;
         };
         size_t maxBytes = DynamicPageCacheByteLimit(tab);
-        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 1ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 12 : 4), 4, 96));
+        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 1ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 4 : 0), 1, 16));
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -5327,9 +5329,15 @@ namespace
                     }),
                 g_pageRenderQueue.end());
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
-            for (auto const& queued : g_pageRenderQueue)
+            for (auto& queued : g_pageRenderQueue)
             {
-                if (SamePageRenderRequest(queued, request)) return;
+                if (SamePageRenderRequest(queued, request))
+                {
+                    // Refresh an identical queued request so it is not
+                    // discarded as stale while waiting behind another render.
+                    queued.viewportGeneration = std::max(queued.viewportGeneration, request.viewportGeneration);
+                    return;
+                }
             }
             request.serial = ++g_pageRenderSerial;
             auto insertAt = std::find_if(
@@ -5395,9 +5403,15 @@ namespace
                     }),
                 g_pageRenderQueue.end());
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
-            for (auto const& queued : g_pageRenderQueue)
+            for (auto& queued : g_pageRenderQueue)
             {
-                if (SamePageRenderRequest(queued, request)) return;
+                if (SamePageRenderRequest(queued, request))
+                {
+                    // Refresh an identical queued request so it is not
+                    // discarded as stale while waiting behind another render.
+                    queued.viewportGeneration = std::max(queued.viewportGeneration, request.viewportGeneration);
+                    return;
+                }
             }
             request.serial = ++g_pageRenderSerial;
             auto insertAt = std::find_if(
@@ -5493,8 +5507,8 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
-        size_t target = visibleBytes * 2ull + 8ull * 1024ull * 1024ull;
-        return std::clamp<size_t>(target, 14ull * 1024ull * 1024ull, 28ull * 1024ull * 1024ull);
+        size_t target = visibleBytes + 4ull * 1024ull * 1024ull;
+        return std::clamp<size_t>(target, 8ull * 1024ull * 1024ull, 16ull * 1024ull * 1024ull);
     }
 
     bool PageVisibleInStage(PdfTab const& tab, int page)
@@ -5517,7 +5531,7 @@ namespace
         if (!tab)
         {
             TrimHomeDocumentCaches();
-            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+
             return;
         }
         PreparePageCache(*tab);
@@ -5559,7 +5573,6 @@ namespace
             g_pdf.shrinkStore(tab->ctx, 0);
             tab->initialStoreTrimPending = false;
         }
-        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
     void ScheduleIdleCacheTrim(HWND hwnd)
     {
@@ -5649,6 +5662,7 @@ namespace
                 [&](PageRenderRequest const& queued) { return SamePageRenderRequest(queued, request); });
             if (existing != g_pageRenderQueue.end())
             {
+                existing->viewportGeneration = std::max(existing->viewportGeneration, request.viewportGeneration);
                 if (priority >= existing->priority) return;
                 request.serial = existing->serial;
                 g_pageRenderQueue.erase(existing);
@@ -5663,7 +5677,7 @@ namespace
                 [&](PageRenderRequest const& queued)
                 { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedTileRenders = 8;
+            constexpr size_t maxQueuedTileRenders = 4;
             auto queuedTileCount = [&]()
             {
                 return static_cast<size_t>(std::count_if(
@@ -5867,6 +5881,54 @@ namespace
         if (!BuildSpreadPageRect(tab, start, y, request.page, pageRect)) return false;
         InflateRect(&pageRect, S(3), S(3));
         return IntersectRect(&out, &pageRect, &g_stage) != FALSE;
+    }
+
+    bool RenderRequestStillUseful(PdfTab const& tab, PageRenderRequest const& request, RECT& dirtyRect)
+    {
+        dirtyRect = {};
+        if (request.tile)
+        {
+            TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level,
+                request.x, request.y, request.w, request.h };
+            // Finished work from an old viewport is kept only when it is
+            // still close enough to be useful for the next paint.
+            if (request.viewportGeneration + 1 < g_viewportGeneration &&
+                !TileVisibleNearby(tab, key, 0.35))
+                return false;
+            return TileRequestScreenRect(tab, request, dirtyRect) ||
+                TileVisibleNearby(tab, key, 0.35);
+        }
+
+        if (request.viewportGeneration + 1 < g_viewportGeneration)
+            return PageRenderRequestScreenRect(tab, request, dirtyRect);
+        return true;
+    }
+
+    void MaintainVisiblePageRenderQueueForScroll(PdfTab const& tab)
+    {
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        auto matchesTab = [&](PageRenderRequest const& request)
+        {
+            return !request.tile && request.documentVersion == tab.renderVersion &&
+                _wcsicmp(request.path.c_str(), tab.path.c_str()) == 0;
+        };
+        if (g_pageRenderActive && matchesTab(g_pageRenderActiveRequest))
+        {
+            RECT visible{};
+            if (!PageRenderRequestScreenRect(tab, g_pageRenderActiveRequest, visible))
+                AbortActivePageRenderLocked();
+        }
+        g_pageRenderQueue.erase(
+            std::remove_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& request)
+                {
+                    if (!matchesTab(request)) return false;
+                    RECT visible{};
+                    return !PageRenderRequestScreenRect(tab, request, visible);
+                }),
+            g_pageRenderQueue.end());
     }
 
     void MaintainVisibleTileRenderQueueForScroll(PdfTab const& tab)
@@ -9092,7 +9154,7 @@ namespace
         }
 
         int warmed = 0;
-        for (int start = startAt; start < tab.pageCount && warmed < 4; start = NextSpreadStart(tab, start))
+        for (int start = startAt; start < tab.pageCount && warmed < 2; start = NextSpreadStart(tab, start))
         {
             int y = g_continuousRead ? g_stage.top + SpreadTopScroll(tab, start) - targetScrollY : g_stage.top + S(28) - targetScrollY;
             int spreadH = SpreadHeight(tab, start);
@@ -9101,7 +9163,7 @@ namespace
             if (!Intersects(spreadRect, view) && (g_continuousRead || start != firstVisible)) continue;
 
             int count = SpreadPageCount(tab, start);
-            for (int j = 0; j < count && warmed < 4; ++j)
+            for (int j = 0; j < count && warmed < 2; ++j)
             {
                 int page = start + j;
                 if (page < 0 || page >= tab.pageCount) continue;
@@ -9208,11 +9270,14 @@ namespace
         }
         UpdateVertScrollBar(hwnd);
         RedrawMainScrollBarNow(hwnd);
-        if (tab && tab->zoom >= TileRenderZoomThreshold)
+        if (tab)
         {
-            MaintainVisibleTileRenderQueueForScroll(*tab);
+            if (tab->zoom >= TileRenderZoomThreshold)
+                MaintainVisibleTileRenderQueueForScroll(*tab);
+            else
+                MaintainVisiblePageRenderQueueForScroll(*tab);
         }
-        else if (!StageScrollPaintInProgress())
+        if (tab && tab->zoom < TileRenderZoomThreshold && !StageScrollPaintInProgress())
         {
             SchedulePagePrefetch(hwnd);
         }
@@ -14764,6 +14829,8 @@ namespace
                 PreparePageCache(tab);
                 bool inserted = false;
                 RECT dirtyRect{};
+                if (!RenderRequestStillUseful(tab, request, dirtyRect))
+                    break;
                 bool isPreview = !request.tile && request.renderZoom > 0.0 && request.renderZoom < request.zoom - 0.001;
                 if (request.tile)
                 {
