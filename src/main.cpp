@@ -1601,7 +1601,6 @@ namespace
         while (size < viewportTile) size <<= 1;
         return std::min(size, 1024);
     }
-    constexpr double TileRenderZoomThreshold = 1.50;
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
     bool g_customZoomCaretVisible{ true };
@@ -4530,6 +4529,22 @@ namespace
     }
 
     int ContinuousContentHeight(PdfTab const& tab);
+    bool UseTiledPageRendering(PdfTab const& tab)
+    {
+        if (tab.pageCount <= 0 || tab.pages.empty()) return false;
+        int page = std::clamp(tab.currentPage, 0, static_cast<int>(tab.pages.size()) - 1);
+        PageInfo const& info = tab.pages[static_cast<size_t>(page)];
+        double pixelScale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
+        double pagePixels = std::max(1.0, info.widthPt * pixelScale) * std::max(1.0, info.heightPt * pixelScale);
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        size_t viewportBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
+        size_t wholePageBudget = std::clamp<size_t>(
+            viewportBytes + 1ull * 1024ull * 1024ull,
+            4ull * 1024ull * 1024ull,
+            8ull * 1024ull * 1024ull);
+        return pagePixels * 4.0 > static_cast<double>(wholePageBudget);
+    }
     int VisiblePageCountForCache(PdfTab const& tab)
     {
         if (tab.pageCount <= 0) return 1;
@@ -5090,7 +5105,7 @@ namespace
 
     void WarmZoomPreviewPagesForCurrentView(PdfTab& tab, int anchorPage)
     {
-        if (tab.zoom < TileRenderZoomThreshold || tab.pageCount <= 0) return;
+        if (!UseTiledPageRendering(tab) || tab.pageCount <= 0) return;
         RECT view = g_stage;
         InflateRect(&view, S(8), S(8));
         int firstVisible = g_continuousRead ?
@@ -5123,7 +5138,7 @@ namespace
 
     size_t DynamicPageCacheByteLimit(PdfTab const& tab)
     {
-        if (tab.zoom >= TileRenderZoomThreshold) return 4ull * 1024ull * 1024ull;
+        if (UseTiledPageRendering(tab)) return 4ull * 1024ull * 1024ull;
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
@@ -5140,7 +5155,7 @@ namespace
             return total;
         };
         size_t maxBytes = DynamicPageCacheByteLimit(tab);
-        size_t maxPages = tab.zoom >= TileRenderZoomThreshold ? 1ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 4 : 0), 1, 16));
+        size_t maxPages = UseTiledPageRendering(tab) ? 1ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 4 : 0), 1, 16));
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -5373,7 +5388,7 @@ namespace
     }
     void QueuePageRender(HWND hwnd, PdfTab const& tab, int page, int priority = 0)
     {
-        if (page < 0 || page >= tab.pageCount || tab.zoom >= TileRenderZoomThreshold) return;
+        if (page < 0 || page >= tab.pageCount || UseTiledPageRendering(tab)) return;
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() && tab.cache.find(page) != tab.cache.end()) return;
         EnsurePageRenderWorker();
         PageRenderRequest request;
@@ -6103,7 +6118,7 @@ namespace
         bool scrolling = (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil) ||
             MainScrollDragRecentlyMoved() || g_draggingMainHScroll || g_smoothStageScroll ||
             g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
-        if (tab->zoom >= TileRenderZoomThreshold)
+        if (UseTiledPageRendering(*tab))
         {
             ScheduleVisibleTilePrefetch(hwnd, *tab);
             return;
@@ -9105,7 +9120,7 @@ namespace
 
     bool LowZoomVisiblePagesReady(HWND hwnd, PdfTab& tab)
     {
-        if (tab.zoom >= TileRenderZoomThreshold || tab.pageCount <= 0) return true;
+        if (UseTiledPageRendering(tab) || tab.pageCount <= 0) return true;
         int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
             FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
         int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
@@ -9144,7 +9159,7 @@ namespace
     }
     bool HighZoomVisiblePagesReady(HWND hwnd, PdfTab& tab)
     {
-        if (tab.zoom < TileRenderZoomThreshold || tab.pageCount <= 0) return true;
+        if (!UseTiledPageRendering(tab) || tab.pageCount <= 0) return true;
         int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
             FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
         int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
@@ -9200,7 +9215,7 @@ namespace
 
     bool VisiblePagesReadyForPixelScroll(HWND hwnd, PdfTab& tab)
     {
-        if (tab.zoom >= TileRenderZoomThreshold)
+        if (UseTiledPageRendering(tab))
         {
             ScheduleVisibleTilePrefetch(hwnd, tab);
             return false;
@@ -9209,7 +9224,7 @@ namespace
     }
     void WarmLowZoomPagesAtScroll(PdfTab& tab, int targetScrollY)
     {
-        if (tab.zoom >= TileRenderZoomThreshold || tab.pageCount <= 0) return;
+        if (UseTiledPageRendering(tab) || tab.pageCount <= 0) return;
         PreparePageCache(tab);
 
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
@@ -9355,12 +9370,12 @@ namespace
         RedrawMainScrollBarNow(hwnd);
         if (tab)
         {
-            if (tab->zoom >= TileRenderZoomThreshold)
+            if (UseTiledPageRendering(*tab))
                 MaintainVisibleTileRenderQueueForScroll(*tab);
             else
                 MaintainVisiblePageRenderQueueForScroll(*tab);
         }
-        if (tab && tab->zoom < TileRenderZoomThreshold && !StageScrollPaintInProgress())
+        if (tab && !UseTiledPageRendering(*tab) && !StageScrollPaintInProgress())
         {
             SchedulePagePrefetch(hwnd);
         }
@@ -9557,7 +9572,7 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() &&
-            tab.zoom < TileRenderZoomThreshold && !tab.cache.empty())
+            !UseTiledPageRendering(tab) && !tab.cache.empty())
         {
             tab.zoomFallbackCache = std::move(tab.cache);
             tab.zoomFallbackZoom = tab.cachedZoom;
@@ -9619,7 +9634,7 @@ namespace
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
 
-        if (tab.zoom < TileRenderZoomThreshold)
+        if (!UseTiledPageRendering(tab))
             WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
         UpdateVertScrollBar(hwnd);
 
@@ -11856,7 +11871,7 @@ namespace
                 RECT visible{};
                 if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
                 hadVisiblePage = true;
-                if (tab.zoom < TileRenderZoomThreshold)
+                if (!UseTiledPageRendering(tab))
                 {
                     auto found = tab.cache.find(page);
                     if (found == tab.cache.end() || ((!found->second.dib && found->second.bgra.empty()) ||
@@ -11984,7 +11999,7 @@ namespace
                 {
                     int savedPageDc = SaveDC(dc);
                     IntersectClipRect(dc, pageRect.left, pageRect.top, pageRect.right, pageRect.bottom);
-                    if (tab.zoom < TileRenderZoomThreshold)
+                    if (!UseTiledPageRendering(tab))
                     {
                         PageImage* image = FindCachedPage(tab, i);
                         bool usingZoomFallback = false;
