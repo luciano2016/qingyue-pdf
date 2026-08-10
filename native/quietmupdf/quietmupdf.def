@@ -37,6 +37,8 @@ EXPORTS
     quiet_new_page_contents_display_list_cookie
     quiet_drop_display_list
     quiet_new_pixmap_from_display_list_clip_cookie
+    quiet_render_display_list_clip_to_buffer
+    quiet_render_page_number_clip_to_buffer
     quiet_drop_render_cookie
     quiet_new_pixmap_from_page_number_clip_cookie
     quiet_pdf_save_annotations

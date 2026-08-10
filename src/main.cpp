@@ -1014,6 +1014,8 @@ namespace
         using NewPageContentsDisplayListCookieFn = fz_display_list*(__cdecl*)(fz_context*, fz_document*, int, void*);
         using DropDisplayListFn = void(__cdecl*)(fz_context*, fz_display_list*);
         using NewPixmapFromDisplayListClipCookieFn = fz_pixmap*(__cdecl*)(fz_context*, fz_display_list*, fz_matrix, fz_colorspace*, int, int, int, int, int, void*);
+        using RenderDisplayListClipToBufferFn = int(__cdecl*)(fz_context*, fz_display_list*, fz_matrix, fz_colorspace*, int, int, int, int, int, unsigned char*, int, void*);
+        using RenderPageNumberClipToBufferFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int, unsigned char*, int, void*);
         using AbortRenderCookieFn = void(__cdecl*)(void*);
 
         using DropRenderCookieFn = void(__cdecl*)(void*);
@@ -1062,6 +1064,8 @@ namespace
             Get(newPageContentsDisplayListCookie, "quiet_new_page_contents_display_list_cookie");
             Get(dropDisplayList, "quiet_drop_display_list");
             Get(newPixmapFromDisplayListClipCookie, "quiet_new_pixmap_from_display_list_clip_cookie");
+            GetOptional(renderDisplayListClipToBuffer, "quiet_render_display_list_clip_to_buffer");
+            GetOptional(renderPageNumberClipToBuffer, "quiet_render_page_number_clip_to_buffer");
             Get(abortRenderCookie, "quiet_abort_render_cookie");
 
             Get(dropRenderCookie, "quiet_drop_render_cookie");
@@ -1110,6 +1114,8 @@ namespace
         NewPageContentsDisplayListCookieFn newPageContentsDisplayListCookie{};
         DropDisplayListFn dropDisplayList{};
         NewPixmapFromDisplayListClipCookieFn newPixmapFromDisplayListClipCookie{};
+        RenderDisplayListClipToBufferFn renderDisplayListClipToBuffer{};
+        RenderPageNumberClipToBufferFn renderPageNumberClipToBuffer{};
         AbortRenderCookieFn abortRenderCookie{};
 
         DropRenderCookieFn dropRenderCookie{};
@@ -4582,6 +4588,8 @@ namespace
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
+        PageImage image;
+        int effectiveTheme = renderTheme >= 0 ? renderTheme : PdfRenderTheme();
         {
             PdfDocumentLock pdfLock(tab);
             if (g_pdf.newPixmapFromPageNumberClip)
@@ -4593,6 +4601,39 @@ namespace
                 int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
                 int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
                 fz_display_list* list = CachedPageDisplayListLocked(tab, index, renderCookie);
+                if (renderToDib && (g_pdf.renderDisplayListClipToBuffer || g_pdf.renderPageNumberClipToBuffer))
+                {
+                    image.width = widthPx;
+                    image.height = heightPx;
+                    auto* pixels = image.AllocateDibPixels();
+                    int rendered = 0;
+                    if (pixels && list && g_pdf.renderDisplayListClipToBuffer)
+                    {
+                        rendered = g_pdf.renderDisplayListClipToBuffer(
+                            tab.ctx, list, matrix, g_pdf.deviceBgr(tab.ctx), 1,
+                            0, 0, widthPx, heightPx, pixels, widthPx * 4, renderCookie);
+                    }
+                    else if (pixels && g_pdf.renderPageNumberClipToBuffer)
+                    {
+                        rendered = g_pdf.renderPageNumberClipToBuffer(
+                            tab.ctx, tab.doc, index, matrix, g_pdf.deviceBgr(tab.ctx), 1,
+                            0, 0, widthPx, heightPx, pixels, widthPx * 4, renderCookie);
+                    }
+                    if (rendered)
+                    {
+                        if (applyTheme && effectiveTheme == 2)
+                        {
+                            for (int y = 0; y < image.height; ++y)
+                            {
+                                auto* row = pixels + static_cast<size_t>(y) * image.width * 4;
+                                for (int x = 0; x < image.width; ++x)
+                                    ApplyPdfThemeFor(effectiveTheme, row[x * 4 + 0], row[x * 4 + 1], row[x * 4 + 2]);
+                            }
+                        }
+                        return image;
+                    }
+                    image = {};
+                }
                 if (list)
                 {
                     pixmap = g_pdf.newPixmapFromDisplayListClipCookie(
@@ -4640,7 +4681,6 @@ namespace
             if (!pixmap && !renderCookie)
                 pixmap = g_pdf.newPixmapFromPageNumber(tab.ctx, tab.doc, index, matrix, g_pdf.deviceBgr(tab.ctx), 1);
         }
-        PageImage image;
         if (!pixmap) return image;
         image.width = g_pdf.pixmapWidth(tab.ctx, pixmap);
         image.height = g_pdf.pixmapHeight(tab.ctx, pixmap);
@@ -4648,7 +4688,6 @@ namespace
         int stride = g_pdf.pixmapStride(tab.ctx, pixmap);
         auto* samples = g_pdf.pixmapSamples(tab.ctx, pixmap);
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
-        int effectiveTheme = renderTheme >= 0 ? renderTheme : PdfRenderTheme();
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
         if (components == 4 && (!applyTheme || effectiveTheme != 2))
@@ -4679,7 +4718,6 @@ namespace
         g_pdf.dropPixmap(tab.ctx, pixmap);
         return image;
     }
-
     PageImage RenderPageAtZoom(PdfTab& tab, int index, double zoom)
     {
         return RenderPageAtScale(tab, index, zoom * static_cast<double>(g_dpi) / 72.0, true);
@@ -4817,9 +4855,45 @@ namespace
     {
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
+        PageImage image;
         {
             PdfDocumentLock pdfLock(tab);
             fz_display_list* list = CachedPageDisplayListLocked(tab, index, renderCookie);
+            if (renderToDib && (g_pdf.renderDisplayListClipToBuffer || g_pdf.renderPageNumberClipToBuffer))
+            {
+                image.width = std::max<int>(1, tile.right - tile.left);
+                image.height = std::max<int>(1, tile.bottom - tile.top);
+                auto* pixels = image.AllocateDibPixels();
+                int rendered = 0;
+                if (pixels && list && g_pdf.renderDisplayListClipToBuffer)
+                {
+                    rendered = g_pdf.renderDisplayListClipToBuffer(
+                        tab.ctx, list, matrix, g_pdf.deviceBgr(tab.ctx), 1,
+                        tile.left, tile.top, tile.right, tile.bottom,
+                        pixels, image.width * 4, renderCookie);
+                }
+                else if (pixels && g_pdf.renderPageNumberClipToBuffer)
+                {
+                    rendered = g_pdf.renderPageNumberClipToBuffer(
+                        tab.ctx, tab.doc, index, matrix, g_pdf.deviceBgr(tab.ctx), 1,
+                        tile.left, tile.top, tile.right, tile.bottom,
+                        pixels, image.width * 4, renderCookie);
+                }
+                if (rendered)
+                {
+                    if (renderTheme == 2)
+                    {
+                        for (int y = 0; y < image.height; ++y)
+                        {
+                            auto* row = pixels + static_cast<size_t>(y) * image.width * 4;
+                            for (int x = 0; x < image.width; ++x)
+                                ApplyPdfThemeFor(renderTheme, row[x * 4 + 0], row[x * 4 + 1], row[x * 4 + 2]);
+                        }
+                    }
+                    return image;
+                }
+                image = {};
+            }
             if (list)
             {
                 pixmap = g_pdf.newPixmapFromDisplayListClipCookie(
@@ -4864,11 +4938,10 @@ namespace
                     tile.bottom);
             }
         }
-        PageImage image = PixmapToImageFor(tab, pixmap, renderTheme, renderToDib);
+        image = PixmapToImageFor(tab, pixmap, renderTheme, renderToDib);
         if (pixmap) g_pdf.dropPixmap(tab.ctx, pixmap);
         return image;
     }
-
     PageImage RenderPageTile(PdfTab& tab, int index, RECT tile)
     {
         double renderScale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
@@ -5524,6 +5597,8 @@ namespace
         RECT pageRect{};
         return BuildSpreadPageRect(tab, start, y, page, pageRect) && Intersects(pageRect, g_stage);
     }
+    bool CurrentZoomVisibleContentReady(PdfTab& tab);
+
     void TrimIdleRenderCaches(HWND hwnd)
     {
         UNREFERENCED_PARAMETER(hwnd);
@@ -5564,6 +5639,14 @@ namespace
             tab->zoomFallbackCache.erase(victim);
         }
         TrimBackgroundRenderCaches();
+        if (!tab->zoomFallbackCache.empty() && CurrentZoomVisibleContentReady(*tab))
+        {
+            tab->zoomFallbackCache.clear();
+            tab->zoomFallbackZoom = 0.0;
+            tab->zoomFallbackDpi = 0;
+            tab->zoomFallbackTheme = -1;
+            tab->zoomFallbackUntil = 0;
+        }
 
         // Keep the current page parsed so the first input after an idle trim
         // does not have to rebuild its display list on the UI-visible path.
@@ -11750,6 +11833,43 @@ namespace
             }
         }
         return true;
+    }
+    bool CurrentZoomVisibleContentReady(PdfTab& tab)
+    {
+        if (tab.pageCount <= 0) return true;
+        int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        bool hadVisiblePage = false;
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+            if (g_continuousRead && spreadRect.top > g_stage.bottom) break;
+            if (!Intersects(spreadRect, g_stage)) continue;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                RECT visible{};
+                if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
+                hadVisiblePage = true;
+                if (tab.zoom < TileRenderZoomThreshold)
+                {
+                    auto found = tab.cache.find(page);
+                    if (found == tab.cache.end() || ((!found->second.dib && found->second.bgra.empty()) ||
+                        found->second.width <= 0 || found->second.height <= 0))
+                        return false;
+                }
+                else if (!TileLevelFullyCached(tab, page, pageRect, visible, 0))
+                {
+                    return false;
+                }
+            }
+        }
+        return hadVisiblePage;
     }
     bool DrawTileLevel(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect, int level, bool renderMissing, bool& missingVisiblePage)
     {

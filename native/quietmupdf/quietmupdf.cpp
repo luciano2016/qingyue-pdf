@@ -84,7 +84,6 @@ extern "C" int quiet_shrink_store(fz_context* ctx, unsigned int percent)
     return fz_shrink_store(ctx, std::min(percent, 100u));
 }
 
-
 static void quiet_set_last_error(const char* message);
 
 namespace
@@ -441,6 +440,97 @@ extern "C" fz_pixmap* quiet_new_pixmap_from_display_list_clip_cookie(
         pix = nullptr;
     }
     return pix;
+}
+
+extern "C" int quiet_render_display_list_clip_to_buffer(
+    fz_context* ctx,
+    fz_display_list* list,
+    fz_matrix ctm,
+    fz_colorspace* cs,
+    int alpha,
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    unsigned char* samples,
+    int stride,
+    fz_cookie* cookie)
+{
+    if (!ctx || !list || !samples || x1 <= x0 || y1 <= y0) return 0;
+    fz_pixmap* pix = nullptr;
+    fz_device* dev = nullptr;
+    int ok = 0;
+
+    fz_try(ctx)
+    {
+        pix = fz_new_pixmap_with_data(ctx, cs, x1 - x0, y1 - y0, nullptr, alpha, stride, samples);
+        pix->x = x0;
+        pix->y = y0;
+        fz_clear_pixmap_with_value(ctx, pix, 255);
+        fz_rect scissor = fz_transform_rect(
+            fz_make_rect(static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(x1), static_cast<float>(y1)),
+            fz_invert_matrix(ctm));
+        dev = fz_new_draw_device(ctx, ctm, pix);
+        fz_run_display_list(ctx, list, dev, fz_identity, scissor, cookie);
+        fz_close_device(ctx, dev);
+        ok = !cookie || !cookie->abort;
+    }
+    fz_always(ctx)
+    {
+        if (dev) fz_drop_device(ctx, dev);
+        if (pix) fz_drop_pixmap(ctx, pix);
+    }
+    fz_catch(ctx)
+    {
+        ok = 0;
+    }
+    return ok;
+}
+
+extern "C" int quiet_render_page_number_clip_to_buffer(
+    fz_context* ctx,
+    fz_document* doc,
+    int number,
+    fz_matrix ctm,
+    fz_colorspace* cs,
+    int alpha,
+    int x0,
+    int y0,
+    int x1,
+    int y1,
+    unsigned char* samples,
+    int stride,
+    fz_cookie* cookie)
+{
+    if (!ctx || !doc || !samples || x1 <= x0 || y1 <= y0) return 0;
+    fz_page* page = nullptr;
+    fz_pixmap* pix = nullptr;
+    fz_device* dev = nullptr;
+    int ok = 0;
+
+    fz_try(ctx)
+    {
+        page = fz_load_page(ctx, doc, number);
+        pix = fz_new_pixmap_with_data(ctx, cs, x1 - x0, y1 - y0, nullptr, alpha, stride, samples);
+        pix->x = x0;
+        pix->y = y0;
+        fz_clear_pixmap_with_value(ctx, pix, 255);
+        dev = fz_new_draw_device(ctx, ctm, pix);
+        fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
+        fz_close_device(ctx, dev);
+        ok = !cookie || !cookie->abort;
+    }
+    fz_always(ctx)
+    {
+        if (dev) fz_drop_device(ctx, dev);
+        if (pix) fz_drop_pixmap(ctx, pix);
+        if (page) fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx)
+    {
+        ok = 0;
+    }
+    return ok;
 }
 
 extern "C" fz_cookie* quiet_new_render_cookie()
