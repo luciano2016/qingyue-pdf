@@ -2463,6 +2463,43 @@ namespace
         Gdiplus::Pen border(GdiColor(edge, IsDarkTheme() ? 120 : 150), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
         DrawGdiRoundRect(g, border, pill, radius);
     }
+    void PaintImmersiveFrostedPill(HDC dc, RECT r, bool hovered, bool pressed)
+    {
+        float radius = static_cast<float>(r.bottom - r.top) * 0.48f;
+        BYTE shadowAlpha = IsDarkTheme() || IsAuroraTheme() ? 22 : 16;
+        DrawRoundedShadow(dc, r, radius, S(1), S(2), S(3), shadowAlpha);
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::RectF pill = Rf(r);
+        COLORREF base = IsDarkTheme() ? MixColor(T().panel2, RGB(18, 23, 31), 0.30)
+            : MixColor(T().panel2, RGB(255, 255, 255), 0.68);
+        if (hovered) base = MixColor(base, T().accent, IsDarkTheme() ? 0.10 : 0.055);
+        if (pressed) base = MixColor(base, T().accent, IsDarkTheme() ? 0.17 : 0.10);
+        Gdiplus::SolidBrush baseBrush(GdiColor(base, IsDarkTheme() ? 218 : 224));
+        FillGdiRoundRect(g, baseBrush, pill, radius);
+        RECT inner{ r.left + S(1), r.top + S(1), r.right - S(1), r.bottom - S(1) };
+        COLORREF frost = IsAuroraTheme() ? MixColor(T().panel2, T().accent, 0.09)
+            : (IsDarkTheme() ? MixColor(T().panel2, T().muted, 0.10)
+                : MixColor(RGB(248, 251, 254), T().accent, 0.025));
+        Gdiplus::SolidBrush frostBrush(GdiColor(frost, IsDarkTheme() ? 92 : 116));
+        FillGdiRoundRect(g, frostBrush, Rf(inner), std::max(1.0f, radius - S(1.0f)));
+        RECT upper{ r.left + S(3), r.top + S(2), r.right - S(3), r.top + (r.bottom - r.top) / 2 };
+        Gdiplus::SolidBrush upperBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 22 : 76));
+        FillGdiRoundRect(g, upperBrush, Rf(upper), std::max(1.0f, radius - S(3.0f)));
+        RECT lower{ r.left + S(4), r.top + (r.bottom - r.top) / 2, r.right - S(4), r.bottom - S(3) };
+        COLORREF lowerColor = IsAuroraTheme() ? T().accent : (IsDarkTheme() ? T().accent : RGB(156, 195, 232));
+        Gdiplus::SolidBrush lowerBrush(GdiColor(lowerColor, pressed ? 22 : (hovered ? 16 : 10)));
+        FillGdiRoundRect(g, lowerBrush, Rf(lower), std::max(1.0f, radius - S(3.0f)));
+        COLORREF edge = MixColor(T().line, IsDarkTheme() ? RGB(255, 255, 255) : RGB(126, 145, 164),
+            pressed ? 0.28 : (hovered ? 0.20 : 0.12));
+        Gdiplus::Pen edgePen(GdiColor(edge, IsDarkTheme() ? 146 : 164), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+        DrawGdiRoundRect(g, edgePen, pill, radius);
+        RECT highlight{ r.left + S(8), r.top + S(2), r.right - S(8), r.top + S(4) };
+        Gdiplus::SolidBrush highlightBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 42 : 116));
+        FillGdiRoundRect(g, highlightBrush, Rf(highlight), S(1.5f));
+    }
+
 
     void GlassRoundedSurface(HDC dc, RECT r, BYTE alpha, float radius)
     {
@@ -12629,90 +12666,28 @@ namespace
         RoundFill(dc, r, S(8), fill, line);
         DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
     }
-
-    void DrawExitImmersiveGlyph(HDC dc, RECT r, COLORREF color, bool pressed)
-    {
-        Gdiplus::Graphics g(dc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.25f, S(1.15f)));
-        pen.SetStartCap(Gdiplus::LineCapRound);
-        pen.SetEndCap(Gdiplus::LineCapRound);
-        pen.SetLineJoin(Gdiplus::LineJoinRound);
-        float cx = (static_cast<float>(r.left + r.right)) * 0.5f;
-        float cy = (static_cast<float>(r.top + r.bottom)) * 0.5f + (pressed ? S(1.0f) : 0.0f);
-        float outer = S(6.0f), inner = S(1.8f), arm = S(3.2f);
-        Gdiplus::PointF topLeft[3] = {
-            { cx - outer, cy - inner }, { cx - inner, cy - inner }, { cx - inner, cy - outer + arm }
-        };
-        Gdiplus::PointF topRight[3] = {
-            { cx + outer, cy - inner }, { cx + inner, cy - inner }, { cx + inner, cy - outer + arm }
-        };
-        Gdiplus::PointF bottomLeft[3] = {
-            { cx - outer, cy + inner }, { cx - inner, cy + inner }, { cx - inner, cy + outer - arm }
-        };
-        Gdiplus::PointF bottomRight[3] = {
-            { cx + outer, cy + inner }, { cx + inner, cy + inner }, { cx + inner, cy + outer - arm }
-        };
-        g.DrawLines(&pen, topLeft, 3); g.DrawLines(&pen, topRight, 3);
-        g.DrawLines(&pen, bottomLeft, 3); g.DrawLines(&pen, bottomRight, 3);
-    }
-    void PaintImmersiveExitControl(HDC dc, RECT client, PdfTab* tab)
-    {
-        int panelW = S(tab ? 178 : 126);
-        int panelH = S(34);
-        RECT panel{ client.right - S(18) - panelW, client.bottom - S(21) - panelH,
-            client.right - S(18), client.bottom - S(21) };
-        int actionW = S(104);
-        RECT action{ panel.right - actionW - S(3), panel.top + S(3), panel.right - S(3), panel.bottom - S(3) };
-        bool hovered = Hit(action, g_mousePos.x, g_mousePos.y);
-        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &action);
-
-        DrawRoundedShadow(dc, panel, S(11.0f), S(1), S(2), S(3), IsDarkTheme() ? 20 : 13);
-        GlassRoundedSurface(dc, panel, IsDarkTheme() || IsAuroraTheme() ? 218 : 230, S(11.0f));
-
-        if (tab)
-        {
-            RECT pageRect{ panel.left + S(13), panel.top, action.left - S(8), panel.bottom };
-            HFONT pageFont = Font(8, FW_SEMIBOLD);
-            HGDIOBJ oldFont = SelectObject(dc, pageFont);
-            std::wstring page = std::to_wstring(tab->currentPage + 1) + L" / " + std::to_wstring(tab->pageCount);
-            Text(dc, page, pageRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
-            SelectObject(dc, oldFont);
-            DeleteObject(pageFont);
-            RECT divider{ action.left - S(5), panel.top + S(8), action.left - S(4), panel.bottom - S(8) };
-            Fill(dc, divider, MixColor(T().line, T().muted, 0.10));
-        }
-
-        COLORREF actionFill = pressed
-            ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.20 : 0.14)
-            : (hovered ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.13 : 0.08) : T().panel2);
-        COLORREF actionLine = pressed
-            ? MixColor(T().line, T().accent, 0.34)
-            : (hovered ? MixColor(T().line, T().accent, 0.22) : T().line);
-        RoundFill(dc, action, S(8), actionFill, actionLine);
-
-        RECT content = action;
-        if (pressed) OffsetRect(&content, 0, S(1));
-        RECT iconRect{ content.left + S(12), content.top + S(6), content.left + S(30), content.bottom - S(6) };
-        COLORREF contentColor = hovered || pressed ? T().text : MixColor(T().muted, T().text, 0.12);
-        DrawExitImmersiveGlyph(dc, iconRect, contentColor, false);
-        RECT label{ content.left + S(34), content.top, content.right - S(10), content.bottom };
-        HFONT labelFont = Font(8, FW_SEMIBOLD);
-        HGDIOBJ oldFont = SelectObject(dc, labelFont);
-        Text(dc, L"\u9000\u51fa\u6c89\u6d78", label, DT_CENTER | DT_VCENTER | DT_SINGLELINE, contentColor);
-        SelectObject(dc, oldFont);
-        DeleteObject(labelFont);
-        AddButton(CmdImmersive, action, L"", L"\u9000\u51fa\u6c89\u6d78\u6a21\u5f0f");
-    }
-
     void PaintStatus(HDC dc, RECT client)
     {
         PdfTab* tab = Active();
         if (!tab && !g_immersive) return;
         if (g_immersive)
         {
-            PaintImmersiveExitControl(dc, client, tab);
+            RECT panel{ client.right - S(154), client.bottom - S(48), client.right - S(18), client.bottom - S(21) };
+            bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &panel);
+            bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &panel);
+            PaintImmersiveFrostedPill(dc, panel, hovered, pressed);
+            std::wstring text = tab ? std::to_wstring(tab->currentPage + 1) + L" / " + std::to_wstring(tab->pageCount) + L"    \u9000\u51fa\u6c89\u6d78" : L"\u9000\u51fa\u6c89\u6d78";
+            AddButton(CmdImmersive, panel, text, L"\u9000\u51fa\u6c89\u6d78\u6a21\u5f0f");
+            HFONT immersiveFont = Font(9);
+            HGDIOBJ oldImmersiveFont = SelectObject(dc, immersiveFont);
+            COLORREF immersiveText = hovered || pressed
+                ? MixColor(T().text, T().accent, IsDarkTheme() ? 0.08 : 0.05)
+                : (IsDarkTheme() ? MixColor(T().muted, RGB(255, 255, 255), 0.10) : MixColor(T().muted, RGB(70, 80, 92), 0.25));
+            RECT textRect = panel;
+            if (pressed) OffsetRect(&textRect, 0, S(1));
+            Text(dc, text, textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, immersiveText);
+            SelectObject(dc, oldImmersiveFont);
+            DeleteObject(immersiveFont);
             return;
         }
         int barH = S(34);
@@ -15343,13 +15318,6 @@ namespace
                     SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
                     return TRUE;
                 }
-                if (g_immersive)
-                {
-                    bool clickable = std::any_of(g_buttons.begin(), g_buttons.end(), [&](Button const& button) {
-                        return button.id == CmdImmersive && Hit(button.rect, pt.x, pt.y);
-                    });
-                    if (clickable) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
-                }
                 if (g_autoScrollActive)
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
@@ -15359,6 +15327,17 @@ namespace
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
                     return TRUE;
+                }
+                if (g_immersive)
+                {
+                    bool clickable = std::any_of(g_buttons.begin(), g_buttons.end(), [&](Button const& button) {
+                        return button.id == CmdImmersive && Hit(button.rect, pt.x, pt.y);
+                    });
+                    if (clickable)
+                    {
+                        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                        return TRUE;
+                    }
                 }
                 if (AnnotationToolbarClickableAt(pt) || AnnotationPageToggleAt(pt))
                 {
