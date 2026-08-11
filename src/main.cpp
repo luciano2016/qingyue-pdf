@@ -1603,8 +1603,8 @@ namespace
     }
     bool g_customZoomOpen{};
     bool g_customZoomFocused{};
-    bool g_customZoomCaretVisible{ true };
     std::wstring g_customZoomText;
+    size_t g_customZoomCaretIndex{};
     struct ThemedMenuItem
     {
         std::wstring text;
@@ -9662,18 +9662,13 @@ namespace
 
     void CloseCustomZoomDialog(HWND hwnd)
     {
-        if (g_hasPressedButton &&
-            (EqualRect(&g_pressedButtonRect, &g_zoomDialogConfirmRect) ||
-                EqualRect(&g_pressedButtonRect, &g_zoomDialogCancelRect)))
-        {
-            g_hasPressedButton = false;
-            if (GetCapture() == hwnd) ReleaseCapture();
-        }
+        g_hasPressedButton = false;
+        HideCaret(hwnd);
+        DestroyCaret();
         g_customZoomOpen = false;
         g_customZoomFocused = false;
         g_customZoomText.clear();
-        g_customZoomCaretVisible = true;
-        KillTimer(hwnd, 17);
+        g_customZoomCaretIndex = 0;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -9683,10 +9678,11 @@ namespace
         if (!tab) return;
         int pct = static_cast<int>(tab->zoom * 100.0 + 0.5);
         g_customZoomText = std::to_wstring(std::clamp(pct, 1, 1600));
+        g_customZoomCaretIndex = g_customZoomText.size();
         g_customZoomOpen = true;
         g_customZoomFocused = true;
-        g_customZoomCaretVisible = true;
-        SetTimer(hwnd, 17, 500, nullptr);
+        CreateCaret(hwnd, nullptr, std::max(1, S(1)), S(24));
+        ShowCaret(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -9702,6 +9698,45 @@ namespace
         pct = std::clamp(pct, 8.33, 1600.0);
         ApplyZoomAtPoint(hwnd, *tab, CurrentZoomAnchorPoint(), pct / 100.0);
         CloseCustomZoomDialog(hwnd);
+    }
+
+    void UpdateCustomZoomCaret(HWND hwnd)
+    {
+        if (!g_customZoomOpen || !g_customZoomFocused || IsRectEmpty(&g_zoomDialogInputRect)) return;
+        g_customZoomCaretIndex = std::min(g_customZoomCaretIndex, g_customZoomText.size());
+        HDC dc = GetDC(hwnd);
+        if (!dc) return;
+        HFONT font = Font(13, FW_SEMIBOLD);
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        SIZE prefixSize{};
+        GetTextExtentPoint32W(dc, g_customZoomText.c_str(), static_cast<int>(g_customZoomCaretIndex), &prefixSize);
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        ReleaseDC(hwnd, dc);
+        int x = std::clamp(g_zoomDialogInputRect.left + S(14) + prefixSize.cx,
+            g_zoomDialogInputRect.left + S(14), g_zoomDialogInputRect.right - S(48));
+        SetCaretPos(x, g_zoomDialogInputRect.top + S(9));
+    }
+
+    size_t CustomZoomCaretIndexAtX(HWND hwnd, int x)
+    {
+        HDC dc = GetDC(hwnd);
+        if (!dc) return g_customZoomText.size();
+        HFONT font = Font(13, FW_SEMIBOLD);
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        int relativeX = std::max<int>(0, x - (g_zoomDialogInputRect.left + S(14)));
+        size_t result = g_customZoomText.size();
+        for (size_t i = 0; i < g_customZoomText.size(); ++i)
+        {
+            SIZE before{}, after{};
+            GetTextExtentPoint32W(dc, g_customZoomText.c_str(), static_cast<int>(i), &before);
+            GetTextExtentPoint32W(dc, g_customZoomText.c_str(), static_cast<int>(i + 1), &after);
+            if (relativeX < (before.cx + after.cx) / 2) { result = i; break; }
+        }
+        SelectObject(dc, oldFont);
+        DeleteObject(font);
+        ReleaseDC(hwnd, dc);
+        return result;
     }
 
     bool ScrollSinglePageByPixels(HWND hwnd, PdfTab& tab, int deltaY)
@@ -11077,16 +11112,11 @@ namespace
         oldFont = SelectObject(dc, inputFont);
         std::wstring inputText = g_customZoomText.empty() ? L"" : g_customZoomText;
         Text(dc, inputText, inputTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        SIZE textSize{};
-        GetTextExtentPoint32W(dc, inputText.c_str(), static_cast<int>(inputText.size()), &textSize);
-        if (g_customZoomFocused && g_customZoomCaretVisible)
+        if (g_customZoomFocused)
         {
-            int caretX = std::clamp(inputTextRect.left + textSize.cx + S(2), inputTextRect.left, inputTextRect.right);
-            Gdiplus::Pen caretPen(GdiColor(T().accent), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
-            caretPen.SetStartCap(Gdiplus::LineCapRound);
-            caretPen.SetEndCap(Gdiplus::LineCapRound);
-            g.DrawLine(&caretPen, static_cast<float>(caretX), static_cast<float>(g_zoomDialogInputRect.top + S(9)),
-                static_cast<float>(caretX), static_cast<float>(g_zoomDialogInputRect.bottom - S(9)));
+            SIZE prefixSize{};
+            GetTextExtentPoint32W(dc, inputText.c_str(), static_cast<int>(std::min(g_customZoomCaretIndex, inputText.size())), &prefixSize);
+            SetCaretPos(std::clamp(inputTextRect.left + prefixSize.cx, inputTextRect.left, inputTextRect.right), g_zoomDialogInputRect.top + S(9));
         }
         SelectObject(dc, oldFont);
         DeleteObject(inputFont);
@@ -11122,12 +11152,6 @@ namespace
             Gdiplus::SolidBrush fillBrush(GdiColor(fill, primary ? 250 : 238));
             Gdiplus::Pen borderPen(GdiColor(line, primary ? 205 : (hover || pressed ? 175 : 130)), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
             FillGdiRoundRect(g, fillBrush, Rf(r), S(6.0f));
-            if (hover && !pressed)
-            {
-                RECT topWash{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + (r.bottom - r.top) / 2 };
-                Gdiplus::SolidBrush wash(GdiColor(RGB(255, 255, 255), primary ? 24 : 18));
-                FillGdiRoundRect(g, wash, Rf(topWash), S(5.0f));
-            }
             DrawGdiRoundRect(g, borderPen, Rf(r), S(6.0f));
             g.Flush();
 
@@ -15360,25 +15384,26 @@ namespace
                 if (Hit(g_zoomDialogInputRect, x, y))
                 {
                     g_customZoomFocused = true;
-                    g_customZoomCaretVisible = true;
-                    SetTimer(hwnd, 17, 500, nullptr);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    g_customZoomCaretIndex = CustomZoomCaretIndexAtX(hwnd, x);
+                    UpdateCustomZoomCaret(hwnd);
                     return 0;
                 }
                 if (Hit(g_zoomDialogConfirmRect, x, y))
                 {
                     g_pressedButtonRect = g_zoomDialogConfirmRect;
                     g_hasPressedButton = true;
-                    SetCapture(hwnd);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    InvalidateRect(hwnd, &g_zoomDialogConfirmRect, FALSE);
+                    UpdateWindow(hwnd);
+                    CommitCustomZoomDialog(hwnd);
                     return 0;
                 }
                 if (Hit(g_zoomDialogCancelRect, x, y))
                 {
                     g_pressedButtonRect = g_zoomDialogCancelRect;
                     g_hasPressedButton = true;
-                    SetCapture(hwnd);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    InvalidateRect(hwnd, &g_zoomDialogCancelRect, FALSE);
+                    UpdateWindow(hwnd);
+                    CloseCustomZoomDialog(hwnd);
                     return 0;
                 }
                 if (!Hit(g_zoomDialogRect, x, y))
@@ -16000,7 +16025,15 @@ namespace
             if (g_customZoomOpen)
             {
                 g_hasHoverTip = false;
-                InvalidateRect(hwnd, nullptr, FALSE);
+                bool oldInput = Hit(g_zoomDialogInputRect, oldMousePos.x, oldMousePos.y);
+                bool newInput = Hit(g_zoomDialogInputRect, newMousePos.x, newMousePos.y);
+                bool oldConfirm = Hit(g_zoomDialogConfirmRect, oldMousePos.x, oldMousePos.y);
+                bool newConfirm = Hit(g_zoomDialogConfirmRect, newMousePos.x, newMousePos.y);
+                bool oldCancel = Hit(g_zoomDialogCancelRect, oldMousePos.x, oldMousePos.y);
+                bool newCancel = Hit(g_zoomDialogCancelRect, newMousePos.x, newMousePos.y);
+                if (oldInput != newInput) InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
+                if (oldConfirm != newConfirm) InvalidateRect(hwnd, &g_zoomDialogConfirmRect, FALSE);
+                if (oldCancel != newCancel) InvalidateRect(hwnd, &g_zoomDialogCancelRect, FALSE);
                 return 0;
             }
             if (ConfirmationDialogOpen())
@@ -16322,27 +16355,6 @@ namespace
             break;
         }
         case WM_LBUTTONUP:
-            if (g_customZoomOpen && g_hasPressedButton &&
-                (EqualRect(&g_pressedButtonRect, &g_zoomDialogConfirmRect) ||
-                    EqualRect(&g_pressedButtonRect, &g_zoomDialogCancelRect)))
-            {
-                int x = GET_X_LPARAM(lParam);
-                int y = GET_Y_LPARAM(lParam);
-                bool confirm = EqualRect(&g_pressedButtonRect, &g_zoomDialogConfirmRect);
-                bool activate = Hit(confirm ? g_zoomDialogConfirmRect : g_zoomDialogCancelRect, x, y);
-                g_hasPressedButton = false;
-                if (GetCapture() == hwnd) ReleaseCapture();
-                if (activate)
-                {
-                    if (confirm) CommitCustomZoomDialog(hwnd);
-                    else CloseCustomZoomDialog(hwnd);
-                }
-                else
-                {
-                    InvalidateRect(hwnd, nullptr, FALSE);
-                }
-                return 0;
-            }
             if (g_pressedAnnotationPage >= 0)
             {
                 int page = g_pressedAnnotationPage;
@@ -16674,18 +16686,6 @@ namespace
                 FlushTouchPan(hwnd);
                 return 0;
             }
-            if (wParam == 17)
-            {
-                if (!g_customZoomOpen || !g_customZoomFocused)
-                {
-                    g_customZoomCaretVisible = true;
-                    KillTimer(hwnd, 17);
-                    return 0;
-                }
-                g_customZoomCaretVisible = !g_customZoomCaretVisible;
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
             if (wParam == 18)
             {
                 StepTouchMomentum(hwnd);
@@ -16880,6 +16880,38 @@ namespace
             if (wParam == VK_ESCAPE && g_autoScrollActive) { StopAutoScroll(hwnd); return 0; }
             if (g_customZoomOpen)
             {
+                if (wParam == VK_LEFT)
+                {
+                    if (g_customZoomCaretIndex > 0) --g_customZoomCaretIndex;
+                    UpdateCustomZoomCaret(hwnd);
+                    return 0;
+                }
+                if (wParam == VK_RIGHT)
+                {
+                    if (g_customZoomCaretIndex < g_customZoomText.size()) ++g_customZoomCaretIndex;
+                    UpdateCustomZoomCaret(hwnd);
+                    return 0;
+                }
+                if (wParam == VK_HOME)
+                {
+                    g_customZoomCaretIndex = 0;
+                    UpdateCustomZoomCaret(hwnd);
+                    return 0;
+                }
+                if (wParam == VK_END)
+                {
+                    g_customZoomCaretIndex = g_customZoomText.size();
+                    UpdateCustomZoomCaret(hwnd);
+                    return 0;
+                }
+                if (wParam == VK_DELETE)
+                {
+                    if (g_customZoomCaretIndex < g_customZoomText.size())
+                        g_customZoomText.erase(g_customZoomCaretIndex, 1);
+                    UpdateCustomZoomCaret(hwnd);
+                    InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
+                    return 0;
+                }
                 if (wParam == VK_RETURN)
                 {
                     CommitCustomZoomDialog(hwnd);
@@ -17034,7 +17066,11 @@ namespace
             {
                 if (wParam == VK_BACK)
                 {
-                    if (!g_customZoomText.empty()) g_customZoomText.pop_back();
+                    if (g_customZoomCaretIndex > 0)
+                    {
+                        g_customZoomText.erase(g_customZoomCaretIndex - 1, 1);
+                        --g_customZoomCaretIndex;
+                    }
                 }
                 else if (wParam == VK_RETURN)
                 {
@@ -17043,16 +17079,21 @@ namespace
                 }
                 else if ((wParam >= L'0' && wParam <= L'9') && g_customZoomText.size() < 7)
                 {
-                    if (g_customZoomText == L"0") g_customZoomText.clear();
-                    g_customZoomText.push_back(static_cast<wchar_t>(wParam));
+                    if (g_customZoomText == L"0")
+                    {
+                        g_customZoomText.clear();
+                        g_customZoomCaretIndex = 0;
+                    }
+                    g_customZoomText.insert(g_customZoomCaretIndex, 1, static_cast<wchar_t>(wParam));
+                    ++g_customZoomCaretIndex;
                 }
                 else if (wParam == L'.' && g_customZoomText.find(L'.') == std::wstring::npos && !g_customZoomText.empty() && g_customZoomText.size() < 7)
                 {
-                    g_customZoomText.push_back(L'.');
+                    g_customZoomText.insert(g_customZoomCaretIndex, 1, L'.');
+                    ++g_customZoomCaretIndex;
                 }
-                g_customZoomCaretVisible = true;
-                SetTimer(hwnd, 17, 500, nullptr);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                UpdateCustomZoomCaret(hwnd);
+                InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
                 return 0;
             }
             if (g_pageInputFocused)
