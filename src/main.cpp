@@ -9662,6 +9662,13 @@ namespace
 
     void CloseCustomZoomDialog(HWND hwnd)
     {
+        if (g_hasPressedButton &&
+            (EqualRect(&g_pressedButtonRect, &g_zoomDialogConfirmRect) ||
+                EqualRect(&g_pressedButtonRect, &g_zoomDialogCancelRect)))
+        {
+            g_hasPressedButton = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+        }
         g_customZoomOpen = false;
         g_customZoomFocused = false;
         g_customZoomText.clear();
@@ -11018,40 +11025,55 @@ namespace
 
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        Gdiplus::SolidBrush scrim(GdiColor(RGB(18, 22, 28), IsDarkTheme() ? 116 : 72));
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::SolidBrush scrim(GdiColor(RGB(18, 22, 28), IsDarkTheme() ? 98 : 58));
         g.FillRectangle(&scrim, Rf(client));
 
-        int panelW = S(202);
-        int panelH = S(114);
+        int panelW = S(246);
+        int panelH = S(166);
         int left = client.left + (client.right - client.left - panelW) / 2;
         int top = client.top + (client.bottom - client.top - panelH) / 2;
         g_zoomDialogRect = RECT{ left, top, left + panelW, top + panelH };
 
-        DrawRoundedShadow(dc, g_zoomDialogRect, S(14.0f), S(1), S(3), S(5), IsDarkTheme() ? 52 : 28);
-        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() || IsAuroraTheme() ? 226 : 238, S(14.0f));
+        DrawRoundedShadow(dc, g_zoomDialogRect, S(12.0f), S(1), S(3), S(4), IsDarkTheme() ? 40 : 22);
+        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() || IsAuroraTheme() ? 234 : 244, S(12.0f));
 
-        RECT shine{ g_zoomDialogRect.left + S(16), g_zoomDialogRect.top + S(7), g_zoomDialogRect.right - S(48), g_zoomDialogRect.top + S(12) };
-        Gdiplus::SolidBrush shineBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 24 : 82));
-        FillGdiRoundRect(g, shineBrush, Rf(shine), S(4.0f));
+        RECT topGleam{ g_zoomDialogRect.left + S(18), g_zoomDialogRect.top + S(5), g_zoomDialogRect.right - S(64), g_zoomDialogRect.top + S(8) };
+        Gdiplus::SolidBrush gleamBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 16 : 48));
+        FillGdiRoundRect(g, gleamBrush, Rf(topGleam), S(2.0f));
 
-        HFONT titleFont = Font(13, FW_SEMIBOLD);
+        HFONT titleFont = Font(10, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
-        RECT title{ g_zoomDialogRect.left + S(14), g_zoomDialogRect.top + S(10), g_zoomDialogRect.right - S(14), g_zoomDialogRect.top + S(30) };
+        RECT title{ g_zoomDialogRect.left + S(18), g_zoomDialogRect.top + S(14), g_zoomDialogRect.right - S(18), g_zoomDialogRect.top + S(36) };
         Text(dc, L"\u81ea\u5b9a\u4e49\u7f29\u653e", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
 
-        HFONT hintFont = Font(6);
+        HFONT hintFont = Font(7);
         oldFont = SelectObject(dc, hintFont);
-        RECT hint{ g_zoomDialogRect.left + S(14), g_zoomDialogRect.top + S(30), g_zoomDialogRect.right - S(14), g_zoomDialogRect.top + S(44) };
-        Text(dc, L"\u8f93\u5165\u9875\u9762\u7f29\u653e\u767e\u5206\u6bd4", hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        RECT hint{ g_zoomDialogRect.left + S(18), g_zoomDialogRect.top + S(37), g_zoomDialogRect.right - S(18), g_zoomDialogRect.top + S(53) };
+        Text(dc, L"\u8f93\u5165\u9875\u9762\u7f29\u653e\u6bd4\u4f8b", hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
         SelectObject(dc, oldFont);
         DeleteObject(hintFont);
 
-        g_zoomDialogInputRect = RECT{ g_zoomDialogRect.left + S(14), g_zoomDialogRect.top + S(47), g_zoomDialogRect.right - S(14), g_zoomDialogRect.top + S(74) };
-        PaintLiquidGlassPill(dc, g_zoomDialogInputRect);
-        RECT inputTextRect{ g_zoomDialogInputRect.left + S(13), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(38), g_zoomDialogInputRect.bottom };
-        HFONT inputFont = Font(8, FW_SEMIBOLD);
+        g_zoomDialogInputRect = RECT{ g_zoomDialogRect.left + S(18), g_zoomDialogRect.top + S(58), g_zoomDialogRect.right - S(18), g_zoomDialogRect.top + S(100) };
+        bool inputHover = Hit(g_zoomDialogInputRect, g_mousePos.x, g_mousePos.y);
+        COLORREF inputFill = MixColor(T().paper, T().panel2, IsDarkTheme() ? 0.18 : 0.08);
+        COLORREF inputLine = g_customZoomFocused
+            ? T().accent
+            : (inputHover ? MixColor(T().line, T().accent, 0.28) : T().line);
+        Gdiplus::SolidBrush inputBrush(GdiColor(inputFill, IsDarkTheme() ? 224 : 238));
+        Gdiplus::Pen inputBorder(
+            GdiColor(inputLine, g_customZoomFocused ? 220 : (inputHover ? 180 : 138)),
+            std::max<Gdiplus::REAL>(1.0f, S(g_customZoomFocused ? 1.2f : 1.0f)));
+        FillGdiRoundRect(g, inputBrush, Rf(g_zoomDialogInputRect), S(8.0f));
+        RECT inputWash{ g_zoomDialogInputRect.left + S(1), g_zoomDialogInputRect.top + S(1), g_zoomDialogInputRect.right - S(1), g_zoomDialogInputRect.top + S(18) };
+        Gdiplus::SolidBrush inputWashBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 12 : 38));
+        FillGdiRoundRect(g, inputWashBrush, Rf(inputWash), S(7.0f));
+        DrawGdiRoundRect(g, inputBorder, Rf(g_zoomDialogInputRect), S(8.0f));
+
+        RECT inputTextRect{ g_zoomDialogInputRect.left + S(14), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(48), g_zoomDialogInputRect.bottom };
+        HFONT inputFont = Font(13, FW_SEMIBOLD);
         oldFont = SelectObject(dc, inputFont);
         std::wstring inputText = g_customZoomText.empty() ? L"" : g_customZoomText;
         Text(dc, inputText, inputTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
@@ -11060,54 +11082,67 @@ namespace
         if (g_customZoomFocused && g_customZoomCaretVisible)
         {
             int caretX = std::clamp(inputTextRect.left + textSize.cx + S(2), inputTextRect.left, inputTextRect.right);
-            HPEN pen = CreatePen(PS_SOLID, std::max(1, S(1)), T().accent);
-            HGDIOBJ oldPen = SelectObject(dc, pen);
-            MoveToEx(dc, caretX, g_zoomDialogInputRect.top + S(6), nullptr);
-            LineTo(dc, caretX, g_zoomDialogInputRect.bottom - S(6));
-            SelectObject(dc, oldPen);
-            DeleteObject(pen);
+            Gdiplus::Pen caretPen(GdiColor(T().accent), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+            caretPen.SetStartCap(Gdiplus::LineCapRound);
+            caretPen.SetEndCap(Gdiplus::LineCapRound);
+            g.DrawLine(&caretPen, static_cast<float>(caretX), static_cast<float>(g_zoomDialogInputRect.top + S(9)),
+                static_cast<float>(caretX), static_cast<float>(g_zoomDialogInputRect.bottom - S(9)));
         }
         SelectObject(dc, oldFont);
         DeleteObject(inputFont);
 
-        HFONT pctFont = Font(7);
+        HFONT pctFont = Font(10, FW_SEMIBOLD);
         oldFont = SelectObject(dc, pctFont);
-        RECT pctRect{ g_zoomDialogInputRect.right - S(34), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(13), g_zoomDialogInputRect.bottom };
-        Text(dc, L"%", pctRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        RECT pctRect{ g_zoomDialogInputRect.right - S(44), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(14), g_zoomDialogInputRect.bottom };
+        Text(dc, L"%", pctRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, MixColor(T().muted, T().text, 0.16));
         SelectObject(dc, oldFont);
         DeleteObject(pctFont);
 
-        g_zoomDialogCancelRect = RECT{ g_zoomDialogRect.right - S(112), g_zoomDialogRect.bottom - S(31), g_zoomDialogRect.right - S(62), g_zoomDialogRect.bottom - S(10) };
-        g_zoomDialogConfirmRect = RECT{ g_zoomDialogRect.right - S(54), g_zoomDialogRect.bottom - S(31), g_zoomDialogRect.right - S(14), g_zoomDialogRect.bottom - S(10) };
+        HFONT rangeFont = Font(7);
+        oldFont = SelectObject(dc, rangeFont);
+        RECT range{ g_zoomDialogRect.left + S(19), g_zoomDialogRect.top + S(103), g_zoomDialogRect.right - S(18), g_zoomDialogRect.top + S(120) };
+        Text(dc, L"\u652f\u6301 8.33% - 1600%", range, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        SelectObject(dc, oldFont);
+        DeleteObject(rangeFont);
+
+        int buttonW = S(72);
+        int buttonH = S(30);
+        int buttonGap = S(8);
+        int buttonBottom = g_zoomDialogRect.bottom - S(14);
+        g_zoomDialogConfirmRect = RECT{ g_zoomDialogRect.right - S(18) - buttonW, buttonBottom - buttonH, g_zoomDialogRect.right - S(18), buttonBottom };
+        g_zoomDialogCancelRect = RECT{ g_zoomDialogConfirmRect.left - buttonGap - buttonW, buttonBottom - buttonH, g_zoomDialogConfirmRect.left - buttonGap, buttonBottom };
         auto drawDialogButton = [&](RECT r, const wchar_t* label, bool primary)
         {
             bool hover = Hit(r, g_mousePos.x, g_mousePos.y);
-            bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
+            bool pressed = hover && g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
             COLORREF fill = primary
-                ? (pressed ? MixColor(T().accent, RGB(0, 0, 0), 0.18) : (hover ? MixColor(T().accent, RGB(255, 255, 255), 0.20) : T().accent))
-                : (pressed ? MixColor(T().panel2, T().accent, 0.22) : (hover ? MixColor(T().panel2, T().accent, 0.10) : T().panel2));
-            COLORREF line = primary ? T().accent : T().line;
-            Gdiplus::SolidBrush fillBrush(GdiColor(fill, 246));
-            Gdiplus::Pen borderPen(GdiColor(line, hover || pressed ? 190 : 145), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
-            FillGdiRoundRect(g, fillBrush, Rf(r), S(5.0f));
-            if (hover)
+                ? (pressed ? MixColor(T().accent, RGB(0, 0, 0), 0.16) : (hover ? MixColor(T().accent, RGB(255, 255, 255), 0.12) : T().accent))
+                : (pressed ? MixColor(T().panel2, T().accent, 0.16) : (hover ? MixColor(T().panel2, T().accent, 0.08) : T().panel2));
+            COLORREF line = primary ? MixColor(T().accent, T().text, 0.08) : (hover || pressed ? MixColor(T().line, T().accent, 0.24) : T().line);
+            Gdiplus::SolidBrush fillBrush(GdiColor(fill, primary ? 250 : 238));
+            Gdiplus::Pen borderPen(GdiColor(line, primary ? 205 : (hover || pressed ? 175 : 130)), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+            FillGdiRoundRect(g, fillBrush, Rf(r), S(6.0f));
+            if (hover && !pressed)
             {
-                Gdiplus::SolidBrush wash(GdiColor(RGB(255, 255, 255), primary ? 36 : 28));
                 RECT topWash{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + (r.bottom - r.top) / 2 };
-                FillGdiRoundRect(g, wash, Rf(topWash), S(4.0f));
+                Gdiplus::SolidBrush wash(GdiColor(RGB(255, 255, 255), primary ? 24 : 18));
+                FillGdiRoundRect(g, wash, Rf(topWash), S(5.0f));
             }
-            DrawGdiRoundRect(g, borderPen, Rf(r), S(5.0f));
+            DrawGdiRoundRect(g, borderPen, Rf(r), S(6.0f));
             g.Flush();
-            HFONT buttonFont = Font(7, FW_SEMIBOLD);
+
+            RECT labelRect = r;
+            if (pressed) OffsetRect(&labelRect, 0, S(1));
+            HFONT buttonFont = Font(8, FW_SEMIBOLD);
             HGDIOBJ oldButtonFont = SelectObject(dc, buttonFont);
-            Text(dc, label, r, DT_CENTER | DT_VCENTER | DT_SINGLELINE, primary ? ForegroundOn(T().accent) : T().muted);
+            Text(dc, label, labelRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                primary ? ForegroundOn(T().accent) : (hover || pressed ? T().text : T().muted));
             SelectObject(dc, oldButtonFont);
             DeleteObject(buttonFont);
         };
         drawDialogButton(g_zoomDialogCancelRect, L"\u53d6\u6d88", false);
         drawDialogButton(g_zoomDialogConfirmRect, L"\u786e\u5b9a", true);
     }
-
 #if 0
     void PaintSidebar(HDC dc, PdfTab& tab, RECT paintClip)
     {
@@ -15201,6 +15236,14 @@ namespace
                 POINT pt{};
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
+                if (g_customZoomOpen)
+                {
+                    HCURSOR cursor = LoadCursorW(nullptr,
+                        Hit(g_zoomDialogInputRect, pt.x, pt.y) ? IDC_IBEAM :
+                        (Hit(g_zoomDialogConfirmRect, pt.x, pt.y) || Hit(g_zoomDialogCancelRect, pt.x, pt.y)) ? IDC_HAND : IDC_ARROW);
+                    SetCursor(cursor);
+                    return TRUE;
+                }
                 if (ConfirmationDialogOpen())
                 {
                     bool clickable = Hit(g_clearDialogConfirmRect, pt.x, pt.y) ||
@@ -15326,19 +15369,20 @@ namespace
                 {
                     g_pressedButtonRect = g_zoomDialogConfirmRect;
                     g_hasPressedButton = true;
-                    SetTimer(hwnd, 2, 90, nullptr);
+                    SetCapture(hwnd);
                     InvalidateRect(hwnd, nullptr, FALSE);
-                    CommitCustomZoomDialog(hwnd);
                     return 0;
                 }
-                if (Hit(g_zoomDialogCancelRect, x, y) || !Hit(g_zoomDialogRect, x, y))
+                if (Hit(g_zoomDialogCancelRect, x, y))
                 {
-                    if (Hit(g_zoomDialogCancelRect, x, y))
-                    {
-                        g_pressedButtonRect = g_zoomDialogCancelRect;
-                        g_hasPressedButton = true;
-                        SetTimer(hwnd, 2, 90, nullptr);
-                    }
+                    g_pressedButtonRect = g_zoomDialogCancelRect;
+                    g_hasPressedButton = true;
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (!Hit(g_zoomDialogRect, x, y))
+                {
                     CloseCustomZoomDialog(hwnd);
                     return 0;
                 }
@@ -16278,6 +16322,27 @@ namespace
             break;
         }
         case WM_LBUTTONUP:
+            if (g_customZoomOpen && g_hasPressedButton &&
+                (EqualRect(&g_pressedButtonRect, &g_zoomDialogConfirmRect) ||
+                    EqualRect(&g_pressedButtonRect, &g_zoomDialogCancelRect)))
+            {
+                int x = GET_X_LPARAM(lParam);
+                int y = GET_Y_LPARAM(lParam);
+                bool confirm = EqualRect(&g_pressedButtonRect, &g_zoomDialogConfirmRect);
+                bool activate = Hit(confirm ? g_zoomDialogConfirmRect : g_zoomDialogCancelRect, x, y);
+                g_hasPressedButton = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                if (activate)
+                {
+                    if (confirm) CommitCustomZoomDialog(hwnd);
+                    else CloseCustomZoomDialog(hwnd);
+                }
+                else
+                {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (g_pressedAnnotationPage >= 0)
             {
                 int page = g_pressedAnnotationPage;
