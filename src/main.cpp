@@ -2958,13 +2958,24 @@ namespace
 
     void DrawDownCaret(HDC dc, int x, int y, COLORREF color)
     {
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, S(1)), color);
-        HGDIOBJ oldPen = SelectObject(dc, pen);
-        MoveToEx(dc, x - S(3), y - S(1), nullptr);
-        LineTo(dc, x, y + S(2));
-        LineTo(dc, x + S(3), y - S(1));
-        SelectObject(dc, oldPen);
-        DeleteObject(pen);
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.0f, S(0.9f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+
+        float cx = static_cast<float>(x);
+        float cy = static_cast<float>(y) + S(0.35f);
+        float halfWidth = S(3.0f);
+        float halfHeight = S(1.8f);
+        Gdiplus::PointF points[] = {
+            { cx - halfWidth, cy - halfHeight },
+            { cx, cy + halfHeight },
+            { cx + halfWidth, cy - halfHeight }
+        };
+        g.DrawLines(&pen, points, static_cast<INT>(std::size(points)));
     }
 
     void DrawTabArrowGlyph(HDC dc, RECT r, bool right, COLORREF color)
