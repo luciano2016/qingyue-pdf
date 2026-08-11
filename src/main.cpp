@@ -12629,22 +12629,90 @@ namespace
         RoundFill(dc, r, S(8), fill, line);
         DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
     }
+
+    void DrawExitImmersiveGlyph(HDC dc, RECT r, COLORREF color, bool pressed)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.25f, S(1.15f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        float cx = (static_cast<float>(r.left + r.right)) * 0.5f;
+        float cy = (static_cast<float>(r.top + r.bottom)) * 0.5f + (pressed ? S(1.0f) : 0.0f);
+        float outer = S(6.0f), inner = S(1.8f), arm = S(3.2f);
+        Gdiplus::PointF topLeft[3] = {
+            { cx - outer, cy - inner }, { cx - inner, cy - inner }, { cx - inner, cy - outer + arm }
+        };
+        Gdiplus::PointF topRight[3] = {
+            { cx + outer, cy - inner }, { cx + inner, cy - inner }, { cx + inner, cy - outer + arm }
+        };
+        Gdiplus::PointF bottomLeft[3] = {
+            { cx - outer, cy + inner }, { cx - inner, cy + inner }, { cx - inner, cy + outer - arm }
+        };
+        Gdiplus::PointF bottomRight[3] = {
+            { cx + outer, cy + inner }, { cx + inner, cy + inner }, { cx + inner, cy + outer - arm }
+        };
+        g.DrawLines(&pen, topLeft, 3); g.DrawLines(&pen, topRight, 3);
+        g.DrawLines(&pen, bottomLeft, 3); g.DrawLines(&pen, bottomRight, 3);
+    }
+    void PaintImmersiveExitControl(HDC dc, RECT client, PdfTab* tab)
+    {
+        int panelW = S(tab ? 178 : 126);
+        int panelH = S(34);
+        RECT panel{ client.right - S(18) - panelW, client.bottom - S(21) - panelH,
+            client.right - S(18), client.bottom - S(21) };
+        int actionW = S(104);
+        RECT action{ panel.right - actionW - S(3), panel.top + S(3), panel.right - S(3), panel.bottom - S(3) };
+        bool hovered = Hit(action, g_mousePos.x, g_mousePos.y);
+        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &action);
+
+        DrawRoundedShadow(dc, panel, S(11.0f), S(1), S(2), S(3), IsDarkTheme() ? 20 : 13);
+        GlassRoundedSurface(dc, panel, IsDarkTheme() || IsAuroraTheme() ? 218 : 230, S(11.0f));
+
+        if (tab)
+        {
+            RECT pageRect{ panel.left + S(13), panel.top, action.left - S(8), panel.bottom };
+            HFONT pageFont = Font(8, FW_SEMIBOLD);
+            HGDIOBJ oldFont = SelectObject(dc, pageFont);
+            std::wstring page = std::to_wstring(tab->currentPage + 1) + L" / " + std::to_wstring(tab->pageCount);
+            Text(dc, page, pageRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+            SelectObject(dc, oldFont);
+            DeleteObject(pageFont);
+            RECT divider{ action.left - S(5), panel.top + S(8), action.left - S(4), panel.bottom - S(8) };
+            Fill(dc, divider, MixColor(T().line, T().muted, 0.10));
+        }
+
+        COLORREF actionFill = pressed
+            ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.20 : 0.14)
+            : (hovered ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.13 : 0.08) : T().panel2);
+        COLORREF actionLine = pressed
+            ? MixColor(T().line, T().accent, 0.34)
+            : (hovered ? MixColor(T().line, T().accent, 0.22) : T().line);
+        RoundFill(dc, action, S(8), actionFill, actionLine);
+
+        RECT content = action;
+        if (pressed) OffsetRect(&content, 0, S(1));
+        RECT iconRect{ content.left + S(12), content.top + S(6), content.left + S(30), content.bottom - S(6) };
+        COLORREF contentColor = hovered || pressed ? T().text : MixColor(T().muted, T().text, 0.12);
+        DrawExitImmersiveGlyph(dc, iconRect, contentColor, false);
+        RECT label{ content.left + S(34), content.top, content.right - S(10), content.bottom };
+        HFONT labelFont = Font(8, FW_SEMIBOLD);
+        HGDIOBJ oldFont = SelectObject(dc, labelFont);
+        Text(dc, L"\u9000\u51fa\u6c89\u6d78", label, DT_CENTER | DT_VCENTER | DT_SINGLELINE, contentColor);
+        SelectObject(dc, oldFont);
+        DeleteObject(labelFont);
+        AddButton(CmdImmersive, action, L"", L"\u9000\u51fa\u6c89\u6d78\u6a21\u5f0f");
+    }
+
     void PaintStatus(HDC dc, RECT client)
     {
         PdfTab* tab = Active();
         if (!tab && !g_immersive) return;
         if (g_immersive)
         {
-            RECT panel{ client.right - S(154), client.bottom - S(48), client.right - S(18), client.bottom - S(21) };
-            PaintLiquidGlassPill(dc, panel);
-            std::wstring text = tab ? std::to_wstring(tab->currentPage + 1) + L" / " + std::to_wstring(tab->pageCount) + L"    \u9000\u51fa\u6c89\u6d78" : L"\u9000\u51fa\u6c89\u6d78";
-            AddButton(CmdImmersive, panel, text);
-            HFONT immersiveFont = Font(9);
-            HGDIOBJ oldImmersiveFont = SelectObject(dc, immersiveFont);
-            COLORREF immersiveText = IsDarkTheme() ? MixColor(T().muted, RGB(255, 255, 255), 0.10) : MixColor(T().muted, RGB(70, 80, 92), 0.25);
-            Text(dc, text, panel, DT_CENTER | DT_VCENTER | DT_SINGLELINE, immersiveText);
-            SelectObject(dc, oldImmersiveFont);
-            DeleteObject(immersiveFont);
+            PaintImmersiveExitControl(dc, client, tab);
             return;
         }
         int barH = S(34);
@@ -15275,6 +15343,13 @@ namespace
                     SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
                     return TRUE;
                 }
+                if (g_immersive)
+                {
+                    bool clickable = std::any_of(g_buttons.begin(), g_buttons.end(), [&](Button const& button) {
+                        return button.id == CmdImmersive && Hit(button.rect, pt.x, pt.y);
+                    });
+                    if (clickable) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
+                }
                 if (g_autoScrollActive)
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
@@ -15831,6 +15906,14 @@ namespace
             {
                 g_pressedButtonRect = b.rect;
                 g_hasPressedButton = true;
+                if (g_immersive && b.id == CmdImmersive)
+                {
+                    InvalidateRect(hwnd, &b.rect, FALSE);
+                    UpdateWindow(hwnd);
+                    Command(hwnd, b.id);
+                    g_hasPressedButton = false;
+                    return 0;
+                }
                 SetTimer(hwnd, 2, 90, nullptr);
                 InvalidateRect(hwnd, &b.rect, FALSE);
                 Command(hwnd, b.id);
