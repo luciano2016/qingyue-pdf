@@ -1942,7 +1942,7 @@ namespace
         lf.lfHeight = -MulDiv(pt, static_cast<int>(g_dpi), 72);
         lf.lfWeight = weight;
         lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
-        wcscpy_s(lf.lfFaceName, L"Segoe UI Variable Text");
+        wcscpy_s(lf.lfFaceName, L"Segoe UI");
         return CreateFontIndirectW(&lf);
     }
 
