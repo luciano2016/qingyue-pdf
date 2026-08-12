@@ -12231,10 +12231,14 @@ namespace
                             {
                                 float markHeight = static_cast<float>(std::max<LONG>(1, mark.bottom - mark.top));
                                 float bottom = static_cast<float>(mark.bottom);
-                                float offset = markHeight * (annotation.kind == AnnotationKind::Underline ? 1.0f / 7.0f : 3.0f / 7.0f);
-                                float lineY = std::clamp(bottom - offset,
-                                    static_cast<float>(pageRect.top), static_cast<float>(pageRect.bottom - 1));
                                 float lineWidth = std::max(1.0f, markHeight / 16.0f);
+                                float lineY = annotation.kind == AnnotationKind::Underline
+                                    ? bottom + std::max(S(1.0f), lineWidth * 0.65f)
+                                    : bottom - markHeight * (3.0f / 7.0f);
+                                float halfWidth = lineWidth * 0.5f;
+                                lineY = std::clamp(lineY,
+                                    static_cast<float>(pageRect.top) + halfWidth,
+                                    static_cast<float>(pageRect.bottom) - halfWidth);
 
                                 Gdiplus::Graphics markGraphics(dc);
                                 markGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
