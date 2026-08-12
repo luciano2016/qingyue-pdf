@@ -12229,15 +12229,22 @@ namespace
                             }
                             else
                             {
-                                int lineY = annotation.kind == AnnotationKind::Underline ?
-                                    std::min(pageRect.bottom - 1, visibleMark.bottom + S(1)) :
-                                    (visibleMark.top + visibleMark.bottom) / 2;
-                                HPEN markPen = CreatePen(PS_SOLID, std::max(1, S(1)), annotationColor);
-                                HGDIOBJ oldMarkPen = SelectObject(dc, markPen);
-                                MoveToEx(dc, visibleMark.left, lineY, nullptr);
-                                LineTo(dc, visibleMark.right, lineY);
-                                SelectObject(dc, oldMarkPen);
-                                DeleteObject(markPen);
+                                float markHeight = static_cast<float>(std::max<LONG>(1, mark.bottom - mark.top));
+                                float bottom = static_cast<float>(mark.bottom);
+                                float offset = markHeight * (annotation.kind == AnnotationKind::Underline ? 1.0f / 7.0f : 3.0f / 7.0f);
+                                float lineY = std::clamp(bottom - offset,
+                                    static_cast<float>(pageRect.top), static_cast<float>(pageRect.bottom - 1));
+                                float lineWidth = std::max(1.0f, markHeight / 16.0f);
+
+                                Gdiplus::Graphics markGraphics(dc);
+                                markGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                                markGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+                                Gdiplus::Pen markPen(GdiColor(annotationColor), lineWidth);
+                                markPen.SetStartCap(Gdiplus::LineCapFlat);
+                                markPen.SetEndCap(Gdiplus::LineCapFlat);
+                                markGraphics.DrawLine(&markPen,
+                                    static_cast<float>(visibleMark.left), lineY,
+                                    static_cast<float>(visibleMark.right), lineY);
                             }
                         };
                         if (!annotation.segments.empty())
