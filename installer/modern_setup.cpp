@@ -438,8 +438,10 @@ void DeleteUninstallWorkerAfterExit() {
     if(!GetEnvironmentVariableW(L"ComSpec",commandProcessor,ARRAYSIZE(commandProcessor)))return;
     std::wstring command=L"\""+std::wstring(commandProcessor)+L"\" /D /Q /C ping 127.0.0.1 -n 2 >nul & del /F /Q \""+self.wstring()+L"\"";
     STARTUPINFOW startup{sizeof(startup)};
+    startup.dwFlags=STARTF_USESHOWWINDOW;
+    startup.wShowWindow=SW_HIDE;
     PROCESS_INFORMATION process{};
-    if(CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|DETACHED_PROCESS,nullptr,nullptr,&startup,&process)) {
+    if(CreateProcessW(commandProcessor,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process)) {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
     }
