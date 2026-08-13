@@ -2099,8 +2099,17 @@ namespace
         {
             double ty = std::clamp(static_cast<double>(y - client.top) / static_cast<double>(fullH), 0.0, 1.0);
             COLORREF color = MixColor(RGB(247, 250, 252), RGB(232, 239, 246), ty);
-            if (ty < 0.44) color = MixColor(color, RGB(255, 248, 241), 0.20);
-            else if (ty > 0.58) color = MixColor(color, RGB(229, 242, 253), 0.24);
+            auto smoothStep = [](double edge0, double edge1, double value)
+            {
+                double t = std::clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+                return t * t * (3.0 - 2.0 * t);
+            };
+            double warmMix = 0.20 * (1.0 - smoothStep(0.34, 0.58, ty));
+            double coolMix = 0.24 * smoothStep(0.44, 0.70, ty);
+            double topLightMix = 0.16 * (1.0 - smoothStep(0.10, 0.46, ty));
+            color = MixColor(color, RGB(255, 248, 241), warmMix);
+            color = MixColor(color, RGB(229, 242, 253), coolMix);
+            color = MixColor(color, RGB(255, 255, 255), topLightMix);
             return color;
         };
         auto fillGradientPart = [&](int top, int bottom)
@@ -2129,10 +2138,8 @@ namespace
 
         int clientW = static_cast<int>(client.right - client.left);
         RECT leftWash{ client.left, client.top, client.left + std::max<int>(1, clientW / 3), client.bottom };
-        RECT topWash{ client.left, client.top, client.right, client.top + std::max(1, fullH / 3) };
         RECT wash{};
         if (IntersectRect(&wash, &r, &leftWash)) AlphaFill(dc, wash, RGB(226, 244, 239), 30);
-        if (IntersectRect(&wash, &r, &topWash)) AlphaFill(dc, wash, RGB(255, 255, 255), 42);
     }
 
     void GlassFill(HDC dc, RECT r, COLORREF fallback, BYTE alpha = 205)
