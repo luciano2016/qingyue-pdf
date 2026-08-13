@@ -22,6 +22,7 @@ namespace {
 constexpr wchar_t kAppName[] = L"\u8f7b\u9605PDF";
 constexpr wchar_t kExeName[] = L"\u8f7b\u9605PDF.exe";
 constexpr wchar_t kPayloadExe[] = L"QuietPDF.Win32.exe";
+constexpr wchar_t kPayloadUninstaller[] = L"QingYuePDF.Uninstaller.exe";
 constexpr wchar_t kDllName[] = L"quietmupdf.dll";
 constexpr wchar_t kRuntimeName[] = L"vcruntime140.dll";
 constexpr wchar_t kUninstallName[] = L"\u5378\u8f7d\u8f7b\u9605PDF.exe";
@@ -270,7 +271,7 @@ bool WriteResource(int id,const wchar_t* type,const std::filesystem::path& targe
     HMODULE m=GetModuleHandleW(nullptr);HRSRC r=FindResourceW(m,MAKEINTRESOURCEW(id),type);if(!r)return false;HGLOBAL loaded=LoadResource(m,r);DWORD size=SizeofResource(m,r);void* data=LockResource(loaded);
     HANDLE f=CreateFileW(target.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_TEMPORARY,nullptr);if(f==INVALID_HANDLE_VALUE)return false;DWORD written=0;BOOL ok=WriteFile(f,data,size,&written,nullptr);CloseHandle(f);return ok&&written==size;
 }
-bool CopySelf(const std::filesystem::path& target){wchar_t self[MAX_PATH]{};GetModuleFileNameW(nullptr,self,MAX_PATH);return CopyFileW(self,target.c_str(),FALSE)!=0;}
+
 std::filesystem::path ModulePath() {
     std::wstring value(32768,static_cast<wchar_t>(0));
     DWORD length=GetModuleFileNameW(nullptr,value.data(),static_cast<DWORD>(value.size()));
@@ -413,7 +414,7 @@ bool LooksLikeInstallDir(const std::filesystem::path& dir) {
     std::error_code ec;
     std::filesystem::copy_file(source,worker,std::filesystem::copy_options::overwrite_existing,ec);
     if(ec)return false;
-    std::wstring parameters=L"/uninstall-worker /install-dir \""+installDir.wstring()+L"\"";
+    std::wstring parameters=L"/uninstall-worker /wait-pid "+std::to_wstring(GetCurrentProcessId())+L" /install-dir \""+installDir.wstring()+L"\"";
     SHELLEXECUTEINFOW info{sizeof(info)};
     info.fMask=SEE_MASK_NOCLOSEPROCESS;
     info.lpVerb=L"open";
@@ -467,7 +468,7 @@ std::wstring InstallPackage(const std::filesystem::path& request,bool desktop) {
         PostProgress(62,L"\u6b63\u5728\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6");
         auto exe=dir/kExeName;
         if(!ReplaceFileFrom(staging/kPayloadExe,exe)||!ReplaceFileFrom(staging/kDllName,dir/kDllName)||!ReplaceFileFrom(staging/kRuntimeName,dir/kRuntimeName))return L"\u65e0\u6cd5\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6\uff0c\u8bf7\u68c0\u67e5\u5b89\u88c5\u76ee\u5f55\u6743\u9650\u540e\u91cd\u8bd5\u3002";
-        if(!CopySelf(dir/kUninstallName))return L"\u65e0\u6cd5\u521b\u5efa\u5378\u8f7d\u7a0b\u5e8f\u3002";
+        if(!ReplaceFileFrom(staging/kPayloadUninstaller,dir/kUninstallName))return L"\u65e0\u6cd5\u521b\u5efa\u5378\u8f7d\u7a0b\u5e8f\u3002";
         PostProgress(82,L"\u6b63\u5728\u521b\u5efa\u5feb\u6377\u65b9\u5f0f");
         if(desktop&&!CreateShortcut(DesktopLink(),exe,dir))return L"\u65e0\u6cd5\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f\u3002";
         if(!CreateShortcut(StartLink(),exe,dir))return L"\u65e0\u6cd5\u521b\u5efa\u5f00\u59cb\u83dc\u5355\u5feb\u6377\u65b9\u5f0f\u3002";
@@ -615,15 +616,25 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     GetModuleFileNameW(nullptr,modulePath,MAX_PATH);
     std::filesystem::path moduleName(modulePath);
     const bool launchedFromInstalledUninstaller=_wcsicmp(moduleName.filename().c_str(),kUninstallName)==0;
+#ifdef QINGYUE_UNINSTALLER
+    g_uninstallMode=true;
+#else
     g_uninstallMode=launchedFromInstalledUninstaller;
+#endif
+    DWORD waitPid=0;
     int argc=0;
     PWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     for(int i=1;argv&&i<argc;++i) {
         if(_wcsicmp(argv[i],L"/uninstall")==0||_wcsicmp(argv[i],L"/uninstall-worker")==0)g_uninstallMode=true;
         if(_wcsicmp(argv[i],L"/uninstall-worker")==0)g_uninstallWorker=true;
+        if(_wcsicmp(argv[i],L"/wait-pid")==0&&i+1<argc)waitPid=wcstoul(argv[++i],nullptr,10);
         if(_wcsicmp(argv[i],L"/install-dir")==0&&i+1<argc)g_uninstallDir=argv[++i];
     }
     if(argv) LocalFree(argv);
+    if(waitPid) {
+        HANDLE parent=OpenProcess(SYNCHRONIZE,FALSE,waitPid);
+        if(parent){WaitForSingleObject(parent,10000);CloseHandle(parent);}
+    }
     if(g_uninstallMode&&!g_uninstallWorker) {
         auto registeredDir=RegisteredInstallDir();
         auto sourceDir=moduleName.parent_path();

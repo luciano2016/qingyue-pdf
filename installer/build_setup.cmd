@@ -28,6 +28,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo Building lightweight uninstaller...
+"%MSBUILD%" "%ROOT%\installer\QingYuePDF.Uninstaller.vcxproj" /m /p:Configuration=Release /p:Platform=x64
+if errorlevel 1 exit /b %errorlevel%
+
 del /q "%ROOT%\build\setup-payload\quietpdf-payload.cab" 2>nul
 "%MAKECAB%" /f "%ROOT%\installer\payload.ddf"
 del /q "%ROOT%\setup.inf" "%ROOT%\setup.rpt" 2>nul

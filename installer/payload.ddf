@@ -11,3 +11,4 @@
 "build\setup-input\QuietPDF.Win32.exe" "QuietPDF.Win32.exe"
 "build\setup-input\quietmupdf.dll" "quietmupdf.dll"
 "build\setup-input\vcruntime140.dll" "vcruntime140.dll"
+"build\setup-input\QingYuePDF.Uninstaller.exe" "QingYuePDF.Uninstaller.exe"
