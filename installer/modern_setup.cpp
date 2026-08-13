@@ -86,13 +86,13 @@ std::wstring WindowText(HWND h) {
 void MakeFonts() {
     for (HFONT* f:{&g_uiFont,&g_smallFont,&g_titleFont,&g_displayFont}) { if(*f) DeleteObject(*f); *f=nullptr; }
     auto make=[](int pt,int weight){ return CreateFontW(-MulDiv(pt,static_cast<int>(g_dpi),72),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_NATURAL_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI"); };
-    g_uiFont=make(10,FW_NORMAL); g_smallFont=make(8,FW_NORMAL); g_titleFont=make(15,FW_SEMIBOLD); g_displayFont=make(24,FW_SEMIBOLD);
+    g_uiFont=make(10,FW_NORMAL); g_smallFont=make(8,FW_NORMAL); g_titleFont=make(15,FW_SEMIBOLD); g_displayFont=make(20,FW_SEMIBOLD);
     if(g_pathEdit) SendMessageW(g_pathEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_uiFont),TRUE);
 }
 void Layout(HWND h) {
     RECT c{}; GetClientRect(h,&c);
     g_close={c.right-S(54),0,c.right,S(48)}; g_back={S(38),c.bottom-S(66),S(116),c.bottom-S(28)};
-    g_primary={c.right-S(184),c.bottom-S(70),c.right-S(38),c.bottom-S(28)};
+    g_primary={c.right-S(168),c.bottom-S(66),c.right-S(38),c.bottom-S(28)};
     g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
     g_desktop={S(40),S(286),S(350),S(320)}; g_launch=g_desktop;
     if(g_pathEdit) { MoveWindow(g_pathEdit,g_editFrame.left+S(12),g_editFrame.top+S(4),g_editFrame.right-g_editFrame.left-S(24),g_editFrame.bottom-g_editFrame.top-S(8),TRUE); ShowWindow(g_pathEdit,g_page==Page::Options?SW_SHOW:SW_HIDE); }
@@ -128,12 +128,12 @@ void DrawProgress(Gdiplus::Graphics& g,RECT r) {
     FillRound(g,f,Sf(5),RGB(48,164,118)); RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(190,241,220),70);
 }
 void DrawPage(Gdiplus::Graphics& g,RECT c) {
-    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(248,246,240))); DrawLogo(g);
+    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(250,249,246))); DrawLogo(g);
     DrawText(g,L"\u8f7b\u9605PDF",{S(90),S(31),S(260),S(60)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
     if(g_page==Page::Welcome) {
-        DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(40),S(126),c.right-S(40),S(178)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(42),S(190),c.right-S(62),S(242)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-        DrawText(g,L"\u7248\u672c 0.3.1    Windows 10 / 11    x64",{S(42),S(280),c.right-S(40),S(308)},g_smallFont,RGB(139,151,144),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
+        DrawText(g,L"\u7248\u672c 0.3.1    Windows 10 / 11    x64",{S(44),S(265),c.right-S(40),S(293)},g_smallFont,RGB(139,151,144),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_primary,L"\u7ee7\u7eed",Hot::Primary,true); return;
     }
     if(g_page==Page::Options) {
@@ -238,7 +238,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_CLOSE:if(g_installing)return 0;DestroyWindow(h);return 0;case WM_DESTROY:for(HFONT f:{g_uiFont,g_smallFont,g_titleFont,g_displayFont})if(f)DeleteObject(f);PostQuitMessage(0);return 0;default:return DefWindowProcW(h,m,w,l);}
 }
 int ShowWizard(HINSTANCE instance,int show) {
-    g_instance=instance;WNDCLASSW wc{};wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
+    g_instance=instance;g_dpi=GetDpiForSystem();WNDCLASSW wc{};wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
     HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(680),S(470),nullptr,nullptr,instance,nullptr);if(!h)return 1;RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(680))/2,work.top+(work.bottom-work.top-S(470))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
 }
 }
