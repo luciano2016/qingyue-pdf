@@ -34,7 +34,7 @@ constexpr UINT_PTR kTimer = 1;
 constexpr int kPathEdit = 1001;
 
 enum class Page { Welcome, Options, Installing, Complete, Failed };
-enum class Hot { None, Close, Back, Primary, Browse, Desktop, Launch };
+enum class Hot { None, Minimize, Close, Back, Primary, Browse, Desktop, Launch };
 struct InstallResult { bool success; std::wstring error; };
 struct ProgressMessage { int percent; std::wstring text; };
 struct CabinetContext { std::filesystem::path target; };
@@ -46,7 +46,7 @@ ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
-RECT g_close{}, g_back{}, g_primary{}, g_browse{}, g_desktop{}, g_launch{}, g_editFrame{};
+RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_browse{}, g_desktop{}, g_launch{}, g_editFrame{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_pathFocused = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
@@ -101,11 +101,23 @@ void ApplyWindowChrome(HWND h) {
 }
 void Layout(HWND h) {
     RECT c{}; GetClientRect(h,&c);
-    g_close={c.right-S(64),S(14),c.right-S(14),S(58)}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
+    constexpr int kWindowButtonSize = 30;
+    constexpr int kWindowButtonGap = 6;
+    g_close={c.right-S(14)-S(kWindowButtonSize),S(18),c.right-S(14),S(18)+S(kWindowButtonSize)};
+    g_minimize={g_close.left-S(kWindowButtonGap)-S(kWindowButtonSize),g_close.top,g_close.left-S(kWindowButtonGap),g_close.bottom}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
     g_primary={c.right-S(176),c.bottom-S(74),c.right-S(38),c.bottom-S(36)};
     g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
     g_desktop={S(40),S(286),S(350),S(320)}; g_launch=g_desktop;
-    if(g_pathEdit) { MoveWindow(g_pathEdit,g_editFrame.left+S(12),g_editFrame.top+S(5),g_editFrame.right-g_editFrame.left-S(24),g_editFrame.bottom-g_editFrame.top-S(10),TRUE); ShowWindow(g_pathEdit,g_page==Page::Options?SW_SHOW:SW_HIDE); }
+    if(g_pathEdit) {
+        const int inset = S(4);
+        const int width = g_editFrame.right-g_editFrame.left-S(24);
+        const int height = g_editFrame.bottom-g_editFrame.top-S(2*inset);
+        MoveWindow(g_pathEdit,g_editFrame.left+S(12),g_editFrame.top+inset,width,height,TRUE);
+        SendMessageW(g_pathEdit,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELONG(S(2),S(2)));
+        RECT format{S(2),S(3),width-S(2),height-S(3)};
+        SendMessageW(g_pathEdit,EM_SETRECTNP,0,reinterpret_cast<LPARAM>(&format));
+        ShowWindow(g_pathEdit,g_page==Page::Options?SW_SHOW:SW_HIDE);
+    }
 }
 void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) {
     HGDIOBJ old=SelectObject(dc,f); SetBkMode(dc,TRANSPARENT); SetTextColor(dc,c); DrawTextW(dc,s.c_str(),static_cast<int>(s.size()),&r,flags); SelectObject(dc,old);
@@ -117,14 +129,25 @@ void DrawLogo(Gdiplus::Graphics& g) {
 void DrawClose(Gdiplus::Graphics& g) {
     const bool hover = g_hover==Hot::Close;
     const bool pressed = g_pressed==Hot::Close;
-    FillRound(g,g_close,Sf(8),pressed?RGB(226,239,232):(hover?RGB(239,247,242):RGB(250,251,250)));
-    StrokeRound(g,g_close,Sf(8),hover?RGB(48,164,118):RGB(218,226,221),255);
+    if(hover||pressed) FillRound(g,g_close,Sf(6),pressed?RGB(226,239,232):RGB(239,247,242));
+
     const float cx = static_cast<float>(g_close.left+g_close.right)/2.0f;
     const float cy = static_cast<float>(g_close.top+g_close.bottom)/2.0f;
     Gdiplus::Pen p(Gc(pressed?RGB(29,99,68):(hover?RGB(36,119,82):RGB(59,73,65)),255),Sf(1.8f));
     p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-    g.DrawLine(&p,cx-Sf(5),cy-Sf(5),cx+Sf(5),cy+Sf(5));
-    g.DrawLine(&p,cx+Sf(5),cy-Sf(5),cx-Sf(5),cy+Sf(5));
+    g.DrawLine(&p,cx-Sf(4.5f),cy-Sf(4.5f),cx+Sf(4.5f),cy+Sf(4.5f));
+    g.DrawLine(&p,cx+Sf(4.5f),cy-Sf(4.5f),cx-Sf(4.5f),cy+Sf(4.5f));
+}
+void DrawMinimize(Gdiplus::Graphics& g) {
+    const bool hover = g_hover==Hot::Minimize;
+    const bool pressed = g_pressed==Hot::Minimize;
+    if(hover||pressed) FillRound(g,g_minimize,Sf(6),pressed?RGB(226,239,232):RGB(239,247,242));
+    const COLORREF ink = pressed?RGB(24,92,63):(hover?RGB(35,116,78):RGB(40,58,48));
+    Gdiplus::Pen p(Gc(ink),Sf(1.8f));
+    p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+    const float cx=static_cast<float>(g_minimize.left+g_minimize.right)/2.0f;
+    const float cy=static_cast<float>(g_minimize.top+g_minimize.bottom)/2.0f;
+    g.DrawLine(&p,cx-S(5),cy,cx+S(5),cy);
 }
 void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bool primary) {
     bool a=g_hover==hot||g_pressed==hot; COLORREF fill=primary?RGB(48,164,118):RGB(255,255,255);
@@ -150,7 +173,7 @@ void DrawProgress(Gdiplus::Graphics& g,RECT r) {
 }
 void DrawPage(Gdiplus::Graphics& g,RECT c) {
     COLORREF text=RGB(39,53,46), muted=RGB(105,122,112); g.Clear(Gc(RGB(245,248,246))); Gdiplus::SolidBrush header(Gc(RGB(235,244,239))); g.FillRectangle(&header,0,0,c.right,S(88)); Gdiplus::SolidBrush footer(Gc(RGB(248,250,249))); g.FillRectangle(&footer,0,c.bottom-S(92),c.right,S(92)); Gdiplus::Pen divider(Gc(RGB(220,231,224)),Sf(1.0f)); g.DrawLine(&divider,Sf(32),Sf(88),Sf(c.right-32),Sf(88));
-    DrawText(g,L"\u8f7b\u9605PDF",{S(52),S(28),S(260),S(58)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawText(g,L"PDF \u9605\u8bfb\u5668",{S(52),S(55),S(190),S(76)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
+    DrawText(g,L"\u8f7b\u9605PDF",{S(52),S(28),S(260),S(58)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawText(g,L"PDF \u9605\u8bfb\u5668",{S(52),S(55),S(190),S(76)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawMinimize(g); DrawClose(g);
     if(g_page==Page::Welcome) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
@@ -190,7 +213,7 @@ void Paint(HWND h) {
     BitBlt(dc,0,0,c.right,c.bottom,mem,0,0,SRCCOPY); SelectObject(mem,old); DeleteObject(bmp); DeleteDC(mem); EndPaint(h,&ps);
 }
 Hot HotAt(POINT p) {
-    if(Hit(g_close,p))return Hot::Close; if(g_page==Page::Welcome)return Hit(g_primary,p)?Hot::Primary:Hot::None;
+    if(Hit(g_minimize,p))return Hot::Minimize; if(Hit(g_close,p))return Hot::Close; if(g_page==Page::Welcome)return Hit(g_primary,p)?Hot::Primary:Hot::None;
     if(g_page==Page::Options){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
     if(g_page==Page::Complete){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_launch,p))return Hot::Launch;}
     if(g_page==Page::Failed){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;} return Hot::None;
@@ -252,7 +275,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_MOUSEMOVE:UpdateHover(h,{GET_X_LPARAM(l),GET_Y_LPARAM(l)});return 0;case WM_MOUSELEAVE:g_hover=Hot::None;InvalidateRect(h,nullptr,FALSE);return 0;case WM_SETCURSOR:SetCursor(LoadCursorW(nullptr,IDC_ARROW));return TRUE;
     case WM_LBUTTONDOWN:{POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};Hot hot=HotAt(p);if(hot!=Hot::None){g_pressed=hot;SetCapture(h);InvalidateRect(h,nullptr,FALSE);return 0;}if(!g_installing&&p.y<S(78)){ReleaseCapture();SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0);}return 0;}
     case WM_LBUTTONUP:{POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};Hot pressed=g_pressed;g_pressed=Hot::None;ReleaseCapture();if(pressed==Hot::Close&&Hit(g_close,p)){PostMessageW(h,WM_CLOSE,0,0);return 0;}if(pressed==Hot::None||pressed!=HotAt(p)||g_installing)return 0;
-        if(pressed==Hot::Primary){if(g_page==Page::Welcome){g_page=Page::Options;Layout(h);InvalidateRect(h,nullptr,FALSE);}else if(g_page==Page::Options){g_page=Page::Installing;g_installing=true;g_progress=g_targetProgress=0;g_stage=L"\u6b63\u5728\u51c6\u5907";Layout(h);SetTimer(h,kTimer,16,nullptr);auto path=std::filesystem::path(WindowText(g_pathEdit));bool desktop=g_desktopShortcut;std::thread([path,desktop]{auto e=InstallPackage(path,desktop);PostMessageW(g_window,kMsgComplete,reinterpret_cast<WPARAM>(new InstallResult{e.empty(),e}),0);}).detach();InvalidateRect(h,nullptr,FALSE);}else if(g_page==Page::Complete){if(g_launchAfterInstall)LaunchInstalled();PostMessageW(h,WM_CLOSE,0,0);}else if(g_page==Page::Failed){g_page=Page::Options;g_error.clear();Layout(h);InvalidateRect(h,nullptr,FALSE);}}
+        if(pressed==Hot::Minimize){ShowWindow(h,SW_MINIMIZE);return 0;} if(pressed==Hot::Primary){if(g_page==Page::Welcome){g_page=Page::Options;Layout(h);InvalidateRect(h,nullptr,FALSE);}else if(g_page==Page::Options){g_page=Page::Installing;g_installing=true;g_progress=g_targetProgress=0;g_stage=L"\u6b63\u5728\u51c6\u5907";Layout(h);SetTimer(h,kTimer,16,nullptr);auto path=std::filesystem::path(WindowText(g_pathEdit));bool desktop=g_desktopShortcut;std::thread([path,desktop]{auto e=InstallPackage(path,desktop);PostMessageW(g_window,kMsgComplete,reinterpret_cast<WPARAM>(new InstallResult{e.empty(),e}),0);}).detach();InvalidateRect(h,nullptr,FALSE);}else if(g_page==Page::Complete){if(g_launchAfterInstall)LaunchInstalled();PostMessageW(h,WM_CLOSE,0,0);}else if(g_page==Page::Failed){g_page=Page::Options;g_error.clear();Layout(h);InvalidateRect(h,nullptr,FALSE);}}
         else if(pressed==Hot::Back){g_page=g_page==Page::Options?Page::Welcome:Page::Options;Layout(h);InvalidateRect(h,nullptr,FALSE);}else if(pressed==Hot::Browse){std::filesystem::path pth;if(BrowseForFolder(h,pth))SetWindowTextW(g_pathEdit,pth.c_str());}else if(pressed==Hot::Desktop){g_desktopShortcut=!g_desktopShortcut;InvalidateRect(h,nullptr,FALSE);}else if(pressed==Hot::Launch){g_launchAfterInstall=!g_launchAfterInstall;InvalidateRect(h,nullptr,FALSE);}return 0;}
     case WM_TIMER:if(w==kTimer&&g_page==Page::Installing){g_progress+=(g_targetProgress-g_progress)*.18f;if(g_targetProgress-g_progress<.003f)g_progress=g_targetProgress;g_shine=(g_shine+S(4))%std::max(1,S(100));InvalidateRect(h,nullptr,FALSE);}return 0;
     case kMsgProgress:{auto* p=reinterpret_cast<ProgressMessage*>(w);if(p){g_targetProgress=std::clamp(p->percent/100.0f,0.0f,1.0f);g_stage=std::move(p->text);delete p;}return 0;}
