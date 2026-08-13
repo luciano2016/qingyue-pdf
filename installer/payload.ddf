@@ -1,0 +1,13 @@
+.OPTION EXPLICIT
+.Set CabinetNameTemplate=quietpdf-payload.cab
+.Set DiskDirectoryTemplate=build\setup-payload
+.Set Cabinet=on
+.Set Compress=on
+.Set CompressionType=LZX
+.Set CompressionMemory=21
+.Set MaxDiskSize=0
+.Set DiskDirectory1=build\setup-payload
+
+"build\setup-input\QuietPDF.Win32.exe" "QuietPDF.Win32.exe"
+"build\setup-input\quietmupdf.dll" "quietmupdf.dll"
+"build\setup-input\vcruntime140.dll" "vcruntime140.dll"

@@ -1,5 +1,4 @@
 #include "resource.h"
 
 IDI_APP_ICON ICON "..\\assets\\xiaoyue.ico"
-IDR_APP_EXE RCDATA "..\\build\\x64\\Release\\QuietPDF.Win32.exe"
-IDR_MUPDF_DLL RCDATA "..\\build\\x64\\Release\\quietmupdf.dll"
+IDR_PAYLOAD_CAB RCDATA "..\\build\\setup-payload\\quietpdf-payload.cab"
