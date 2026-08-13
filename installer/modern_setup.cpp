@@ -301,11 +301,15 @@ void RegisterInstallation(const std::filesystem::path& dir) {
     SetRegString(HKEY_CURRENT_USER,L"Software\\RegisteredApplications",L"QingYuePDF",kCapabilitiesKey);SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST,nullptr,nullptr);
 }
 std::filesystem::path RegisteredInstallDir(){HKEY k{};if(RegOpenKeyExW(HKEY_CURRENT_USER,kUninstallKey,0,KEY_QUERY_VALUE,&k)!=ERROR_SUCCESS)return DefaultInstallDir();wchar_t b[MAX_PATH*4]{};DWORD n=sizeof(b),t=0;std::filesystem::path r=DefaultInstallDir();if(RegQueryValueExW(k,L"InstallLocation",nullptr,&t,reinterpret_cast<BYTE*>(b),&n)==ERROR_SUCCESS&&t==REG_SZ)r=b;RegCloseKey(k);return r;}
+int CALLBACK BrowseFolderCallback(HWND dialog,UINT message,LPARAM,LPARAM data) {
+    if(message==BFFM_INITIALIZED&&data)SendMessageW(dialog,BFFM_SETSELECTIONW,TRUE,data);
+    return 0;
+}
 bool BrowseForFolder(HWND owner,const std::filesystem::path& initialFolder,std::filesystem::path& selected) {
-    IFileDialog* d=nullptr;if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_IFileDialog,reinterpret_cast<void**>(&d))))return false;DWORD o=0;d->GetOptions(&o);d->SetOptions(o|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM);d->SetTitle(L"\u9009\u62e9\u5b89\u88c5\u4f4d\u7f6e");
     std::filesystem::path folder=initialFolder;std::error_code folderError;while(!folder.empty()&&!std::filesystem::is_directory(folder,folderError)){folderError.clear();auto parent=folder.parent_path();if(parent==folder)break;folder=std::move(parent);}
-    if(!folder.empty()){IShellItem* initial=nullptr;if(SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(),nullptr,IID_PPV_ARGS(&initial)))){d->SetFolder(initial);initial->Release();}}bool ok=false;
-    if(SUCCEEDED(d->Show(owner))){IShellItem* i=nullptr;if(SUCCEEDED(d->GetResult(&i))){PWSTR p=nullptr;if(SUCCEEDED(i->GetDisplayName(SIGDN_FILESYSPATH,&p))){selected=p;CoTaskMemFree(p);if(_wcsicmp(selected.filename().c_str(),kAppName)!=0)selected/=kAppName;ok=true;}i->Release();}}d->Release();return ok;
+    auto initial=folder.wstring();BROWSEINFOW info{};info.hwndOwner=owner;info.lpszTitle=L"\u9009\u62e9\u5b89\u88c5\u8f7b\u9605PDF\u7684\u4f4d\u7f6e\uff1a";info.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;info.lpfn=BrowseFolderCallback;info.lParam=reinterpret_cast<LPARAM>(initial.c_str());
+    PIDLIST_ABSOLUTE item=SHBrowseForFolderW(&info);if(!item)return false;wchar_t path[MAX_PATH]{};bool ok=SHGetPathFromIDListW(item,path)!=FALSE;CoTaskMemFree(item);if(!ok)return false;
+    selected=path;if(_wcsicmp(selected.filename().c_str(),kAppName)!=0)selected/=kAppName;return true;
 }
 UINT CALLBACK CabinetCallback(PVOID context, UINT note, UINT_PTR p1, UINT_PTR p2) {
     if(note==SPFILENOTIFY_FILEINCABINET){auto* f=reinterpret_cast<FILE_IN_CABINET_INFO_W*>(p1);auto* c=reinterpret_cast<CabinetContext*>(context);auto target=c->target/f->NameInCabinet;std::filesystem::create_directories(target.parent_path());wcsncpy_s(f->FullTargetName,ARRAYSIZE(f->FullTargetName),target.c_str(),_TRUNCATE);return FILEOP_DOIT;}
