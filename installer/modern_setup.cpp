@@ -98,12 +98,10 @@ void ApplyWindowChrome(HWND h) {
     DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
     const BOOL darkMode = FALSE;
     DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
-    MARGINS frame{1, 1, 1, 1};
-    DwmExtendFrameIntoClientArea(h, &frame);
 }
 void Layout(HWND h) {
     RECT c{}; GetClientRect(h,&c);
-    g_close={c.right-S(62),S(8),c.right-S(8),S(54)}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
+    g_close={c.right-S(64),S(14),c.right-S(14),S(58)}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
     g_primary={c.right-S(176),c.bottom-S(74),c.right-S(38),c.bottom-S(36)};
     g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
     g_desktop={S(40),S(286),S(350),S(320)}; g_launch=g_desktop;
@@ -114,14 +112,19 @@ void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags)
 }
 void DrawText(Gdiplus::Graphics& g,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) { HDC dc=g.GetHDC(); DrawText(dc,s,r,f,c,flags); g.ReleaseHDC(dc); }
 void DrawLogo(Gdiplus::Graphics& g) {
-    FillRound(g,{S(36),S(30),S(78),S(72)},Sf(12),RGB(48,164,118));
-    Gdiplus::Pen p(Gc(RGB(255,255,255)),Sf(2.3f)); p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-    Gdiplus::PointF pts[]={{Sf(49),Sf(51)},{Sf(55),Sf(58)},{Sf(67),Sf(43)}}; g.DrawLines(&p,pts,3);
+    // The installer uses a wordmark; a checkmark is reserved for completion state.
 }
 void DrawClose(Gdiplus::Graphics& g) {
-    bool a=g_hover==Hot::Close||g_pressed==Hot::Close; if(a) FillRound(g,g_close,Sf(9),RGB(229,237,232));
-    Gdiplus::Pen p(Gc(a?RGB(42,101,76):RGB(120,130,124)),Sf(1.5f)); p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-    g.DrawLine(&p,Sf(g_close.left+21),Sf(17),Sf(g_close.left+32),Sf(28)); g.DrawLine(&p,Sf(g_close.left+32),Sf(17),Sf(g_close.left+21),Sf(28));
+    const bool hover = g_hover==Hot::Close;
+    const bool pressed = g_pressed==Hot::Close;
+    FillRound(g,g_close,Sf(8),pressed?RGB(226,239,232):(hover?RGB(239,247,242):RGB(250,251,250)));
+    StrokeRound(g,g_close,Sf(8),hover?RGB(48,164,118):RGB(218,226,221),255);
+    const float cx = Sf((g_close.left+g_close.right)/2.0f);
+    const float cy = Sf((g_close.top+g_close.bottom)/2.0f);
+    Gdiplus::Pen p(Gc(pressed?RGB(29,99,68):(hover?RGB(36,119,82):RGB(59,73,65)),255),Sf(1.8f));
+    p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+    g.DrawLine(&p,cx-Sf(5),cy-Sf(5),cx+Sf(5),cy+Sf(5));
+    g.DrawLine(&p,cx+Sf(5),cy-Sf(5),cx-Sf(5),cy+Sf(5));
 }
 void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bool primary) {
     bool a=g_hover==hot||g_pressed==hot; COLORREF fill=primary?RGB(48,164,118):RGB(255,255,255);
@@ -130,18 +133,24 @@ void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bo
     DrawText(g,label,r,g_uiFont,primary?RGB(255,255,255):RGB(53,65,58),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 }
 void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
-    int side=S(16); RECT b{r.left,r.top+(r.bottom-r.top-side)/2,r.left+side,r.top+(r.bottom-r.top-side)/2+side};
-    FillRound(g,b,Sf(4),checked?RGB(48,164,118):RGB(255,255,255)); StrokeRound(g,b,Sf(4),checked||active?RGB(48,164,118):RGB(190,202,195));
-    if(!checked) return; Gdiplus::Pen p(Gc(RGB(255,255,255)),Sf(1.6f)); p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-    g.DrawLine(&p,Sf(b.left+4),Sf(b.top+8),Sf(b.left+7),Sf(b.top+11)); g.DrawLine(&p,Sf(b.left+7),Sf(b.top+11),Sf(b.left+13),Sf(b.top+5));
+    const int side=S(18);
+    RECT b{r.left,r.top+(r.bottom-r.top-side)/2,r.left+side,r.top+(r.bottom-r.top-side)/2+side};
+    const COLORREF fill=checked?RGB(48,164,118):(active?RGB(244,249,246):RGB(255,255,255));
+    FillRound(g,b,Sf(4),fill);
+    StrokeRound(g,b,Sf(4),checked?RGB(48,164,118):(active?RGB(48,164,118):RGB(181,195,186)),255);
+    if(!checked) return;
+    Gdiplus::Pen p(Gc(RGB(255,255,255),255),Sf(2.0f));
+    p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+    g.DrawLine(&p,Sf(b.left+4),Sf(b.top+9),Sf(b.left+8),Sf(b.top+13));
+    g.DrawLine(&p,Sf(b.left+8),Sf(b.top+13),Sf(b.left+15),Sf(b.top+5));
 }
 void DrawProgress(Gdiplus::Graphics& g,RECT r) {
     FillRound(g,r,Sf(5),RGB(225,234,229)); RECT f=r; f.right=f.left+static_cast<int>((r.right-r.left)*std::clamp(g_progress,0.0f,1.0f)); if(f.right<=f.left)return;
     FillRound(g,f,Sf(5),RGB(48,164,118)); RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(190,241,220),70);
 }
 void DrawPage(Gdiplus::Graphics& g,RECT c) {
-    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(229,235,231))); FillRound(g,{S(5),S(5),c.right-S(5),c.bottom-S(5)},Sf(14),RGB(238,243,240)); FillRound(g,{S(8),S(8),c.right-S(8),c.bottom-S(8)},Sf(12),RGB(255,255,255)); StrokeRound(g,{S(8),S(8),c.right-S(8),c.bottom-S(8)},Sf(12),RGB(220,228,223),230); DrawLogo(g);
-    DrawText(g,L"\u8f7b\u9605PDF",{S(90),S(31),S(260),S(60)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
+    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(255,255,255))); StrokeRound(g,{S(1),S(1),c.right-S(1),c.bottom-S(1)},Sf(11),RGB(216,225,219),255);
+    DrawText(g,L"\u8f7b\u9605PDF",{S(40),S(31),S(260),S(60)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
     if(g_page==Page::Welcome) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
@@ -153,7 +162,7 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u9009\u62e9\u5b89\u88c5\u4f4d\u7f6e\u548c\u5feb\u6377\u65b9\u5f0f\u8bbe\u7f6e",{S(42),S(162),c.right-S(40),S(190)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(40),S(202),S(180),S(222)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         FillRound(g,g_editFrame,Sf(7),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(7),g_pathFocused?RGB(48,164,118):RGB(210,221,215),g_pathFocused?235:220); DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
-        DrawCheckbox(g,g_desktop,g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop); DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{S(66),S(286),S(330),S(320)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawCheckbox(g,g_desktop,g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop); DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{S(70),S(286),S(360),S(322)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_primary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); return;
     }
     if(g_page==Page::Installing) {
@@ -168,7 +177,7 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
         g.DrawLine(&p,Sf(57),Sf(149),Sf(64),Sf(157)); g.DrawLine(&p,Sf(64),Sf(157),Sf(78),Sf(141));
         DrawText(g,L"\u5b89\u88c5\u5b8c\u6210",{S(126),S(124),c.right-S(40),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u8f7b\u9605PDF \u5df2\u51c6\u5907\u5c31\u7eea\u3002",{S(128),S(176),c.right-S(40),S(208)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawCheckbox(g,g_launch,g_launchAfterInstall,g_hover==Hot::Launch||g_pressed==Hot::Launch); DrawText(g,L"\u5b8c\u6210\u540e\u6253\u5f00\u8f7b\u9605PDF",{S(66),S(286),S(330),S(320)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawCheckbox(g,g_launch,g_launchAfterInstall,g_hover==Hot::Launch||g_pressed==Hot::Launch); DrawText(g,L"\u5b8c\u6210\u540e\u6253\u5f00\u8f7b\u9605PDF",{S(70),S(286),S(360),S(322)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_primary,L"\u5b8c\u6210",Hot::Primary,true); return;
     }
     DrawText(g,L"\u672a\u80fd\u5b8c\u6210\u5b89\u88c5",{S(40),S(126),c.right-S(40),S(176)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
