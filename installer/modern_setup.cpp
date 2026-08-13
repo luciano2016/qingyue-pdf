@@ -36,7 +36,7 @@ constexpr UINT_PTR kTimer = 1;
 constexpr int kPathEdit = 1001;
 
 enum class Page { Welcome, Options, Installing, Complete, Failed, UninstallConfirm, Uninstalling, UninstallComplete, UninstallFailed };
-enum class Hot { None, Minimize, Close, Back, Primary, Browse, Desktop, DeleteData, Launch };
+enum class Hot { None, Minimize, Close, Back, Primary, WelcomeCancel, OptionsCancel, Browse, Desktop, DeleteData, Launch };
 struct InstallResult { bool success; std::wstring error; };
 struct ProgressMessage { int percent; std::wstring text; };
 struct CabinetContext { std::filesystem::path target; };
@@ -52,7 +52,7 @@ ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
-RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{};
+RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_uninstallMode = false, g_uninstallWorker = false, g_deleteAppData = true;
 bool g_pathFocused = false;
@@ -114,6 +114,7 @@ void Layout(HWND h) {
     g_close={c.right-S(14)-S(kWindowButtonSize),S(18),c.right-S(14),S(18)+S(kWindowButtonSize)};
     g_minimize={g_close.left-S(kWindowButtonGap)-S(kWindowButtonSize),g_close.top,g_close.left-S(kWindowButtonGap),g_close.bottom}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
     g_primary={c.right-S(176),c.bottom-S(74),c.right-S(38),c.bottom-S(36)};
+    g_welcomeCancel=g_primary; g_welcomePrimary={c.right-S(324),c.bottom-S(74),c.right-S(186),c.bottom-S(36)}; g_optionsCancel=g_primary;
     g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
     g_desktop={S(40),S(286),S(350),S(320)}; g_deleteData={S(40),S(250),S(520),S(286)}; g_launch=g_desktop;
     if(g_pathEdit) {
@@ -221,7 +222,7 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
         DrawText(g,L"\u7248\u672c 0.3.1    Windows 10 / 11    x64",{S(44),S(265),c.right-S(40),S(293)},g_smallFont,RGB(139,151,144),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawButton(g,g_primary,L"\u7ee7\u7eed",Hot::Primary,true); return;
+        DrawButton(g,g_welcomePrimary,L"\u7ee7\u7eed",Hot::Primary,true); DrawButton(g,g_welcomeCancel,L"\u53d6\u6d88",Hot::WelcomeCancel,false); return;
     }
     if(g_page==Page::Options) {
         DrawText(g,L"\u5b89\u88c5\u9009\u9879",{S(40),S(108),c.right-S(40),S(148)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -229,7 +230,7 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(40),S(202),S(180),S(222)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         FillRound(g,g_editFrame,Sf(7),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(7),g_pathFocused?RGB(48,164,118):RGB(210,221,215),g_pathFocused?235:220); DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
         DrawCheckbox(g,g_desktop,g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop); DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{S(70),S(286),S(360),S(322)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_primary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); return;
+        DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_welcomePrimary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
     }
     if(g_page==Page::Installing) {
         DrawText(g,L"\u6b63\u5728\u5b89\u88c5",{S(40),S(126),c.right-S(40),S(176)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -259,8 +260,8 @@ Hot HotAt(POINT p) {
     if(Hit(g_minimize,p))return Hot::Minimize; if(Hit(g_close,p))return Hot::Close;
     if(g_page==Page::UninstallConfirm){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_deleteData,p))return Hot::DeleteData;return Hot::None;}
     if(g_page==Page::UninstallComplete||g_page==Page::UninstallFailed)return Hit(g_primary,p)?Hot::Primary:Hot::None;
-    if(g_page==Page::Welcome)return Hit(g_primary,p)?Hot::Primary:Hot::None;
-    if(g_page==Page::Options){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
+    if(g_page==Page::Welcome){if(Hit(g_welcomePrimary,p))return Hot::Primary;if(Hit(g_welcomeCancel,p))return Hot::WelcomeCancel;return Hot::None;}
+    if(g_page==Page::Options){if(Hit(g_back,p))return Hot::Back;if(Hit(g_welcomePrimary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
     if(g_page==Page::Complete){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_launch,p))return Hot::Launch;}
     if(g_page==Page::Failed){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;} return Hot::None;
 }
@@ -338,37 +339,39 @@ std::vector<DWORD> RunningAppProcesses(const std::filesystem::path& installDir) 
     CloseHandle(snapshot);
     return result;
 }
-bool WaitForAppExit(const std::filesystem::path& installDir,DWORD timeoutMs) {
-    DWORD start=GetTickCount();
-    do {
-        if(RunningAppProcesses(installDir).empty())return true;
-        Sleep(50);
-    }while(GetTickCount()-start<timeoutMs);
-    return RunningAppProcesses(installDir).empty();
+bool AppIsRunning(const std::filesystem::path& installDir) {
+    return !installDir.empty()&&!RunningAppProcesses(installDir).empty();
 }
-bool CloseRunningApp(const std::filesystem::path& installDir) {
-    if(installDir.empty())return true;
-    auto running=RunningAppProcesses(installDir);
-    HWND found=nullptr;
-    while((found=FindWindowExW(nullptr,found,L"XiaoYuePDFWindow",nullptr))!=nullptr) {
-        DWORD pid=0;GetWindowThreadProcessId(found,&pid);
-        if(std::find(running.begin(),running.end(),pid)!=running.end())PostMessageW(found,WM_CLOSE,0,0);
+bool PromptForAppClose(HWND owner,const std::vector<std::filesystem::path>& installDirs,bool uninstalling) {
+    for(;;) {
+        bool running=false;
+        for(size_t i=0;i<installDirs.size();++i) {
+            if(installDirs[i].empty())continue;
+            bool duplicate=false;
+            for(size_t j=0;j<i;++j)if(SamePath(installDirs[i],installDirs[j])){duplicate=true;break;}
+            if(!duplicate&&AppIsRunning(installDirs[i])){running=true;break;}
+        }
+        if(!running)return true;
+        const wchar_t* message=uninstalling
+            ? L"\u8f7b\u9605PDF \u6b63\u5728\u8fd0\u884c\uff0c\u65e0\u6cd5\u7ee7\u7eed\u5378\u8f7d\u3002\n\n\u8bf7\u5148\u5173\u95ed\u6240\u6709\u8f7b\u9605PDF \u7a97\u53e3\uff0c\u7136\u540e\u70b9\u51fb\u201c\u91cd\u8bd5\u201d\u3002\n\u70b9\u51fb\u201c\u53d6\u6d88\u201d\u8fd4\u56de\u5378\u8f7d\u754c\u9762\u3002"
+            : L"\u8f7b\u9605PDF \u6b63\u5728\u8fd0\u884c\uff0c\u65e0\u6cd5\u7ee7\u7eed\u5b89\u88c5\u3002\n\n\u8bf7\u5148\u5173\u95ed\u6240\u6709\u8f7b\u9605PDF \u7a97\u53e3\uff0c\u7136\u540e\u70b9\u51fb\u201c\u91cd\u8bd5\u201d\u3002\n\u70b9\u51fb\u201c\u53d6\u6d88\u201d\u8fd4\u56de\u5b89\u88c5\u754c\u9762\u3002";
+        const wchar_t* title=uninstalling?L"\u65e0\u6cd5\u7ee7\u7eed\u5378\u8f7d":L"\u65e0\u6cd5\u7ee7\u7eed\u5b89\u88c5";
+        if(MessageBoxW(owner,message,title,MB_RETRYCANCEL|MB_ICONWARNING|MB_DEFBUTTON1)!=IDRETRY)return false;
     }
-    if(WaitForAppExit(installDir,5000))return true;
-    for(DWORD pid:RunningAppProcesses(installDir)) {
-        HANDLE process=OpenProcess(PROCESS_TERMINATE|SYNCHRONIZE,FALSE,pid);
-        if(process){TerminateProcess(process,0);WaitForSingleObject(process,2000);CloseHandle(process);}
-    }
-    return WaitForAppExit(installDir,2000);
-}
-bool ReplaceFileFrom(const std::filesystem::path& source,const std::filesystem::path& target) {
+}bool ReplaceFileFrom(const std::filesystem::path& source,const std::filesystem::path& target) {
     std::filesystem::path pending=target;pending+=L".new";
     std::error_code ec;std::filesystem::copy_file(source,pending,std::filesystem::copy_options::overwrite_existing,ec);
     if(ec)return false;
     if(!MoveFileExW(pending.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) { DeleteFileW(pending.c_str()); return false; }
     return true;
 }
-bool StartUninstallWorker(const std::filesystem::path& installDir) {
+bool LooksLikeInstallDir(const std::filesystem::path& dir) {
+    if(dir.empty())return false;
+    std::error_code ec;
+    return std::filesystem::is_regular_file(dir/kExeName,ec)
+        ||std::filesystem::is_regular_file(dir/kDllName,ec)
+        ||std::filesystem::is_regular_file(dir/kUninstallName,ec);
+}bool StartUninstallWorker(const std::filesystem::path& installDir) {
     auto source=ModulePath();
     if(source.empty())return false;
     auto worker=std::filesystem::temp_directory_path()/(L"QingYuePDF-Uninstall-"+std::to_wstring(GetCurrentProcessId())+L".exe");
@@ -419,10 +422,9 @@ std::wstring InstallPackage(const std::filesystem::path& request,bool desktop) {
         CabinetContext context{staging};
         if(!SetupIterateCabinetW(cab.c_str(),0,CabinetCallback,reinterpret_cast<LPVOID>(&context)))return L"\u5b89\u88c5\u6587\u4ef6\u89e3\u538b\u5931\u8d25\u3002";
         DeleteFileW(cab.c_str());
-        PostProgress(48,L"\u6b63\u5728\u5173\u95ed\u8fd0\u884c\u4e2d\u7684\u8f7b\u9605PDF");
+        PostProgress(48,L"\u6b63\u5728\u68c0\u67e5\u8fd0\u884c\u72b6\u6001");
         auto previousDir=RegisteredInstallDir();
-        if(!SamePath(previousDir,dir)&&!CloseRunningApp(previousDir))return L"\u65e0\u6cd5\u5173\u95ed\u6b63\u5728\u8fd0\u884c\u7684\u8f7b\u9605PDF\uff0c\u8bf7\u624b\u52a8\u5173\u95ed\u540e\u91cd\u8bd5\u3002";
-        if(!CloseRunningApp(dir))return L"\u65e0\u6cd5\u5173\u95ed\u6b63\u5728\u8fd0\u884c\u7684\u8f7b\u9605PDF\uff0c\u8bf7\u624b\u52a8\u5173\u95ed\u540e\u91cd\u8bd5\u3002";
+        if((!SamePath(previousDir,dir)&&AppIsRunning(previousDir))||AppIsRunning(dir))return L"\u8f7b\u9605PDF \u4ecd\u5728\u8fd0\u884c\uff0c\u8bf7\u5173\u95ed\u540e\u91cd\u8bd5\u3002";
         std::filesystem::create_directories(dir);
         PostProgress(62,L"\u6b63\u5728\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6");
         auto exe=dir/kExeName;
@@ -441,8 +443,8 @@ std::wstring UninstallPackage(bool deleteAppData) {
     try {
         auto dir=g_uninstallDir.empty()?RegisteredInstallDir():g_uninstallDir;
         if(dir.empty())return L"\u65e0\u6cd5\u786e\u5b9a\u8f7b\u9605PDF \u7684\u5b89\u88c5\u4f4d\u7f6e\u3002";
-        PostProgress(8,L"\u6b63\u5728\u5173\u95ed\u8fd0\u884c\u4e2d\u7684\u8f7b\u9605PDF");
-        if(!CloseRunningApp(dir))return L"\u65e0\u6cd5\u5173\u95ed\u6b63\u5728\u8fd0\u884c\u7684\u8f7b\u9605PDF\uff0c\u8bf7\u624b\u52a8\u5173\u95ed\u540e\u91cd\u8bd5\u3002";
+        PostProgress(8,L"\u6b63\u5728\u68c0\u67e5\u8fd0\u884c\u72b6\u6001");
+        if(AppIsRunning(dir))return L"\u8f7b\u9605PDF \u4ecd\u5728\u8fd0\u884c\uff0c\u8bf7\u5173\u95ed\u540e\u91cd\u8bd5\u3002";
         PostProgress(22,L"\u6b63\u5728\u79fb\u9664\u5feb\u6377\u65b9\u5f0f");
         DeleteFileW(DesktopLink().c_str());
         DeleteFileW(StartLink().c_str());
@@ -506,10 +508,13 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(pressed==Hot::Close&&Hit(g_close,p)) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
         if(pressed==Hot::None||pressed!=HotAt(p)||g_installing) return 0;
         if(pressed==Hot::Minimize) { ShowWindow(h,SW_MINIMIZE); return 0; }
+        if(pressed==Hot::WelcomeCancel&&g_page==Page::Welcome) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
+        if(pressed==Hot::OptionsCancel&&g_page==Page::Options) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
         if(g_uninstallMode) {
             if(pressed==Hot::Back&&g_page==Page::UninstallConfirm) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
             if(pressed==Hot::DeleteData&&g_page==Page::UninstallConfirm) { g_deleteAppData=!g_deleteAppData; InvalidateRect(h,nullptr,FALSE); return 0; }
             if(pressed==Hot::Primary&&g_page==Page::UninstallConfirm) {
+                if(!PromptForAppClose(h,{g_uninstallDir},true))return 0;
                 g_page=Page::Uninstalling; g_installing=true; g_progress=g_targetProgress=0; g_stage=L"\u6b63\u5728\u51c6\u5907"; SetTimer(h,kTimer,16,nullptr);
                 std::thread([] { bool deleteData=g_deleteAppData; auto error=UninstallPackage(deleteData); PostMessageW(g_window,kMsgComplete,reinterpret_cast<WPARAM>(new InstallResult{error.empty(),error}),0); }).detach();
                 Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
@@ -520,8 +525,11 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(pressed==Hot::Primary) {
             if(g_page==Page::Welcome) { g_page=Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE); }
             else if(g_page==Page::Options) {
+                auto requestedPath=std::filesystem::path(WindowText(g_pathEdit));
+                auto absolutePath=requestedPath.empty()?requestedPath:std::filesystem::absolute(requestedPath);
+                if(!PromptForAppClose(h,{RegisteredInstallDir(),absolutePath},false))return 0;
                 g_page=Page::Installing; g_installing=true; g_progress=g_targetProgress=0; g_stage=L"\u6b63\u5728\u51c6\u5907"; Layout(h); SetTimer(h,kTimer,16,nullptr);
-                auto path=std::filesystem::path(WindowText(g_pathEdit)); bool desktop=g_desktopShortcut;
+                auto path=std::move(requestedPath); bool desktop=g_desktopShortcut;
                 std::thread([path,desktop] { auto error=InstallPackage(path,desktop); PostMessageW(g_window,kMsgComplete,reinterpret_cast<WPARAM>(new InstallResult{error.empty(),error}),0); }).detach(); InvalidateRect(h,nullptr,FALSE);
             } else if(g_page==Page::Complete) { if(g_launchAfterInstall) LaunchInstalled(); PostMessageW(h,WM_CLOSE,0,0); }
             else if(g_page==Page::Failed) { g_page=Page::Options; g_error.clear(); Layout(h); InvalidateRect(h,nullptr,FALSE); }
@@ -563,7 +571,8 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     wchar_t modulePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr,modulePath,MAX_PATH);
     std::filesystem::path moduleName(modulePath);
-    g_uninstallMode=_wcsicmp(moduleName.filename().c_str(),kUninstallName)==0;
+    const bool launchedFromInstalledUninstaller=_wcsicmp(moduleName.filename().c_str(),kUninstallName)==0;
+    g_uninstallMode=launchedFromInstalledUninstaller;
     int argc=0;
     PWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     for(int i=1;argv&&i<argc;++i) {
@@ -573,7 +582,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     }
     if(argv) LocalFree(argv);
     if(g_uninstallMode&&!g_uninstallWorker) {
-        g_uninstallDir=RegisteredInstallDir();
+        auto registeredDir=RegisteredInstallDir();
+        auto sourceDir=moduleName.parent_path();
+        g_uninstallDir=launchedFromInstalledUninstaller&&LooksLikeInstallDir(sourceDir)?sourceDir:registeredDir;
         const bool started=StartUninstallWorker(g_uninstallDir);
         Gdiplus::GdiplusShutdown(g_gdiplusToken);
         CoUninitialize();
