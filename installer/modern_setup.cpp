@@ -36,6 +36,8 @@ constexpr UINT kMsgProgress = WM_APP + 31;
 constexpr UINT kMsgComplete = WM_APP + 32;
 constexpr UINT_PTR kTimer = 1;
 constexpr int kPathEdit = 1001;
+constexpr ULONGLONG kEstimatedInstalledBytes =
+    1044992ULL + 18015744ULL + 178616ULL + 258560ULL;
 
 enum class Page { Welcome, Options, Installing, Complete, Failed, UninstallConfirm, Uninstalling, UninstallComplete, UninstallFailed };
 enum class Hot { None, Minimize, Close, Back, Primary, WelcomeCancel, OptionsCancel, Browse, Desktop, DeleteData, Launch };
@@ -49,6 +51,7 @@ struct DirectoryCleanup {
 
 HINSTANCE g_instance{};
 HWND g_window{}, g_pathEdit{};
+HICON g_headerIcon{};
 HFONT g_uiFont{}, g_smallFont{}, g_titleFont{}, g_displayFont{};
 ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
@@ -61,6 +64,7 @@ bool g_pathFocused = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
 int g_shine = 0;
 std::wstring g_stage, g_error;
+std::wstring g_spacePath, g_availableSpaceText;
 std::filesystem::path g_installedDir;
 std::filesystem::path g_uninstallDir;
 
@@ -94,6 +98,40 @@ std::filesystem::path StartFolder() { return KnownFolder(FOLDERID_StartMenu)/L"P
 std::filesystem::path StartLink() { return StartFolder()/(std::wstring(kAppName)+L".lnk"); }
 std::wstring WindowText(HWND h) {
     int n=GetWindowTextLengthW(h); std::wstring s(static_cast<size_t>(n+1),L'\0'); GetWindowTextW(h,s.data(),n+1); s.resize(n); return s;
+}
+std::wstring FormatStorageSize(ULONGLONG bytes,bool megabytes) {
+    const double unit=megabytes?1024.0*1024.0:1024.0*1024.0*1024.0;
+    wchar_t value[48]{};
+    swprintf_s(value,L"%.1f %s",static_cast<double>(bytes)/unit,megabytes?L"MB":L"GB");
+    return value;
+}
+bool AvailableSpaceForPath(std::filesystem::path path,ULONGLONG& bytes) {
+    if(path.empty())return false;
+    std::error_code ec;
+    path=std::filesystem::absolute(path,ec);
+    if(ec)return false;
+    while(!path.empty()&&!std::filesystem::exists(path,ec)) {
+        ec.clear();
+        auto parent=path.parent_path();
+        if(parent==path)break;
+        path=std::move(parent);
+    }
+    if(path.empty()||ec)return false;
+    if(!std::filesystem::is_directory(path,ec))path=path.parent_path();
+    ULARGE_INTEGER available{},total{},free{};
+    if(path.empty()||!GetDiskFreeSpaceExW(path.c_str(),&available,&total,&free))return false;
+    bytes=available.QuadPart;
+    return true;
+}
+const std::wstring& AvailableSpaceText() {
+    const std::wstring path=WindowText(g_pathEdit);
+    if(path==g_spacePath&&!g_availableSpaceText.empty())return g_availableSpaceText;
+    g_spacePath=path;
+    ULONGLONG bytes=0;
+    g_availableSpaceText=AvailableSpaceForPath(path,bytes)
+        ?FormatStorageSize(bytes,bytes<1024ULL*1024ULL*1024ULL)
+        :L"\u65e0\u6cd5\u83b7\u53d6";
+    return g_availableSpaceText;
 }
 void MakeFonts() {
     for (HFONT* f:{&g_uiFont,&g_smallFont,&g_titleFont,&g_displayFont}) { if(*f) DeleteObject(*f); *f=nullptr; }
@@ -142,7 +180,8 @@ void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags)
 }
 void DrawText(Gdiplus::Graphics& g,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) { HDC dc=g.GetHDC(); DrawText(dc,s,r,f,c,flags); g.ReleaseHDC(dc); }
 void DrawLogo(Gdiplus::Graphics& g) {
-    // The installer uses a wordmark; a checkmark is reserved for completion state.
+    if(!g_headerIcon)return;
+    HDC dc=g.GetHDC();DrawIconEx(dc,S(48),S(37),g_headerIcon,S(30),S(30),0,nullptr,DI_NORMAL);g.ReleaseHDC(dc);
 }
 void DrawClose(Gdiplus::Graphics& g) {
     const bool hover = g_hover==Hot::Close;
@@ -191,7 +230,7 @@ void DrawProgress(Gdiplus::Graphics& g,RECT r) {
 }
 void DrawPage(Gdiplus::Graphics& g,RECT c) {
     COLORREF text=RGB(39,53,46), muted=RGB(105,122,112); g.Clear(Gc(RGB(245,248,246))); Gdiplus::SolidBrush header(Gc(RGB(235,244,239))); g.FillRectangle(&header,0,0,c.right,S(88)); Gdiplus::SolidBrush footer(Gc(RGB(248,250,249))); g.FillRectangle(&footer,0,c.bottom-S(92),c.right,S(92)); Gdiplus::Pen divider(Gc(RGB(220,231,224)),Sf(1.0f)); g.DrawLine(&divider,0.0f,Sf(88),static_cast<float>(c.right),Sf(88));
-    DrawText(g,L"\u8f7b\u9605PDF",{S(52),S(28),S(260),S(58)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawText(g,L"PDF \u9605\u8bfb\u5668",{S(52),S(55),S(190),S(76)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawMinimize(g); DrawClose(g);
+    DrawLogo(g); DrawText(g,L"\u8f7b\u9605PDF",{S(90),S(28),S(298),S(58)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawText(g,L"PDF \u9605\u8bfb\u5668",{S(90),S(55),S(228),S(76)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawMinimize(g); DrawClose(g);
     if(g_uninstallMode) {
         if(g_page==Page::UninstallConfirm) {
             DrawText(g,L"\u5378\u8f7d\u8f7b\u9605PDF",{S(40),S(128),c.right-S(40),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -232,6 +271,8 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(40),S(202),S(180),S(222)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         FillRound(g,g_editFrame,Sf(7),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(7),g_pathFocused?RGB(48,164,118):RGB(210,221,215),g_pathFocused?235:220); DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
         DrawCheckbox(g,g_desktop,g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop); DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{S(70),S(286),S(360),S(322)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u6240\u9700\u7a7a\u95f4\uff1a"+FormatStorageSize(kEstimatedInstalledBytes,true),{S(42),S(326),S(260),S(345)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u53ef\u7528\u7a7a\u95f4\uff1a"+AvailableSpaceText(),{S(42),S(347),S(300),S(366)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_welcomePrimary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
     }
     if(g_page==Page::Installing) {
@@ -567,6 +608,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         static HBRUSH brush=CreateSolidBrush(RGB(255,255,255)); return reinterpret_cast<LRESULT>(brush);
     }
     case WM_COMMAND:
+        if(LOWORD(w)==kPathEdit&&HIWORD(w)==EN_CHANGE) { g_spacePath.clear(); g_availableSpaceText.clear(); InvalidateRect(h,nullptr,FALSE); return 0; }
         if(LOWORD(w)==kPathEdit&&(HIWORD(w)==EN_SETFOCUS||HIWORD(w)==EN_KILLFOCUS)) { g_pathFocused=HIWORD(w)==EN_SETFOCUS; InvalidateRect(h,nullptr,FALSE); return 0; }
         return 0;
     case WM_MOUSEMOVE: UpdateHover(h,{GET_X_LPARAM(l),GET_Y_LPARAM(l)}); return 0;
@@ -629,12 +671,12 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
     }
     case WM_CLOSE: if(g_installing)return 0; DestroyWindow(h); return 0;
-    case WM_DESTROY: for(HFONT font:{g_uiFont,g_smallFont,g_titleFont,g_displayFont})if(font)DeleteObject(font); if(g_uninstallWorker&&g_page==Page::UninstallComplete)DeleteUninstallWorkerAfterExit(); PostQuitMessage(0); return 0;
+    case WM_DESTROY: for(HFONT font:{g_uiFont,g_smallFont,g_titleFont,g_displayFont})if(font)DeleteObject(font); if(g_headerIcon){DestroyIcon(g_headerIcon);g_headerIcon=nullptr;} if(g_uninstallWorker&&g_page==Page::UninstallComplete)DeleteUninstallWorkerAfterExit(); PostQuitMessage(0); return 0;
     default: return DefWindowProcW(h,m,w,l);
     }
 }
 int ShowWizard(HINSTANCE instance,int show) {
-    g_instance=instance;g_page=g_uninstallMode?Page::UninstallConfirm:Page::Welcome;g_dpi=GetDpiForSystem();WNDCLASSW wc{};wc.style=CS_DBLCLKS|CS_DROPSHADOW;wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
+    g_instance=instance;g_page=g_uninstallMode?Page::UninstallConfirm:Page::Welcome;g_dpi=GetDpiForSystem();g_headerIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_APP_ICON),IMAGE_ICON,S(30),S(30),LR_DEFAULTCOLOR));WNDCLASSW wc{};wc.style=CS_DBLCLKS|CS_DROPSHADOW;wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
     HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(680),S(470),nullptr,nullptr,instance,nullptr);if(!h)return 1;ApplyWindowChrome(h);RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(680))/2,work.top+(work.bottom-work.top-S(470))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
 }
 }
