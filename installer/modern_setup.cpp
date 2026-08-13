@@ -109,13 +109,20 @@ void Layout(HWND h) {
     g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
     g_desktop={S(40),S(286),S(350),S(320)}; g_launch=g_desktop;
     if(g_pathEdit) {
-        const int inset = S(4);
-        const int width = g_editFrame.right-g_editFrame.left-S(24);
-        const int height = g_editFrame.bottom-g_editFrame.top-S(2*inset);
-        MoveWindow(g_pathEdit,g_editFrame.left+S(12),g_editFrame.top+inset,width,height,TRUE);
+        HDC dc=GetDC(g_pathEdit);
+        HGDIOBJ oldFont=SelectObject(dc,g_uiFont);
+        TEXTMETRICW metrics{};
+        GetTextMetricsW(dc,&metrics);
+        SelectObject(dc,oldFont);
+        ReleaseDC(g_pathEdit,dc);
+
+        const int width=g_editFrame.right-g_editFrame.left-S(24);
+        const int frameHeight=g_editFrame.bottom-g_editFrame.top;
+        const int textHeight=static_cast<int>(metrics.tmHeight);
+        const int height=std::min(frameHeight-S(6),textHeight+S(6));
+        const int top=g_editFrame.top+(frameHeight-height)/2+S(2);
+        MoveWindow(g_pathEdit,g_editFrame.left+S(12),top,width,height,TRUE);
         SendMessageW(g_pathEdit,EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,MAKELONG(S(2),S(2)));
-        RECT format{S(2),S(3),width-S(2),height-S(3)};
-        SendMessageW(g_pathEdit,EM_SETRECTNP,0,reinterpret_cast<LPARAM>(&format));
         ShowWindow(g_pathEdit,g_page==Page::Options?SW_SHOW:SW_HIDE);
     }
 }
