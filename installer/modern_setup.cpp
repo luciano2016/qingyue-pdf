@@ -1,6 +1,7 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <windowsx.h>
+#include <dwmapi.h>
 #include <objbase.h>
 #include <gdiplus.h>
 #include <setupapi.h>
@@ -47,6 +48,7 @@ Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
 RECT g_close{}, g_back{}, g_primary{}, g_browse{}, g_desktop{}, g_launch{}, g_editFrame{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
+bool g_pathFocused = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
 int g_shine = 0;
 std::wstring g_stage, g_error;
@@ -89,13 +91,23 @@ void MakeFonts() {
     g_uiFont=make(10,FW_NORMAL); g_smallFont=make(8,FW_NORMAL); g_titleFont=make(15,FW_SEMIBOLD); g_displayFont=make(20,FW_SEMIBOLD);
     if(g_pathEdit) SendMessageW(g_pathEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_uiFont),TRUE);
 }
+void ApplyWindowChrome(HWND h) {
+    const BOOL enabled = TRUE;
+    DwmSetWindowAttribute(h, DWMWA_NCRENDERING_ENABLED, &enabled, sizeof(enabled));
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+    const BOOL darkMode = FALSE;
+    DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
+    MARGINS frame{1, 1, 1, 1};
+    DwmExtendFrameIntoClientArea(h, &frame);
+}
 void Layout(HWND h) {
     RECT c{}; GetClientRect(h,&c);
-    g_close={c.right-S(54),0,c.right,S(48)}; g_back={S(38),c.bottom-S(66),S(116),c.bottom-S(28)};
-    g_primary={c.right-S(168),c.bottom-S(66),c.right-S(38),c.bottom-S(28)};
+    g_close={c.right-S(62),S(8),c.right-S(8),S(54)}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
+    g_primary={c.right-S(176),c.bottom-S(74),c.right-S(38),c.bottom-S(36)};
     g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
     g_desktop={S(40),S(286),S(350),S(320)}; g_launch=g_desktop;
-    if(g_pathEdit) { MoveWindow(g_pathEdit,g_editFrame.left+S(12),g_editFrame.top+S(4),g_editFrame.right-g_editFrame.left-S(24),g_editFrame.bottom-g_editFrame.top-S(8),TRUE); ShowWindow(g_pathEdit,g_page==Page::Options?SW_SHOW:SW_HIDE); }
+    if(g_pathEdit) { MoveWindow(g_pathEdit,g_editFrame.left+S(12),g_editFrame.top+S(5),g_editFrame.right-g_editFrame.left-S(24),g_editFrame.bottom-g_editFrame.top-S(10),TRUE); ShowWindow(g_pathEdit,g_page==Page::Options?SW_SHOW:SW_HIDE); }
 }
 void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) {
     HGDIOBJ old=SelectObject(dc,f); SetBkMode(dc,TRANSPARENT); SetTextColor(dc,c); DrawTextW(dc,s.c_str(),static_cast<int>(s.size()),&r,flags); SelectObject(dc,old);
@@ -128,7 +140,7 @@ void DrawProgress(Gdiplus::Graphics& g,RECT r) {
     FillRound(g,f,Sf(5),RGB(48,164,118)); RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(190,241,220),70);
 }
 void DrawPage(Gdiplus::Graphics& g,RECT c) {
-    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(250,249,246))); DrawLogo(g);
+    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(229,235,231))); FillRound(g,{S(5),S(5),c.right-S(5),c.bottom-S(5)},Sf(14),RGB(238,243,240)); FillRound(g,{S(8),S(8),c.right-S(8),c.bottom-S(8)},Sf(12),RGB(255,255,255)); StrokeRound(g,{S(8),S(8),c.right-S(8),c.bottom-S(8)},Sf(12),RGB(220,228,223),230); DrawLogo(g);
     DrawText(g,L"\u8f7b\u9605PDF",{S(90),S(31),S(260),S(60)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
     if(g_page==Page::Welcome) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -140,7 +152,7 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u5b89\u88c5\u9009\u9879",{S(40),S(108),c.right-S(40),S(148)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u9009\u62e9\u5b89\u88c5\u4f4d\u7f6e\u548c\u5feb\u6377\u65b9\u5f0f\u8bbe\u7f6e",{S(42),S(162),c.right-S(40),S(190)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(40),S(202),S(180),S(222)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        FillRound(g,g_editFrame,Sf(7),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(7),RGB(214,223,218)); DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
+        FillRound(g,g_editFrame,Sf(7),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(7),g_pathFocused?RGB(48,164,118):RGB(210,221,215),g_pathFocused?235:220); DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
         DrawCheckbox(g,g_desktop,g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop); DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{S(66),S(286),S(330),S(320)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_primary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); return;
     }
@@ -224,9 +236,10 @@ int Uninstall() {
 }
 LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     switch(m){
-    case WM_CREATE:g_window=h;g_dpi=GetDpiForWindow(h);MakeFonts();g_pathEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",DefaultInstallDir().c_str(),WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,h,reinterpret_cast<HMENU>(kPathEdit),g_instance,nullptr);SendMessageW(g_pathEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_uiFont),TRUE);Layout(h);return 0;
+    case WM_CREATE:g_window=h;g_dpi=GetDpiForWindow(h);MakeFonts();g_pathEdit=CreateWindowExW(0,L"EDIT",RegisteredInstallDir().c_str(),WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,h,reinterpret_cast<HMENU>(kPathEdit),g_instance,nullptr);SendMessageW(g_pathEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_uiFont),TRUE);Layout(h);return 0;
     case WM_PAINT:Paint(h);return 0;case WM_ERASEBKGND:return 1;case WM_SIZE:Layout(h);InvalidateRect(h,nullptr,FALSE);return 0;
-    case WM_CTLCOLOREDIT:{HDC dc=reinterpret_cast<HDC>(w);SetTextColor(dc,RGB(46,60,52));SetBkColor(dc,RGB(255,255,255));static HBRUSH b=CreateSolidBrush(RGB(255,255,255));return reinterpret_cast<LRESULT>(b);}
+    case WM_CTLCOLOREDIT:{HDC dc=reinterpret_cast<HDC>(w);SetTextColor(dc,RGB(46,60,52));SetBkColor(dc,RGB(255,255,255));SetBkMode(dc,OPAQUE);static HBRUSH b=CreateSolidBrush(RGB(255,255,255));return reinterpret_cast<LRESULT>(b);}
+    case WM_COMMAND:if(LOWORD(w)==kPathEdit&&(HIWORD(w)==EN_SETFOCUS||HIWORD(w)==EN_KILLFOCUS)){g_pathFocused=HIWORD(w)==EN_SETFOCUS;InvalidateRect(h,nullptr,FALSE);return 0;}return 0;
     case WM_MOUSEMOVE:UpdateHover(h,{GET_X_LPARAM(l),GET_Y_LPARAM(l)});return 0;case WM_MOUSELEAVE:g_hover=Hot::None;InvalidateRect(h,nullptr,FALSE);return 0;case WM_SETCURSOR:SetCursor(LoadCursorW(nullptr,IDC_ARROW));return TRUE;
     case WM_LBUTTONDOWN:{POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};Hot hot=HotAt(p);if(hot!=Hot::None){g_pressed=hot;SetCapture(h);InvalidateRect(h,nullptr,FALSE);return 0;}if(!g_installing&&p.y<S(78)){ReleaseCapture();SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0);}return 0;}
     case WM_LBUTTONUP:{POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};Hot pressed=g_pressed;g_pressed=Hot::None;ReleaseCapture();if(pressed==Hot::Close&&Hit(g_close,p)){PostMessageW(h,WM_CLOSE,0,0);return 0;}if(pressed==Hot::None||pressed!=HotAt(p)||g_installing)return 0;
@@ -238,8 +251,8 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_CLOSE:if(g_installing)return 0;DestroyWindow(h);return 0;case WM_DESTROY:for(HFONT f:{g_uiFont,g_smallFont,g_titleFont,g_displayFont})if(f)DeleteObject(f);PostQuitMessage(0);return 0;default:return DefWindowProcW(h,m,w,l);}
 }
 int ShowWizard(HINSTANCE instance,int show) {
-    g_instance=instance;g_dpi=GetDpiForSystem();WNDCLASSW wc{};wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
-    HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(680),S(470),nullptr,nullptr,instance,nullptr);if(!h)return 1;RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(680))/2,work.top+(work.bottom-work.top-S(470))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
+    g_instance=instance;g_dpi=GetDpiForSystem();WNDCLASSW wc{};wc.style=CS_DBLCLKS|CS_DROPSHADOW;wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
+    HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(680),S(470),nullptr,nullptr,instance,nullptr);if(!h)return 1;ApplyWindowChrome(h);RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(680))/2,work.top+(work.bottom-work.top-S(470))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
 }
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
