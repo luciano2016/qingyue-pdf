@@ -3729,16 +3729,129 @@ namespace
     void ActivateTab(HWND hwnd, int index);
     void RestoreActiveTabSidebarState(HWND hwnd);
 
-    std::filesystem::path StatePath()
+    std::filesystem::path RoamingStorageDir()
     {
         PWSTR appData = nullptr;
-        if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData))) return L"quietpdf-state.txt";
-        std::filesystem::path p = appData;
+        if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData)))
+            return ExeDir() / L"Data";
+        std::filesystem::path value = appData;
         CoTaskMemFree(appData);
-        p /= L"QingYuePDF";
-        std::filesystem::create_directories(p);
-        p /= L"state.txt";
-        return p;
+        return value / L"QingYuePDF";
+    }
+
+    bool SameStoragePath(std::filesystem::path const& left, std::filesystem::path const& right)
+    {
+        std::error_code leftError, rightError;
+        auto leftPath = std::filesystem::absolute(left, leftError).lexically_normal().wstring();
+        auto rightPath = std::filesystem::absolute(right, rightError).lexically_normal().wstring();
+        return !leftError && !rightError && _wcsicmp(leftPath.c_str(), rightPath.c_str()) == 0;
+    }
+
+    bool DirectoryIsWritable(std::filesystem::path const& directory)
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        if (ec) return false;
+        auto probe = directory / (L".quietpdf-write-test-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+        HANDLE file = CreateFileW(probe.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (file == INVALID_HANDLE_VALUE) return false;
+        CloseHandle(file);
+        return true;
+    }
+
+    bool FileIsNewerOrMissing(std::filesystem::path const& source, std::filesystem::path const& target)
+    {
+        std::error_code sourceError, targetError;
+        if (!std::filesystem::exists(target, targetError)) return true;
+        auto sourceTime = std::filesystem::last_write_time(source, sourceError);
+        auto targetTime = std::filesystem::last_write_time(target, targetError);
+        return !sourceError && !targetError && sourceTime > targetTime;
+    }
+
+    bool MigrateStorageFile(std::filesystem::path const& source, std::filesystem::path const& target)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(source, ec)) return true;
+        std::filesystem::create_directories(target.parent_path(), ec);
+        if (ec) return false;
+        if (FileIsNewerOrMissing(source, target))
+        {
+            ec.clear();
+            std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) return false;
+        }
+        ec.clear();
+        std::filesystem::remove(source, ec);
+        return !ec;
+    }
+
+    bool MigrateStorageDirectory(std::filesystem::path const& source, std::filesystem::path const& target)
+    {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(source, ec)) return true;
+        std::filesystem::create_directories(target, ec);
+        if (ec) return false;
+        bool copied = true;
+        for (std::filesystem::recursive_directory_iterator it(source, ec), end; !ec && it != end; it.increment(ec))
+        {
+            auto relative = std::filesystem::relative(it->path(), source, ec);
+            if (ec) { copied = false; break; }
+            auto destination = target / relative;
+            if (it->is_directory(ec))
+            {
+                std::filesystem::create_directories(destination, ec);
+                if (ec) { copied = false; break; }
+            }
+            else if (it->is_regular_file(ec) && FileIsNewerOrMissing(it->path(), destination))
+            {
+                std::filesystem::create_directories(destination.parent_path(), ec);
+                if (!ec) std::filesystem::copy_file(it->path(), destination, std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) { copied = false; break; }
+            }
+        }
+        if (!copied || ec) return false;
+        std::filesystem::remove_all(source, ec);
+        return !ec;
+    }
+
+    struct AppStoragePaths
+    {
+        std::filesystem::path data;
+        std::filesystem::path homeThumbs;
+    };
+
+    AppStoragePaths const& StoragePaths()
+    {
+        static const AppStoragePaths paths = []
+        {
+            auto roaming = RoamingStorageDir();
+            AppStoragePaths selected{ ExeDir() / L"Data", ExeDir() / L"Cache" / L"HomeThumbs" };
+            auto roamingFallback = [&]
+            {
+                DirectoryIsWritable(roaming);
+                DirectoryIsWritable(roaming / L"thumbs");
+                return AppStoragePaths{ roaming, roaming / L"thumbs" };
+            };
+            if (!DirectoryIsWritable(selected.data) || !DirectoryIsWritable(selected.homeThumbs))
+                return roamingFallback();
+
+            if (!SameStoragePath(selected.data, roaming))
+            {
+                if (!MigrateStorageFile(roaming / L"state.txt", selected.data / L"state.txt"))
+                    return roamingFallback();
+                MigrateStorageDirectory(roaming / L"thumbs", selected.homeThumbs);
+                std::error_code ec;
+                std::filesystem::remove(roaming, ec);
+            }
+            return selected;
+        }();
+        return paths;
+    }
+
+    std::filesystem::path StatePath()
+    {
+        return StoragePaths().data / L"state.txt";
     }
 
     std::vector<std::string> SplitTabLine(std::string const& text)
@@ -3933,26 +4046,7 @@ namespace
 
     std::filesystem::path HomeThumbCacheDir()
     {
-        static const std::filesystem::path dir = []
-        {
-            PWSTR appData = nullptr;
-            std::filesystem::path value;
-            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appData)))
-            {
-                value = appData;
-                CoTaskMemFree(appData);
-            }
-            else
-            {
-                value = std::filesystem::current_path();
-            }
-            value /= L"QingYuePDF";
-            value /= L"thumbs";
-            std::error_code ec;
-            std::filesystem::create_directories(value, ec);
-            return value;
-        }();
-        return dir;
+        return StoragePaths().homeThumbs;
     }
 
     std::wstring HashWideForPath(std::wstring const& text)

@@ -310,6 +310,27 @@ UINT CALLBACK CabinetCallback(PVOID context, UINT note, UINT_PTR p1, UINT_PTR p2
     return note==SPFILENOTIFY_NEEDNEWCABINET?FILEOP_ABORT:NO_ERROR;
 }
 std::filesystem::path AppDataDir() { return KnownFolder(FOLDERID_RoamingAppData)/L"QingYuePDF"; }
+std::filesystem::path InstallDataDir(const std::filesystem::path& installDir) { return installDir/L"Data"; }
+bool PreserveInstalledData(const std::filesystem::path& installDir) {
+    auto source=InstallDataDir(installDir);
+    std::error_code ec;
+    if(!std::filesystem::is_directory(source,ec))return true;
+    auto target=AppDataDir();
+    std::filesystem::create_directories(target,ec);
+    if(ec)return false;
+    for(std::filesystem::recursive_directory_iterator it(source,ec),end;!ec&&it!=end;it.increment(ec)) {
+        auto relative=std::filesystem::relative(it->path(),source,ec);
+        if(ec)return false;
+        auto destination=target/relative;
+        if(it->is_directory(ec))std::filesystem::create_directories(destination,ec);
+        else if(it->is_regular_file(ec)) {
+            std::filesystem::create_directories(destination.parent_path(),ec);
+            if(!ec)std::filesystem::copy_file(it->path(),destination,std::filesystem::copy_options::overwrite_existing,ec);
+        }
+        if(ec)return false;
+    }
+    return !ec;
+}
 bool SamePath(const std::filesystem::path& a,const std::filesystem::path& b) {
     std::error_code ecA,ecB;
     auto left=std::filesystem::weakly_canonical(a,ecA).wstring();
@@ -469,6 +490,8 @@ std::wstring InstallPackage(const std::filesystem::path& request,bool desktop) {
         auto previousDir=RegisteredInstallDir();
         if((!SamePath(previousDir,dir)&&AppIsRunning(previousDir))||AppIsRunning(dir))return L"\u8f7b\u9605PDF \u4ecd\u5728\u8fd0\u884c\uff0c\u8bf7\u5173\u95ed\u540e\u91cd\u8bd5\u3002";
         std::filesystem::create_directories(dir);
+        std::filesystem::create_directories(dir/L"Data");
+        std::filesystem::create_directories(dir/L"Cache"/L"HomeThumbs");
         PostProgress(62,L"\u6b63\u5728\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6");
         auto exe=dir/kExeName;
         if(!ReplaceFileFrom(staging/kPayloadExe,exe)||!ReplaceFileFrom(staging/kDllName,dir/kDllName)||!ReplaceFileFrom(staging/kRuntimeName,dir/kRuntimeName))return L"\u65e0\u6cd5\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6\uff0c\u8bf7\u68c0\u67e5\u5b89\u88c5\u76ee\u5f55\u6743\u9650\u540e\u91cd\u8bd5\u3002";
@@ -499,6 +522,8 @@ std::wstring UninstallPackage(bool deleteAppData) {
             ec.clear();
             std::filesystem::remove_all(AppDataDir(),ec);
             if(ec||std::filesystem::exists(AppDataDir()))return L"\u5e94\u7528\u914d\u7f6e\u6570\u636e\u672a\u80fd\u5b8c\u5168\u5220\u9664\uff0c\u8bf7\u68c0\u67e5\u76ee\u5f55\uff1a\n"+AppDataDir().wstring();
+        } else if(!PreserveInstalledData(dir)) {
+            return L"\u65e0\u6cd5\u4fdd\u7559\u5e94\u7528\u914d\u7f6e\u6570\u636e\uff0c\u8bf7\u68c0\u67e5\u76ee\u5f55\uff1a\n"+AppDataDir().wstring();
         }
         PostProgress(60,L"\u6b63\u5728\u79fb\u9664\u7a0b\u5e8f\u6587\u4ef6");
         for(int attempt=0;attempt<20&&std::filesystem::exists(dir);++attempt) {
