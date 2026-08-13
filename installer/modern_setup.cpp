@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 #include "resource.h"
+#include "..\version.h"
 
 namespace {
 constexpr wchar_t kAppName[] = L"\u8f7b\u9605PDF";
@@ -221,8 +222,8 @@ void DrawPage(Gdiplus::Graphics& g,RECT c) {
     }
     if(g_page==Page::Welcome) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-        DrawText(g,L"\u7248\u672c 0.3.1    Windows 10 / 11    x64",{S(44),S(265),c.right-S(40),S(293)},g_smallFont,RGB(139,151,144),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u8ba9\u7528\u6237\u6ca1\u6709\u6253\u6270\uff0c\u4e13\u6ce8\u9605\u8bfb\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
+        DrawText(g,L"\u7248\u672c " QINGYUE_VERSION_STRING_W L"    Windows 10 / 11    x64",{S(44),S(265),c.right-S(40),S(293)},g_smallFont,RGB(139,151,144),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_welcomePrimary,L"\u7ee7\u7eed",Hot::Primary,true); DrawButton(g,g_welcomeCancel,L"\u53d6\u6d88",Hot::WelcomeCancel,false); return;
     }
     if(g_page==Page::Options) {
@@ -293,7 +294,7 @@ void SetRegString(HKEY root,const std::wstring& path,const wchar_t* name,const s
 }
 void RegisterInstallation(const std::filesystem::path& dir) {
     auto exe=dir/kExeName,un=dir/kUninstallName;std::wstring app=std::wstring(L"Software\\Classes\\Applications\\")+kExeName, prog=std::wstring(L"Software\\Classes\\")+kProgId;
-    SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"DisplayName",kAppName);SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"DisplayVersion",L"0.3.1");SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"Publisher",L"\u8f7b\u9605");
+    SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"DisplayName",kAppName);SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"DisplayVersion",QINGYUE_VERSION_STRING_W);SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"Publisher",L"\u8f7b\u9605");
     SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"DisplayIcon",exe.wstring());SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"InstallLocation",dir.wstring());SetRegString(HKEY_CURRENT_USER,kUninstallKey,L"UninstallString",L"\""+un.wstring()+L"\" /uninstall");
     SetRegString(HKEY_CURRENT_USER,kInstallKey,L"InstallLocation",dir.wstring());SetRegString(HKEY_CURRENT_USER,app+L"\\DefaultIcon",nullptr,exe.wstring()+L",0");SetRegString(HKEY_CURRENT_USER,app+L"\\shell\\open\\command",nullptr,L"\""+exe.wstring()+L"\" \"%1\"");
     SetRegString(HKEY_CURRENT_USER,app+L"\\SupportedTypes",L".pdf",L"");SetRegString(HKEY_CURRENT_USER,L"Software\\Classes\\.pdf\\OpenWithProgids",kProgId,L"");SetRegString(HKEY_CURRENT_USER,prog+L"\\DefaultIcon",nullptr,exe.wstring()+L",0");

@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "resource.h"
+#include "..\version.h"
 
 namespace
 {
@@ -13679,6 +13680,8 @@ namespace
         AppendThemedMenuItem(menu, 2601, L"\u6253\u5370", false, !Active());
         AppendThemedMenuSeparator(menu);
         AppendThemedMenuItem(menu, 2600, L"\u8bbe\u7f6e\u4e3a\u9ed8\u8ba4 PDF \u9605\u8bfb\u5668");
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2602, L"\u7248\u672c " QINGYUE_VERSION_STRING_W, false, true);
         ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
     }
 

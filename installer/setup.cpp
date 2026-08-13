@@ -7,6 +7,7 @@
 #include <string>
 
 #include "resource.h"
+#include "..\version.h"
 
 namespace
 {
@@ -151,7 +152,7 @@ namespace
         std::wstring uninstall = L"\"" + uninstaller.wstring() + L"\" /uninstall";
         DWORD estimatedSize = 18 * 1024;
         WriteStringValue(key, L"DisplayName", AppName);
-        WriteStringValue(key, L"DisplayVersion", L"0.3.0");
+        WriteStringValue(key, L"DisplayVersion", QINGYUE_VERSION_STRING_W);
         WriteStringValue(key, L"Publisher", L"轻阅");
         WriteStringValue(key, L"DisplayIcon", exe.wstring());
         WriteStringValue(key, L"InstallLocation", dir.wstring());
