@@ -410,7 +410,8 @@ bool LooksLikeInstallDir(const std::filesystem::path& dir) {
 }bool StartUninstallWorker(const std::filesystem::path& installDir) {
     auto source=ModulePath();
     if(source.empty())return false;
-    auto worker=std::filesystem::temp_directory_path()/(L"QingYuePDF-Uninstall-"+std::to_wstring(GetCurrentProcessId())+L".exe");
+    auto tempDir=std::filesystem::temp_directory_path();
+    auto worker=tempDir/(L"QingYuePDF-Uninstall-"+std::to_wstring(GetCurrentProcessId())+L".exe");
     std::error_code ec;
     std::filesystem::copy_file(source,worker,std::filesystem::copy_options::overwrite_existing,ec);
     if(ec)return false;
@@ -420,6 +421,7 @@ bool LooksLikeInstallDir(const std::filesystem::path& dir) {
     info.lpVerb=L"open";
     info.lpFile=worker.c_str();
     info.lpParameters=parameters.c_str();
+    info.lpDirectory=tempDir.c_str();
     info.nShow=SW_SHOWNORMAL;
     if(!ShellExecuteExW(&info)) {
         DeleteFileW(worker.c_str());
@@ -631,6 +633,10 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         if(_wcsicmp(argv[i],L"/install-dir")==0&&i+1<argc)g_uninstallDir=argv[++i];
     }
     if(argv) LocalFree(argv);
+    if(g_uninstallWorker) {
+        auto tempDir=std::filesystem::temp_directory_path();
+        SetCurrentDirectoryW(tempDir.c_str());
+    }
     if(waitPid) {
         HANDLE parent=OpenProcess(SYNCHRONIZE,FALSE,waitPid);
         if(parent){WaitForSingleObject(parent,10000);CloseHandle(parent);}
