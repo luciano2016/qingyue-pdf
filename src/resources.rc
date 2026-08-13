@@ -22,7 +22,6 @@ BEGIN
         BLOCK "080404B0"
         BEGIN
             VALUE "CompanyName", "QingYue"
-            VALUE "FileDescription", "QingYue PDF Reader"
             VALUE "FileVersion", QINGYUE_VERSION_FILE_STRING
             VALUE "InternalName", "QuietPDF.Win32"
             VALUE "OriginalFilename", "QuietPDF.Win32.exe"
