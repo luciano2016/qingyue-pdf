@@ -119,8 +119,8 @@ void DrawClose(Gdiplus::Graphics& g) {
     const bool pressed = g_pressed==Hot::Close;
     FillRound(g,g_close,Sf(8),pressed?RGB(226,239,232):(hover?RGB(239,247,242):RGB(250,251,250)));
     StrokeRound(g,g_close,Sf(8),hover?RGB(48,164,118):RGB(218,226,221),255);
-    const float cx = Sf((g_close.left+g_close.right)/2.0f);
-    const float cy = Sf((g_close.top+g_close.bottom)/2.0f);
+    const float cx = static_cast<float>(g_close.left+g_close.right)/2.0f;
+    const float cy = static_cast<float>(g_close.top+g_close.bottom)/2.0f;
     Gdiplus::Pen p(Gc(pressed?RGB(29,99,68):(hover?RGB(36,119,82):RGB(59,73,65)),255),Sf(1.8f));
     p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
     g.DrawLine(&p,cx-Sf(5),cy-Sf(5),cx+Sf(5),cy+Sf(5));
@@ -141,16 +141,16 @@ void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
     if(!checked) return;
     Gdiplus::Pen p(Gc(RGB(255,255,255),255),Sf(2.0f));
     p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-    g.DrawLine(&p,Sf(b.left+4),Sf(b.top+9),Sf(b.left+8),Sf(b.top+13));
-    g.DrawLine(&p,Sf(b.left+8),Sf(b.top+13),Sf(b.left+15),Sf(b.top+5));
+    g.DrawLine(&p,static_cast<float>(b.left)+Sf(4),static_cast<float>(b.top)+Sf(9),static_cast<float>(b.left)+Sf(8),static_cast<float>(b.top)+Sf(13));
+    g.DrawLine(&p,static_cast<float>(b.left)+Sf(8),static_cast<float>(b.top)+Sf(13),static_cast<float>(b.left)+Sf(15),static_cast<float>(b.top)+Sf(5));
 }
 void DrawProgress(Gdiplus::Graphics& g,RECT r) {
     FillRound(g,r,Sf(5),RGB(225,234,229)); RECT f=r; f.right=f.left+static_cast<int>((r.right-r.left)*std::clamp(g_progress,0.0f,1.0f)); if(f.right<=f.left)return;
     FillRound(g,f,Sf(5),RGB(48,164,118)); RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(190,241,220),70);
 }
 void DrawPage(Gdiplus::Graphics& g,RECT c) {
-    COLORREF text=RGB(39,53,46), muted=RGB(112,127,118); g.Clear(Gc(RGB(255,255,255))); StrokeRound(g,{S(1),S(1),c.right-S(1),c.bottom-S(1)},Sf(11),RGB(216,225,219),255);
-    DrawText(g,L"\u8f7b\u9605PDF",{S(40),S(31),S(260),S(60)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
+    COLORREF text=RGB(39,53,46), muted=RGB(105,122,112); g.Clear(Gc(RGB(245,248,246))); Gdiplus::SolidBrush header(Gc(RGB(235,244,239))); g.FillRectangle(&header,0,0,c.right,S(88)); Gdiplus::SolidBrush footer(Gc(RGB(248,250,249))); g.FillRectangle(&footer,0,c.bottom-S(92),c.right,S(92)); Gdiplus::Pen divider(Gc(RGB(220,231,224)),Sf(1.0f)); g.DrawLine(&divider,Sf(32),Sf(88),Sf(c.right-32),Sf(88));
+    DrawText(g,L"\u8f7b\u9605PDF",{S(52),S(28),S(260),S(58)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawText(g,L"PDF \u9605\u8bfb\u5668",{S(52),S(55),S(190),S(76)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawClose(g);
     if(g_page==Page::Welcome) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u5b89\u88c5\u53ea\u9700\u51e0\u79d2\uff0c\u4e0d\u4f1a\u6346\u7ed1\u5176\u4ed6\u7ec4\u4ef6\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
