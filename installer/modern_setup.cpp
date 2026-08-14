@@ -149,14 +149,14 @@ void Layout(HWND h) {
     constexpr int kWindowButtonGap = 6;
     g_close={c.right-S(20)-S(kWindowButtonSize),S(18),c.right-S(20),S(18)+S(kWindowButtonSize)};
     g_minimize={g_close.left-S(kWindowButtonGap)-S(kWindowButtonSize),g_close.top,g_close.left-S(kWindowButtonGap),g_close.bottom};
-    g_primary={S(207),c.bottom-S(68),S(377),c.bottom-S(28)};
+    g_primary={S(279),c.bottom-S(68),S(449),c.bottom-S(28)};
     g_welcomePrimary=g_primary;
-    g_welcomeCancel={S(393),c.bottom-S(68),S(513),c.bottom-S(28)};
+    g_welcomeCancel={S(465),c.bottom-S(68),S(585),c.bottom-S(28)};
     g_optionsCancel=g_welcomeCancel;
-    g_back={S(48),c.bottom-S(68),S(158),c.bottom-S(28)};
+    g_back={S(76),c.bottom-S(68),S(116),c.bottom-S(28)};
     g_editFrame={S(48),S(205),S(520),S(247)};
     g_browse={S(535),S(205),S(672),S(247)};
-    g_desktop={S(48),S(268),S(672),S(322)};
+    g_desktop={S(48),S(268),S(672),S(310)};
     g_deleteData={S(48),S(210),S(672),S(278)};
     g_launch={S(110),S(310),S(610),S(360)};
     if(g_pathEdit) {
@@ -239,6 +239,23 @@ void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bo
         g.DrawLine(&pen,x-Sf(5),y,x+Sf(4),y); g.DrawLine(&pen,x+Sf(4),y,x,y-Sf(4)); g.DrawLine(&pen,x+Sf(4),y,x,y+Sf(4));
     }
 }
+void DrawBackButton(Gdiplus::Graphics& g,RECT r) {
+    const bool hover=g_hover==Hot::Back;
+    const bool pressed=g_pressed==Hot::Back;
+    if(!pressed) {
+        RECT shadow{r.left,r.top+S(2),r.right,r.bottom+S(2)};
+        FillRound(g,shadow,Sf(20),RGB(72,61,53),12);
+    }
+    FillRound(g,r,Sf(20),pressed?RGB(246,239,234):(hover?RGB(255,247,241):RGB(255,255,255)));
+    StrokeRound(g,r,Sf(20),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),230);
+    const float cx=static_cast<float>(r.left+r.right)/2.0f;
+    const float cy=static_cast<float>(r.top+r.bottom)/2.0f;
+    Gdiplus::Pen pen(Gc(pressed?RGB(184,70,27):(hover?RGB(221,92,37):RGB(70,72,70))),Sf(1.8f));
+    pen.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+    g.DrawLine(&pen,cx+Sf(5),cy,cx-Sf(5),cy);
+    g.DrawLine(&pen,cx-Sf(5),cy,cx-Sf(1),cy-Sf(4));
+    g.DrawLine(&pen,cx-Sf(5),cy,cx-Sf(1),cy+Sf(4));
+}
 void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
     const int side=S(18);
     RECT b{r.left,r.top+(r.bottom-r.top-side)/2,r.left+side,r.top+(r.bottom-r.top-side)/2+side};
@@ -294,10 +311,10 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
     if(g_page==Page::Welcome) {
         DrawText(g,L"\u8ba9\u9605\u8bfb\n\u56de\u5f52\u5185\u5bb9\u672c\u8eab",{S(58),S(86),c.right-S(58),S(184)},g_displayFont,text,DT_LEFT|DT_WORDBREAK);
         DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\n\u8ba9\u7528\u6237\u6ca1\u6709\u6253\u6270\uff0c\u4e13\u6ce8\u9605\u8bfb\u3002",{S(60),S(191),c.right-S(60),S(240)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-        FillRound(g,{S(60),S(267),S(72),S(279)},Sf(6),RGB(255,130,28));
+        FillRound(g,{S(63),S(270),S(69),S(276)},Sf(3),RGB(255,130,28));
         DrawText(g,L"\u8f7b\u91cf\u5feb\u901f",{S(88),S(256),S(240),S(288)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u5c0f\u4f53\u79ef\u3001\u4f4e\u5360\u7528\u3001\u6253\u5f00\u5373\u8bfb",{S(242),S(256),S(510),S(288)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        FillRound(g,{S(60),S(317),S(72),S(329)},Sf(6),RGB(255,130,28));
+        FillRound(g,{S(63),S(320),S(69),S(326)},Sf(3),RGB(255,130,28));
         DrawText(g,L"\u5b89\u9759\u4e13\u6ce8",{S(88),S(306),S(240),S(338)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u5e72\u51c0\u7684\u9605\u8bfb\u754c\u9762\uff0c\u4e0d\u6253\u65ad\u601d\u8def",{S(242),S(306),S(560),S(338)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u7248\u672c " QINGYUE_VERSION_STRING_W L"   \u00b7   Windows 10 / 11   \u00b7   x64",{S(60),S(365),c.right-S(60),S(393)},g_smallFont,RGB(146,141,134),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -312,8 +329,9 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
         FillRound(g,g_desktop,Sf(9),g_hover==Hot::Desktop?RGB(255,247,241):RGB(255,255,255)); StrokeRound(g,g_desktop,Sf(9),RGB(229,224,218),220);
         DrawCheckbox(g,{g_desktop.left+S(18),g_desktop.top,g_desktop.left+S(45),g_desktop.bottom},g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop);
         DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{g_desktop.left+S(58),g_desktop.top,g_desktop.right-S(16),g_desktop.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u6240\u9700\u7a7a\u95f4  "+FormatStorageSize(kEstimatedInstalledBytes,true),{S(57),S(340),S(305),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u53ef\u7528\u7a7a\u95f4  "+AvailableSpaceText(),{S(310),S(340),S(610),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u6240\u9700\u7a7a\u95f4  "+FormatStorageSize(kEstimatedInstalledBytes,true),{S(57),S(340),S(190),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u53ef\u7528\u7a7a\u95f4  "+AvailableSpaceText(),{S(205),S(340),S(450),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawBackButton(g,g_back);
         DrawButton(g,g_primary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
     }
     const bool uninstalling=g_page==Page::Uninstalling;
@@ -351,7 +369,7 @@ Hot HotAt(POINT p) {
     if(g_page==Page::UninstallConfirm){if(Hit(g_optionsCancel,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_deleteData,p))return Hot::DeleteData;return Hot::None;}
     if(g_page==Page::UninstallComplete||g_page==Page::UninstallFailed)return Hit(g_primary,p)?Hot::Primary:Hot::None;
     if(g_page==Page::Welcome){if(Hit(g_welcomePrimary,p))return Hot::Primary;if(Hit(g_welcomeCancel,p))return Hot::WelcomeCancel;return Hot::None;}
-    if(g_page==Page::Options){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
+    if(g_page==Page::Options){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
     if(g_page==Page::Complete){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_launch,p))return Hot::Launch;}
     if(g_page==Page::Failed)return Hit(g_primary,p)?Hot::Primary:Hot::None; return Hot::None;
 }
