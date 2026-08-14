@@ -281,15 +281,19 @@ void DrawHeader(Gdiplus::Graphics& g,RECT c) {
     DrawMinimize(g);
     DrawClose(g);
 }
-void DrawCompactStatus(Gdiplus::Graphics& g,bool success) {
-    RECT circle{S(376),S(112),S(444),S(180)};
+void DrawCompactStatus(Gdiplus::Graphics& g,RECT c,bool success) {
+    const int size=S(68);
+    const int left=(c.right-size)/2;
+    RECT circle{left,S(112),left+size,S(112)+size};
     FillRound(g,circle,Sf(34),success?RGB(255,238,224):RGB(255,235,231));
     Gdiplus::Pen pen(Gc(success?RGB(244,103,22):RGB(205,64,45)),Sf(3.2f));
     pen.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+    const float cx=static_cast<float>(c.right)/2.0f;
+    const float cy=Sf(146);
     if(success) {
-        g.DrawLine(&pen,Sf(393),Sf(146),Sf(405),Sf(157)); g.DrawLine(&pen,Sf(405),Sf(157),Sf(428),Sf(132));
+        g.DrawLine(&pen,cx-Sf(17),cy,cx-Sf(5),cy+Sf(11)); g.DrawLine(&pen,cx-Sf(5),cy+Sf(11),cx+Sf(18),cy-Sf(14));
     } else {
-        g.DrawLine(&pen,Sf(396),Sf(132),Sf(424),Sf(160)); g.DrawLine(&pen,Sf(424),Sf(132),Sf(396),Sf(160));
+        g.DrawLine(&pen,cx-Sf(14),cy-Sf(14),cx+Sf(14),cy+Sf(14)); g.DrawLine(&pen,cx+Sf(14),cy-Sf(14),cx-Sf(14),cy+Sf(14));
     }
 }
 void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
@@ -345,7 +349,7 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,g_stage.empty()?L"\u6b63\u5728\u51c6\u5907":g_stage,{S(90),S(318),c.right-S(90),S(346)},g_smallFont,muted,DT_CENTER|DT_VCENTER|DT_SINGLELINE); return;
     }
     if(complete||failed) {
-        DrawCompactStatus(g,complete);
+        DrawCompactStatus(g,c,complete);
         DrawText(g,complete?(g_uninstallMode?L"\u5378\u8f7d\u5b8c\u6210":L"\u5b89\u88c5\u5b8c\u6210"):(g_uninstallMode?L"\u5378\u8f7d\u672a\u5b8c\u6210":L"\u672a\u80fd\u5b8c\u6210\u5b89\u88c5"),{S(55),S(195),c.right-S(55),S(238)},g_displayFont,text,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         std::wstring detail=complete?(g_uninstallMode?L"\u8f7b\u9605PDF \u5df2\u4ece\u7535\u8111\u4e2d\u79fb\u9664\u3002":L"\u8f7b\u9605PDF \u5df2\u51c6\u5907\u5c31\u7eea\u3002"):(g_error.empty()?L"\u64cd\u4f5c\u8fc7\u7a0b\u4e2d\u51fa\u73b0\u4e86\u95ee\u9898\uff0c\u8bf7\u91cd\u8bd5\u3002":g_error);
         DrawText(g,detail,{S(90),S(242),c.right-S(90),S(292)},g_uiFont,muted,DT_CENTER|DT_WORDBREAK);
