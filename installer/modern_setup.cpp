@@ -52,7 +52,7 @@ struct DirectoryCleanup {
 HINSTANCE g_instance{};
 HWND g_window{}, g_pathEdit{};
 HICON g_headerIcon{};
-HFONT g_uiFont{}, g_smallFont{}, g_titleFont{}, g_displayFont{};
+HFONT g_uiFont{}, g_smallFont{}, g_titleFont{}, g_displayFont{}, g_emphasisFont{};
 ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
@@ -71,10 +71,6 @@ std::filesystem::path g_uninstallDir;
 int S(int v) { return MulDiv(v, static_cast<int>(g_dpi), 96); }
 float Sf(float v) { return v * static_cast<float>(g_dpi) / 96.0f; }
 bool Hit(RECT r, POINT p) { return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom; }
-COLORREF Mix(COLORREF a, COLORREF b, float t) {
-    auto f = [t](int x, int y) { return static_cast<BYTE>(x + (y - x) * t + .5f); };
-    return RGB(f(GetRValue(a), GetRValue(b)), f(GetGValue(a), GetGValue(b)), f(GetBValue(a), GetBValue(b)));
-}
 Gdiplus::Color Gc(COLORREF c, BYTE a = 255) { return {a, GetRValue(c), GetGValue(c), GetBValue(c)}; }
 Gdiplus::RectF Rf(RECT r) { return {static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right-r.left), static_cast<float>(r.bottom-r.top)}; }
 void AddRoundPath(Gdiplus::GraphicsPath& path, RECT r, float radius) {
@@ -134,9 +130,9 @@ const std::wstring& AvailableSpaceText() {
     return g_availableSpaceText;
 }
 void MakeFonts() {
-    for (HFONT* f:{&g_uiFont,&g_smallFont,&g_titleFont,&g_displayFont}) { if(*f) DeleteObject(*f); *f=nullptr; }
+    for (HFONT* f:{&g_uiFont,&g_smallFont,&g_titleFont,&g_displayFont,&g_emphasisFont}) { if(*f) DeleteObject(*f); *f=nullptr; }
     auto make=[](int pt,int weight){ return CreateFontW(-MulDiv(pt,static_cast<int>(g_dpi),72),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_NATURAL_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI"); };
-    g_uiFont=make(10,FW_NORMAL); g_smallFont=make(8,FW_NORMAL); g_titleFont=make(15,FW_SEMIBOLD); g_displayFont=make(20,FW_SEMIBOLD);
+    g_uiFont=make(10,FW_NORMAL); g_smallFont=make(8,FW_NORMAL); g_titleFont=make(15,FW_SEMIBOLD); g_displayFont=make(23,FW_BOLD); g_emphasisFont=make(10,FW_SEMIBOLD);
     if(g_pathEdit) SendMessageW(g_pathEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_uiFont),TRUE);
 }
 void ApplyWindowChrome(HWND h) {
@@ -151,12 +147,18 @@ void Layout(HWND h) {
     RECT c{}; GetClientRect(h,&c);
     constexpr int kWindowButtonSize = 30;
     constexpr int kWindowButtonGap = 6;
-    g_close={c.right-S(14)-S(kWindowButtonSize),S(18),c.right-S(14),S(18)+S(kWindowButtonSize)};
-    g_minimize={g_close.left-S(kWindowButtonGap)-S(kWindowButtonSize),g_close.top,g_close.left-S(kWindowButtonGap),g_close.bottom}; g_back={S(38),c.bottom-S(74),S(116),c.bottom-S(36)};
-    g_primary={c.right-S(176),c.bottom-S(74),c.right-S(38),c.bottom-S(36)};
-    g_welcomeCancel=g_primary; g_welcomePrimary={c.right-S(324),c.bottom-S(74),c.right-S(186),c.bottom-S(36)}; g_optionsCancel=g_primary;
-    g_editFrame={S(40),S(225),c.right-S(136),S(265)}; g_browse={c.right-S(122),S(225),c.right-S(40),S(265)};
-    g_desktop={S(40),S(286),S(350),S(320)}; g_deleteData={S(40),S(250),S(520),S(286)}; g_launch=g_desktop;
+    g_close={c.right-S(20)-S(kWindowButtonSize),S(18),c.right-S(20),S(18)+S(kWindowButtonSize)};
+    g_minimize={g_close.left-S(kWindowButtonGap)-S(kWindowButtonSize),g_close.top,g_close.left-S(kWindowButtonGap),g_close.bottom};
+    g_primary={S(207),c.bottom-S(68),S(377),c.bottom-S(28)};
+    g_welcomePrimary=g_primary;
+    g_welcomeCancel={S(393),c.bottom-S(68),S(513),c.bottom-S(28)};
+    g_optionsCancel=g_welcomeCancel;
+    g_back={S(48),c.bottom-S(68),S(158),c.bottom-S(28)};
+    g_editFrame={S(48),S(205),S(520),S(247)};
+    g_browse={S(535),S(205),S(672),S(247)};
+    g_desktop={S(48),S(268),S(672),S(322)};
+    g_deleteData={S(48),S(210),S(672),S(278)};
+    g_launch={S(110),S(310),S(610),S(360)};
     if(g_pathEdit) {
         HDC dc=GetDC(g_pathEdit);
         HGDIOBJ oldFont=SelectObject(dc,g_uiFont);
@@ -181,16 +183,16 @@ void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags)
 void DrawText(Gdiplus::Graphics& g,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) { HDC dc=g.GetHDC(); DrawText(dc,s,r,f,c,flags); g.ReleaseHDC(dc); }
 void DrawLogo(Gdiplus::Graphics& g) {
     if(!g_headerIcon)return;
-    HDC dc=g.GetHDC();DrawIconEx(dc,S(48),S(37),g_headerIcon,S(30),S(30),0,nullptr,DI_NORMAL);g.ReleaseHDC(dc);
+    HDC dc=g.GetHDC();DrawIconEx(dc,S(38),S(17),g_headerIcon,S(36),S(36),0,nullptr,DI_NORMAL);g.ReleaseHDC(dc);
 }
 void DrawClose(Gdiplus::Graphics& g) {
     const bool hover = g_hover==Hot::Close;
     const bool pressed = g_pressed==Hot::Close;
-    if(hover||pressed) FillRound(g,g_close,Sf(6),pressed?RGB(226,239,232):RGB(239,247,242));
+    if(hover||pressed) FillRound(g,g_close,Sf(7),pressed?RGB(255,222,202):RGB(255,239,229));
 
     const float cx = static_cast<float>(g_close.left+g_close.right)/2.0f;
     const float cy = static_cast<float>(g_close.top+g_close.bottom)/2.0f;
-    Gdiplus::Pen p(Gc(pressed?RGB(29,99,68):(hover?RGB(36,119,82):RGB(59,73,65)),255),Sf(1.8f));
+    Gdiplus::Pen p(Gc(pressed?RGB(190,67,23):(hover?RGB(224,83,28):RGB(70,72,70)),255),Sf(1.65f));
     p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
     g.DrawLine(&p,cx-Sf(4.5f),cy-Sf(4.5f),cx+Sf(4.5f),cy+Sf(4.5f));
     g.DrawLine(&p,cx+Sf(4.5f),cy-Sf(4.5f),cx-Sf(4.5f),cy+Sf(4.5f));
@@ -198,26 +200,51 @@ void DrawClose(Gdiplus::Graphics& g) {
 void DrawMinimize(Gdiplus::Graphics& g) {
     const bool hover = g_hover==Hot::Minimize;
     const bool pressed = g_pressed==Hot::Minimize;
-    if(hover||pressed) FillRound(g,g_minimize,Sf(6),pressed?RGB(226,239,232):RGB(239,247,242));
-    const COLORREF ink = pressed?RGB(24,92,63):(hover?RGB(35,116,78):RGB(40,58,48));
-    Gdiplus::Pen p(Gc(ink),Sf(1.8f));
+    if(hover||pressed) FillRound(g,g_minimize,Sf(7),pressed?RGB(255,226,207):RGB(255,242,233));
+    const COLORREF ink = pressed?RGB(184,70,27):(hover?RGB(221,92,37):RGB(70,72,70));
+    Gdiplus::Pen p(Gc(ink),Sf(1.65f));
     p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
     const float cx=static_cast<float>(g_minimize.left+g_minimize.right)/2.0f;
     const float cy=static_cast<float>(g_minimize.top+g_minimize.bottom)/2.0f;
     g.DrawLine(&p,cx-S(5),cy,cx+S(5),cy);
 }
 void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bool primary) {
-    bool a=g_hover==hot||g_pressed==hot; COLORREF fill=primary?RGB(48,164,118):RGB(255,255,255);
-    if(a) fill=primary?Mix(fill,RGB(21,111,74),g_pressed==hot?.20f:.09f):RGB(238,244,240);
-    FillRound(g,r,Sf(8),fill); StrokeRound(g,r,Sf(8),primary?RGB(48,164,118):RGB(211,222,216),primary?255:220);
-    DrawText(g,label,r,g_uiFont,primary?RGB(255,255,255):RGB(53,65,58),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    const bool hover=g_hover==hot;
+    const bool pressed=g_pressed==hot;
+    RECT body=r;
+    if(!pressed) {
+        RECT shadow{r.left,r.top+S(2),r.right,r.bottom+S(2)};
+        FillRound(g,shadow,Sf(9),primary?RGB(189,82,27):RGB(72,61,53),primary?38:14);
+    }
+    if(primary) {
+        Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate); AddRoundPath(path,body,Sf(9));
+        const COLORREF left=pressed?RGB(227,81,18):(hover?RGB(255,112,25):RGB(255,121,24));
+        const COLORREF right=pressed?RGB(239,119,24):(hover?RGB(255,155,36):RGB(255,166,39));
+        Gdiplus::LinearGradientBrush brush(Rf(body),Gc(left),Gc(right),Gdiplus::LinearGradientModeHorizontal);
+        g.FillPath(&brush,&path);
+        StrokeRound(g,body,Sf(9),pressed?RGB(215,80,20):RGB(247,116,24),210);
+    } else {
+        const COLORREF fill=pressed?RGB(246,239,234):(hover?RGB(255,247,241):RGB(255,255,255));
+        FillRound(g,body,Sf(9),fill);
+        StrokeRound(g,body,Sf(9),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),230);
+    }
+    RECT textRect=body;
+    const bool arrow=primary&&(label==L"\u7ee7\u7eed"||label==L"\u5f00\u59cb\u5b89\u88c5");
+    if(arrow) textRect.right-=S(30);
+    DrawText(g,label,textRect,g_emphasisFont,primary?RGB(255,255,255):RGB(56,55,52),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    if(arrow) {
+        const float x=static_cast<float>(body.right-S(29)), y=static_cast<float>((body.top+body.bottom)/2);
+        Gdiplus::Pen pen(Gc(RGB(255,255,255)),Sf(1.8f));
+        pen.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+        g.DrawLine(&pen,x-Sf(5),y,x+Sf(4),y); g.DrawLine(&pen,x+Sf(4),y,x,y-Sf(4)); g.DrawLine(&pen,x+Sf(4),y,x,y+Sf(4));
+    }
 }
 void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
     const int side=S(18);
     RECT b{r.left,r.top+(r.bottom-r.top-side)/2,r.left+side,r.top+(r.bottom-r.top-side)/2+side};
-    const COLORREF fill=checked?RGB(48,164,118):(active?RGB(244,249,246):RGB(255,255,255));
+    const COLORREF fill=checked?RGB(255,126,27):(active?RGB(255,246,239):RGB(255,255,255));
     FillRound(g,b,Sf(4),fill);
-    StrokeRound(g,b,Sf(4),checked?RGB(48,164,118):(active?RGB(48,164,118):RGB(181,195,186)),255);
+    StrokeRound(g,b,Sf(4),checked?RGB(242,106,19):(active?RGB(241,153,97):RGB(188,187,182)),255);
     if(!checked) return;
     Gdiplus::Pen p(Gc(RGB(255,255,255),255),Sf(2.0f));
     p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
@@ -225,88 +252,108 @@ void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
     g.DrawLine(&p,static_cast<float>(b.left)+Sf(8),static_cast<float>(b.top)+Sf(13),static_cast<float>(b.left)+Sf(15),static_cast<float>(b.top)+Sf(5));
 }
 void DrawProgress(Gdiplus::Graphics& g,RECT r) {
-    FillRound(g,r,Sf(5),RGB(225,234,229)); RECT f=r; f.right=f.left+static_cast<int>((r.right-r.left)*std::clamp(g_progress,0.0f,1.0f)); if(f.right<=f.left)return;
-    FillRound(g,f,Sf(5),RGB(48,164,118)); RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(190,241,220),70);
+    FillRound(g,r,Sf(5),RGB(238,232,226)); RECT f=r; f.right=f.left+static_cast<int>((r.right-r.left)*std::clamp(g_progress,0.0f,1.0f)); if(f.right<=f.left)return;
+    Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate); AddRoundPath(path,f,Sf(5)); Gdiplus::LinearGradientBrush brush(Rf(f),Gc(RGB(255,116,23)),Gc(RGB(255,166,39)),Gdiplus::LinearGradientModeHorizontal); g.FillPath(&brush,&path);
+    RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(255,225,176),72);
 }
-void DrawPage(Gdiplus::Graphics& g,RECT c) {
-    COLORREF text=RGB(39,53,46), muted=RGB(105,122,112); g.Clear(Gc(RGB(245,248,246))); Gdiplus::SolidBrush header(Gc(RGB(235,244,239))); g.FillRectangle(&header,0,0,c.right,S(88)); Gdiplus::SolidBrush footer(Gc(RGB(248,250,249))); g.FillRectangle(&footer,0,c.bottom-S(92),c.right,S(92)); Gdiplus::Pen divider(Gc(RGB(220,231,224)),Sf(1.0f)); g.DrawLine(&divider,0.0f,Sf(88),static_cast<float>(c.right),Sf(88));
-    DrawLogo(g); DrawText(g,L"\u8f7b\u9605PDF",{S(90),S(28),S(298),S(58)},g_titleFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawText(g,L"PDF \u9605\u8bfb\u5668",{S(90),S(55),S(228),S(76)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); DrawMinimize(g); DrawClose(g);
-    if(g_uninstallMode) {
-        if(g_page==Page::UninstallConfirm) {
-            DrawText(g,L"\u5378\u8f7d\u8f7b\u9605PDF",{S(40),S(128),c.right-S(40),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawText(g,L"\u8f7b\u9605PDF \u5c06\u4ece\u5f53\u524d\u7535\u8111\u4e2d\u79fb\u9664\u3002",{S(42),S(184),c.right-S(70),S(218)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-            DrawCheckbox(g,g_deleteData,g_deleteAppData,g_hover==Hot::DeleteData||g_pressed==Hot::DeleteData);
-            DrawText(g,L"\u5220\u9664\u5e94\u7528\u914d\u7f6e\u6570\u636e\uff08\u9605\u8bfb\u8fdb\u5ea6\u3001\u6700\u8fd1\u6587\u6863\u3001\u4e3b\u9898\u8bbe\u7f6e\uff09",{S(70),S(250),c.right-S(40),S(286)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawButton(g,g_back,L"\u53d6\u6d88",Hot::Back,false); DrawButton(g,g_primary,L"\u5378\u8f7d",Hot::Primary,true); return;
-        }
-        if(g_page==Page::Uninstalling) {
-            DrawText(g,L"\u6b63\u5728\u5378\u8f7d",{S(40),S(126),c.right-S(40),S(176)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawText(g,L"\u8bf7\u7a0d\u5019\uff0c\u6b63\u5728\u79fb\u9664\u8f7b\u9605PDF\u3002",{S(42),S(188),c.right-S(40),S(216)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawProgress(g,{S(42),S(258),c.right-S(42),S(270)}); std::wstring pct=std::to_wstring(static_cast<int>(g_progress*100+.5f))+L"%";
-            DrawText(g,pct,{S(42),S(286),c.right-S(42),S(316)},g_titleFont,RGB(48,133,99),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawText(g,g_stage.empty()?L"\u6b63\u5728\u51c6\u5907":g_stage,{S(42),S(326),c.right-S(42),S(352)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); return;
-        }
-        if(g_page==Page::UninstallComplete) {
-            FillRound(g,{S(40),S(124),S(92),S(176)},Sf(22),RGB(225,244,235)); Gdiplus::Pen check(Gc(RGB(48,164,118)),Sf(3)); check.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-            g.DrawLine(&check,Sf(57),Sf(149),Sf(64),Sf(157)); g.DrawLine(&check,Sf(64),Sf(157),Sf(78),Sf(141));
-            DrawText(g,L"\u5378\u8f7d\u5b8c\u6210",{S(126),S(124),c.right-S(40),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawText(g,L"\u8f7b\u9605PDF \u5df2\u4ece\u7535\u8111\u4e2d\u79fb\u9664\u3002",{S(128),S(176),c.right-S(40),S(208)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawButton(g,g_primary,L"\u5b8c\u6210",Hot::Primary,true); return;
-        }
-        if(g_page==Page::UninstallFailed) {
-            DrawText(g,L"\u5378\u8f7d\u672a\u5b8c\u6210",{S(40),S(126),c.right-S(40),S(176)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-            DrawText(g,g_error.empty()?L"\u5378\u8f7d\u8fc7\u7a0b\u4e2d\u51fa\u73b0\u4e86\u95ee\u9898\u3002":g_error,{S(42),S(188),c.right-S(42),S(248)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-            DrawButton(g,g_primary,L"\u5173\u95ed",Hot::Primary,true); return;
-        }
+void DrawHeader(Gdiplus::Graphics& g,RECT c) {
+    DrawLogo(g);
+    DrawText(g,L"\u8f7b\u9605PDF",{S(86),S(15),S(280),S(40)},g_titleFont,RGB(35,38,37),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    DrawText(g,L"\u5b89\u88c5\u7a0b\u5e8f  \u00b7  " QINGYUE_VERSION_STRING_W,{S(87),S(38),S(300),S(59)},g_smallFont,RGB(126,125,120),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    Gdiplus::Pen line(Gc(RGB(229,225,220)),Sf(1.0f));
+    g.DrawLine(&line,0.0f,Sf(70),static_cast<float>(c.right),Sf(70));
+    DrawMinimize(g);
+    DrawClose(g);
+}
+void DrawCompactStatus(Gdiplus::Graphics& g,bool success) {
+    RECT circle{S(376),S(112),S(444),S(180)};
+    FillRound(g,circle,Sf(34),success?RGB(255,238,224):RGB(255,235,231));
+    Gdiplus::Pen pen(Gc(success?RGB(244,103,22):RGB(205,64,45)),Sf(3.2f));
+    pen.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
+    if(success) {
+        g.DrawLine(&pen,Sf(393),Sf(146),Sf(405),Sf(157)); g.DrawLine(&pen,Sf(405),Sf(157),Sf(428),Sf(132));
+    } else {
+        g.DrawLine(&pen,Sf(396),Sf(132),Sf(424),Sf(160)); g.DrawLine(&pen,Sf(424),Sf(132),Sf(396),Sf(160));
+    }
+}
+void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
+    const COLORREF text=RGB(38,41,40), muted=RGB(113,112,107);
+    g.Clear(Gc(RGB(251,250,248)));
+    DrawHeader(g,c);
+    Gdiplus::SolidBrush footer(Gc(RGB(248,246,243))); g.FillRectangle(&footer,0,c.bottom-S(88),c.right,S(88));
+    Gdiplus::Pen divider(Gc(RGB(229,225,220)),Sf(1)); g.DrawLine(&divider,0.0f,static_cast<float>(c.bottom-S(88)),static_cast<float>(c.right),static_cast<float>(c.bottom-S(88)));
+    if(g_uninstallMode&&g_page==Page::UninstallConfirm) {
+        DrawText(g,L"\u5378\u8f7d\u8f7b\u9605PDF",{S(55),S(96),c.right-S(55),S(142)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u5c06\u4ece\u5f53\u524d\u7535\u8111\u4e2d\u79fb\u9664\u8f7b\u9605PDF\u3002",{S(57),S(148),c.right-S(55),S(178)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        FillRound(g,g_deleteData,Sf(10),RGB(255,255,255)); StrokeRound(g,g_deleteData,Sf(10),RGB(229,224,218),220);
+        DrawCheckbox(g,{g_deleteData.left+S(18),g_deleteData.top,g_deleteData.left+S(45),g_deleteData.bottom},g_deleteAppData,g_hover==Hot::DeleteData||g_pressed==Hot::DeleteData);
+        DrawText(g,L"\u5220\u9664\u5e94\u7528\u914d\u7f6e\u6570\u636e",{g_deleteData.left+S(58),g_deleteData.top+S(7),g_deleteData.right-S(18),g_deleteData.top+S(31)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u9605\u8bfb\u8fdb\u5ea6\u3001\u6700\u8fd1\u6587\u6863\u548c\u4e3b\u9898\u8bbe\u7f6e",{g_deleteData.left+S(58),g_deleteData.top+S(30),g_deleteData.right-S(18),g_deleteData.bottom-S(5)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawButton(g,g_primary,L"\u5378\u8f7d",Hot::Primary,true); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::Back,false); return;
     }
     if(g_page==Page::Welcome) {
-        DrawText(g,L"\u8ba9\u9605\u8bfb\u56de\u5230\u5185\u5bb9\u672c\u8eab",{S(42),S(128),c.right-S(42),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\u8ba9\u7528\u6237\u6ca1\u6709\u6253\u6270\uff0c\u4e13\u6ce8\u9605\u8bfb\u3002",{S(44),S(184),c.right-S(70),S(232)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-        DrawText(g,L"\u7248\u672c " QINGYUE_VERSION_STRING_W L"    Windows 10 / 11    x64",{S(44),S(265),c.right-S(40),S(293)},g_smallFont,RGB(139,151,144),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u8ba9\u9605\u8bfb\n\u56de\u5f52\u5185\u5bb9\u672c\u8eab",{S(58),S(86),c.right-S(58),S(184)},g_displayFont,text,DT_LEFT|DT_WORDBREAK);
+        DrawText(g,L"\u8f7b\u9605PDF \u662f\u4e00\u6b3e\u8f7b\u91cf\u3001\u5b89\u9759\u7684 PDF \u9605\u8bfb\u5668\u3002\n\u8ba9\u7528\u6237\u6ca1\u6709\u6253\u6270\uff0c\u4e13\u6ce8\u9605\u8bfb\u3002",{S(60),S(191),c.right-S(60),S(240)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
+        FillRound(g,{S(60),S(267),S(72),S(279)},Sf(6),RGB(255,130,28));
+        DrawText(g,L"\u8f7b\u91cf\u5feb\u901f",{S(88),S(256),S(240),S(288)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u5c0f\u4f53\u79ef\u3001\u4f4e\u5360\u7528\u3001\u6253\u5f00\u5373\u8bfb",{S(242),S(256),S(510),S(288)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        FillRound(g,{S(60),S(317),S(72),S(329)},Sf(6),RGB(255,130,28));
+        DrawText(g,L"\u5b89\u9759\u4e13\u6ce8",{S(88),S(306),S(240),S(338)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u5e72\u51c0\u7684\u9605\u8bfb\u754c\u9762\uff0c\u4e0d\u6253\u65ad\u601d\u8def",{S(242),S(306),S(560),S(338)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u7248\u672c " QINGYUE_VERSION_STRING_W L"   \u00b7   Windows 10 / 11   \u00b7   x64",{S(60),S(365),c.right-S(60),S(393)},g_smallFont,RGB(146,141,134),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_welcomePrimary,L"\u7ee7\u7eed",Hot::Primary,true); DrawButton(g,g_welcomeCancel,L"\u53d6\u6d88",Hot::WelcomeCancel,false); return;
     }
     if(g_page==Page::Options) {
-        DrawText(g,L"\u5b89\u88c5\u9009\u9879",{S(40),S(108),c.right-S(40),S(148)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u9009\u62e9\u5b89\u88c5\u4f4d\u7f6e\u548c\u5feb\u6377\u65b9\u5f0f\u8bbe\u7f6e",{S(42),S(162),c.right-S(40),S(190)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(40),S(202),S(180),S(222)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        FillRound(g,g_editFrame,Sf(7),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(7),g_pathFocused?RGB(48,164,118):RGB(210,221,215),g_pathFocused?235:220); DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
-        DrawCheckbox(g,g_desktop,g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop); DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{S(70),S(286),S(360),S(322)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u6240\u9700\u7a7a\u95f4\uff1a"+FormatStorageSize(kEstimatedInstalledBytes,true),{S(42),S(326),S(260),S(345)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u53ef\u7528\u7a7a\u95f4\uff1a"+AvailableSpaceText(),{S(42),S(347),S(300),S(366)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_welcomePrimary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
+        DrawText(g,L"\u5b89\u88c5\u8f7b\u9605PDF",{S(55),S(88),c.right-S(55),S(130)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u786e\u8ba4\u5b89\u88c5\u4f4d\u7f6e\u548c\u5feb\u6377\u65b9\u5f0f",{S(57),S(133),c.right-S(55),S(162)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(55),S(174),S(230),S(199)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        FillRound(g,g_editFrame,Sf(9),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(9),g_pathFocused?RGB(246,135,66):RGB(218,215,210),g_pathFocused?240:220);
+        DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
+        FillRound(g,g_desktop,Sf(9),g_hover==Hot::Desktop?RGB(255,247,241):RGB(255,255,255)); StrokeRound(g,g_desktop,Sf(9),RGB(229,224,218),220);
+        DrawCheckbox(g,{g_desktop.left+S(18),g_desktop.top,g_desktop.left+S(45),g_desktop.bottom},g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop);
+        DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{g_desktop.left+S(58),g_desktop.top,g_desktop.right-S(16),g_desktop.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u6240\u9700\u7a7a\u95f4  "+FormatStorageSize(kEstimatedInstalledBytes,true),{S(57),S(340),S(305),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u53ef\u7528\u7a7a\u95f4  "+AvailableSpaceText(),{S(310),S(340),S(610),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawButton(g,g_primary,L"\u5f00\u59cb\u5b89\u88c5",Hot::Primary,true); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
     }
-    if(g_page==Page::Installing) {
-        DrawText(g,L"\u6b63\u5728\u5b89\u88c5",{S(40),S(126),c.right-S(40),S(176)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u8bf7\u7a0d\u5019\uff0c\u8f7b\u9605PDF \u6b63\u5728\u51c6\u5907\u6587\u4ef6\u3002",{S(42),S(188),c.right-S(40),S(216)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawProgress(g,{S(42),S(258),c.right-S(42),S(270)}); std::wstring pct=std::to_wstring(static_cast<int>(g_progress*100+.5f))+L"%";
-        DrawText(g,pct,{S(42),S(286),c.right-S(42),S(316)},g_titleFont,RGB(48,133,99),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,g_stage.empty()?L"\u6b63\u5728\u51c6\u5907":g_stage,{S(42),S(326),c.right-S(42),S(352)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE); return;
+    const bool uninstalling=g_page==Page::Uninstalling;
+    const bool complete=g_page==Page::Complete||g_page==Page::UninstallComplete;
+    const bool failed=g_page==Page::Failed||g_page==Page::UninstallFailed;
+    if(g_page==Page::Installing||uninstalling) {
+        DrawText(g,uninstalling?L"\u6b63\u5728\u5378\u8f7d":L"\u6b63\u5728\u5b89\u88c5",{S(60),S(112),c.right-S(60),S(165)},g_displayFont,text,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,uninstalling?L"\u6b63\u5728\u79fb\u9664\u7a0b\u5e8f\u6587\u4ef6\u548c\u76f8\u5173\u8bbe\u7f6e":L"\u8bf7\u7a0d\u5019\uff0c\u8f7b\u9605PDF \u6b63\u5728\u51c6\u5907\u5c31\u7eea\u3002",{S(60),S(172),c.right-S(60),S(202)},g_uiFont,muted,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        DrawProgress(g,{S(90),S(248),c.right-S(90),S(260)});
+        std::wstring pct=std::to_wstring(static_cast<int>(g_progress*100+.5f))+L"%";
+        DrawText(g,pct,{S(90),S(277),c.right-S(90),S(312)},g_titleFont,RGB(231,93,21),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,g_stage.empty()?L"\u6b63\u5728\u51c6\u5907":g_stage,{S(90),S(318),c.right-S(90),S(346)},g_smallFont,muted,DT_CENTER|DT_VCENTER|DT_SINGLELINE); return;
     }
-    if(g_page==Page::Complete) {
-        FillRound(g,{S(40),S(124),S(92),S(176)},Sf(22),RGB(225,244,235)); Gdiplus::Pen p(Gc(RGB(48,164,118)),Sf(3)); p.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
-        g.DrawLine(&p,Sf(57),Sf(149),Sf(64),Sf(157)); g.DrawLine(&p,Sf(64),Sf(157),Sf(78),Sf(141));
-        DrawText(g,L"\u5b89\u88c5\u5b8c\u6210",{S(126),S(124),c.right-S(40),S(168)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawText(g,L"\u8f7b\u9605PDF \u5df2\u51c6\u5907\u5c31\u7eea\u3002",{S(128),S(176),c.right-S(40),S(208)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawCheckbox(g,g_launch,g_launchAfterInstall,g_hover==Hot::Launch||g_pressed==Hot::Launch); DrawText(g,L"\u5b8c\u6210\u540e\u6253\u5f00\u8f7b\u9605PDF",{S(70),S(286),S(360),S(322)},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawButton(g,g_primary,L"\u5b8c\u6210",Hot::Primary,true); return;
+    if(complete||failed) {
+        DrawCompactStatus(g,complete);
+        DrawText(g,complete?(g_uninstallMode?L"\u5378\u8f7d\u5b8c\u6210":L"\u5b89\u88c5\u5b8c\u6210"):(g_uninstallMode?L"\u5378\u8f7d\u672a\u5b8c\u6210":L"\u672a\u80fd\u5b8c\u6210\u5b89\u88c5"),{S(55),S(195),c.right-S(55),S(238)},g_displayFont,text,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        std::wstring detail=complete?(g_uninstallMode?L"\u8f7b\u9605PDF \u5df2\u4ece\u7535\u8111\u4e2d\u79fb\u9664\u3002":L"\u8f7b\u9605PDF \u5df2\u51c6\u5907\u5c31\u7eea\u3002"):(g_error.empty()?L"\u64cd\u4f5c\u8fc7\u7a0b\u4e2d\u51fa\u73b0\u4e86\u95ee\u9898\uff0c\u8bf7\u91cd\u8bd5\u3002":g_error);
+        DrawText(g,detail,{S(90),S(242),c.right-S(90),S(292)},g_uiFont,muted,DT_CENTER|DT_WORDBREAK);
+        if(g_page==Page::Complete) {
+            FillRound(g,g_launch,Sf(9),g_hover==Hot::Launch?RGB(255,247,241):RGB(255,255,255)); StrokeRound(g,g_launch,Sf(9),RGB(229,224,218),220);
+            DrawCheckbox(g,{g_launch.left+S(18),g_launch.top,g_launch.left+S(45),g_launch.bottom},g_launchAfterInstall,g_hover==Hot::Launch||g_pressed==Hot::Launch);
+            DrawText(g,L"\u5b8c\u6210\u540e\u6253\u5f00\u8f7b\u9605PDF",{g_launch.left+S(58),g_launch.top,g_launch.right-S(18),g_launch.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        }
+        DrawButton(g,g_primary,failed?(g_uninstallMode?L"\u5173\u95ed":L"\u91cd\u8bd5"):L"\u5b8c\u6210",Hot::Primary,true);
+        return;
     }
-    DrawText(g,L"\u672a\u80fd\u5b8c\u6210\u5b89\u88c5",{S(40),S(126),c.right-S(40),S(176)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    DrawText(g,g_error.empty()?L"\u5b89\u88c5\u8fc7\u7a0b\u4e2d\u51fa\u73b0\u4e86\u95ee\u9898\uff0c\u8bf7\u91cd\u8bd5\u3002":g_error,{S(42),S(188),c.right-S(42),S(248)},g_uiFont,muted,DT_LEFT|DT_WORDBREAK);
-    DrawButton(g,g_back,L"\u8fd4\u56de",Hot::Back,false); DrawButton(g,g_primary,L"\u91cd\u8bd5",Hot::Primary,true);
 }
 void Paint(HWND h) {
     PAINTSTRUCT ps{}; HDC dc=BeginPaint(h,&ps); RECT c{}; GetClientRect(h,&c); HDC mem=CreateCompatibleDC(dc); HBITMAP bmp=CreateCompatibleBitmap(dc,c.right,c.bottom); HGDIOBJ old=SelectObject(mem,bmp);
-    Gdiplus::Graphics g(mem); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias); g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit); DrawPage(g,c);
+    Gdiplus::Graphics g(mem); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias); g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit); DrawCompactPage(g,c);
     BitBlt(dc,0,0,c.right,c.bottom,mem,0,0,SRCCOPY); SelectObject(mem,old); DeleteObject(bmp); DeleteDC(mem); EndPaint(h,&ps);
 }
 Hot HotAt(POINT p) {
     if(Hit(g_minimize,p))return Hot::Minimize; if(Hit(g_close,p))return Hot::Close;
-    if(g_page==Page::UninstallConfirm){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_deleteData,p))return Hot::DeleteData;return Hot::None;}
+    if(g_page==Page::UninstallConfirm){if(Hit(g_optionsCancel,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_deleteData,p))return Hot::DeleteData;return Hot::None;}
     if(g_page==Page::UninstallComplete||g_page==Page::UninstallFailed)return Hit(g_primary,p)?Hot::Primary:Hot::None;
     if(g_page==Page::Welcome){if(Hit(g_welcomePrimary,p))return Hot::Primary;if(Hit(g_welcomeCancel,p))return Hot::WelcomeCancel;return Hot::None;}
-    if(g_page==Page::Options){if(Hit(g_back,p))return Hot::Back;if(Hit(g_welcomePrimary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
+    if(g_page==Page::Options){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
     if(g_page==Page::Complete){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_launch,p))return Hot::Launch;}
-    if(g_page==Page::Failed){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;} return Hot::None;
+    if(g_page==Page::Failed)return Hit(g_primary,p)?Hot::Primary:Hot::None; return Hot::None;
 }
 void UpdateHover(HWND h,POINT p){Hot n=HotAt(p);if(n!=g_hover){g_hover=n;InvalidateRect(h,nullptr,FALSE);}TRACKMOUSEEVENT t{sizeof(t),TME_LEAVE,h,0};TrackMouseEvent(&t);}
 bool WriteResource(int id,const wchar_t* type,const std::filesystem::path& target) {
@@ -604,7 +651,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_SIZE: Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
     case WM_CTLCOLOREDIT: {
-        HDC dc=reinterpret_cast<HDC>(w); SetTextColor(dc,RGB(46,60,52)); SetBkColor(dc,RGB(255,255,255)); SetBkMode(dc,OPAQUE);
+        HDC dc=reinterpret_cast<HDC>(w); SetTextColor(dc,RGB(45,47,46)); SetBkColor(dc,RGB(255,255,255)); SetBkMode(dc,OPAQUE);
         static HBRUSH brush=CreateSolidBrush(RGB(255,255,255)); return reinterpret_cast<LRESULT>(brush);
     }
     case WM_COMMAND:
@@ -617,7 +664,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_LBUTTONDOWN: {
         POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)}; Hot hot=HotAt(p);
         if(hot!=Hot::None) { g_pressed=hot; SetCapture(h); InvalidateRect(h,nullptr,FALSE); return 0; }
-        if(!g_installing&&p.y<S(78)) { ReleaseCapture(); SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0); }
+        if(!g_installing&&p.y<S(70)) { ReleaseCapture(); SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0); }
         return 0;
     }
     case WM_LBUTTONUP: {
@@ -671,13 +718,15 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
     }
     case WM_CLOSE: if(g_installing)return 0; DestroyWindow(h); return 0;
-    case WM_DESTROY: for(HFONT font:{g_uiFont,g_smallFont,g_titleFont,g_displayFont})if(font)DeleteObject(font); if(g_headerIcon){DestroyIcon(g_headerIcon);g_headerIcon=nullptr;} if(g_uninstallWorker&&g_page==Page::UninstallComplete)DeleteUninstallWorkerAfterExit(); PostQuitMessage(0); return 0;
+    case WM_DESTROY: for(HFONT font:{g_uiFont,g_smallFont,g_titleFont,g_displayFont,g_emphasisFont})if(font)DeleteObject(font); if(g_headerIcon){DestroyIcon(g_headerIcon);g_headerIcon=nullptr;} if(g_uninstallWorker&&g_page==Page::UninstallComplete)DeleteUninstallWorkerAfterExit(); PostQuitMessage(0); return 0;
     default: return DefWindowProcW(h,m,w,l);
     }
 }
 int ShowWizard(HINSTANCE instance,int show) {
-    g_instance=instance;g_page=g_uninstallMode?Page::UninstallConfirm:Page::Welcome;g_dpi=GetDpiForSystem();g_headerIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_APP_ICON),IMAGE_ICON,S(30),S(30),LR_DEFAULTCOLOR));WNDCLASSW wc{};wc.style=CS_DBLCLKS|CS_DROPSHADOW;wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
-    HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(680),S(470),nullptr,nullptr,instance,nullptr);if(!h)return 1;ApplyWindowChrome(h);RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(680))/2,work.top+(work.bottom-work.top-S(470))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
+    g_instance=instance;g_page=g_uninstallMode?Page::UninstallConfirm:Page::Welcome;g_dpi=GetDpiForSystem();
+    g_headerIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_APP_ICON),IMAGE_ICON,S(36),S(36),LR_DEFAULTCOLOR));
+    WNDCLASSW wc{};wc.style=CS_DBLCLKS|CS_DROPSHADOW;wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
+    HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(720),S(500),nullptr,nullptr,instance,nullptr);if(!h)return 1;ApplyWindowChrome(h);RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(720))/2,work.top+(work.bottom-work.top-S(500))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
 }
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
