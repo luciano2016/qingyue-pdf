@@ -275,8 +275,7 @@ void DrawProgress(Gdiplus::Graphics& g,RECT r) {
 }
 void DrawHeader(Gdiplus::Graphics& g,RECT c) {
     DrawLogo(g);
-    DrawText(g,L"\u8f7b\u9605PDF",{S(86),S(15),S(280),S(40)},g_titleFont,RGB(35,38,37),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    DrawText(g,L"\u5b89\u88c5\u7a0b\u5e8f  \u00b7  " QINGYUE_VERSION_STRING_W,{S(87),S(38),S(300),S(59)},g_smallFont,RGB(126,125,120),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+    DrawText(g,L"\u8f7b\u9605PDF",{S(86),S(17),S(280),S(53)},g_titleFont,RGB(35,38,37),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
     Gdiplus::Pen line(Gc(RGB(229,225,220)),Sf(1.0f));
     g.DrawLine(&line,0.0f,Sf(70),static_cast<float>(c.right),Sf(70));
     DrawMinimize(g);
