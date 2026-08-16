@@ -10650,7 +10650,7 @@ namespace
         }
 
         AddButton(CmdTabListToggle, g_tabCountRect, L"", L"\u5168\u90e8\u6807\u7b7e\u9875");
-        drawUtilityButton(g_tabCountRect, g_tabListOpen);
+        drawUtilityButton(g_tabCountRect, g_tabListOpen, true);
         RECT countText{ g_tabCountRect.left + S(6), g_tabCountRect.top, g_tabCountRect.right - S(18), g_tabCountRect.bottom };
         HFONT countFont = Font(9);
         HGDIOBJ oldCountFont = SelectObject(dc, countFont);
