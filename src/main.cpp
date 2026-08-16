@@ -2918,11 +2918,17 @@ namespace
 
     void DrawButton(HDC dc, const Button& b)
     {
+        bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &b.rect);
         bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &b.rect);
-        COLORREF fill = pressed ? T().line : T().panel2;
-        COLORREF line = pressed ? T().accent : T().line;
+        COLORREF fill = pressed ? T().line : (hovered ? SidebarHoverFill() : T().panel2);
+        COLORREF line = pressed ? T().accent : (hovered ? MixColor(T().line, T().accent, 0.22) : T().line);
+        if (IsGlassTheme() && hovered && !pressed)
+        {
+            fill = RGB(232, 239, 247);
+            line = RGB(184, 199, 215);
+        }
         RoundFill(dc, b.rect, S(8), fill, line);
-        Text(dc, b.text, b.rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+        Text(dc, b.text, b.rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, pressed || hovered ? T().text : T().muted);
     }
 
     void DrawFlatMenuItem(HDC dc, const Button& b)
@@ -2966,9 +2972,16 @@ namespace
 
     void DrawStatusHotArea(HDC dc, RECT r, int radius = 6)
     {
-        if (g_mousePos.x >= r.left && g_mousePos.x <= r.right && g_mousePos.y >= r.top && g_mousePos.y <= r.bottom)
+        if (Hit(r, g_mousePos.x, g_mousePos.y))
         {
-            RoundFill(dc, r, S(radius), T().panel2, T().line);
+            if (IsGlassTheme())
+            {
+                RoundFill(dc, r, S(radius), RGB(232, 239, 247), RGB(184, 199, 215));
+            }
+            else
+            {
+                RoundFill(dc, r, S(radius), T().panel2, T().line);
+            }
         }
     }
 
@@ -10584,7 +10597,6 @@ namespace
             COLORREF line = active ? MixColor(T().line, T().accent, 0.40) : T().line;
             if (IsGlassTheme() || IsAuroraTheme())
             {
-                BYTE alpha = active ? 176 : (hover ? 140 : 88);
                 if (IsAuroraTheme())
                 {
                     COLORREF utilFill = active ? MixColor(T().panel2, T().accent, 0.06) : (hover ? SidebarHoverFill() : T().panel);
@@ -10593,8 +10605,9 @@ namespace
                 }
                 else
                 {
-                    AlphaFill(dc, r, RGB(255, 255, 255), alpha);
-                    RoundFill(dc, r, S(9), active ? RGB(252, 254, 255) : RGB(255, 255, 255), active ? RGB(212, 220, 228) : RGB(228, 233, 239));
+                    COLORREF utilFill = pressed ? RGB(218, 228, 239) : (active ? RGB(247, 250, 253) : (hover ? RGB(232, 239, 247) : RGB(255, 255, 255)));
+                    COLORREF utilLine = pressed ? RGB(170, 188, 207) : (active ? RGB(208, 218, 228) : (hover ? RGB(184, 199, 215) : RGB(228, 233, 239)));
+                    RoundFill(dc, r, S(9), utilFill, utilLine);
                 }
             }
             else
@@ -15094,8 +15107,8 @@ namespace
         PaintTabListOverlay(mem, client);
         PaintClearRecentDialog(mem, client);
         PaintCustomZoomDialog(mem, client);
-        if (!g_customZoomOpen) PaintHoverTip(mem, client);
         PaintTabDragOverlay(mem);
+        if (!g_customZoomOpen) PaintHoverTip(mem, client);
         auto flushRect = [&](RECT r)
         {
             RECT clipped{};
