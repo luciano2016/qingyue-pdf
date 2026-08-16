@@ -993,6 +993,7 @@ namespace
         using SharedContextFn = fz_context*(__cdecl*)(size_t);
         using CloneContextFn = fz_context*(__cdecl*)(fz_context*);
         using ShrinkStoreFn = int(__cdecl*)(fz_context*, unsigned int);
+        using ShrinkSharedStoreFn = int(__cdecl*)(unsigned int);
         using DropContextFn = void(__cdecl*)(fz_context*);
         using RegisterHandlersFn = void(__cdecl*)(fz_context*);
         using OpenDocumentFn = fz_document*(__cdecl*)(fz_context*, const char*);
@@ -1043,6 +1044,7 @@ namespace
             Get(newSharedContext, "quiet_new_shared_context");
             Get(cloneContext, "quiet_clone_context");
             GetOptional(shrinkStore, "quiet_shrink_store");
+            GetOptional(shrinkSharedStore, "quiet_shrink_shared_store");
             Get(registerHandlers, "fz_register_document_handlers");
             Get(openDocument, "fz_open_document");
             Get(openDocumentShared, "quiet_open_document_shared_w");
@@ -1093,6 +1095,7 @@ namespace
         SharedContextFn newSharedContext{};
         CloneContextFn cloneContext{};
         ShrinkStoreFn shrinkStore{};
+        ShrinkSharedStoreFn shrinkSharedStore{};
         RegisterHandlersFn registerHandlers{};
         OpenDocumentFn openDocument{};
         OpenDocumentSharedFn openDocumentShared{};
@@ -1187,6 +1190,7 @@ namespace
     constexpr size_t PdfResourceStoreLimit = 256ull * 1024ull * 1024ull;
 
     MuPdf g_pdf;
+    bool g_sharedStoreTrimPending{};
 
     PageRenderSession::~PageRenderSession()
     {
@@ -1233,6 +1237,14 @@ namespace
         g_pdf.setAaLevel(session->renderContext, 8);
         return session;
     }
+
+    void TrimSharedStoreIfPending()
+    {
+        if (!g_sharedStoreTrimPending || !g_pdf.shrinkSharedStore) return;
+        g_pdf.shrinkSharedStore(0);
+        g_sharedStoreTrimPending = false;
+    }
+
     HWND g_hwnd{};
     unsigned g_dpi{ 96 };
     std::vector<std::unique_ptr<PdfTab>> g_tabs;
@@ -5804,7 +5816,7 @@ namespace
         if (!tab)
         {
             TrimHomeDocumentCaches();
-
+            TrimSharedStoreIfPending();
             return;
         }
         PreparePageCache(*tab);
@@ -5849,11 +5861,12 @@ namespace
         // Keep the current page parsed so the first input after an idle trim
         // does not have to rebuild its display list on the UI-visible path.
         TrimDisplayLists(*tab, 0);
-        if (tab->initialStoreTrimPending && g_pdf.shrinkStore && tab->ctx)
+        if (tab->initialStoreTrimPending)
         {
-            g_pdf.shrinkStore(tab->ctx, 0);
             tab->initialStoreTrimPending = false;
+            g_sharedStoreTrimPending = true;
         }
+        TrimSharedStoreIfPending();
     }
     void ScheduleIdleCacheTrim(HWND hwnd)
     {
@@ -14411,6 +14424,7 @@ namespace
         if (closingActive) SaveActiveTabProgress();
         TouchRecentProgress(tab, true);
         CancelPageRendersForClosedTab(tab);
+        g_sharedStoreTrimPending = true;
         DropTab(tab);
         g_tabs.erase(g_tabs.begin() + index);
         if (g_tabs.empty()) g_active = -1;

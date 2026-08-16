@@ -84,6 +84,13 @@ extern "C" int quiet_shrink_store(fz_context* ctx, unsigned int percent)
     return fz_shrink_store(ctx, std::min(percent, 100u));
 }
 
+extern "C" int quiet_shrink_shared_store(unsigned int percent)
+{
+    std::lock_guard<std::mutex> guard(quiet_context_mutex());
+    fz_context* root = quiet_shared_root();
+    return root ? fz_shrink_store(root, std::min(percent, 100u)) : 0;
+}
+
 static void quiet_set_last_error(const char* message);
 
 namespace
