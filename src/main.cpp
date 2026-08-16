@@ -8983,15 +8983,32 @@ namespace
 
     void OpenDialog(HWND hwnd)
     {
-        wchar_t file[MAX_PATH]{};
+        constexpr DWORD OpenDialogBufferChars = 64 * 1024;
+        std::vector<wchar_t> files(OpenDialogBufferChars, L'\0');
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
         ofn.hwndOwner = hwnd;
-        ofn.lpstrFile = file;
-        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrFile = files.data();
+        ofn.nMaxFile = OpenDialogBufferChars;
         ofn.lpstrFilter = L"PDF \u6587\u4ef6 (*.pdf)\0*.pdf\0\u6240\u6709\u6587\u4ef6 (*.*)\0*.*\0";
-        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-        if (GetOpenFileNameW(&ofn)) OpenOrActivatePdf(hwnd, file);
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_EXPLORER | OFN_ALLOWMULTISELECT;
+        if (!GetOpenFileNameW(&ofn)) return;
+
+        wchar_t const* entry = files.data();
+        std::wstring first(entry);
+        entry += first.size() + 1;
+        if (*entry == L'\0')
+        {
+            OpenOrActivatePdf(hwnd, first);
+            return;
+        }
+
+        std::filesystem::path folder(first);
+        while (*entry != L'\0')
+        {
+            OpenOrActivatePdf(hwnd, (folder / entry).wstring());
+            entry += wcslen(entry) + 1;
+        }
     }
 
     void DisableNativeScrollbars(HWND hwnd)
