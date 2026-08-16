@@ -2922,10 +2922,10 @@ namespace
         bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &b.rect);
         COLORREF fill = pressed ? T().line : (hovered ? SidebarHoverFill() : T().panel2);
         COLORREF line = pressed ? T().accent : (hovered ? MixColor(T().line, T().accent, 0.22) : T().line);
-        if (IsGlassTheme() && hovered && !pressed)
+        if (IsGlassTheme())
         {
-            fill = RGB(232, 239, 247);
-            line = RGB(184, 199, 215);
+            fill = pressed ? RGB(232, 236, 241) : (hovered ? RGB(255, 255, 255) : T().panel);
+            line = pressed ? RGB(202, 210, 220) : (hovered ? RGB(228, 234, 241) : T().line);
         }
         RoundFill(dc, b.rect, S(8), fill, line);
         Text(dc, b.text, b.rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, pressed || hovered ? T().text : T().muted);
@@ -2976,7 +2976,7 @@ namespace
         {
             if (IsGlassTheme())
             {
-                RoundFill(dc, r, S(radius), RGB(232, 239, 247), RGB(184, 199, 215));
+                RoundFill(dc, r, S(radius), RGB(255, 255, 255), RGB(228, 234, 241));
             }
             else
             {
@@ -3356,10 +3356,9 @@ namespace
 
     void DrawSideTabIcon(HDC dc, RECT r, SideTabIcon icon, COLORREF color)
     {
-        UNREFERENCED_PARAMETER(color);
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        COLORREF iconColor = RGB(142, 142, 142);
+        COLORREF iconColor = color;
         Gdiplus::Pen pen(GdiColor(iconColor), std::max<Gdiplus::REAL>(1.55f, S(1)));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
@@ -3729,11 +3728,11 @@ namespace
         int h = S(28);
         int x = (g_hoverTipRect.left + g_hoverTipRect.right - w) / 2;
         x = std::clamp<int>(x, S(8), client.right - w - S(8));
-        int y = g_hoverTipRect.top - h - S(8);
-        if (y < S(8)) y = g_hoverTipRect.bottom + S(8);
+        int y = g_hoverTipRect.top - h - S(9);
+        if (y < S(8)) y = g_hoverTipRect.bottom + S(9);
         y = std::clamp<int>(y, S(8), client.bottom - h - S(8));
         RECT box{ x, y, x + w, y + h };
-        RoundFill(dc, box, S(6), T().panel2, T().line);
+        RoundFill(dc, box, S(9), T().panel2, T().line);
         Text(dc, g_hoverTip, box, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(f);
@@ -10605,8 +10604,10 @@ namespace
                 }
                 else
                 {
-                    COLORREF utilFill = pressed ? RGB(218, 228, 239) : (active ? RGB(247, 250, 253) : (hover ? RGB(232, 239, 247) : RGB(255, 255, 255)));
-                    COLORREF utilLine = pressed ? RGB(170, 188, 207) : (active ? RGB(208, 218, 228) : (hover ? RGB(184, 199, 215) : RGB(228, 233, 239)));
+                    COLORREF utilFill = pressed ? RGB(232, 236, 241)
+                        : (active ? RGB(247, 250, 253) : (hover ? RGB(255, 255, 255) : T().panel));
+                    COLORREF utilLine = pressed ? RGB(202, 210, 220)
+                        : (active ? RGB(208, 218, 228) : (hover ? RGB(228, 234, 241) : T().line));
                     RoundFill(dc, r, S(9), utilFill, utilLine);
                 }
             }
@@ -11414,7 +11415,10 @@ namespace
                 else if (IsDarkTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
                 else RoundFill(dc, tabRect, S(7), active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
             }
-            DrawSideTabIcon(dc, tabRect, sideIcons[i], active ? T().accent : SidebarIconColor());
+            COLORREF iconColor = active
+                ? ((IsDarkTheme() && !IsAuroraTheme()) ? MixColor(T().accent, T().text, 0.30) : T().accent)
+                : SidebarIconColor();
+            DrawSideTabIcon(dc, tabRect, sideIcons[i], iconColor);
         }
 
         auto visible = [&](RECT r)
@@ -11719,17 +11723,12 @@ namespace
         {
             RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(8), g_sidebar.right - S(12), g_sidebar.top + S(36) };
             Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
-            RECT smallBtn{ sizeBar.right - S(78), sizeBar.top, sizeBar.right - S(42), sizeBar.bottom };
-            RECT largeBtn{ sizeBar.right - S(36), sizeBar.top, sizeBar.right, sizeBar.bottom };
-            AddButton(CmdOutlineSmall, smallBtn, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
-            AddButton(CmdOutlineLarge, largeBtn, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
-            DrawButton(dc, Button{ CmdOutlineSmall, smallBtn, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7" });
-            DrawButton(dc, Button{ CmdOutlineLarge, largeBtn, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7" });
+
             Fill(dc, sizeBar, T().panel);
             RECT toggleAll{ sizeBar.left, sizeBar.top, sizeBar.left + S(92), sizeBar.bottom };
             std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"\u6536\u8d77\u6240\u6709" : L"\u5c55\u5f00\u6240\u6709";
             if (registerSidebarButtons) AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
-            bool toggleHovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &toggleAll);
+            bool toggleHovered = Hit(toggleAll, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &toggleAll);
             if (toggleHovered || togglePressed)
             {
