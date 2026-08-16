@@ -10588,7 +10588,7 @@ namespace
             }
         }
 
-        auto drawUtilityButton = [&](RECT r, bool active)
+        auto drawUtilityButton = [&](RECT r, bool active, bool showIdleBorder = false)
         {
             bool hover = Hit(r, g_mousePos.x, g_mousePos.y);
             bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
@@ -10604,10 +10604,11 @@ namespace
                 }
                 else
                 {
+                    constexpr COLORREF tabBarFill = RGB(250, 251, 253);
                     COLORREF utilFill = pressed ? RGB(232, 236, 241)
-                        : (active ? RGB(247, 250, 253) : (hover ? RGB(255, 255, 255) : T().panel));
+                        : (active ? RGB(247, 250, 253) : (hover ? RGB(255, 255, 255) : tabBarFill));
                     COLORREF utilLine = pressed ? RGB(202, 210, 220)
-                        : (active ? RGB(208, 218, 228) : (hover ? RGB(228, 234, 241) : T().line));
+                        : (active ? RGB(208, 218, 228) : (hover ? RGB(228, 234, 241) : (showIdleBorder ? T().line : tabBarFill)));
                     RoundFill(dc, r, S(9), utilFill, utilLine);
                 }
             }
@@ -10618,7 +10619,7 @@ namespace
         };
 
         AddButton(CmdOpen, plusRect, L"+", L"\u6253\u5f00\u65b0\u6587\u6863");
-        drawUtilityButton(plusRect, false);
+        drawUtilityButton(plusRect, false, true);
         DrawPlusGlyph(dc, plusRect, T().muted);
 
         if (showNav)
@@ -11416,7 +11417,8 @@ namespace
                 else RoundFill(dc, tabRect, S(7), active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
             }
             COLORREF iconColor = active
-                ? ((IsDarkTheme() && !IsAuroraTheme()) ? MixColor(T().accent, T().text, 0.30) : T().accent)
+                ? (IsGlassTheme() ? RGB(142, 142, 142)
+                    : ((IsDarkTheme() && !IsAuroraTheme()) ? MixColor(T().accent, T().text, 0.30) : T().accent))
                 : SidebarIconColor();
             DrawSideTabIcon(dc, tabRect, sideIcons[i], iconColor);
         }
