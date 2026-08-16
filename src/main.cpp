@@ -5410,6 +5410,7 @@ namespace
                 if (g_pageRenderCanceledSerial == request.serial)
                     g_pageRenderCanceledSerial = 0;
                 g_pageRenderActiveCookie = nullptr;
+                g_pageRenderActiveRequest = {};
             }
             g_pdf.dropRenderCookie(renderCookie);
             if (!stale && (result->image.dib || !result->image.bgra.empty()) && IsWindow(request.target))
@@ -5430,6 +5431,7 @@ namespace
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             g_pageRenderStop = false;
             g_pageRenderQueue.clear();
+            g_pageRenderActiveRequest = {};
             g_pageRenderActive = false;
         }
         g_pageRenderThread = std::thread(PageRenderWorkerMain);
@@ -5483,6 +5485,25 @@ namespace
         {
             AbortActivePageRenderLocked();
         }
+    }
+
+    void CancelPageRendersForClosedTab(PdfTab const& tab)
+    {
+        std::shared_ptr<PageRenderSession> closingSession = tab.renderSession;
+        if (!closingSession) return;
+
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        g_pageRenderQueue.erase(
+            std::remove_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& request)
+                {
+                    return request.session == closingSession;
+                }),
+            g_pageRenderQueue.end());
+        if (g_pageRenderActive && g_pageRenderActiveRequest.session == closingSession)
+            AbortActivePageRenderLocked();
     }
 
     void HomeThumbWorkerMain()
@@ -14389,6 +14410,7 @@ namespace
         if (!ConfirmCloseDirtyTab(g_hwnd, tab)) return false;
         if (closingActive) SaveActiveTabProgress();
         TouchRecentProgress(tab, true);
+        CancelPageRendersForClosedTab(tab);
         DropTab(tab);
         g_tabs.erase(g_tabs.begin() + index);
         if (g_tabs.empty()) g_active = -1;
@@ -14403,6 +14425,7 @@ namespace
         SetTitle();
         StartActiveFileWatcher(g_hwnd);
         InvalidateRect(g_hwnd, nullptr, FALSE);
+        ScheduleIdleCacheTrim(g_hwnd);
         return true;
     }
 
