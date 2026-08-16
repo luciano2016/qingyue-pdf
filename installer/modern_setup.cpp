@@ -72,6 +72,16 @@ int S(int v) { return MulDiv(v, static_cast<int>(g_dpi), 96); }
 float Sf(float v) { return v * static_cast<float>(g_dpi) / 96.0f; }
 bool Hit(RECT r, POINT p) { return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom; }
 Gdiplus::Color Gc(COLORREF c, BYTE a = 255) { return {a, GetRValue(c), GetGValue(c), GetBValue(c)}; }
+constexpr COLORREF kWarmSurface = RGB(251, 250, 247);
+constexpr COLORREF kWarmHeader = RGB(246, 250, 248);
+constexpr COLORREF kWarmFooter = RGB(249, 248, 245);
+constexpr COLORREF kWarmLine = RGB(229, 225, 220);
+constexpr COLORREF kWarmPanel = RGB(255, 255, 252);
+constexpr COLORREF kWarmPanelHover = RGB(255, 248, 241);
+constexpr COLORREF kWarmPanelPressed = RGB(248, 240, 233);
+constexpr COLORREF kAccentOrange = RGB(255, 121, 24);
+constexpr COLORREF kAccentOrange2 = RGB(255, 166, 39);
+constexpr COLORREF kAccentOrangeDark = RGB(227, 81, 18);
 Gdiplus::RectF Rf(RECT r) { return {static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right-r.left), static_cast<float>(r.bottom-r.top)}; }
 void AddRoundPath(Gdiplus::GraphicsPath& path, RECT r, float radius) {
     auto b = Rf(r); float d = std::min(radius * 2.0f, std::min(b.Width, b.Height));
@@ -83,6 +93,27 @@ void FillRound(Gdiplus::Graphics& g, RECT r, float radius, COLORREF c, BYTE a = 
 }
 void StrokeRound(Gdiplus::Graphics& g, RECT r, float radius, COLORREF c, BYTE a = 255) {
     Gdiplus::GraphicsPath p(Gdiplus::FillModeAlternate); AddRoundPath(p,r,radius); Gdiplus::Pen pen(Gc(c,a),std::max(1.0f,Sf(1.0f))); g.DrawPath(&pen,&p);
+}
+void FillGlowEllipse(Gdiplus::Graphics& g, RECT r, COLORREF c, BYTE centerAlpha) {
+    Gdiplus::GraphicsPath path;
+    path.AddEllipse(Rf(r));
+    Gdiplus::PathGradientBrush brush(&path);
+    brush.SetCenterColor(Gc(c, centerAlpha));
+    Gdiplus::Color edge = Gc(c, 0);
+    Gdiplus::Color surround[] = { edge };
+    INT count = 1;
+    brush.SetSurroundColors(surround, &count);
+    g.FillPath(&brush, &path);
+}
+void DrawWarmBackdrop(Gdiplus::Graphics& g, RECT c) {
+    g.Clear(Gc(kWarmSurface));
+    Gdiplus::SolidBrush top(Gc(kWarmHeader, 224));
+    g.FillRectangle(&top, 0, 0, c.right, S(70));
+    Gdiplus::SolidBrush foot(Gc(kWarmFooter, 236));
+    g.FillRectangle(&foot, 0, c.bottom - S(88), c.right, S(88));
+    FillGlowEllipse(g, {c.right - S(340), S(8), c.right + S(60), S(430)}, RGB(255, 145, 42), 42);
+    FillGlowEllipse(g, {c.right - S(220), S(60), c.right + S(12), S(300)}, RGB(255, 186, 117), 34);
+    FillGlowEllipse(g, {S(22), c.bottom - S(190), S(300), c.bottom + S(56)}, RGB(255, 178, 98), 18);
 }
 std::filesystem::path KnownFolder(REFKNOWNFOLDERID id) {
     PWSTR value=nullptr; if (FAILED(SHGetKnownFolderPath(id,0,nullptr,&value))) return {};
@@ -214,19 +245,19 @@ void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bo
     RECT body=r;
     if(!pressed) {
         RECT shadow{r.left,r.top+S(2),r.right,r.bottom+S(2)};
-        FillRound(g,shadow,Sf(9),primary?RGB(189,82,27):RGB(72,61,53),primary?38:14);
+        FillRound(g,shadow,Sf(9),primary?RGB(189,82,27):RGB(72,61,53),primary?34:10);
     }
     if(primary) {
         Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate); AddRoundPath(path,body,Sf(9));
-        const COLORREF left=pressed?RGB(227,81,18):(hover?RGB(255,112,25):RGB(255,121,24));
-        const COLORREF right=pressed?RGB(239,119,24):(hover?RGB(255,155,36):RGB(255,166,39));
+        const COLORREF left=pressed?kAccentOrangeDark:(hover?RGB(255,112,25):kAccentOrange);
+        const COLORREF right=pressed?RGB(239,119,24):(hover?RGB(255,155,36):kAccentOrange2);
         Gdiplus::LinearGradientBrush brush(Rf(body),Gc(left),Gc(right),Gdiplus::LinearGradientModeHorizontal);
         g.FillPath(&brush,&path);
-        StrokeRound(g,body,Sf(9),pressed?RGB(215,80,20):RGB(247,116,24),210);
+        StrokeRound(g,body,Sf(9),pressed?RGB(215,80,20):RGB(247,116,24),190);
     } else {
-        const COLORREF fill=pressed?RGB(246,239,234):(hover?RGB(255,247,241):RGB(255,255,255));
+        const COLORREF fill=pressed?kWarmPanelPressed:(hover?kWarmPanelHover:kWarmPanel);
         FillRound(g,body,Sf(9),fill);
-        StrokeRound(g,body,Sf(9),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),230);
+        StrokeRound(g,body,Sf(9),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),210);
     }
     RECT textRect=body;
     const bool arrow=primary&&(label==L"\u7ee7\u7eed"||label==L"\u5f00\u59cb\u5b89\u88c5");
@@ -246,8 +277,8 @@ void DrawBackButton(Gdiplus::Graphics& g,RECT r) {
         RECT shadow{r.left,r.top+S(2),r.right,r.bottom+S(2)};
         FillRound(g,shadow,Sf(20),RGB(72,61,53),12);
     }
-    FillRound(g,r,Sf(20),pressed?RGB(246,239,234):(hover?RGB(255,247,241):RGB(255,255,255)));
-    StrokeRound(g,r,Sf(20),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),230);
+    FillRound(g,r,Sf(20),pressed?kWarmPanelPressed:(hover?kWarmPanelHover:kWarmPanel));
+    StrokeRound(g,r,Sf(20),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),210);
     const float cx=static_cast<float>(r.left+r.right)/2.0f;
     const float cy=static_cast<float>(r.top+r.bottom)/2.0f;
     Gdiplus::Pen pen(Gc(pressed?RGB(184,70,27):(hover?RGB(221,92,37):RGB(70,72,70))),Sf(1.8f));
@@ -259,7 +290,7 @@ void DrawBackButton(Gdiplus::Graphics& g,RECT r) {
 void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
     const int side=S(18);
     RECT b{r.left,r.top+(r.bottom-r.top-side)/2,r.left+side,r.top+(r.bottom-r.top-side)/2+side};
-    const COLORREF fill=checked?RGB(255,126,27):(active?RGB(255,246,239):RGB(255,255,255));
+    const COLORREF fill=checked?RGB(255,126,27):(active?kWarmPanelHover:kWarmPanel);
     FillRound(g,b,Sf(4),fill);
     StrokeRound(g,b,Sf(4),checked?RGB(242,106,19):(active?RGB(241,153,97):RGB(188,187,182)),255);
     if(!checked) return;
@@ -269,14 +300,14 @@ void DrawCheckbox(Gdiplus::Graphics& g,RECT r,bool checked,bool active) {
     g.DrawLine(&p,static_cast<float>(b.left)+Sf(8),static_cast<float>(b.top)+Sf(13),static_cast<float>(b.left)+Sf(15),static_cast<float>(b.top)+Sf(5));
 }
 void DrawProgress(Gdiplus::Graphics& g,RECT r) {
-    FillRound(g,r,Sf(5),RGB(238,232,226)); RECT f=r; f.right=f.left+static_cast<int>((r.right-r.left)*std::clamp(g_progress,0.0f,1.0f)); if(f.right<=f.left)return;
+    FillRound(g,r,Sf(5),RGB(239,232,224)); RECT f=r; f.right=f.left+static_cast<int>((r.right-r.left)*std::clamp(g_progress,0.0f,1.0f)); if(f.right<=f.left)return;
     Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate); AddRoundPath(path,f,Sf(5)); Gdiplus::LinearGradientBrush brush(Rf(f),Gc(RGB(255,116,23)),Gc(RGB(255,166,39)),Gdiplus::LinearGradientModeHorizontal); g.FillPath(&brush,&path);
     RECT sh{std::max(f.left,f.right-S(84)+g_shine),f.top,std::min(f.right,f.right+S(18)),f.bottom}; if(sh.right>sh.left) FillRound(g,sh,Sf(5),RGB(255,225,176),72);
 }
 void DrawHeader(Gdiplus::Graphics& g,RECT c) {
     DrawLogo(g);
     DrawText(g,L"\u8f7b\u9605PDF",{S(86),S(17),S(280),S(53)},g_titleFont,RGB(35,38,37),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-    Gdiplus::Pen line(Gc(RGB(229,225,220)),Sf(1.0f));
+    Gdiplus::Pen line(Gc(kWarmLine,170),Sf(1.0f));
     g.DrawLine(&line,0.0f,Sf(70),static_cast<float>(c.right),Sf(70));
     DrawMinimize(g);
     DrawClose(g);
@@ -285,7 +316,7 @@ void DrawCompactStatus(Gdiplus::Graphics& g,RECT c,bool success) {
     const int size=S(68);
     const int left=(c.right-size)/2;
     RECT circle{left,S(112),left+size,S(112)+size};
-    FillRound(g,circle,Sf(34),success?RGB(255,238,224):RGB(255,235,231));
+    FillRound(g,circle,Sf(34),success?RGB(255,239,225):RGB(255,236,232));
     Gdiplus::Pen pen(Gc(success?RGB(244,103,22):RGB(205,64,45)),Sf(3.2f));
     pen.SetLineCap(Gdiplus::LineCapRound,Gdiplus::LineCapRound,Gdiplus::DashCapRound);
     const float cx=static_cast<float>(c.right)/2.0f;
@@ -298,14 +329,14 @@ void DrawCompactStatus(Gdiplus::Graphics& g,RECT c,bool success) {
 }
 void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
     const COLORREF text=RGB(38,41,40), muted=RGB(113,112,107);
-    g.Clear(Gc(RGB(251,250,248)));
+    DrawWarmBackdrop(g,c);
     DrawHeader(g,c);
-    Gdiplus::SolidBrush footer(Gc(RGB(248,246,243))); g.FillRectangle(&footer,0,c.bottom-S(88),c.right,S(88));
-    Gdiplus::Pen divider(Gc(RGB(229,225,220)),Sf(1)); g.DrawLine(&divider,0.0f,static_cast<float>(c.bottom-S(88)),static_cast<float>(c.right),static_cast<float>(c.bottom-S(88)));
+    Gdiplus::SolidBrush footer(Gc(kWarmFooter,236)); g.FillRectangle(&footer,0,c.bottom-S(88),c.right,S(88));
+    Gdiplus::Pen divider(Gc(kWarmLine,170),Sf(1)); g.DrawLine(&divider,0.0f,static_cast<float>(c.bottom-S(88)),static_cast<float>(c.right),static_cast<float>(c.bottom-S(88)));
     if(g_uninstallMode&&g_page==Page::UninstallConfirm) {
         DrawText(g,L"\u5378\u8f7d\u8f7b\u9605PDF",{S(55),S(96),c.right-S(55),S(142)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u5c06\u4ece\u5f53\u524d\u7535\u8111\u4e2d\u79fb\u9664\u8f7b\u9605PDF\u3002",{S(57),S(148),c.right-S(55),S(178)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        FillRound(g,g_deleteData,Sf(10),RGB(255,255,255)); StrokeRound(g,g_deleteData,Sf(10),RGB(229,224,218),220);
+        FillRound(g,g_deleteData,Sf(10),g_hover==Hot::DeleteData?kWarmPanelHover:kWarmPanel); StrokeRound(g,g_deleteData,Sf(10),RGB(229,224,218),205);
         DrawCheckbox(g,{g_deleteData.left+S(18),g_deleteData.top,g_deleteData.left+S(45),g_deleteData.bottom},g_deleteAppData,g_hover==Hot::DeleteData||g_pressed==Hot::DeleteData);
         DrawText(g,L"\u5220\u9664\u5e94\u7528\u914d\u7f6e\u6570\u636e",{g_deleteData.left+S(58),g_deleteData.top+S(7),g_deleteData.right-S(18),g_deleteData.top+S(31)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u9605\u8bfb\u8fdb\u5ea6\u3001\u6700\u8fd1\u6587\u6863\u548c\u4e3b\u9898\u8bbe\u7f6e",{g_deleteData.left+S(58),g_deleteData.top+S(30),g_deleteData.right-S(18),g_deleteData.bottom-S(5)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -327,9 +358,9 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u5b89\u88c5\u8f7b\u9605PDF",{S(55),S(88),c.right-S(55),S(130)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u786e\u8ba4\u5b89\u88c5\u4f4d\u7f6e\u548c\u5feb\u6377\u65b9\u5f0f",{S(57),S(133),c.right-S(55),S(162)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u5b89\u88c5\u4f4d\u7f6e",{S(55),S(174),S(230),S(199)},g_emphasisFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        FillRound(g,g_editFrame,Sf(9),RGB(255,255,255)); StrokeRound(g,g_editFrame,Sf(9),g_pathFocused?RGB(246,135,66):RGB(218,215,210),g_pathFocused?240:220);
+        FillRound(g,g_editFrame,Sf(9),kWarmPanel); StrokeRound(g,g_editFrame,Sf(9),g_pathFocused?RGB(246,135,66):RGB(218,215,210),g_pathFocused?240:205);
         DrawButton(g,g_browse,L"\u6d4f\u89c8",Hot::Browse,false);
-        FillRound(g,g_desktop,Sf(9),g_hover==Hot::Desktop?RGB(255,247,241):RGB(255,255,255)); StrokeRound(g,g_desktop,Sf(9),RGB(229,224,218),220);
+        FillRound(g,g_desktop,Sf(9),g_hover==Hot::Desktop?kWarmPanelHover:kWarmPanel); StrokeRound(g,g_desktop,Sf(9),RGB(229,224,218),205);
         DrawCheckbox(g,{g_desktop.left+S(18),g_desktop.top,g_desktop.left+S(45),g_desktop.bottom},g_desktopShortcut,g_hover==Hot::Desktop||g_pressed==Hot::Desktop);
         DrawText(g,L"\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f",{g_desktop.left+S(58),g_desktop.top,g_desktop.right-S(16),g_desktop.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u6240\u9700\u7a7a\u95f4  "+FormatStorageSize(kEstimatedInstalledBytes,true),{S(57),S(340),S(190),S(373)},g_smallFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -354,7 +385,7 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
         std::wstring detail=complete?(g_uninstallMode?L"\u8f7b\u9605PDF \u5df2\u4ece\u7535\u8111\u4e2d\u79fb\u9664\u3002":L"\u8f7b\u9605PDF \u5df2\u51c6\u5907\u5c31\u7eea\u3002"):(g_error.empty()?L"\u64cd\u4f5c\u8fc7\u7a0b\u4e2d\u51fa\u73b0\u4e86\u95ee\u9898\uff0c\u8bf7\u91cd\u8bd5\u3002":g_error);
         DrawText(g,detail,{S(90),S(242),c.right-S(90),S(292)},g_uiFont,muted,DT_CENTER|DT_WORDBREAK);
         if(g_page==Page::Complete) {
-            FillRound(g,g_launch,Sf(9),g_hover==Hot::Launch?RGB(255,247,241):RGB(255,255,255)); StrokeRound(g,g_launch,Sf(9),RGB(229,224,218),220);
+            FillRound(g,g_launch,Sf(9),g_hover==Hot::Launch?kWarmPanelHover:kWarmPanel); StrokeRound(g,g_launch,Sf(9),RGB(229,224,218),205);
             DrawCheckbox(g,{g_launch.left+S(18),g_launch.top,g_launch.left+S(45),g_launch.bottom},g_launchAfterInstall,g_hover==Hot::Launch||g_pressed==Hot::Launch);
             DrawText(g,L"\u5b8c\u6210\u540e\u6253\u5f00\u8f7b\u9605PDF",{g_launch.left+S(58),g_launch.top,g_launch.right-S(18),g_launch.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         }
@@ -672,8 +703,8 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_ERASEBKGND: return 1;
     case WM_SIZE: Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
     case WM_CTLCOLOREDIT: {
-        HDC dc=reinterpret_cast<HDC>(w); SetTextColor(dc,RGB(45,47,46)); SetBkColor(dc,RGB(255,255,255)); SetBkMode(dc,OPAQUE);
-        static HBRUSH brush=CreateSolidBrush(RGB(255,255,255)); return reinterpret_cast<LRESULT>(brush);
+        HDC dc=reinterpret_cast<HDC>(w); SetTextColor(dc,RGB(45,47,46)); SetBkColor(dc,kWarmPanel); SetBkMode(dc,OPAQUE);
+        static HBRUSH brush=CreateSolidBrush(kWarmPanel); return reinterpret_cast<LRESULT>(brush);
     }
     case WM_COMMAND:
         if(LOWORD(w)==kPathEdit&&HIWORD(w)==EN_CHANGE) { g_spacePath.clear(); g_availableSpaceText.clear(); InvalidateRect(h,nullptr,FALSE); return 0; }
