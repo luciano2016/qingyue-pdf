@@ -8499,7 +8499,7 @@ namespace
         int clamped = ClampTabListScrollValue(client, value);
         if (clamped == g_tabListScrollY) return;
         g_tabListScrollY = clamped;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        InvalidateRect(hwnd, &g_tabListRect, FALSE);
     }
 
     int PageFromScroll(PdfTab const& tab, int scrollY)
@@ -15150,6 +15150,7 @@ namespace
             flushRect(g_mainScrollTrackRect);
             flushRect(g_mainHScrollTrackRect);
             flushRect(g_sidebarPanelToggleRect);
+            flushRect(g_tabListRect);
 
         }
         RestoreDC(mem, paintState);
@@ -16523,9 +16524,14 @@ namespace
                     break;
                 }
             }
-            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect || oldHoverTabListItem != g_hoverTabListItem)
+            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect)
             {
                 InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (oldHoverTabListItem != g_hoverTabListItem)
+            {
+                // Keep the tab list responsive without forcing a PDF-page repaint.
+                InvalidateRect(hwnd, &g_tabListRect, FALSE);
             }
             if (oldHoverOutlineRow != g_hoverOutlineRow || oldHoverOutlineToggle != g_hoverOutlineToggle)
             {
