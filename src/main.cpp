@@ -16316,6 +16316,7 @@ namespace
                         g_pdfLinkPressUri = std::move(uri);
                     }
                     g_selectingContent = true;
+                    if(g_hoverTipIsPdfLink) { g_hasHoverTip=false; g_hoverTipIsPdfLink=false; g_hoverTip.clear(); InvalidateRect(hwnd,nullptr,FALSE); }
                     g_hasContentSelection = false;
                     g_selectionIsImage = false;
                     g_selectionPage = page;
