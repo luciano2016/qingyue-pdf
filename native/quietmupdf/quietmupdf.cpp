@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 #include <mutex>
 
@@ -1409,6 +1410,15 @@ struct quiet_visual_line
     float size;
 };
 
+struct quiet_pdf_link_info
+{
+    float x0;
+    float y0;
+    float x1;
+    float y1;
+    char uri[1024];
+};
+
 struct quiet_visual_caret
 {
     int line;
@@ -1535,6 +1545,223 @@ static std::vector<quiet_visual_line> quiet_build_visual_lines(fz_stext_page* st
         return ax < bx;
     });
     return lines;
+}
+
+struct quiet_link_record
+{
+    fz_rect rect;
+    std::string uri;
+};
+
+static char quiet_ascii_lower(char value)
+{
+    return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value;
+}
+
+static bool quiet_ascii_starts_with(const char* text, const char* prefix)
+{
+    if (!text || !prefix) return false;
+    while (*prefix)
+    {
+        if (!*text || quiet_ascii_lower(*text) != quiet_ascii_lower(*prefix))
+            return false;
+        ++text;
+        ++prefix;
+    }
+    return true;
+}
+
+static bool quiet_is_supported_external_uri(const char* uri)
+{
+    return quiet_ascii_starts_with(uri, "http://") ||
+        quiet_ascii_starts_with(uri, "https://") ||
+        quiet_ascii_starts_with(uri, "mailto:") ||
+        quiet_ascii_starts_with(uri, "ftp://") ||
+        quiet_ascii_starts_with(uri, "www.");
+}
+
+static fz_rect quiet_normalized_rect(fz_rect rect, fz_rect bounds)
+{
+    float width = std::max(0.0001f, bounds.x1 - bounds.x0);
+    float height = std::max(0.0001f, bounds.y1 - bounds.y0);
+    return fz_rect{
+        (rect.x0 - bounds.x0) / width,
+        (rect.y0 - bounds.y0) / height,
+        (rect.x1 - bounds.x0) / width,
+        (rect.y1 - bounds.y0) / height
+    };
+}
+
+static bool quiet_link_rect_overlaps(const std::vector<quiet_link_record>& links, fz_rect candidate)
+{
+    float candidateArea = std::max(0.0f, candidate.x1 - candidate.x0) *
+        std::max(0.0f, candidate.y1 - candidate.y0);
+    if (candidateArea <= 0.0f) return true;
+    for (const quiet_link_record& link : links)
+    {
+        float x0 = std::max(link.rect.x0, candidate.x0);
+        float y0 = std::max(link.rect.y0, candidate.y0);
+        float x1 = std::min(link.rect.x1, candidate.x1);
+        float y1 = std::min(link.rect.y1, candidate.y1);
+        float overlap = std::max(0.0f, x1 - x0) * std::max(0.0f, y1 - y0);
+        if (overlap / candidateArea >= 0.25f)
+            return true;
+    }
+    return false;
+}
+
+static bool quiet_is_url_prefix(const std::string& text, size_t index)
+{
+    const char* value = text.c_str() + index;
+    return quiet_ascii_starts_with(value, "http://") ||
+        quiet_ascii_starts_with(value, "https://") ||
+        quiet_ascii_starts_with(value, "www.");
+}
+
+static bool quiet_is_url_boundary(char value)
+{
+    return value == 0 || static_cast<unsigned char>(value) <= 32 ||
+        value == '<' || value == '>' || value == '"';
+}
+
+static bool quiet_is_trailing_url_punctuation(char value)
+{
+    return value == '.' || value == ',' || value == ';' || value == ':' ||
+        value == '!' || value == '?' || value == ')' || value == ']' || value == '}';
+}
+
+extern "C" int quiet_pdf_get_links(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    quiet_pdf_link_info* output,
+    int max_links,
+    fz_rect* text_boxes,
+    int max_text_boxes,
+    int* text_box_count)
+{
+    quiet_set_last_error("");
+    if (!ctx || !doc || page_number < 0 || max_links < 0 || (max_links > 0 && !output) ||
+        max_text_boxes < 0 || (max_text_boxes > 0 && !text_boxes) || !text_box_count)
+    {
+        quiet_set_last_error("invalid quiet_pdf_get_links arguments");
+        return 0;
+    }
+    *text_box_count = 0;
+
+    fz_page* page = nullptr;
+    fz_link* pageLinks = nullptr;
+    fz_stext_page* stext = nullptr;
+    std::vector<quiet_link_record> links;
+    int resultCount = 0;
+    int characterCount = 0;
+    fz_try(ctx)
+    {
+        if (page_number >= fz_count_pages(ctx, doc))
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "page out of range");
+
+        page = fz_load_page(ctx, doc, page_number);
+        fz_rect bounds = fz_bound_page(ctx, page);
+        pageLinks = fz_load_links(ctx, page);
+        for (fz_link* link = pageLinks; link; link = link->next)
+        {
+            if (!quiet_is_supported_external_uri(link->uri))
+                continue;
+            std::string uri = link->uri;
+            if (quiet_ascii_starts_with(uri.c_str(), "www."))
+                uri.insert(0, "https://");
+            links.push_back(quiet_link_record{ quiet_normalized_rect(link->rect, bounds), std::move(uri) });
+        }
+
+        fz_stext_options options{};
+        options.flags = FZ_STEXT_DEHYPHENATE;
+        stext = fz_new_stext_page_from_page_number(ctx, doc, page_number, &options);
+        std::vector<quiet_visual_line> lines = quiet_build_visual_lines(stext);
+        for (const quiet_visual_line& line : lines)
+        {
+            for (const quiet_visual_char& ch : line.chars)
+            {
+                if (text_boxes && characterCount < max_text_boxes)
+                    text_boxes[characterCount] = quiet_normalized_rect(ch.rect, bounds);
+                ++characterCount;
+            }
+        }
+        *text_box_count = characterCount;
+        for (const quiet_visual_line& line : lines)
+        {
+            std::string text;
+            text.reserve(line.chars.size());
+            for (const quiet_visual_char& ch : line.chars)
+                text.push_back(ch.ch->c > 0 && ch.ch->c < 128 ? static_cast<char>(ch.ch->c) : ' ');
+
+            for (size_t start = 0; start < text.size();)
+            {
+                bool prefixBoundary = start == 0 || quiet_is_url_boundary(text[start - 1]) ||
+                    text[start - 1] == '(' || text[start - 1] == '[';
+                if (!prefixBoundary || !quiet_is_url_prefix(text, start))
+                {
+                    ++start;
+                    continue;
+                }
+
+                size_t end = start;
+                while (end < text.size() && !quiet_is_url_boundary(text[end]))
+                    ++end;
+                while (end > start && quiet_is_trailing_url_punctuation(text[end - 1]))
+                    --end;
+                if (end <= start + 4)
+                {
+                    ++start;
+                    continue;
+                }
+
+                fz_rect rect = line.chars[start].rect;
+                for (size_t i = start + 1; i < end; ++i)
+                {
+                    rect.x0 = std::min(rect.x0, line.chars[i].rect.x0);
+                    rect.y0 = std::min(rect.y0, line.chars[i].rect.y0);
+                    rect.x1 = std::max(rect.x1, line.chars[i].rect.x1);
+                    rect.y1 = std::max(rect.y1, line.chars[i].rect.y1);
+                }
+                fz_rect normalized = quiet_normalized_rect(rect, bounds);
+                if (!quiet_link_rect_overlaps(links, normalized))
+                {
+                    std::string uri = text.substr(start, end - start);
+                    if (quiet_ascii_starts_with(uri.c_str(), "www."))
+                        uri.insert(0, "https://");
+                    links.push_back(quiet_link_record{ normalized, std::move(uri) });
+                }
+                start = std::max(end, start + 1);
+            }
+        }
+
+        resultCount = static_cast<int>(links.size());
+        for (int i = 0; i < std::min(resultCount, max_links); ++i)
+        {
+            output[i].x0 = links[static_cast<size_t>(i)].rect.x0;
+            output[i].y0 = links[static_cast<size_t>(i)].rect.y0;
+            output[i].x1 = links[static_cast<size_t>(i)].rect.x1;
+            output[i].y1 = links[static_cast<size_t>(i)].rect.y1;
+            strncpy_s(
+                output[i].uri,
+                sizeof(output[i].uri),
+                links[static_cast<size_t>(i)].uri.c_str(),
+                _TRUNCATE);
+        }
+    }
+    fz_always(ctx)
+    {
+        if (stext) fz_drop_stext_page(ctx, stext);
+        if (pageLinks) fz_drop_link(ctx, pageLinks);
+        if (page) fz_drop_page(ctx, page);
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        resultCount = 0;
+        *text_box_count = 0;
+    }
+    return resultCount;
 }
 
 static int quiet_char_boundary_index(const quiet_visual_line& line, fz_point p)

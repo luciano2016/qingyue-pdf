@@ -323,6 +323,21 @@ namespace
         char contents[512]{};
     };
 
+    struct QuietPdfLinkInfo
+    {
+        float x0{};
+        float y0{};
+        float x1{};
+        float y1{};
+        char uri[1024]{};
+    };
+
+    struct PdfLink
+    {
+        fz_rect rect{};
+        std::wstring uri;
+    };
+
     struct OutlineLayoutRow
     {
         int top{};
@@ -358,6 +373,8 @@ namespace
         std::map<TileKey, PageImage> tileCache;
         std::map<int, PageImage> thumbCache;
         std::map<int, std::vector<fz_rect>> textBoxes;
+        std::map<int, std::vector<PdfLink>> links;
+        std::set<int> linksReady;
         std::set<int> textBoxesReady;
         std::vector<PdfAnnotation> annotations;
         std::vector<OutlineLayoutRow> outlineLayout;
@@ -1029,6 +1046,7 @@ namespace
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
         using SelectWordAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_quad*, int, char*, int);
         using TextCharBoxesFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_rect*, int);
+        using GetLinksFn = int(__cdecl*)(fz_context*, fz_document*, int, QuietPdfLinkInfo*, int, fz_rect*, int, int*);
         using FindImageAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_rect*);
         using PixmapIntFn = int(__cdecl*)(fz_context*, fz_pixmap*);
         using PixmapSamplesFn = unsigned char*(__cdecl*)(fz_context*, fz_pixmap*);
@@ -1079,6 +1097,7 @@ namespace
             Get(pageBounds, "quiet_pdf_get_page_bounds");
             Get(selectText, "quiet_pdf_select_text");
             GetOptional(selectWordAtPoint, "quiet_pdf_select_word_at_point");
+            Get(getLinks, "quiet_pdf_get_links");
             GetOptional(textCharBoxes, "quiet_pdf_get_text_char_boxes");
             GetOptional(findImageAtPoint, "quiet_pdf_find_image_at_point");
             Get(pixmapWidth, "fz_pixmap_width");
@@ -1129,6 +1148,7 @@ namespace
         LoadAnnotationsFn loadAnnotations{};
         PageBoundsFn pageBounds{};
         SelectTextFn selectText{};
+        GetLinksFn getLinks{};
         SelectWordAtPointFn selectWordAtPoint{};
         TextCharBoxesFn textCharBoxes{};
         FindImageAtPointFn findImageAtPoint{};
@@ -1430,6 +1450,7 @@ namespace
     bool g_hasPressedButton{};
     bool g_hasHoverButton{};
     bool g_hasHoverTip{};
+    bool g_hoverTipIsPdfLink{};
     bool g_pageInputFocused{};
     bool g_pageCaretVisible{ true };
     bool g_smoothStageScroll{};
@@ -1542,6 +1563,10 @@ namespace
     fz_rect g_selectionNorm{};
     std::vector<fz_quad> g_selectionQuads;
     std::wstring g_selectionText;
+    bool g_pdfLinkPressPending{};
+    int g_pdfLinkPressPage{ -1 };
+    POINT g_pdfLinkPressStart{};
+    std::wstring g_pdfLinkPressUri;
     class QuietPdfUiaProvider;
     QuietPdfUiaProvider* g_uiaProvider{};
     class QuietPdfUiaRootProvider;
@@ -3736,16 +3761,27 @@ namespace
         HGDIOBJ oldFont = SelectObject(dc, f);
         SIZE sz{};
         GetTextExtentPoint32W(dc, g_hoverTip.c_str(), static_cast<int>(g_hoverTip.size()), &sz);
-        int w = sz.cx + S(20);
+        int maxW = std::max<int>(S(80), static_cast<int>(client.right) - S(16));
+        int w = std::min<int>(static_cast<int>(sz.cx) + S(20), maxW);
         int h = S(28);
         int x = (g_hoverTipRect.left + g_hoverTipRect.right - w) / 2;
-        x = std::clamp<int>(x, S(8), client.right - w - S(8));
-        int y = g_hoverTipRect.top - h - S(9);
-        if (y < S(8)) y = g_hoverTipRect.bottom + S(9);
-        y = std::clamp<int>(y, S(8), client.bottom - h - S(8));
+        x = std::clamp<int>(x, S(8), std::max<int>(S(8), static_cast<int>(client.right) - w - S(8)));
+        int y = g_hoverTipIsPdfLink ? g_hoverTipRect.bottom + S(6) : g_hoverTipRect.top - h - S(9);
+        if (g_hoverTipIsPdfLink && y + h > client.bottom - S(8))
+            y = g_hoverTipRect.top - h - S(6);
+        else if (!g_hoverTipIsPdfLink && y < S(8))
+            y = g_hoverTipRect.bottom + S(9);
+        y = std::clamp<int>(y, S(8), static_cast<int>(client.bottom) - h - S(8));
         RECT box{ x, y, x + w, y + h };
-        RoundFill(dc, box, S(9), T().panel2, T().line);
-        Text(dc, g_hoverTip, box, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
+        COLORREF fillColor = g_hoverTipIsPdfLink
+            ? (IsDarkTheme() ? MixColor(T().panel2, T().accent, 0.12) : RGB(255, 250, 222))
+            : T().panel2;
+        COLORREF lineColor = g_hoverTipIsPdfLink ? MixColor(T().line, T().accent, 0.24) : T().line;
+        RoundFill(dc, box, g_hoverTipIsPdfLink ? S(5) : S(9), fillColor, lineColor);
+        RECT textBox{ box.left + S(10), box.top, box.right - S(10), box.bottom };
+        Text(dc, g_hoverTip, textBox,
+            (g_hoverTipIsPdfLink ? DT_LEFT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            T().text);
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -6678,6 +6714,149 @@ namespace
                 return true;
         }
         return false;
+    }
+
+    void TrimLinkCache(PdfTab& tab, int protectedPage)
+    {
+        constexpr size_t kMaxLinkPages = 12;
+        while (tab.linksReady.size() > kMaxLinkPages)
+        {
+            int victim = -1;
+            int farthest = -1;
+            for (int page : tab.linksReady)
+            {
+                if (page == protectedPage)
+                    continue;
+                int distance = std::abs(page - tab.currentPage);
+                if (distance > farthest)
+                {
+                    farthest = distance;
+                    victim = page;
+                }
+            }
+            if (victim < 0)
+                break;
+            tab.linksReady.erase(victim);
+            tab.links.erase(victim);
+        }
+    }
+
+    std::vector<PdfLink> const* LinksForPage(PdfTab& tab, int page)
+    {
+        if (page < 0 || page >= tab.pageCount || !g_pdf.getLinks)
+            return nullptr;
+        if (tab.linksReady.find(page) == tab.linksReady.end())
+        {
+            PdfDocumentLock pdfLock(tab);
+            std::vector<QuietPdfLinkInfo> raw(64);
+            std::vector<fz_rect> textBoxes(8192);
+            int textBoxCount = 0;
+            int count = g_pdf.getLinks(
+                tab.ctx,
+                tab.doc,
+                page,
+                raw.data(),
+                static_cast<int>(raw.size()),
+                textBoxes.data(),
+                static_cast<int>(textBoxes.size()),
+                &textBoxCount);
+            if (count > static_cast<int>(raw.size()) && count <= 4096)
+            {
+                raw.resize(static_cast<size_t>(count));
+                int ignoredTextBoxCount = 0;
+                count = g_pdf.getLinks(tab.ctx, tab.doc, page, raw.data(), count, nullptr, 0, &ignoredTextBoxCount);
+            }
+            if (textBoxCount > static_cast<int>(textBoxes.size()) && textBoxCount <= 1000000 && g_pdf.textCharBoxes)
+            {
+                textBoxes.resize(static_cast<size_t>(textBoxCount));
+                textBoxCount = g_pdf.textCharBoxes(tab.ctx, tab.doc, page, textBoxes.data(), textBoxCount);
+            }
+            tab.textBoxesReady.insert(page);
+            if (textBoxCount > 0)
+            {
+                textBoxes.resize(static_cast<size_t>(std::min<int>(textBoxCount, static_cast<int>(textBoxes.size()))));
+                tab.textBoxes[page] = std::move(textBoxes);
+            }
+            else
+            {
+                tab.textBoxes.erase(page);
+            }
+            TrimTextBoxCache(tab, page);
+            std::vector<PdfLink> links;
+            if (count > 0)
+            {
+                int copied = std::min<int>(count, static_cast<int>(raw.size()));
+                links.reserve(static_cast<size_t>(copied));
+                for (int i = 0; i < copied; ++i)
+                {
+                    if (raw[static_cast<size_t>(i)].uri[0] == 0)
+                        continue;
+                    links.push_back(PdfLink{
+                        fz_rect{
+                            raw[static_cast<size_t>(i)].x0,
+                            raw[static_cast<size_t>(i)].y0,
+                            raw[static_cast<size_t>(i)].x1,
+                            raw[static_cast<size_t>(i)].y1
+                        },
+                        FromUtf8(raw[static_cast<size_t>(i)].uri)
+                    });
+                }
+            }
+            tab.links[page] = std::move(links);
+            tab.linksReady.insert(page);
+            TrimLinkCache(tab, page);
+        }
+        auto found = tab.links.find(page);
+        return found == tab.links.end() ? nullptr : &found->second;
+    }
+
+    bool HitTestPdfLink(PdfTab& tab, int page, RECT pageRect, POINT clientPt, std::wstring& uri, RECT* hitRect = nullptr)
+    {
+        std::vector<PdfLink> const* links = LinksForPage(tab, page);
+        if (!links || IsRectEmpty(&pageRect))
+            return false;
+        double pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        float x = static_cast<float>((clientPt.x - pageRect.left) / pageW);
+        float y = static_cast<float>((clientPt.y - pageRect.top) / pageH);
+        for (PdfLink const& link : *links)
+        {
+            if (x < link.rect.x0 || x > link.rect.x1 || y < link.rect.y0 || y > link.rect.y1)
+                continue;
+            uri = link.uri;
+            if (hitRect)
+            {
+                *hitRect = RECT{
+                    pageRect.left + static_cast<int>(link.rect.x0 * pageW + 0.5),
+                    pageRect.top + static_cast<int>(link.rect.y0 * pageH + 0.5),
+                    pageRect.left + static_cast<int>(link.rect.x1 * pageW + 0.5),
+                    pageRect.top + static_cast<int>(link.rect.y1 * pageH + 0.5)
+                };
+            }
+            return true;
+        }
+        return false;
+    }
+
+    bool PdfLinkDragExceeded(POINT point)
+    {
+        int thresholdX = std::max(2, GetSystemMetrics(SM_CXDRAG));
+        int thresholdY = std::max(2, GetSystemMetrics(SM_CYDRAG));
+        return std::abs(point.x - g_pdfLinkPressStart.x) >= thresholdX ||
+            std::abs(point.y - g_pdfLinkPressStart.y) >= thresholdY;
+    }
+
+    bool OpenPdfExternalLink(HWND hwnd, std::wstring const& uri)
+    {
+        if (uri.empty())
+            return false;
+        std::wstring lower = LowerCopy(uri);
+        if (lower.rfind(L"http://", 0) != 0 &&
+            lower.rfind(L"https://", 0) != 0 &&
+            lower.rfind(L"mailto:", 0) != 0 &&
+            lower.rfind(L"ftp://", 0) != 0)
+            return false;
+        return reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
     }
 
     fz_rect NormalizeSelectionRect(RECT pageRect, POINT a, POINT b)
@@ -15532,11 +15711,19 @@ namespace
                 {
                     int page = -1;
                     RECT pageRect{};
-                    if (PageRectAtPoint(*tab, pt.x, pt.y, page, pageRect) &&
-                        IsTextAtPoint(*tab, page, pageRect, pt))
+                    if (PageRectAtPoint(*tab, pt.x, pt.y, page, pageRect))
                     {
-                        SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
-                        return TRUE;
+                        std::wstring uri;
+                        if (!g_selectingContent && HitTestPdfLink(*tab, page, pageRect, pt, uri))
+                        {
+                            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                            return TRUE;
+                        }
+                        if (IsTextAtPoint(*tab, page, pageRect, pt))
+                        {
+                            SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                            return TRUE;
+                        }
                     }
                 }
             }
@@ -15612,6 +15799,9 @@ namespace
             }
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            g_pdfLinkPressPending = false;
+            g_pdfLinkPressPage = -1;
+            g_pdfLinkPressUri.clear();
             if (g_autoScrollActive)
             {
                 StopAutoScroll(hwnd);
@@ -16117,6 +16307,14 @@ namespace
                 RECT pageRect{};
                 if (PageRectAtPoint(*tab, x, y, page, pageRect))
                 {
+                    std::wstring uri;
+                    if (HitTestPdfLink(*tab, page, pageRect, POINT{ x, y }, uri))
+                    {
+                        g_pdfLinkPressPending = true;
+                        g_pdfLinkPressPage = page;
+                        g_pdfLinkPressStart = POINT{ x, y };
+                        g_pdfLinkPressUri = std::move(uri);
+                    }
                     g_selectingContent = true;
                     g_hasContentSelection = false;
                     g_selectionIsImage = false;
@@ -16411,6 +16609,12 @@ namespace
             }
             if (g_selectingContent)
             {
+                if (g_pdfLinkPressPending && PdfLinkDragExceeded(newMousePos))
+                {
+                    g_pdfLinkPressPending = false;
+                    g_pdfLinkPressPage = -1;
+                    g_pdfLinkPressUri.clear();
+                }
                 g_selectionEnd = POINT{
                     static_cast<LONG>(std::clamp(mx, static_cast<int>(g_selectionPageRect.left), static_cast<int>(g_selectionPageRect.right))),
                     static_cast<LONG>(std::clamp(my, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom)))
@@ -16506,7 +16710,10 @@ namespace
             }
             bool hadTip = g_hasHoverTip;
             std::wstring oldTip = g_hoverTip;
+            RECT oldTipRect = g_hoverTipRect;
+            bool oldTipIsPdfLink = g_hoverTipIsPdfLink;
             g_hasHoverTip = false;
+            g_hoverTipIsPdfLink = false;
             g_hoverTip.clear();
             if (g_hoverTab >= 0)
             {
@@ -16519,6 +16726,21 @@ namespace
                         g_hoverTipRect = g_tabRects[i];
                         break;
                     }
+                }
+            }
+            if (PdfTab* tab = Active(); tab && !g_selectingContent && Hit(g_stage, mx, my))
+            {
+                int page = -1;
+                RECT pageRect{};
+                std::wstring uri;
+                RECT linkRect{};
+                if (PageRectAtPoint(*tab, mx, my, page, pageRect) &&
+                    HitTestPdfLink(*tab, page, pageRect, POINT{ mx, my }, uri, &linkRect))
+                {
+                    g_hasHoverTip = true;
+                    g_hoverTipIsPdfLink = true;
+                    g_hoverTip = uri;
+                    g_hoverTipRect = linkRect;
                 }
             }
             if (!Active())
@@ -16561,7 +16783,10 @@ namespace
                     break;
                 }
             }
-            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip || oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab || oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect)
+            if (hadTip != g_hasHoverTip || oldTip != g_hoverTip ||
+                oldTipIsPdfLink != g_hoverTipIsPdfLink || !EqualRect(&oldTipRect, &g_hoverTipRect) ||
+                oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab ||
+                oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect)
             {
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -16645,6 +16870,39 @@ namespace
             }
             if (g_selectingContent)
             {
+                POINT releasePoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                bool activateLink = false;
+                std::wstring linkUri;
+                if (g_pdfLinkPressPending && !PdfLinkDragExceeded(releasePoint))
+                {
+                    if (PdfTab* tab = Active())
+                    {
+                        int page = -1;
+                        RECT pageRect{};
+                        std::wstring releaseUri;
+                        if (PageRectAtPoint(*tab, releasePoint.x, releasePoint.y, page, pageRect) &&
+                            page == g_pdfLinkPressPage &&
+                            HitTestPdfLink(*tab, page, pageRect, releasePoint, releaseUri) &&
+                            releaseUri == g_pdfLinkPressUri)
+                        {
+                            activateLink = true;
+                            linkUri = std::move(releaseUri);
+                        }
+                    }
+                }
+                g_pdfLinkPressPending = false;
+                g_pdfLinkPressPage = -1;
+                g_pdfLinkPressUri.clear();
+                if (activateLink)
+                {
+                    g_selectingContent = false;
+                    ReleaseCapture();
+                    ClearTextSelection();
+                    NotifyUiaSelectionChanged();
+                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    OpenPdfExternalLink(hwnd, linkUri);
+                    return 0;
+                }
                 RECT selection = CurrentSelectionRect();
                 bool largeEnough =
                     (selection.right - selection.left) >= S(8) &&

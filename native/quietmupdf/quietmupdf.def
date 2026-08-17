@@ -50,3 +50,4 @@ EXPORTS
     quiet_pdf_get_text_char_boxes
     quiet_pdf_select_word_at_point
     quiet_pdf_find_image_at_point
+    quiet_pdf_get_links

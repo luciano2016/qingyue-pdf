@@ -111,8 +111,6 @@ void DrawWarmBackdrop(Gdiplus::Graphics& g, RECT c) {
     g.FillRectangle(&top, 0, 0, c.right, S(70));
     Gdiplus::SolidBrush foot(Gc(kWarmFooter, 236));
     g.FillRectangle(&foot, 0, c.bottom - S(88), c.right, S(88));
-    FillGlowEllipse(g, {c.right - S(340), S(8), c.right + S(60), S(430)}, RGB(255, 145, 42), 42);
-    FillGlowEllipse(g, {c.right - S(220), S(60), c.right + S(12), S(300)}, RGB(255, 186, 117), 34);
     FillGlowEllipse(g, {S(22), c.bottom - S(190), S(300), c.bottom + S(56)}, RGB(255, 178, 98), 18);
 }
 std::filesystem::path KnownFolder(REFKNOWNFOLDERID id) {
