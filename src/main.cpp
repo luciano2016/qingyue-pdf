@@ -1392,6 +1392,7 @@ namespace
     int g_theme{};
     int g_viewMode{};
     int g_contextTab{ -1 };
+    int g_contextRecent{ -1 };
     int g_lastSessionActive{ -1 };
     int g_searchCurrent{};
     int g_selectedOutlineRow{ -1 };
@@ -3776,7 +3777,7 @@ namespace
         COLORREF fillColor = g_hoverTipIsPdfLink
             ? (IsDarkTheme() ? MixColor(T().panel2, T().accent, 0.12) : RGB(255, 250, 222))
             : T().panel2;
-        COLORREF lineColor = g_hoverTipIsPdfLink ? MixColor(T().line, T().accent, 0.24) : T().line;
+        COLORREF lineColor = g_hoverTipIsPdfLink ? MixColor(fillColor, T().line, IsDarkTheme() ? 0.55 : 0.42) : T().line;
         RoundFill(dc, box, g_hoverTipIsPdfLink ? S(5) : S(9), fillColor, lineColor);
         RECT textBox{ box.left + S(10), box.top, box.right - S(10), box.bottom };
         Text(dc, g_hoverTip, textBox,
@@ -14107,6 +14108,15 @@ namespace
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
+    void ShowRecentMenu(HWND hwnd, int x, int y)
+    {
+        HMENU menu = CreatePopupMenu();
+        AppendThemedMenuItem(menu, 2110, L"\u590d\u5236\u6587\u4ef6\u8def\u5f84");
+        AppendThemedMenuItem(menu, 2111, L"\u6253\u5f00\u6240\u5728\u6587\u4ef6\u5939");
+        AppendThemedMenuItem(menu, 2112, L"\u5c5e\u6027");
+        ShowThemedPopupMenu(hwnd, menu, x, y);
+    }
+
     void ShowSelectionMenu(HWND hwnd, int x, int y, bool imageOnly)
     {
         HMENU menu = CreatePopupMenu();
@@ -14841,6 +14851,45 @@ namespace
         ShellExecuteW(hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
     }
 
+    void CopyFilePath(HWND hwnd, std::wstring const& path)
+    {
+        if (path.empty() || !OpenClipboard(hwnd)) return;
+        EmptyClipboard();
+        size_t bytes = (path.size() + 1) * sizeof(wchar_t);
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (mem)
+        {
+            void* data = GlobalLock(mem);
+            if (data)
+            {
+                memcpy(data, path.c_str(), bytes);
+                GlobalUnlock(mem);
+                if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
+            }
+            else GlobalFree(mem);
+        }
+        CloseClipboard();
+    }
+
+    void ShowRecentProperties(HWND hwnd, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(g_recent.size())) return;
+        RecentItem const& item = g_recent[static_cast<size_t>(index)];
+        int openTab = FindOpenTabByPath(item.path);
+        if (openTab >= 0)
+        {
+            ShowProperties(hwnd, *g_tabs[static_cast<size_t>(openTab)]);
+            return;
+        }
+
+        std::uintmax_t size = 0;
+        try { size = std::filesystem::file_size(item.path); } catch (...) {}
+        std::wstring msg = L"\u6587\u4ef6: " + item.path +
+            L"\n\u4e0a\u6b21\u9605\u8bfb\u9875\uff1a " + std::to_wstring(std::max(1, item.page)) +
+            L"\n\u6587\u4ef6\u5927\u5c0f: " + std::to_wstring(size / 1024) + L" KB";
+        MessageBoxW(hwnd, msg.c_str(), L"\u5c5e\u6027", MB_OK | MB_ICONINFORMATION);
+    }
+
     void ClearRecentRecords()
     {
         g_recent.clear();
@@ -14989,22 +15038,16 @@ namespace
         if (id == 2104 && g_contextTab >= 0) { while (g_contextTab > 0) { if (!CloseTab(0)) return; --g_contextTab; } return; }
         if (id == 2105 && g_contextTab >= 0)
         {
-            const auto& path = g_tabs[static_cast<size_t>(g_contextTab)]->path;
-            if (OpenClipboard(hwnd))
-            {
-                EmptyClipboard();
-                size_t bytes = (path.size() + 1) * sizeof(wchar_t);
-                HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-                if (mem)
-                {
-                    memcpy(GlobalLock(mem), path.c_str(), bytes);
-                    GlobalUnlock(mem);
-                    SetClipboardData(CF_UNICODETEXT, mem);
-                }
-                CloseClipboard();
-            }
+            CopyFilePath(hwnd, g_tabs[static_cast<size_t>(g_contextTab)]->path);
             return;
         }
+        if (id == 2110 && g_contextRecent >= 0 && g_contextRecent < static_cast<int>(g_recent.size()))
+        {
+            CopyFilePath(hwnd, g_recent[static_cast<size_t>(g_contextRecent)].path);
+            return;
+        }
+        if (id == 2111 && g_contextRecent >= 0) { OpenRecentFolder(hwnd, g_contextRecent); return; }
+        if (id == 2112 && g_contextRecent >= 0) { ShowRecentProperties(hwnd, g_contextRecent); return; }
         if (id == 2441)
         {
             g_searchMatchCase = !g_searchMatchCase;
@@ -16473,6 +16516,24 @@ namespace
                     ClientToScreen(hwnd, &pt);
                     g_contextTab = i < g_tabRectIds.size() ? g_tabRectIds[i] : static_cast<int>(i);
                     ShowTabMenu(hwnd, pt.x, pt.y);
+                    return 0;
+                }
+            }
+            if (!Active())
+            {
+                for (size_t i = 1; i < g_recentRects.size(); ++i)
+                {
+                    RECT target = g_recentRects[i];
+                    if (!g_homeListView) target.bottom = std::min<int>(target.bottom, target.top + S(198));
+                    if (!Hit(target, x, y)) continue;
+                    size_t displayIndex = i - 1;
+                    if (displayIndex >= g_homeRecentIds.size()) break;
+                    int recentIndex = g_homeRecentIds[displayIndex];
+                    if (recentIndex < 0 || recentIndex >= static_cast<int>(g_recent.size())) break;
+                    POINT pt{ x, y };
+                    ClientToScreen(hwnd, &pt);
+                    g_contextRecent = recentIndex;
+                    ShowRecentMenu(hwnd, pt.x, pt.y);
                     return 0;
                 }
             }
