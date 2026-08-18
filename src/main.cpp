@@ -14599,6 +14599,47 @@ namespace
         return true;
     }
 
+    bool ConfirmCloseDirtyTabs(HWND hwnd)
+    {
+        int dirtyCount = 0;
+        int onlyDirtyIndex = -1;
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            if (!g_tabs[static_cast<size_t>(i)]->dirty) continue;
+            ++dirtyCount;
+            onlyDirtyIndex = i;
+        }
+        if (dirtyCount == 0) return true;
+
+        std::wstring message;
+        if (dirtyCount == 1)
+        {
+            PdfTab const& tab = *g_tabs[static_cast<size_t>(onlyDirtyIndex)];
+            std::wstring name = tab.name.empty() ? L"\u5f53\u524d\u6587\u6863" : tab.name;
+            message = L"\u9000\u51fa\u524d\u662f\u5426\u4fdd\u5b58\u5bf9\u201c" + name + L"\u201d\u7684\u4fee\u6539\uff1f";
+        }
+        else
+        {
+            message = L"\u5f53\u524d\u6709 " + std::to_wstring(dirtyCount) +
+                L" \u4e2a\u6587\u6863\u5305\u542b\u672a\u4fdd\u5b58\u7684\u6807\u6ce8\u3002\n\n\u9000\u51fa\u524d\u662f\u5426\u5168\u90e8\u4fdd\u5b58\uff1f";
+        }
+
+        int choice = MessageBoxW(hwnd, message.c_str(), AppName,
+            MB_ICONWARNING | MB_YESNOCANCEL | MB_DEFBUTTON1);
+        if (choice == IDCANCEL || choice == 0) return false;
+        if (choice == IDNO) return true;
+
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
+            if (!tab.dirty) continue;
+            if (g_active != i) ActivateTab(hwnd, i);
+            SaveAnnotationsToPdf(hwnd, tab);
+            if (tab.dirty) return false;
+        }
+        return true;
+    }
+
     bool CloseTab(int index)
     {
         if (index < 0 || index >= static_cast<int>(g_tabs.size())) return false;
@@ -17737,6 +17778,9 @@ namespace
             break;
         case WM_PAINT:
             Paint(hwnd);
+            return 0;
+        case WM_CLOSE:
+            if (ConfirmCloseDirtyTabs(hwnd)) DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
         {
