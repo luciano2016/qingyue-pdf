@@ -16877,6 +16877,8 @@ namespace
             if (g_selectingContent)
             {
                 POINT releasePoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                int activateAnnotation = -1;
+                RECT annotationHitRect{};
                 bool activateLink = false;
                 std::wstring linkUri;
                 bool hasDragSelection =
@@ -16887,22 +16889,40 @@ namespace
                 {
                     if (PdfTab* tab = Active())
                     {
-                        int page = -1;
-                        RECT pageRect{};
-                        std::wstring releaseUri;
-                        if (PageRectAtPoint(*tab, releasePoint.x, releasePoint.y, page, pageRect) &&
-                            page == g_pdfLinkPressPage &&
-                            HitTestPdfLink(*tab, page, pageRect, releasePoint, releaseUri) &&
-                            releaseUri == g_pdfLinkPressUri)
+                        activateAnnotation = HitTestAnnotation(
+                            *tab, releasePoint.x, releasePoint.y, &annotationHitRect);
+                        if (activateAnnotation < 0)
                         {
-                            activateLink = true;
-                            linkUri = std::move(releaseUri);
+                            int page = -1;
+                            RECT pageRect{};
+                            std::wstring releaseUri;
+                            if (PageRectAtPoint(*tab, releasePoint.x, releasePoint.y, page, pageRect) &&
+                                page == g_pdfLinkPressPage &&
+                                HitTestPdfLink(*tab, page, pageRect, releasePoint, releaseUri) &&
+                                releaseUri == g_pdfLinkPressUri)
+                            {
+                                activateLink = true;
+                                linkUri = std::move(releaseUri);
+                            }
                         }
                     }
                 }
                 g_pdfLinkPressPending = false;
                 g_pdfLinkPressPage = -1;
                 g_pdfLinkPressUri.clear();
+                if (activateAnnotation >= 0)
+                {
+                    g_selectingContent = false;
+                    ReleaseCapture();
+                    ClearTextSelection();
+                    g_activeAnnotation = activateAnnotation;
+                    g_annotationHitRect = annotationHitRect;
+                    g_annotationToolbarOpen = true;
+                    g_annotationNoteOpen = false;
+                    g_annotationNoteFocused = false;
+                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    return 0;
+                }
                 if (activateLink)
                 {
                     g_selectingContent = false;
