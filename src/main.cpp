@@ -14177,10 +14177,15 @@ namespace
         if (annotation.segments.empty())
             annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
         tab->annotations.push_back(annotation);
-        g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
-        g_annotationToolbarOpen = true;
         tab->dirty = true;
         ClearTextSelection();
+        g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
+        g_annotationToolbarOpen = true;
+        g_annotationNoteOpen = false;
+        g_annotationNoteFocused = false;
+        g_hasHoverTip = false;
+        g_hoverTipIsPdfLink = false;
+        g_hoverTip.clear();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -16874,7 +16879,11 @@ namespace
                 POINT releasePoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 bool activateLink = false;
                 std::wstring linkUri;
-                if (g_pdfLinkPressPending && !PdfLinkDragExceeded(releasePoint))
+                bool hasDragSelection =
+                    g_selectionHadTextDuringDrag ||
+                    !g_selectionQuads.empty() ||
+                    !g_selectionText.empty();
+                if (g_pdfLinkPressPending && !PdfLinkDragExceeded(releasePoint) && !hasDragSelection)
                 {
                     if (PdfTab* tab = Active())
                     {
