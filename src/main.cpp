@@ -10753,8 +10753,8 @@ namespace
                     }
                     else
                     {
-                        AlphaFill(dc, r, RGB(255, 255, 255), 82);
-                        RoundFill(dc, r, S(9), RGB(255, 255, 255), RGB(230, 235, 241));
+                        constexpr COLORREF tabBarFill = RGB(250, 251, 253);
+                        RoundFill(dc, r, S(9), tabBarFill, RGB(230, 235, 241));
                     }
                 }
             }
@@ -10765,7 +10765,7 @@ namespace
                     : ((active || hovered) ? T().panel2 : T().panel);
                 COLORREF line = pressed
                     ? MixColor(T().line, T().accent, 0.34)
-                    : ((active || hovered) ? T().line : T().panel);
+                    : ((active || hovered) ? T().line : MixColor(T().line, T().panel, IsDarkTheme() ? 0.20 : 0.14));
                 RoundFill(dc, r, S(9), fill, line);
             }
             PdfTab const& tab = *g_tabs[static_cast<size_t>(actualIndex)];
