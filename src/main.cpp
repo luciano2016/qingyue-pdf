@@ -7004,7 +7004,7 @@ namespace
             int bestDistance = 0x7fffffff;
             for (auto& line : lines)
             {
-                int tolerance = std::max(S(4), std::max(line.height, height) / 2);
+                int tolerance = std::max(S(2), std::min(line.height, height) / 4);
                 int distance = std::abs(center - line.centerY);
                 if (distance <= tolerance && distance < bestDistance)
                 {
@@ -7032,15 +7032,36 @@ namespace
             best->height = std::max<int>(best->height, best->bottom - best->top);
         }
 
-        for (SelectionLine& line : lines)
+        std::sort(lines.begin(), lines.end(), [](SelectionLine const& a, SelectionLine const& b)
         {
+            return a.centerY < b.centerY;
+        });
+
+        for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
+        {
+            SelectionLine& line = lines[lineIndex];
             std::sort(line.rects.begin(), line.rects.end(), [](RECT const& a, RECT const& b)
             {
                 return a.left < b.left;
             });
 
-            int lineTop = std::clamp<int>(line.top - S(1), static_cast<int>(pageRect.top), static_cast<int>(pageRect.bottom));
-            int lineBottom = std::clamp<int>(line.bottom + S(1), static_cast<int>(pageRect.top), static_cast<int>(pageRect.bottom));
+            int lineTop = line.top - S(1);
+            int lineBottom = line.bottom + S(1);
+            if (lineIndex > 0)
+            {
+                int split = (lines[lineIndex - 1].centerY + line.centerY + 1) / 2;
+                lineTop = std::max(lineTop, split);
+            }
+            if (lineIndex + 1 < lines.size())
+            {
+                int split = (line.centerY + lines[lineIndex + 1].centerY) / 2;
+                lineBottom = std::min(lineBottom, split);
+            }
+            lineTop = std::clamp<int>(lineTop, static_cast<int>(pageRect.top), static_cast<int>(pageRect.bottom));
+            lineBottom = std::clamp<int>(lineBottom, static_cast<int>(pageRect.top), static_cast<int>(pageRect.bottom));
+            if (lineBottom <= lineTop)
+                continue;
+
             std::vector<RECT> merged;
             for (RECT r : line.rects)
             {

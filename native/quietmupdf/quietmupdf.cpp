@@ -1443,10 +1443,12 @@ static bool quiet_is_selectable_rune(int c)
 
 static bool quiet_line_accepts_char(const quiet_visual_line& line, const quiet_visual_char& ch)
 {
-    float line_h = std::max(1.0f, line.y1 - line.y0);
-    float char_h = std::max(1.0f, ch.rect.y1 - ch.rect.y0);
-    float tolerance = std::max({ line_h * 0.42f, char_h * 0.42f, ch.size * 0.38f, 1.2f });
-    return std::abs(ch.cy - line.cy) <= tolerance || (ch.rect.y0 <= line.y1 && ch.rect.y1 >= line.y0);
+    // Glyph rectangles may overlap vertically across adjacent code lines. Group by
+    // baseline center only, so a rectangle overlap cannot turn two text rows into
+    // one selectable visual line.
+    float reference_size = std::max(1.0f, std::min(line.size, ch.size));
+    float tolerance = std::max(1.2f, reference_size * 0.30f);
+    return std::abs(ch.cy - line.cy) <= tolerance;
 }
 
 static void quiet_add_char_to_line(quiet_visual_line& line, const quiet_visual_char& ch)
