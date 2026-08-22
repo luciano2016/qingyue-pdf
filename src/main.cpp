@@ -18297,6 +18297,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
             }
             LocalFree(cliArgv);
         }
+        bool hadExistingWindow = FindWindowW(L"XiaoYuePDFWindow", nullptr) != nullptr;
         if (!forceNewWindow && !launchFiles.empty())
         {
             HWND existing = FindWindowW(L"XiaoYuePDFWindow", nullptr);
@@ -18323,7 +18324,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
             CW_USEDEFAULT, CW_USEDEFAULT, 1180, 840, nullptr, nullptr, instance, nullptr);
         if (!g_hwnd) return 1;
         ApplyWindowChrome();
-        RestoreLastSessionAndOpenLaunchFiles(g_hwnd, launchFiles, !forceNewWindow);
+        bool restoreSavedSession = !forceNewWindow && !(launchFiles.empty() && hadExistingWindow);
+        RestoreLastSessionAndOpenLaunchFiles(g_hwnd, launchFiles, restoreSavedSession);
         ShowWindow(g_hwnd, show == SW_SHOWMINIMIZED ? show : SW_SHOWMAXIMIZED);
         UpdateWindow(g_hwnd);
         MSG msg{};
