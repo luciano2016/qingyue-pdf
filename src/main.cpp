@@ -13683,6 +13683,8 @@ namespace
         g_themedSearchMenuHover = hover;
         InvalidateRect(popup, nullptr, FALSE);
     }
+    bool PointInSearchParentItem(POINT screenPt);
+
     bool PointInSearchSubmenuTransition(POINT screenPt)
     {
         if (!g_themedMenuPopup || !g_themedSearchMenuPopup) return false;
@@ -13691,11 +13693,24 @@ namespace
         GetWindowRect(g_themedMenuPopup, &parentRect);
         GetWindowRect(g_themedSearchMenuPopup, &childRect);
 
+        RECT parentItem{};
+        bool foundParentItem = false;
+        for (size_t i = 0; i < g_themedMenuItems.size() && i < g_themedMenuItemRects.size(); ++i)
+        {
+            if (!g_themedMenuItems[i] || g_themedMenuItems[i]->id != 2511)
+                continue;
+            parentItem = g_themedMenuItemRects[i];
+            OffsetRect(&parentItem, parentRect.left, parentRect.top);
+            foundParentItem = true;
+            break;
+        }
+        if (!foundParentItem) return false;
+
         RECT bridge{
-            std::min(parentRect.right, childRect.left) - S(4),
-            childRect.top - S(6),
-            std::max(parentRect.right, childRect.left) + S(4),
-            childRect.bottom + S(6)
+            std::min(parentItem.left, childRect.left) - S(12),
+            std::min(parentItem.top, childRect.top) - S(8),
+            std::max(parentItem.right, childRect.right) + S(12),
+            std::max(parentItem.bottom, childRect.bottom) + S(8)
         };
         return PtInRect(&bridge, screenPt) &&
             !PtInRect(&parentRect, screenPt) &&
