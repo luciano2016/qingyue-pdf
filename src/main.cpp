@@ -13692,10 +13692,10 @@ namespace
         GetWindowRect(g_themedSearchMenuPopup, &childRect);
 
         RECT bridge{
-            std::min(parentRect.right, childRect.left) - S(2),
-            childRect.top - S(4),
-            std::max(parentRect.right, childRect.left) + S(2),
-            childRect.bottom + S(4)
+            std::min(parentRect.right, childRect.left) - S(4),
+            childRect.top - S(6),
+            std::max(parentRect.right, childRect.left) + S(4),
+            childRect.bottom + S(6)
         };
         return PtInRect(&bridge, screenPt) &&
             !PtInRect(&parentRect, screenPt) &&
@@ -13720,6 +13720,7 @@ namespace
             return 0;
         case WM_MOUSEMOVE:
         {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             POINT screenPt{};
             GetCursorPos(&screenPt);
             if (!isSearchSubmenu)
@@ -13789,6 +13790,7 @@ namespace
         case WM_LBUTTONDOWN:
         case WM_RBUTTONDOWN:
         {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             POINT screenPt{};
             GetCursorPos(&screenPt);
             if (!isSearchSubmenu)
@@ -13868,6 +13870,7 @@ namespace
         case WM_LBUTTONUP:
         case WM_RBUTTONUP:
         {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             POINT screenPt{};
             GetCursorPos(&screenPt);
             if (!isSearchSubmenu)
