@@ -1658,6 +1658,11 @@ namespace
     std::vector<RECT> g_themedMenuItemRects;
     int g_themedMenuHover{ -1 };
     int g_themedMenuPressed{ -1 };
+    std::vector<std::unique_ptr<ThemedMenuItem>> g_themedSearchMenuItems;
+    HWND g_themedSearchMenuPopup{};
+    std::vector<RECT> g_themedSearchMenuItemRects;
+    int g_themedSearchMenuHover{ -1 };
+    int g_themedSearchMenuPressed{ -1 };
     Theme g_themes[] = {
         { L"\u4e91\u6bcd\u767d", RGB(244,247,250), RGB(255,255,255), RGB(250,252,254), RGB(238,243,247), RGB(255,255,255), RGB(31,35,40), RGB(105,113,125), RGB(210,217,226), RGB(59,170,124) },
         { L"\u8f7b\u67d4\u7070", RGB(246,247,249), RGB(242,243,245), RGB(255,255,255), RGB(238,240,243), RGB(255,255,255), RGB(43,48,56), RGB(116,123,132), RGB(213,217,222), RGB(83,145,207) },
@@ -13337,6 +13342,10 @@ namespace
     }
 
     void ShowCustomThemedPopupMenu(HWND hwnd, HMENU menu, int x, int y);
+    void AddSearchMenuItem(std::wstring text, UINT id);
+    void CloseThemedPopupMenu();
+    void CloseSearchEngineSubmenu(bool restoreParentCapture);
+    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect);
 
     void ShowThemedPopupMenu(HWND hwnd, HMENU menu, int x, int y)
     {
@@ -13570,7 +13579,7 @@ namespace
         DeleteObject(font);
     }
 
-    void PaintThemedPopupMenu(HWND hwnd)
+    void PaintThemedPopupMenu(HWND hwnd, std::vector<std::unique_ptr<ThemedMenuItem>> const& items, std::vector<RECT> const& itemRects, int hover, int pressed)
     {
         PAINTSTRUCT ps{};
         HDC dc = BeginPaint(hwnd, &ps);
@@ -13600,9 +13609,9 @@ namespace
             std::max(1.0f, static_cast<float>(h) - borderInset * 2.0f) };
         DrawGdiRoundRect(g, border, borderRect, S(5.25f));
 
-        for (int i = 0; i < static_cast<int>(g_themedMenuItems.size()) && i < static_cast<int>(g_themedMenuItemRects.size()); ++i)
+        for (int i = 0; i < static_cast<int>(items.size()) && i < static_cast<int>(itemRects.size()); ++i)
         {
-            DrawThemedMenuEntry(mem, *g_themedMenuItems[static_cast<size_t>(i)], g_themedMenuItemRects[static_cast<size_t>(i)], i == g_themedMenuHover, i == g_themedMenuPressed);
+            DrawThemedMenuEntry(mem, *items[static_cast<size_t>(i)], itemRects[static_cast<size_t>(i)], i == hover, i == pressed);
         }
 
         BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -13613,6 +13622,7 @@ namespace
     }
     void DestroyThemedPopupWindowOnly()
     {
+        CloseSearchEngineSubmenu(false);
         HWND popup = g_themedMenuPopup;
         if (popup)
         {
@@ -13627,6 +13637,7 @@ namespace
 
     void CloseThemedPopupMenu()
     {
+        CloseSearchEngineSubmenu(false);
         HWND popup = g_themedMenuPopup;
         if (popup)
         {
@@ -13641,17 +13652,63 @@ namespace
         g_themedMenuPressed = -1;
     }
 
+    int ThemedSearchMenuHitTest(POINT pt)
+    {
+        for (int i = 0; i < static_cast<int>(g_themedSearchMenuItemRects.size()); ++i)
+        {
+            if (Hit(g_themedSearchMenuItemRects[static_cast<size_t>(i)], pt.x, pt.y))
+                return i;
+        }
+        return -1;
+    }
+
     LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
+        bool isSearchSubmenu = hwnd == g_themedSearchMenuPopup;
         switch (msg)
         {
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
-            PaintThemedPopupMenu(hwnd);
+            if (isSearchSubmenu)
+                PaintThemedPopupMenu(hwnd, g_themedSearchMenuItems, g_themedSearchMenuItemRects, g_themedSearchMenuHover, g_themedSearchMenuPressed);
+            else
+                PaintThemedPopupMenu(hwnd, g_themedMenuItems, g_themedMenuItemRects, g_themedMenuHover, g_themedMenuPressed);
             return 0;
         case WM_MOUSEMOVE:
         {
+            POINT screenPt{};
+            GetCursorPos(&screenPt);
+            if (isSearchSubmenu)
+            {
+                RECT parentRect{};
+                RECT childRect{};
+                if (g_themedMenuPopup) GetWindowRect(g_themedMenuPopup, &parentRect);
+                GetWindowRect(hwnd, &childRect);
+                if (g_themedMenuPopup && PtInRect(&parentRect, screenPt))
+                {
+                    CloseSearchEngineSubmenu(true);
+                    POINT parentPt = screenPt;
+                    ScreenToClient(g_themedMenuPopup, &parentPt);
+                    SendMessageW(g_themedMenuPopup, WM_MOUSEMOVE, wParam, MAKELPARAM(parentPt.x, parentPt.y));
+                    return 0;
+                }
+                if (!PtInRect(&childRect, screenPt))
+                {
+                    CloseThemedPopupMenu();
+                    return 0;
+                }
+
+                POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                int hover = ThemedSearchMenuHitTest(pt);
+                if (hover != g_themedSearchMenuHover)
+                {
+                    g_themedSearchMenuHover = hover;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+
             POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             int hover = ThemedMenuHitTest(pt);
             if (hover >= 0 && g_themedMenuItems[static_cast<size_t>(hover)]->separator) hover = -1;
@@ -13660,18 +13717,68 @@ namespace
                 g_themedMenuHover = hover;
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
+            if (hover >= 0 && hover < static_cast<int>(g_themedMenuItems.size()) &&
+                g_themedMenuItems[static_cast<size_t>(hover)]->id == 2511)
+            {
+                if (!g_themedSearchMenuPopup)
+                    ShowSearchEngineSubmenu(g_themedMenuOwner, g_themedMenuItemRects[static_cast<size_t>(hover)]);
+            }
+            else if (g_themedSearchMenuPopup)
+            {
+                CloseSearchEngineSubmenu(true);
+            }
             return 0;
         }
         case WM_LBUTTONDOWN:
         case WM_RBUTTONDOWN:
         {
+            POINT screenPt{};
+            GetCursorPos(&screenPt);
+            if (isSearchSubmenu)
+            {
+                RECT parentRect{};
+                RECT childRect{};
+                if (g_themedMenuPopup) GetWindowRect(g_themedMenuPopup, &parentRect);
+                GetWindowRect(hwnd, &childRect);
+                if (g_themedMenuPopup && PtInRect(&parentRect, screenPt))
+                {
+                    CloseSearchEngineSubmenu(true);
+                    POINT parentPt = screenPt;
+                    ScreenToClient(g_themedMenuPopup, &parentPt);
+                    SendMessageW(g_themedMenuPopup, msg, wParam, MAKELPARAM(parentPt.x, parentPt.y));
+                    return 0;
+                }
+                if (!PtInRect(&childRect, screenPt))
+                {
+                    HWND owner = g_themedMenuOwner;
+                    CloseThemedPopupMenu();
+                    if (msg == WM_RBUTTONDOWN && owner && IsWindow(owner))
+                    {
+                        POINT clientPt = screenPt;
+                        ScreenToClient(owner, &clientPt);
+                        PostMessageW(owner, WM_RBUTTONDOWN, 0, MAKELPARAM(clientPt.x, clientPt.y));
+                    }
+                    return 0;
+                }
+
+                POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                int hitIndex = ThemedSearchMenuHitTest(pt);
+                if (hitIndex < 0)
+                {
+                    CloseThemedPopupMenu();
+                    return 0;
+                }
+                auto const& item = *g_themedSearchMenuItems[static_cast<size_t>(hitIndex)];
+                g_themedSearchMenuPressed = (!item.separator && !item.disabled) ? hitIndex : -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
             POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             int hitIndex = ThemedMenuHitTest(pt);
             if (hitIndex < 0)
             {
                 HWND owner = g_themedMenuOwner;
-                POINT screenPt{};
-                GetCursorPos(&screenPt);
                 CloseThemedPopupMenu();
                 if (msg == WM_RBUTTONDOWN && owner && IsWindow(owner))
                 {
@@ -13681,7 +13788,7 @@ namespace
                 }
                 return 0;
             }
-            ThemedMenuItem const& item = *g_themedMenuItems[static_cast<size_t>(hitIndex)];
+            auto const& item = *g_themedMenuItems[static_cast<size_t>(hitIndex)];
             g_themedMenuPressed = (!item.separator && !item.disabled) ? hitIndex : -1;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -13689,6 +13796,45 @@ namespace
         case WM_LBUTTONUP:
         case WM_RBUTTONUP:
         {
+            POINT screenPt{};
+            GetCursorPos(&screenPt);
+            if (isSearchSubmenu)
+            {
+                RECT parentRect{};
+                RECT childRect{};
+                if (g_themedMenuPopup) GetWindowRect(g_themedMenuPopup, &parentRect);
+                GetWindowRect(hwnd, &childRect);
+                if (g_themedMenuPopup && PtInRect(&parentRect, screenPt))
+                {
+                    CloseSearchEngineSubmenu(true);
+                    POINT parentPt = screenPt;
+                    ScreenToClient(g_themedMenuPopup, &parentPt);
+                    SendMessageW(g_themedMenuPopup, msg, wParam, MAKELPARAM(parentPt.x, parentPt.y));
+                    return 0;
+                }
+                if (!PtInRect(&childRect, screenPt))
+                {
+                    CloseThemedPopupMenu();
+                    return 0;
+                }
+
+                POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                int hitIndex = ThemedSearchMenuHitTest(pt);
+                int pressed = g_themedSearchMenuPressed;
+                g_themedSearchMenuPressed = -1;
+                if (pressed >= 0 && pressed == hitIndex &&
+                    pressed < static_cast<int>(g_themedSearchMenuItems.size()))
+                {
+                    UINT id = g_themedSearchMenuItems[static_cast<size_t>(pressed)]->id;
+                    HWND owner = g_themedMenuOwner;
+                    CloseThemedPopupMenu();
+                    if (owner && id) SendMessageW(owner, WM_COMMAND, id, 0);
+                    return 0;
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+
             POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             int hitIndex = ThemedMenuHitTest(pt);
             int pressed = g_themedMenuPressed;
@@ -13705,28 +13851,46 @@ namespace
             return 0;
         }
         case WM_CAPTURECHANGED:
-            if (reinterpret_cast<HWND>(lParam) != hwnd && g_themedMenuPopup == hwnd)
+            if (isSearchSubmenu)
+            {
+                if (g_themedSearchMenuPopup == hwnd)
+                    CloseSearchEngineSubmenu(false);
+            }
+            else if (reinterpret_cast<HWND>(lParam) != hwnd && g_themedMenuPopup == hwnd)
+            {
                 CloseThemedPopupMenu();
+            }
             return 0;
         case WM_NCDESTROY:
         {
-            bool wasActivePopup = g_themedMenuPopup == hwnd;
-            if (wasActivePopup) g_themedMenuPopup = nullptr;
-            if (GetCapture() == hwnd) ReleaseCapture();
-            if (wasActivePopup)
+            if (isSearchSubmenu)
             {
-                g_themedMenuOwner = nullptr;
-                g_themedMenuItemRects.clear();
-                g_themedMenuItems.clear();
-                g_themedMenuHover = -1;
-                g_themedMenuPressed = -1;
+                if (g_themedSearchMenuPopup == hwnd) g_themedSearchMenuPopup = nullptr;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                g_themedSearchMenuItemRects.clear();
+                g_themedSearchMenuItems.clear();
+                g_themedSearchMenuHover = -1;
+                g_themedSearchMenuPressed = -1;
+            }
+            else
+            {
+                bool wasActivePopup = g_themedMenuPopup == hwnd;
+                if (wasActivePopup) g_themedMenuPopup = nullptr;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                if (wasActivePopup)
+                {
+                    g_themedMenuOwner = nullptr;
+                    g_themedMenuItemRects.clear();
+                    g_themedMenuItems.clear();
+                    g_themedMenuHover = -1;
+                    g_themedMenuPressed = -1;
+                }
             }
             return 0;
         }
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
-
     ATOM EnsureThemedMenuPopupClass()
     {
         static ATOM atom{};
@@ -13846,6 +14010,117 @@ namespace
         int ncRenderingPolicy = 1;
         DwmSetWindowAttribute(popup, 2, &ncRenderingPolicy, sizeof(ncRenderingPolicy));
         HRGN popupRegion = CreateRoundRectRgn(0, 0, popupWidth + 1, popupHeight + 1, S(12), S(12));
+        SetWindowRgn(popup, popupRegion, FALSE);
+        ShowWindow(popup, SW_SHOWNOACTIVATE);
+        UpdateWindow(popup);
+        SetCapture(popup);
+    }
+    void CloseSearchEngineSubmenu(bool restoreParentCapture)
+    {
+        HWND popup = g_themedSearchMenuPopup;
+        if (popup)
+        {
+            g_themedSearchMenuPopup = nullptr;
+            if (GetCapture() == popup) ReleaseCapture();
+            DestroyWindow(popup);
+        }
+        g_themedSearchMenuItemRects.clear();
+        g_themedSearchMenuItems.clear();
+        g_themedSearchMenuHover = -1;
+        g_themedSearchMenuPressed = -1;
+        if (restoreParentCapture && g_themedMenuPopup)
+            SetCapture(g_themedMenuPopup);
+    }
+
+    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect)
+    {
+        if (!hwnd || !g_themedMenuPopup || g_themedSearchMenuPopup)
+            return;
+
+        g_themedSearchMenuItems.clear();
+        g_themedSearchMenuItemRects.clear();
+        g_themedSearchMenuHover = -1;
+        g_themedSearchMenuPressed = -1;
+        AddSearchMenuItem(L"\u8c37\u6b4c\u641c\u7d22", 2512);
+        AddSearchMenuItem(L"\u767e\u5ea6\u641c\u7d22", 2513);
+
+        HDC dc = GetDC(hwnd);
+        HFONT font = Font(9);
+        HGDIOBJ old = SelectObject(dc, font);
+        int width = S(112);
+        int height = S(6);
+        std::vector<int> heights;
+        heights.reserve(g_themedSearchMenuItems.size());
+        for (auto const& item : g_themedSearchMenuItems)
+        {
+            int rowH = ThemedMenuRowHeight(item.get());
+            heights.push_back(rowH);
+            HFONT rowFont = Font(ThemedMenuFontPt(item.get()));
+            HGDIOBJ oldRowFont = SelectObject(dc, rowFont);
+            SIZE textSize{};
+            GetTextExtentPoint32W(dc, item->text.c_str(), static_cast<int>(item->text.size()), &textSize);
+            SelectObject(dc, oldRowFont);
+            DeleteObject(rowFont);
+            width = std::max(width, static_cast<int>(textSize.cx) + S(54));
+            height += rowH;
+        }
+        height += S(6);
+        SelectObject(dc, old);
+        DeleteObject(font);
+        ReleaseDC(hwnd, dc);
+
+        int rowInset = S(3);
+        int rowTop = rowInset;
+        for (int rowHeight : heights)
+        {
+            g_themedSearchMenuItemRects.push_back(RECT{ rowInset, rowTop, width - rowInset, rowTop + rowHeight });
+            rowTop += rowHeight;
+        }
+
+        RECT parentWindowRect{};
+        GetWindowRect(g_themedMenuPopup, &parentWindowRect);
+        int x = parentWindowRect.right - S(1);
+        int y = parentWindowRect.top + parentItemRect.top - S(3);
+        POINT monitorPoint{ x, y };
+        HMONITOR monitor = MonitorFromPoint(monitorPoint, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        GetMonitorInfoW(monitor, &monitorInfo);
+        if (x + width > monitorInfo.rcWork.right - S(4))
+            x = parentWindowRect.left - width + S(1);
+        if (y + height > monitorInfo.rcWork.bottom - S(4))
+            y = monitorInfo.rcWork.bottom - height - S(4);
+        x = std::max<int>(static_cast<int>(monitorInfo.rcWork.left) + S(4), x);
+        y = std::max<int>(static_cast<int>(monitorInfo.rcWork.top) + S(4), y);
+
+        HWND popup = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            L"QuietPDF.ThemedPopupMenu",
+            L"",
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            hwnd,
+            nullptr,
+            GetModuleHandleW(nullptr),
+            nullptr);
+        if (!popup)
+        {
+            g_themedSearchMenuItems.clear();
+            g_themedSearchMenuItemRects.clear();
+            return;
+        }
+
+        g_themedSearchMenuPopup = popup;
+        int cornerPreference = 3;
+        DwmSetWindowAttribute(popup, 33, &cornerPreference, sizeof(cornerPreference));
+        DWORD borderColor = 0xFFFFFFFE;
+        DwmSetWindowAttribute(popup, 34, &borderColor, sizeof(borderColor));
+        int ncRenderingPolicy = 1;
+        DwmSetWindowAttribute(popup, 2, &ncRenderingPolicy, sizeof(ncRenderingPolicy));
+        HRGN popupRegion = CreateRoundRectRgn(0, 0, width + 1, height + 1, S(12), S(12));
         SetWindowRgn(popup, popupRegion, FALSE);
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
@@ -14145,6 +14420,9 @@ namespace
         if (!imageOnly)
         {
             AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2510, L"\u4f7f\u7528\u5fc5\u5e94\u641c\u7d22");
+            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
+            AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae");
             AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf");
             AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf");
@@ -14161,6 +14439,9 @@ namespace
         if (!imageOnly)
         {
             AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2510, L"\u4f7f\u7528\u5fc5\u5e94\u641c\u7d22");
+            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
+            AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae\tCtrl + H");
             AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf\tCtrl + U");
             AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf\tCtrl + K");
@@ -14169,6 +14450,65 @@ namespace
         }
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
+    void AddSearchMenuItem(std::wstring text, UINT id)
+    {
+        auto item = std::make_unique<ThemedMenuItem>();
+        item->text = std::move(text);
+        item->id = id;
+        g_themedSearchMenuItems.push_back(std::move(item));
+    }
+
+    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect);
+
+    std::string UrlEncodeUtf8(std::wstring const& text)
+    {
+        static char const hex[] = "0123456789ABCDEF";
+        std::string utf8 = ToUtf8(text);
+        std::string encoded;
+        encoded.reserve(utf8.size());
+        for (unsigned char byte : utf8)
+        {
+            bool safe = (byte >= 'A' && byte <= 'Z') ||
+                (byte >= 'a' && byte <= 'z') ||
+                (byte >= '0' && byte <= '9') ||
+                byte == '-' || byte == '_' || byte == '.' || byte == '~';
+            if (safe)
+            {
+                encoded.push_back(static_cast<char>(byte));
+            }
+            else
+            {
+                encoded.push_back('%');
+                encoded.push_back(hex[(byte >> 4) & 0x0F]);
+                encoded.push_back(hex[byte & 0x0F]);
+            }
+        }
+        return encoded;
+    }
+
+    void SearchSelection(HWND hwnd, int provider)
+    {
+        std::wstring query = g_selectionText;
+        auto isSpace = [](wchar_t ch)
+        {
+            return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n';
+        };
+        query.erase(query.begin(), std::find_if(query.begin(), query.end(), [&](wchar_t ch) { return !isSpace(ch); }));
+        query.erase(std::find_if(query.rbegin(), query.rend(), [&](wchar_t ch) { return !isSpace(ch); }).base(), query.end());
+        if (query.empty()) return;
+
+        std::string encoded = UrlEncodeUtf8(query);
+        std::string url;
+        switch (provider)
+        {
+        case 0: url = "https://www.bing.com/search?q=" + encoded; break;
+        case 1: url = "https://www.google.com/search?q=" + encoded; break;
+        case 2: url = "https://www.baidu.com/s?wd=" + encoded; break;
+        default: return;
+        }
+        OpenPdfExternalLink(hwnd, FromUtf8(url));
+    }
+
     void AddAnnotationFromSelection(HWND hwnd, AnnotationKind kind)
     {
         PdfTab* tab = Active();
@@ -15082,7 +15422,29 @@ namespace
             CopyCurrentSelectionToClipboard(hwnd);
             return;
         }
-        if (id == 2106 && g_contextTab >= 0)
+        if (id == 2510)
+        {
+            SearchSelection(hwnd, 0);
+            return;
+        }
+        if (id == 2511)
+        {
+            RECT parentItem{};
+            if (g_themedMenuHover >= 0 && g_themedMenuHover < static_cast<int>(g_themedMenuItemRects.size()))
+                parentItem = g_themedMenuItemRects[static_cast<size_t>(g_themedMenuHover)];
+            ShowSearchEngineSubmenu(hwnd, parentItem);
+            return;
+        }
+        if (id == 2512)
+        {
+            SearchSelection(hwnd, 1);
+            return;
+        }
+        if (id == 2513)
+        {
+            SearchSelection(hwnd, 2);
+            return;
+        }        if (id == 2106 && g_contextTab >= 0)
         {
             std::wstring args = L"/select,\"" + g_tabs[static_cast<size_t>(g_contextTab)]->path + L"\"";
             ShellExecuteW(hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
