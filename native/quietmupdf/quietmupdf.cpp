@@ -1973,7 +1973,14 @@ extern "C" int quiet_pdf_select_text(
 
         std::vector<quiet_visual_line> lines = quiet_build_visual_lines(stext);
         bool selectingDown = (b.y > a.y) || (std::abs(b.y - a.y) < 0.01f && b.x >= a.x);
-        quiet_visual_caret caretA = quiet_caret_for_visual_point(lines, a, quiet_gap_policy::nearest);
+
+        // In a gap between visual lines, retain the closest text span in the drag
+        // direction. This avoids a single code line pulling in its neighbor when
+        // glyph bounds do not fill the full visual line height.
+        quiet_visual_caret caretA = quiet_caret_for_visual_point(
+            lines,
+            a,
+            selectingDown ? quiet_gap_policy::next_line_start : quiet_gap_policy::previous_line_end);
         quiet_visual_caret caretB = quiet_caret_for_visual_point(
             lines,
             b,
