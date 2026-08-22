@@ -13702,6 +13702,23 @@ namespace
             !PtInRect(&childRect, screenPt);
     }
 
+    bool PointInSearchParentItem(POINT screenPt)
+    {
+        if (!g_themedMenuPopup)
+            return false;
+        RECT parentRect{};
+        if (!GetWindowRect(g_themedMenuPopup, &parentRect))
+            return false;
+        for (size_t i = 0; i < g_themedMenuItems.size() && i < g_themedMenuItemRects.size(); ++i)
+        {
+            if (!g_themedMenuItems[i] || g_themedMenuItems[i]->id != 2511)
+                continue;
+            RECT itemRect = g_themedMenuItemRects[i];
+            OffsetRect(&itemRect, parentRect.left, parentRect.top);
+            return PtInRect(&itemRect, screenPt);
+        }
+        return false;
+    }
     bool IsThemedPopupCursorActive(HWND hwnd)
     {
         if (!g_themedMenuPopup && !g_themedSearchMenuPopup)
@@ -13762,6 +13779,8 @@ namespace
                 GetWindowRect(hwnd, &childRect);
                 if (g_themedMenuPopup && PtInRect(&parentRect, screenPt))
                 {
+                    if (PointInSearchParentItem(screenPt))
+                        return 0;
                     CloseSearchEngineSubmenu(true);
                     POINT parentPt = screenPt;
                     ScreenToClient(g_themedMenuPopup, &parentPt);
@@ -13835,6 +13854,8 @@ namespace
                 GetWindowRect(hwnd, &childRect);
                 if (g_themedMenuPopup && PtInRect(&parentRect, screenPt))
                 {
+                    if (PointInSearchParentItem(screenPt))
+                        return 0;
                     CloseSearchEngineSubmenu(true);
                     POINT parentPt = screenPt;
                     ScreenToClient(g_themedMenuPopup, &parentPt);
@@ -13924,6 +13945,8 @@ namespace
                 GetWindowRect(hwnd, &childRect);
                 if (g_themedMenuPopup && PtInRect(&parentRect, screenPt))
                 {
+                    if (PointInSearchParentItem(screenPt))
+                        return 0;
                     CloseSearchEngineSubmenu(true);
                     POINT parentPt = screenPt;
                     ScreenToClient(g_themedMenuPopup, &parentPt);
