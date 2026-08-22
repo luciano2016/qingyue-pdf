@@ -14289,7 +14289,7 @@ namespace
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        SetCapture(popup);
+        if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
     }
     void ShowThemeMenu(HWND hwnd)
     {
