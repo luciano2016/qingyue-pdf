@@ -14578,42 +14578,70 @@ namespace
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
-    void ShowSelectionMenu(HWND hwnd, int x, int y, bool imageOnly)
+    void AppendThemedMenuSubmenu(HMENU menu, HMENU submenu, UINT id, const wchar_t* text)
     {
+        ThemedMenuItem* item = AddThemedMenuStorage(text ? text : L"", false);
+        item->id = id;
+        AppendMenuW(menu, MF_OWNERDRAW | MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), reinterpret_cast<LPCWSTR>(item));
+    }
+
+    void ShowSelectionNativeMenu(HWND hwnd, int x, int y, bool imageOnly, bool withShortcuts)
+    {
+        CloseThemedPopupMenu();
         HMENU menu = CreatePopupMenu();
-        AppendThemedMenuItem(menu, 2501, imageOnly ? L"\u590d\u5236\u56fe\u7247" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9");
+        if (!menu) return;
+
+        const wchar_t* copyText = imageOnly ? L"\u590d\u5236\u56fe\u7247" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9";
+        AppendThemedMenuItem(menu, 2501, withShortcuts ? (imageOnly ? L"\u590d\u5236\u56fe\u7247\tCtrl + C" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9\tCtrl + C") : copyText);
         if (!imageOnly)
         {
             AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae");
-            AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf");
-            AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf");
+            AppendThemedMenuItem(menu, 2502, withShortcuts ? L"\u9ad8\u4eae\tCtrl + H" : L"\u9ad8\u4eae");
+            AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
+            AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u9664\u7ebf");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
-            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
+
+            HMENU searchMenu = CreatePopupMenu();
+            if (searchMenu)
+            {
+                AppendThemedMenuItem(searchMenu, 2512, L"\u8c37\u6b4c\u641c\u7d22");
+                AppendThemedMenuItem(searchMenu, 2513, L"\u767e\u5ea6\u641c\u7d22");
+                AppendThemedMenuSubmenu(menu, searchMenu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
+            }
         }
-        ShowThemedPopupMenu(hwnd, menu, x, y);
+
+        HBRUSH backgroundBrush = CreateSolidBrush(MenuPopupFill());
+        if (backgroundBrush)
+        {
+            MENUINFO info{};
+            info.cbSize = sizeof(info);
+            info.fMask = MIM_BACKGROUND | MIM_STYLE | MIM_APPLYTOSUBMENUS;
+            info.hbrBack = backgroundBrush;
+            info.dwStyle = MNS_CHECKORBMP;
+            SetMenuInfo(menu, &info);
+        }
+
+        int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, x, y, 0, hwnd, nullptr);
+        if (backgroundBrush) DeleteObject(backgroundBrush);
+        DestroyMenu(menu);
+        g_themedMenuItems.clear();
+        g_themedMenuItemRects.clear();
+        g_themedMenuHover = -1;
+        g_themedMenuPressed = -1;
+        if (command) SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+    }
+
+    void ShowSelectionMenu(HWND hwnd, int x, int y, bool imageOnly)
+    {
+        ShowSelectionNativeMenu(hwnd, x, y, imageOnly, false);
     }
 
     void ShowSelectionMenuWithShortcuts(HWND hwnd, int x, int y, bool imageOnly)
     {
-        HMENU menu = CreatePopupMenu();
-        AppendThemedMenuItem(menu, 2501, imageOnly ? L"\u590d\u5236\u56fe\u7247\tCtrl + C" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9\tCtrl + C");
-        if (!imageOnly)
-        {
-            AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae\tCtrl + H");
-            AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf\tCtrl + U");
-            AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf\tCtrl + K");
-            AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
-            AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
-            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
-        }
-        ShowThemedPopupMenu(hwnd, menu, x, y);
+        ShowSelectionNativeMenu(hwnd, x, y, imageOnly, true);
     }
     void AddSearchMenuItem(std::wstring text, UINT id)
     {
