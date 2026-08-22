@@ -13683,6 +13683,25 @@ namespace
         g_themedSearchMenuHover = hover;
         InvalidateRect(popup, nullptr, FALSE);
     }
+    bool PointInSearchSubmenuTransition(POINT screenPt)
+    {
+        if (!g_themedMenuPopup || !g_themedSearchMenuPopup) return false;
+        RECT parentRect{};
+        RECT childRect{};
+        GetWindowRect(g_themedMenuPopup, &parentRect);
+        GetWindowRect(g_themedSearchMenuPopup, &childRect);
+
+        RECT bridge{
+            std::min(parentRect.right, childRect.left) - S(2),
+            childRect.top - S(4),
+            std::max(parentRect.right, childRect.left) + S(2),
+            childRect.bottom + S(4)
+        };
+        return PtInRect(&bridge, screenPt) &&
+            !PtInRect(&parentRect, screenPt) &&
+            !PtInRect(&childRect, screenPt);
+    }
+
     LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         bool isSearchSubmenu = hwnd == g_themedSearchMenuPopup;
@@ -13690,6 +13709,9 @@ namespace
         {
         case WM_ERASEBKGND:
             return 1;
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
         case WM_PAINT:
             if (isSearchSubmenu)
                 PaintThemedPopupMenu(hwnd, g_themedSearchMenuItems, g_themedSearchMenuItemRects, g_themedSearchMenuHover, g_themedSearchMenuPressed);
@@ -13710,6 +13732,8 @@ namespace
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
+                if (PointInSearchSubmenuTransition(screenPt))
+                    return 0;
             }
 
             if (isSearchSubmenu)
