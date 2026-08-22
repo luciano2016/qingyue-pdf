@@ -13702,6 +13702,23 @@ namespace
             !PtInRect(&childRect, screenPt);
     }
 
+    bool IsThemedPopupCursorActive(HWND hwnd)
+    {
+        if (!g_themedMenuPopup && !g_themedSearchMenuPopup)
+            return false;
+        HWND capture = GetCapture();
+        if (capture == g_themedMenuPopup || capture == g_themedSearchMenuPopup)
+            return true;
+
+        POINT screenPt{};
+        GetCursorPos(&screenPt);
+        RECT rect{};
+        if (g_themedMenuPopup && GetWindowRect(g_themedMenuPopup, &rect) && PtInRect(&rect, screenPt))
+            return true;
+        if (g_themedSearchMenuPopup && GetWindowRect(g_themedSearchMenuPopup, &rect) && PtInRect(&rect, screenPt))
+            return true;
+        return hwnd == g_themedMenuPopup || hwnd == g_themedSearchMenuPopup;
+    }
     LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         bool isSearchSubmenu = hwnd == g_themedSearchMenuPopup;
@@ -13751,11 +13768,13 @@ namespace
                     SendMessageW(g_themedMenuPopup, WM_MOUSEMOVE, wParam, MAKELPARAM(parentPt.x, parentPt.y));
                     return 0;
                 }
-                if (!PtInRect(&childRect, screenPt))
+                if (!PtInRect(&childRect, screenPt) && !PointInSearchSubmenuTransition(screenPt))
                 {
                     CloseThemedPopupMenu();
                     return 0;
                 }
+                if (!PtInRect(&childRect, screenPt))
+                    return 0;
 
                 POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 int hover = ThemedSearchMenuHitTest(pt);
@@ -13911,11 +13930,13 @@ namespace
                     SendMessageW(g_themedMenuPopup, msg, wParam, MAKELPARAM(parentPt.x, parentPt.y));
                     return 0;
                 }
-                if (!PtInRect(&childRect, screenPt))
+                if (!PtInRect(&childRect, screenPt) && !PointInSearchSubmenuTransition(screenPt))
                 {
                     CloseThemedPopupMenu();
                     return 0;
                 }
+                if (!PtInRect(&childRect, screenPt))
+                    return 0;
 
                 POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 int hitIndex = ThemedSearchMenuHitTest(pt);
@@ -13952,11 +13973,16 @@ namespace
         case WM_CAPTURECHANGED:
             if (isSearchSubmenu)
             {
+                HWND nextCapture = reinterpret_cast<HWND>(lParam);
+                if (nextCapture == g_themedMenuPopup)
+                    return 0;
                 if (g_themedSearchMenuPopup == hwnd)
                     CloseSearchEngineSubmenu(false);
             }
             else if (reinterpret_cast<HWND>(lParam) != hwnd && g_themedMenuPopup == hwnd)
             {
+                if (reinterpret_cast<HWND>(lParam) == g_themedSearchMenuPopup)
+                    return 0;
                 CloseThemedPopupMenu();
             }
             return 0;
@@ -14112,6 +14138,7 @@ namespace
         SetWindowRgn(popup, popupRegion, FALSE);
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
     }
     void CloseSearchEngineSubmenu(bool restoreParentCapture)
@@ -14223,7 +14250,8 @@ namespace
         SetWindowRgn(popup, popupRegion, FALSE);
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
-        if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        SetCapture(popup);
     }
     void ShowThemeMenu(HWND hwnd)
     {
@@ -16232,6 +16260,11 @@ namespace
             return 1;
         case WM_SETCURSOR:
         {
+            if (IsThemedPopupCursorActive(hwnd))
+            {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            }
             if (LOWORD(lParam) == HTCLIENT)
             {
                 POINT pt{};
