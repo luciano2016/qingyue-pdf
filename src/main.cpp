@@ -13662,6 +13662,27 @@ namespace
         return -1;
     }
 
+    bool PointInSearchSubmenu(POINT screenPt, POINT* localPt = nullptr)
+    {
+        if (!g_themedSearchMenuPopup) return false;
+        RECT rect{};
+        GetWindowRect(g_themedSearchMenuPopup, &rect);
+        if (!PtInRect(&rect, screenPt)) return false;
+        if (localPt)
+        {
+            *localPt = screenPt;
+            ScreenToClient(g_themedSearchMenuPopup, localPt);
+        }
+        return true;
+    }
+
+    void UpdateSearchSubmenuHover(HWND popup, POINT localPt)
+    {
+        int hover = ThemedSearchMenuHitTest(localPt);
+        if (hover == g_themedSearchMenuHover) return;
+        g_themedSearchMenuHover = hover;
+        InvalidateRect(popup, nullptr, FALSE);
+    }
     LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         bool isSearchSubmenu = hwnd == g_themedSearchMenuPopup;
@@ -13679,6 +13700,18 @@ namespace
         {
             POINT screenPt{};
             GetCursorPos(&screenPt);
+            if (!isSearchSubmenu)
+            {
+                POINT childPt{};
+                if (PointInSearchSubmenu(screenPt, &childPt))
+                {
+                    g_themedMenuPressed = -1;
+                    UpdateSearchSubmenuHover(g_themedSearchMenuPopup, childPt);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
             if (isSearchSubmenu)
             {
                 RECT parentRect{};
@@ -13734,6 +13767,21 @@ namespace
         {
             POINT screenPt{};
             GetCursorPos(&screenPt);
+            if (!isSearchSubmenu)
+            {
+                POINT childPt{};
+                if (PointInSearchSubmenu(screenPt, &childPt))
+                {
+                    int hitIndex = ThemedSearchMenuHitTest(childPt);
+                    g_themedMenuPressed = -1;
+                    g_themedSearchMenuPressed =
+                        hitIndex >= 0 && hitIndex < static_cast<int>(g_themedSearchMenuItems.size()) &&
+                        !g_themedSearchMenuItems[static_cast<size_t>(hitIndex)]->disabled
+                        ? hitIndex : -1;
+                    InvalidateRect(g_themedSearchMenuPopup, nullptr, FALSE);
+                    return 0;
+                }
+            }
             if (isSearchSubmenu)
             {
                 RECT parentRect{};
@@ -13798,6 +13846,30 @@ namespace
         {
             POINT screenPt{};
             GetCursorPos(&screenPt);
+            if (!isSearchSubmenu)
+            {
+                POINT childPt{};
+                if (PointInSearchSubmenu(screenPt, &childPt))
+                {
+                    int hitIndex = ThemedSearchMenuHitTest(childPt);
+                    int pressed = g_themedSearchMenuPressed;
+                    g_themedSearchMenuPressed = -1;
+                    if (pressed >= 0 && pressed == hitIndex &&
+                        pressed < static_cast<int>(g_themedSearchMenuItems.size()))
+                    {
+                        UINT id = g_themedSearchMenuItems[static_cast<size_t>(pressed)]->id;
+                        HWND owner = g_themedMenuOwner;
+                        CloseThemedPopupMenu();
+                        if (owner && id) SendMessageW(owner, WM_COMMAND, id, 0);
+                    }
+                    else
+                    {
+                        InvalidateRect(g_themedSearchMenuPopup, nullptr, FALSE);
+                    }
+                    return 0;
+                }
+            }
+
             if (isSearchSubmenu)
             {
                 RECT parentRect{};
@@ -14013,7 +14085,7 @@ namespace
         SetWindowRgn(popup, popupRegion, FALSE);
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
-        SetCapture(popup);
+        if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
     }
     void CloseSearchEngineSubmenu(bool restoreParentCapture)
     {
@@ -14124,7 +14196,7 @@ namespace
         SetWindowRgn(popup, popupRegion, FALSE);
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
-        SetCapture(popup);
+        if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
     }
     void ShowThemeMenu(HWND hwnd)
     {
@@ -14420,14 +14492,14 @@ namespace
         if (!imageOnly)
         {
             AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2510, L"\u4f7f\u7528\u5fc5\u5e94\u641c\u7d22");
-            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
-            AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae");
             AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf");
             AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
+            AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
+            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
         }
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
@@ -14439,14 +14511,14 @@ namespace
         if (!imageOnly)
         {
             AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2510, L"\u4f7f\u7528\u5fc5\u5e94\u641c\u7d22");
-            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
-            AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, L"\u9ad8\u4eae\tCtrl + H");
             AppendThemedMenuItem(menu, 2503, L"\u4e0b\u5212\u7ebf\tCtrl + U");
             AppendThemedMenuItem(menu, 2504, L"\u5220\u9664\u7ebf\tCtrl + K");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
+            AppendThemedMenuSeparator(menu);
+            AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
+            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
         }
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
