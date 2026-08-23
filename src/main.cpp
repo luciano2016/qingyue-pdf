@@ -13746,18 +13746,6 @@ namespace
     LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         bool isSearchSubmenu = hwnd == g_themedSearchMenuPopup;
-        if (isSearchSubmenu && (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP))
-        {
-            HWND parentPopup = g_themedMenuPopup;
-            if (parentPopup && IsWindow(parentPopup))
-            {
-                POINT screenPt{};
-                GetCursorPos(&screenPt);
-                ScreenToClient(parentPopup, &screenPt);
-                SendMessageW(parentPopup, msg, wParam, MAKELPARAM(screenPt.x, screenPt.y));
-            }
-            return 0;
-        }
         switch (msg)
         {
         case WM_ERASEBKGND:
@@ -13814,7 +13802,8 @@ namespace
                 if (!PtInRect(&childRect, screenPt))
                     return 0;
 
-                POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                POINT pt = screenPt;
+            ScreenToClient(hwnd, &pt);
                 int hover = ThemedSearchMenuHitTest(pt);
                 if (hover != g_themedSearchMenuHover)
                 {
@@ -13824,7 +13813,8 @@ namespace
                 return 0;
             }
 
-            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            POINT pt = screenPt;
+            ScreenToClient(hwnd, &pt);
             int hover = ThemedMenuHitTest(pt);
             if (hover >= 0 && g_themedMenuItems[static_cast<size_t>(hover)]->separator) hover = -1;
             if (hover != g_themedMenuHover)
@@ -13894,7 +13884,8 @@ namespace
                     return 0;
                 }
 
-                POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                POINT pt = screenPt;
+            ScreenToClient(hwnd, &pt);
                 int hitIndex = ThemedSearchMenuHitTest(pt);
                 if (hitIndex < 0)
                 {
@@ -13907,7 +13898,8 @@ namespace
                 return 0;
             }
 
-            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            POINT pt = screenPt;
+            ScreenToClient(hwnd, &pt);
             int hitIndex = ThemedMenuHitTest(pt);
             if (hitIndex < 0)
             {
@@ -13980,7 +13972,8 @@ namespace
                 if (!PtInRect(&childRect, screenPt))
                     return 0;
 
-                POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                POINT pt = screenPt;
+            ScreenToClient(hwnd, &pt);
                 int hitIndex = ThemedSearchMenuHitTest(pt);
                 int pressed = g_themedSearchMenuPressed;
                 g_themedSearchMenuPressed = -1;
@@ -13997,7 +13990,8 @@ namespace
                 return 0;
             }
 
-            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            POINT pt = screenPt;
+            ScreenToClient(hwnd, &pt);
             int hitIndex = ThemedMenuHitTest(pt);
             int pressed = g_themedMenuPressed;
             g_themedMenuPressed = -1;
@@ -14023,7 +14017,8 @@ namespace
             }
             else if (reinterpret_cast<HWND>(lParam) != hwnd && g_themedMenuPopup == hwnd)
             {
-                if (reinterpret_cast<HWND>(lParam) == g_themedSearchMenuPopup)
+                // The parent deliberately releases capture while the child popup is under the pointer. Keep the menu alive until the child decides whether the pointer returned to the parent or left both.
+                if (g_themedSearchMenuPopup)
                     return 0;
                 CloseThemedPopupMenu();
             }
@@ -14296,7 +14291,8 @@ namespace
         ShowWindow(popup, SW_SHOWNOACTIVATE);
         UpdateWindow(popup);
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
+        // Let the submenu receive native mouse messages directly. The parent capture would redirect clicks over the child back to the parent.
+        if (GetCapture() == g_themedMenuPopup) ReleaseCapture();
     }
     void ShowThemeMenu(HWND hwnd)
     {
