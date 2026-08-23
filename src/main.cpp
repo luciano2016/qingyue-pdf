@@ -13746,6 +13746,18 @@ namespace
     LRESULT CALLBACK ThemedMenuPopupProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         bool isSearchSubmenu = hwnd == g_themedSearchMenuPopup;
+        if (isSearchSubmenu && (msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP))
+        {
+            HWND parentPopup = g_themedMenuPopup;
+            if (parentPopup && IsWindow(parentPopup))
+            {
+                POINT screenPt{};
+                GetCursorPos(&screenPt);
+                ScreenToClient(parentPopup, &screenPt);
+                SendMessageW(parentPopup, msg, wParam, MAKELPARAM(screenPt.x, screenPt.y));
+            }
+            return 0;
+        }
         switch (msg)
         {
         case WM_ERASEBKGND:
@@ -14260,7 +14272,7 @@ namespace
             y,
             width,
             height,
-            hwnd,
+            g_themedMenuPopup,
             nullptr,
             GetModuleHandleW(nullptr),
             nullptr);
