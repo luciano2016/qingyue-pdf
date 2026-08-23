@@ -13762,12 +13762,15 @@ namespace
         ScreenToClient(g_themedMenuPopup, &pt);
         RECT parentRect{ 0, 0, g_themedMenuBaseWidth, g_themedMenuBaseHeight };
         RECT childRect = g_themedSearchMenuInlineRect;
+        int corridorLeft = std::min(parentRect.right, childRect.left) - S(14);
+        int corridorRight = std::max(parentRect.right, childRect.left) + S(14);
+        int corridorTop = std::min(childRect.top, parentRect.top) - S(12);
+        int corridorBottom = std::max(childRect.bottom, parentRect.bottom) + S(12);
         RECT bridge{
-            parentRect.right - S(2),
-            std::min(parentRect.top, childRect.top) - S(8),
-            childRect.left + S(2),
-            std::max(parentRect.bottom, childRect.bottom) + S(8) };
-        return PtInRect(&bridge, pt) && !PtInRect(&parentRect, pt) && !PtInRect(&childRect, pt);
+            corridorLeft, corridorTop, corridorRight, corridorBottom };
+        return PtInRect(&bridge, pt) &&
+            pt.x >= parentRect.right - S(14) &&
+            pt.x <= childRect.left + S(14);
     }
 
     bool PointInSearchParentItem(POINT screenPt)
@@ -13888,6 +13891,8 @@ namespace
             }
             else if (g_themedSearchMenuInline)
             {
+                if (PointInSearchSubmenuTransition(screenPt))
+                    return 0;
                 CloseSearchEngineSubmenu(true);
             }
             return 0;
@@ -14324,10 +14329,9 @@ namespace
             g_themedSearchMenuItemRects.clear();
             return;
         }
-        int gap = S(6);
-        int offsetX = g_themedMenuBaseWidth + gap;
-        int offsetY = std::clamp(static_cast<int>(parentItemRect.top) - S(3), S(3), std::max(S(3), g_themedMenuBaseHeight - height - S(3)));
-        int totalWidth = g_themedMenuBaseWidth + gap + width;
+        int offsetX = g_themedMenuBaseWidth - S(1);
+        int offsetY = std::clamp(static_cast<int>(parentItemRect.top), S(3), std::max(S(3), g_themedMenuBaseHeight - height - S(3)));
+        int totalWidth = g_themedMenuBaseWidth + width - S(1);
         int totalHeight = std::max(g_themedMenuBaseHeight, offsetY + height);
         HMONITOR monitor = MonitorFromRect(&base, MONITOR_DEFAULTTONEAREST);
         MONITORINFO monitorInfo{};
