@@ -1658,6 +1658,11 @@ namespace
     std::vector<RECT> g_themedMenuItemRects;
     int g_themedMenuHover{ -1 };
     int g_themedMenuPressed{ -1 };
+    RECT g_themedMenuBaseWindowRect{};
+    int g_themedMenuBaseWidth{};
+    int g_themedMenuBaseHeight{};
+    int g_themedSearchMenuWidth{};
+    int g_themedSearchMenuHeight{};
     std::vector<std::unique_ptr<ThemedMenuItem>> g_themedSearchMenuItems;
     HWND g_themedSearchMenuPopup{};
     std::vector<RECT> g_themedSearchMenuItemRects;
@@ -13582,6 +13587,35 @@ namespace
         DeleteObject(font);
     }
 
+    void ApplyThemedPopupRegion(HWND hwnd)
+    {
+        if (!hwnd) return;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int w = std::max<int>(1, client.right - client.left);
+        int h = std::max<int>(1, client.bottom - client.top);
+        int parentW = g_themedSearchMenuInline ? g_themedMenuBaseWidth : w;
+        int parentH = g_themedSearchMenuInline ? g_themedMenuBaseHeight : h;
+        HRGN parent = CreateRoundRectRgn(0, 0, parentW + 1, parentH + 1, S(12), S(12));
+        if (!g_themedSearchMenuInline)
+        {
+            SetWindowRgn(hwnd, parent, TRUE);
+            return;
+        }
+
+        HRGN child = CreateRoundRectRgn(
+            g_themedSearchMenuInlineRect.left,
+            g_themedSearchMenuInlineRect.top,
+            g_themedSearchMenuInlineRect.right + 1,
+            g_themedSearchMenuInlineRect.bottom + 1,
+            S(12), S(12));
+        HRGN combined = CreateRectRgn(0, 0, 0, 0);
+        CombineRgn(combined, parent, child, RGN_OR);
+        DeleteObject(parent);
+        DeleteObject(child);
+        SetWindowRgn(hwnd, combined, TRUE);
+    }
+
     void PaintThemedPopupMenu(HWND hwnd, std::vector<std::unique_ptr<ThemedMenuItem>> const& items, std::vector<RECT> const& itemRects, int hover, int pressed)
     {
         PAINTSTRUCT ps{};
@@ -13593,38 +13627,62 @@ namespace
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bitmap = CreateCompatibleBitmap(dc, w, h);
         HGDIOBJ oldBitmap = SelectObject(mem, bitmap);
+        Fill(mem, RECT{ 0, 0, w, h }, MenuPopupFill());
 
-        RECT local{ 0, 0, w, h };
-        Fill(mem, local, MenuPopupFill());
-        Gdiplus::Graphics g(mem);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
-        Gdiplus::SolidBrush fill(GdiColor(MenuPopupFill()));
-        FillGdiRoundRect(g, fill, Rf(local), S(6.0f));
-        Gdiplus::Pen border(GdiColor(MenuPopupBorder()), std::max<Gdiplus::REAL>(0.85f, S(1.0f)));
-        Gdiplus::RectF borderRect{ S(0.75f), S(0.75f),
-            std::max(1.0f, static_cast<float>(w) - S(1.5f)),
-            std::max(1.0f, static_cast<float>(h) - S(1.5f)) };
-        DrawGdiRoundRect(g, border, borderRect, S(5.25f));
-
-        for (int i = 0; i < static_cast<int>(items.size()) && i < static_cast<int>(itemRects.size()); ++i)
+        auto paintBox = [&](RECT box,
+            std::vector<std::unique_ptr<ThemedMenuItem>> const& boxItems,
+            std::vector<RECT> const& boxRects,
+            int boxHover, int boxPressed)
         {
-            RECT row = itemRects[static_cast<size_t>(i)];
-            DrawThemedMenuEntry(mem, *items[static_cast<size_t>(i)], row, i == hover, i == pressed);
-            if (items[static_cast<size_t>(i)]->id == 2511)
+            Gdiplus::Graphics g(mem);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+            g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+            Gdiplus::SolidBrush fill(GdiColor(MenuPopupFill()));
+            FillGdiRoundRect(g, fill, Rf(box), S(6.0f));
+            Gdiplus::Pen border(GdiColor(MenuPopupBorder()), std::max<Gdiplus::REAL>(0.85f, S(1.0f)));
+            Gdiplus::RectF borderRect{
+                static_cast<Gdiplus::REAL>(box.left) + S(0.75f),
+                static_cast<Gdiplus::REAL>(box.top) + S(0.75f),
+                std::max(1.0f, static_cast<float>(box.right - box.left) - S(1.5f)),
+                std::max(1.0f, static_cast<float>(box.bottom - box.top) - S(1.5f)) };
+            DrawGdiRoundRect(g, border, borderRect, S(5.25f));
+
+            for (int i = 0; i < static_cast<int>(boxItems.size()) && i < static_cast<int>(boxRects.size()); ++i)
             {
-                float cx = static_cast<float>(row.right - S(13));
-                float cy = static_cast<float>((row.top + row.bottom) / 2);
-                Gdiplus::Pen arrow(GdiColor(MenuPopupShortcutText(false), 205), std::max<Gdiplus::REAL>(S(0.85f), 0.95f));
-                arrow.SetStartCap(Gdiplus::LineCapRound);
-                arrow.SetEndCap(Gdiplus::LineCapRound);
-                arrow.SetLineJoin(Gdiplus::LineJoinRound);
-                g.DrawLine(&arrow, cx - S(2.0f), cy - S(2.6f), cx + S(0.8f), cy);
-                g.DrawLine(&arrow, cx + S(0.8f), cy, cx - S(2.0f), cy + S(2.6f));
+                RECT row = boxRects[static_cast<size_t>(i)];
+                OffsetRect(&row, box.left, box.top);
+                DrawThemedMenuEntry(mem, *boxItems[static_cast<size_t>(i)], row, i == boxHover, i == boxPressed);
+                if (boxItems[static_cast<size_t>(i)]->id == 2511)
+                {
+                    float cx = static_cast<float>(row.right - S(13));
+                    float cy = static_cast<float>((row.top + row.bottom) / 2);
+                    Gdiplus::Pen arrow(GdiColor(MenuPopupShortcutText(false), 205), std::max<Gdiplus::REAL>(S(0.85f), 0.95f));
+                    arrow.SetStartCap(Gdiplus::LineCapRound);
+                    arrow.SetEndCap(Gdiplus::LineCapRound);
+                    arrow.SetLineJoin(Gdiplus::LineJoinRound);
+                    g.DrawLine(&arrow, cx - S(2.0f), cy - S(2.6f), cx + S(0.8f), cy);
+                    g.DrawLine(&arrow, cx + S(0.8f), cy, cx - S(2.0f), cy + S(2.6f));
+                }
             }
+        };
+
+        RECT parentBox{ 0, 0, w, h };
+        if (g_themedSearchMenuInline)
+            parentBox = RECT{ 0, 0, g_themedMenuBaseWidth, g_themedMenuBaseHeight };
+        paintBox(parentBox, items, itemRects, hover, pressed);
+        BitBlt(dc, parentBox.left, parentBox.top, parentBox.right - parentBox.left, parentBox.bottom - parentBox.top,
+            mem, parentBox.left, parentBox.top, SRCCOPY);
+
+        if (g_themedSearchMenuInline)
+        {
+            RECT childBox = g_themedSearchMenuInlineRect;
+            paintBox(childBox, g_themedSearchMenuItems, g_themedSearchMenuItemRects,
+                g_themedSearchMenuHover, g_themedSearchMenuPressed);
+            BitBlt(dc, childBox.left, childBox.top, childBox.right - childBox.left, childBox.bottom - childBox.top,
+                mem, childBox.left, childBox.top, SRCCOPY);
         }
-        BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+
         SelectObject(mem, oldBitmap);
         DeleteObject(bitmap);
         DeleteDC(mem);
@@ -13674,14 +13732,16 @@ namespace
 
     bool PointInSearchSubmenu(POINT screenPt, POINT* localPt = nullptr)
     {
-        if (!g_themedMenuPopup || !g_themedSearchMenuPopup || !g_themedSearchMenuInline) return false;
-        RECT childRect{};
-        GetWindowRect(g_themedSearchMenuPopup, &childRect);
-        if (!PtInRect(&childRect, screenPt)) return false;
+        if (!g_themedMenuPopup || !g_themedSearchMenuInline) return false;
+        RECT parentRect{};
+        if (!GetWindowRect(g_themedMenuPopup, &parentRect)) return false;
+        POINT pt = screenPt;
+        ScreenToClient(g_themedMenuPopup, &pt);
+        if (!PtInRect(&g_themedSearchMenuInlineRect, pt)) return false;
         if (localPt)
         {
-            *localPt = screenPt;
-            ScreenToClient(g_themedSearchMenuPopup, localPt);
+            localPt->x = pt.x - g_themedSearchMenuInlineRect.left;
+            localPt->y = pt.y - g_themedSearchMenuInlineRect.top;
         }
         return true;
     }
@@ -13697,19 +13757,17 @@ namespace
 
     bool PointInSearchSubmenuTransition(POINT screenPt)
     {
-        if (!g_themedMenuPopup || !g_themedSearchMenuPopup || !g_themedSearchMenuInline) return false;
-        RECT parentRect{};
-        RECT childRect{};
-        GetWindowRect(g_themedMenuPopup, &parentRect);
-        GetWindowRect(g_themedSearchMenuPopup, &childRect);
-        bool childOnRight = childRect.left >= parentRect.right;
+        if (!g_themedMenuPopup || !g_themedSearchMenuInline) return false;
+        POINT pt = screenPt;
+        ScreenToClient(g_themedMenuPopup, &pt);
+        RECT parentRect{ 0, 0, g_themedMenuBaseWidth, g_themedMenuBaseHeight };
+        RECT childRect = g_themedSearchMenuInlineRect;
         RECT bridge{
-            childOnRight ? parentRect.right - S(8) : childRect.right - S(8),
+            parentRect.right - S(2),
             std::min(parentRect.top, childRect.top) - S(8),
-            childOnRight ? childRect.left + S(8) : parentRect.left + S(8),
+            childRect.left + S(2),
             std::max(parentRect.bottom, childRect.bottom) + S(8) };
-        return PtInRect(&bridge, screenPt) &&
-            !PtInRect(&parentRect, screenPt) && !PtInRect(&childRect, screenPt);
+        return PtInRect(&bridge, pt) && !PtInRect(&parentRect, pt) && !PtInRect(&childRect, pt);
     }
 
     bool PointInSearchParentItem(POINT screenPt)
@@ -13770,8 +13828,8 @@ namespace
                 if (PointInSearchSubmenu(screenPt, &childPt))
                 {
                     g_themedMenuPressed = -1;
-                    UpdateSearchSubmenuHover(g_themedSearchMenuPopup, childPt);
-                    InvalidateRect(g_themedSearchMenuPopup, nullptr, FALSE);
+                    UpdateSearchSubmenuHover(hwnd, childPt);
+                    InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
                 if (PointInSearchSubmenuTransition(screenPt))
@@ -14017,9 +14075,13 @@ namespace
             }
             else if (reinterpret_cast<HWND>(lParam) != hwnd && g_themedMenuPopup == hwnd)
             {
-                // The parent deliberately releases capture while the child popup is under the pointer. Keep the menu alive until the child decides whether the pointer returned to the parent or left both.
+                // Keep all menu input on the parent popup while the submenu is visible.
+                // The child popup is visual only; re-acquire capture if Windows moved it.
                 if (g_themedSearchMenuPopup)
+                {
+                    SetCapture(g_themedMenuPopup);
                     return 0;
+                }
                 CloseThemedPopupMenu();
             }
             return 0;
@@ -14167,6 +14229,11 @@ namespace
             return;
         }
         g_themedMenuPopup = popup;
+        g_themedSearchMenuPopup = nullptr;
+        g_themedMenuBaseWindowRect = RECT{ x, y, x + popupWidth, y + popupHeight };
+        g_themedMenuBaseWidth = popupWidth;
+        g_themedMenuBaseHeight = popupHeight;
+        g_themedSearchMenuInline = false;
         int cornerPreference = 3;
         DwmSetWindowAttribute(popup, 33, &cornerPreference, sizeof(cornerPreference));
         DWORD borderColor = 0xFFFFFFFE;
@@ -14182,14 +14249,21 @@ namespace
     }
     void CloseSearchEngineSubmenu(bool restoreParentCapture)
     {
-        HWND popup = g_themedSearchMenuPopup;
-        if (popup)
+        g_themedSearchMenuPopup = nullptr;
+        if (g_themedSearchMenuInline && g_themedMenuPopup)
         {
-            g_themedSearchMenuPopup = nullptr;
-            DestroyWindow(popup);
+            SetWindowPos(g_themedMenuPopup, HWND_TOPMOST,
+                g_themedMenuBaseWindowRect.left, g_themedMenuBaseWindowRect.top,
+                g_themedMenuBaseWidth, g_themedMenuBaseHeight,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            g_themedSearchMenuInline = false;
+            g_themedSearchMenuInlineRect = RECT{};
+            ApplyThemedPopupRegion(g_themedMenuPopup);
         }
         g_themedSearchMenuInline = false;
         g_themedSearchMenuInlineRect = RECT{};
+        g_themedSearchMenuWidth = 0;
+        g_themedSearchMenuHeight = 0;
         g_themedSearchMenuItemRects.clear();
         g_themedSearchMenuItems.clear();
         g_themedSearchMenuHover = -1;
@@ -14200,7 +14274,7 @@ namespace
 
     void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect)
     {
-        if (!hwnd || !g_themedMenuPopup || g_themedSearchMenuPopup)
+        if (!hwnd || !g_themedMenuPopup || g_themedSearchMenuInline)
             return;
 
         g_themedSearchMenuItems.clear();
@@ -14243,56 +14317,42 @@ namespace
             rowTop += rowHeight;
         }
 
-        RECT parentWindowRect{};
-        GetWindowRect(g_themedMenuPopup, &parentWindowRect);
-        int x = parentWindowRect.right - S(1);
-        int y = parentWindowRect.top + parentItemRect.top - S(3);
-        HMONITOR monitor = MonitorFromPoint(POINT{ x, y }, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO monitorInfo{};
-        monitorInfo.cbSize = sizeof(monitorInfo);
-        GetMonitorInfoW(monitor, &monitorInfo);
-        if (x + width > monitorInfo.rcWork.right - S(4))
-            x = parentWindowRect.left - width + S(1);
-        if (y + height > monitorInfo.rcWork.bottom - S(4))
-            y = monitorInfo.rcWork.bottom - height - S(4);
-        x = std::max<int>(static_cast<int>(monitorInfo.rcWork.left) + S(4), x);
-        y = std::max<int>(static_cast<int>(monitorInfo.rcWork.top) + S(4), y);
-
-        HWND popup = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            L"QuietPDF.ThemedPopupMenu",
-            L"",
-            WS_POPUP,
-            x,
-            y,
-            width,
-            height,
-            g_themedMenuPopup,
-            nullptr,
-            GetModuleHandleW(nullptr),
-            nullptr);
-        if (!popup)
+        RECT base = g_themedMenuBaseWindowRect;
+        if (!GetWindowRect(g_themedMenuPopup, &base))
         {
             g_themedSearchMenuItems.clear();
             g_themedSearchMenuItemRects.clear();
             return;
         }
+        int gap = S(6);
+        int offsetX = g_themedMenuBaseWidth + gap;
+        int offsetY = std::clamp(static_cast<int>(parentItemRect.top) - S(3), S(3), std::max(S(3), g_themedMenuBaseHeight - height - S(3)));
+        int totalWidth = g_themedMenuBaseWidth + gap + width;
+        int totalHeight = std::max(g_themedMenuBaseHeight, offsetY + height);
+        HMONITOR monitor = MonitorFromRect(&base, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        GetMonitorInfoW(monitor, &monitorInfo);
+        int x = base.left;
+        int y = base.top;
+        if (x + totalWidth > monitorInfo.rcWork.right - S(4))
+            x = monitorInfo.rcWork.right - totalWidth - S(4);
+        if (y + totalHeight > monitorInfo.rcWork.bottom - S(4))
+            y = monitorInfo.rcWork.bottom - totalHeight - S(4);
+        x = std::max<int>(static_cast<int>(monitorInfo.rcWork.left) + S(4), x);
+        y = std::max<int>(static_cast<int>(monitorInfo.rcWork.top) + S(4), y);
 
-        g_themedSearchMenuPopup = popup;
+        g_themedSearchMenuWidth = width;
+        g_themedSearchMenuHeight = height;
+        g_themedSearchMenuInlineRect = RECT{ offsetX, offsetY, offsetX + width, offsetY + height };
         g_themedSearchMenuInline = true;
-        int cornerPreference = 3;
-        DwmSetWindowAttribute(popup, 33, &cornerPreference, sizeof(cornerPreference));
-        DWORD borderColor = 0xFFFFFFFE;
-        DwmSetWindowAttribute(popup, 34, &borderColor, sizeof(borderColor));
-        int ncRenderingPolicy = 1;
-        DwmSetWindowAttribute(popup, 2, &ncRenderingPolicy, sizeof(ncRenderingPolicy));
-        HRGN popupRegion = CreateRoundRectRgn(0, 0, width + 1, height + 1, S(12), S(12));
-        SetWindowRgn(popup, popupRegion, FALSE);
-        ShowWindow(popup, SW_SHOWNOACTIVATE);
-        UpdateWindow(popup);
+        SetWindowPos(g_themedMenuPopup, HWND_TOPMOST, x, y, totalWidth, totalHeight,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        ApplyThemedPopupRegion(g_themedMenuPopup);
+        InvalidateRect(g_themedMenuPopup, nullptr, FALSE);
+        UpdateWindow(g_themedMenuPopup);
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        // Let the submenu receive native mouse messages directly. The parent capture would redirect clicks over the child back to the parent.
-        if (GetCapture() == g_themedMenuPopup) ReleaseCapture();
+        SetCapture(g_themedMenuPopup);
     }
     void ShowThemeMenu(HWND hwnd)
     {
