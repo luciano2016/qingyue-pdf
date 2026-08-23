@@ -1663,6 +1663,10 @@ namespace
     std::vector<RECT> g_themedSearchMenuItemRects;
     int g_themedSearchMenuHover{ -1 };
     int g_themedSearchMenuPressed{ -1 };
+    bool g_themedSearchMenuInline{};
+    RECT g_themedSearchMenuInlineRect{};
+    POINT g_themedMenuParentOffset{};
+    RECT g_themedMenuBaseWindowRect{};
     Theme g_themes[] = {
         { L"\u4e91\u6bcd\u767d", RGB(244,247,250), RGB(255,255,255), RGB(250,252,254), RGB(238,243,247), RGB(255,255,255), RGB(31,35,40), RGB(105,113,125), RGB(210,217,226), RGB(59,170,124) },
         { L"\u8f7b\u67d4\u7070", RGB(246,247,249), RGB(242,243,245), RGB(255,255,255), RGB(238,240,243), RGB(255,255,255), RGB(43,48,56), RGB(116,123,132), RGB(213,217,222), RGB(83,145,207) },
@@ -13518,6 +13522,8 @@ namespace
     }
     int ThemedMenuHitTest(POINT pt)
     {
+        pt.x -= g_themedMenuParentOffset.x;
+        pt.y -= g_themedMenuParentOffset.y;
         for (int i = 0; i < static_cast<int>(g_themedMenuItemRects.size()); ++i)
         {
             if (Hit(g_themedMenuItemRects[static_cast<size_t>(i)], pt.x, pt.y))
@@ -13567,7 +13573,8 @@ namespace
 
         HFONT font = Font(ThemedMenuFontPt(&item));
         HGDIOBJ old = SelectObject(dc, font);
-        RECT textRect{ r.left + ThemedMenuTextLeft(&item), r.top, r.right - S(10), r.bottom };
+        int rightInset = item.id == 2511 ? S(22) : S(10);
+        RECT textRect{ r.left + ThemedMenuTextLeft(&item), r.top, r.right - rightInset, r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
         Text(dc, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(item.disabled));
         if (!shortcut.empty())
@@ -13587,33 +13594,54 @@ namespace
         GetClientRect(hwnd, &client);
         int w = std::max<int>(1, client.right - client.left);
         int h = std::max<int>(1, client.bottom - client.top);
-
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bitmap = CreateCompatibleBitmap(dc, w, h);
         HGDIOBJ oldBitmap = SelectObject(mem, bitmap);
-
-        RECT local{ 0, 0, w, h };
-        Fill(mem, local, MenuPopupFill());
-        Gdiplus::Graphics g(mem);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
-        Gdiplus::SolidBrush fill(GdiColor(MenuPopupFill()));
-        FillGdiRoundRect(g, fill, Rf(local), S(6.0f));
-        Gdiplus::Pen border(GdiColor(MenuPopupBorder()), std::max<Gdiplus::REAL>(0.85f, S(1.0f)));
-        float borderInset = S(0.75f);
-        Gdiplus::RectF borderRect{
-            borderInset,
-            borderInset,
-            std::max(1.0f, static_cast<float>(w) - borderInset * 2.0f),
-            std::max(1.0f, static_cast<float>(h) - borderInset * 2.0f) };
-        DrawGdiRoundRect(g, border, borderRect, S(5.25f));
-
-        for (int i = 0; i < static_cast<int>(items.size()) && i < static_cast<int>(itemRects.size()); ++i)
+        Fill(mem, RECT{ 0, 0, w, h }, MenuPopupFill());
+        auto drawPanel = [&](RECT panel, std::vector<std::unique_ptr<ThemedMenuItem>> const& panelItems,
+            std::vector<RECT> const& panelRects, POINT origin, int panelHover, int panelPressed, bool drawArrow)
         {
-            DrawThemedMenuEntry(mem, *items[static_cast<size_t>(i)], itemRects[static_cast<size_t>(i)], i == hover, i == pressed);
+            Gdiplus::Graphics g(mem);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+            g.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+            Gdiplus::SolidBrush fill(GdiColor(MenuPopupFill()));
+            FillGdiRoundRect(g, fill, Rf(panel), S(6.0f));
+            Gdiplus::Pen border(GdiColor(MenuPopupBorder()), std::max<Gdiplus::REAL>(0.85f, S(1.0f)));
+            Gdiplus::RectF borderRect{ static_cast<Gdiplus::REAL>(panel.left) + S(0.75f),
+                static_cast<Gdiplus::REAL>(panel.top) + S(0.75f),
+                std::max<Gdiplus::REAL>(1.0f, static_cast<Gdiplus::REAL>(panel.right - panel.left) - S(1.5f)),
+                std::max<Gdiplus::REAL>(1.0f, static_cast<Gdiplus::REAL>(panel.bottom - panel.top) - S(1.5f)) };
+            DrawGdiRoundRect(g, border, borderRect, S(5.25f));
+            for (int i = 0; i < static_cast<int>(panelItems.size()) && i < static_cast<int>(panelRects.size()); ++i)
+            {
+                RECT row = panelRects[static_cast<size_t>(i)];
+                OffsetRect(&row, origin.x, origin.y);
+                DrawThemedMenuEntry(mem, *panelItems[static_cast<size_t>(i)], row, i == panelHover, i == panelPressed);
+                if (drawArrow && panelItems[static_cast<size_t>(i)]->id == 2511)
+                {
+                    float cx = static_cast<float>(row.right - S(13));
+                    float cy = static_cast<float>((row.top + row.bottom) / 2);
+                    Gdiplus::Pen arrow(GdiColor(MenuPopupShortcutText(false), 205), std::max<Gdiplus::REAL>(S(0.85f), 0.95f));
+                    arrow.SetStartCap(Gdiplus::LineCapRound);
+                    arrow.SetEndCap(Gdiplus::LineCapRound);
+                    arrow.SetLineJoin(Gdiplus::LineJoinRound);
+                    g.DrawLine(&arrow, cx - S(2.0f), cy - S(2.6f), cx + S(0.8f), cy);
+                    g.DrawLine(&arrow, cx + S(0.8f), cy, cx - S(2.0f), cy + S(2.6f));
+                }
+            }
+        };
+        int parentWidth = g_themedMenuBaseWindowRect.right > 0 ? g_themedMenuBaseWindowRect.right : w;
+        int parentHeight = g_themedMenuBaseWindowRect.bottom > 0 ? g_themedMenuBaseWindowRect.bottom : h;
+        RECT parentPanel{ g_themedMenuParentOffset.x, g_themedMenuParentOffset.y,
+            g_themedMenuParentOffset.x + parentWidth, g_themedMenuParentOffset.y + parentHeight };
+        drawPanel(parentPanel, items, itemRects, g_themedMenuParentOffset, hover, pressed, true);
+        if (g_themedSearchMenuInline)
+        {
+            drawPanel(g_themedSearchMenuInlineRect, g_themedSearchMenuItems, g_themedSearchMenuItemRects,
+                POINT{ g_themedSearchMenuInlineRect.left, g_themedSearchMenuInlineRect.top },
+                g_themedSearchMenuHover, g_themedSearchMenuPressed, false);
         }
-
         BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
         SelectObject(mem, oldBitmap);
         DeleteObject(bitmap);
@@ -13664,14 +13692,16 @@ namespace
 
     bool PointInSearchSubmenu(POINT screenPt, POINT* localPt = nullptr)
     {
-        if (!g_themedSearchMenuPopup) return false;
-        RECT rect{};
-        GetWindowRect(g_themedSearchMenuPopup, &rect);
-        if (!PtInRect(&rect, screenPt)) return false;
+        if (!g_themedMenuPopup || !g_themedSearchMenuInline) return false;
+        RECT windowRect{};
+        GetWindowRect(g_themedMenuPopup, &windowRect);
+        POINT local{ screenPt.x - windowRect.left, screenPt.y - windowRect.top };
+        if (!PtInRect(&g_themedSearchMenuInlineRect, local)) return false;
         if (localPt)
         {
-            *localPt = screenPt;
-            ScreenToClient(g_themedSearchMenuPopup, localPt);
+            *localPt = local;
+            localPt->x -= g_themedSearchMenuInlineRect.left;
+            localPt->y -= g_themedSearchMenuInlineRect.top;
         }
         return true;
     }
@@ -13687,50 +13717,26 @@ namespace
 
     bool PointInSearchSubmenuTransition(POINT screenPt)
     {
-        if (!g_themedMenuPopup || !g_themedSearchMenuPopup) return false;
-        RECT parentRect{};
-        RECT childRect{};
-        GetWindowRect(g_themedMenuPopup, &parentRect);
-        GetWindowRect(g_themedSearchMenuPopup, &childRect);
-
-        RECT parentItem{};
-        bool foundParentItem = false;
-        for (size_t i = 0; i < g_themedMenuItems.size() && i < g_themedMenuItemRects.size(); ++i)
-        {
-            if (!g_themedMenuItems[i] || g_themedMenuItems[i]->id != 2511)
-                continue;
-            parentItem = g_themedMenuItemRects[i];
-            OffsetRect(&parentItem, parentRect.left, parentRect.top);
-            foundParentItem = true;
-            break;
-        }
-        if (!foundParentItem) return false;
-
-        RECT bridge{
-            std::min(parentItem.left, childRect.left) - S(12),
-            std::min(parentItem.top, childRect.top) - S(8),
-            std::max(parentItem.right, childRect.right) + S(12),
-            std::max(parentItem.bottom, childRect.bottom) + S(8)
-        };
-        return PtInRect(&bridge, screenPt) &&
-            !PtInRect(&parentRect, screenPt) &&
-            !PtInRect(&childRect, screenPt);
+        if (!g_themedMenuPopup || !g_themedSearchMenuInline) return false;
+        RECT windowRect{};
+        GetWindowRect(g_themedMenuPopup, &windowRect);
+        POINT local{ screenPt.x - windowRect.left, screenPt.y - windowRect.top };
+        RECT bridge = g_themedSearchMenuInlineRect;
+        InflateRect(&bridge, S(8), S(6));
+        return PtInRect(&bridge, local);
     }
 
     bool PointInSearchParentItem(POINT screenPt)
     {
-        if (!g_themedMenuPopup)
-            return false;
-        RECT parentRect{};
-        if (!GetWindowRect(g_themedMenuPopup, &parentRect))
-            return false;
+        if (!g_themedMenuPopup) return false;
+        RECT windowRect{};
+        if (!GetWindowRect(g_themedMenuPopup, &windowRect)) return false;
+        POINT local{ screenPt.x - windowRect.left - g_themedMenuParentOffset.x,
+            screenPt.y - windowRect.top - g_themedMenuParentOffset.y };
         for (size_t i = 0; i < g_themedMenuItems.size() && i < g_themedMenuItemRects.size(); ++i)
         {
-            if (!g_themedMenuItems[i] || g_themedMenuItems[i]->id != 2511)
-                continue;
-            RECT itemRect = g_themedMenuItemRects[i];
-            OffsetRect(&itemRect, parentRect.left, parentRect.top);
-            return PtInRect(&itemRect, screenPt);
+            if (g_themedMenuItems[i] && g_themedMenuItems[i]->id == 2511)
+                return PtInRect(&g_themedMenuItemRects[i], local);
         }
         return false;
     }
@@ -13778,7 +13784,7 @@ namespace
                 if (PointInSearchSubmenu(screenPt, &childPt))
                 {
                     g_themedMenuPressed = -1;
-                    UpdateSearchSubmenuHover(g_themedSearchMenuPopup, childPt);
+                    UpdateSearchSubmenuHover(hwnd, childPt);
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -13831,10 +13837,10 @@ namespace
             if (hover >= 0 && hover < static_cast<int>(g_themedMenuItems.size()) &&
                 g_themedMenuItems[static_cast<size_t>(hover)]->id == 2511)
             {
-                if (!g_themedSearchMenuPopup)
+                if (!g_themedSearchMenuInline)
                     ShowSearchEngineSubmenu(g_themedMenuOwner, g_themedMenuItemRects[static_cast<size_t>(hover)]);
             }
-            else if (g_themedSearchMenuPopup)
+            else if (g_themedSearchMenuInline)
             {
                 CloseSearchEngineSubmenu(true);
             }
@@ -13857,7 +13863,7 @@ namespace
                         hitIndex >= 0 && hitIndex < static_cast<int>(g_themedSearchMenuItems.size()) &&
                         !g_themedSearchMenuItems[static_cast<size_t>(hitIndex)]->disabled
                         ? hitIndex : -1;
-                    InvalidateRect(g_themedSearchMenuPopup, nullptr, FALSE);
+                    InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
             }
@@ -13946,7 +13952,7 @@ namespace
                     }
                     else
                     {
-                        InvalidateRect(g_themedSearchMenuPopup, nullptr, FALSE);
+                        InvalidateRect(hwnd, nullptr, FALSE);
                     }
                     return 0;
                 }
@@ -14147,6 +14153,10 @@ namespace
         g_themedMenuOwner = hwnd;
         g_themedMenuHover = -1;
         g_themedMenuPressed = -1;
+        g_themedSearchMenuInline = false;
+        g_themedSearchMenuInlineRect = RECT{};
+        g_themedMenuParentOffset = POINT{};
+        g_themedMenuBaseWindowRect = RECT{ x, y, popupWidth, popupHeight };
         HWND popup = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             L"QuietPDF.ThemedPopupMenu",
@@ -14181,12 +14191,25 @@ namespace
     }
     void CloseSearchEngineSubmenu(bool restoreParentCapture)
     {
-        HWND popup = g_themedSearchMenuPopup;
-        if (popup)
+        g_themedSearchMenuInline = false;
+        g_themedSearchMenuInlineRect = RECT{};
+        g_themedMenuParentOffset = POINT{};
+        g_themedSearchMenuPopup = nullptr;
+        HWND popup = g_themedMenuPopup;
+        if (popup && g_themedMenuBaseWindowRect.right > 0 && g_themedMenuBaseWindowRect.bottom > 0)
         {
-            g_themedSearchMenuPopup = nullptr;
-            if (GetCapture() == popup) ReleaseCapture();
-            DestroyWindow(popup);
+            SetWindowPos(popup, HWND_TOPMOST,
+                g_themedMenuBaseWindowRect.left,
+                g_themedMenuBaseWindowRect.top,
+                g_themedMenuBaseWindowRect.right,
+                g_themedMenuBaseWindowRect.bottom,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            HRGN region = CreateRoundRectRgn(0, 0,
+                g_themedMenuBaseWindowRect.right + 1,
+                g_themedMenuBaseWindowRect.bottom + 1,
+                S(12), S(12));
+            SetWindowRgn(popup, region, FALSE);
+            InvalidateRect(popup, nullptr, FALSE);
         }
         g_themedSearchMenuItemRects.clear();
         g_themedSearchMenuItems.clear();
@@ -14198,7 +14221,7 @@ namespace
 
     void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect)
     {
-        if (!hwnd || !g_themedMenuPopup || g_themedSearchMenuPopup)
+        if (!hwnd || !g_themedMenuPopup || g_themedSearchMenuInline)
             return;
 
         g_themedSearchMenuItems.clear();
@@ -14241,55 +14264,63 @@ namespace
             rowTop += rowHeight;
         }
 
-        RECT parentWindowRect{};
-        GetWindowRect(g_themedMenuPopup, &parentWindowRect);
-        int x = parentWindowRect.right - S(1);
-        int y = parentWindowRect.top + parentItemRect.top - S(3);
-        POINT monitorPoint{ x, y };
-        HMONITOR monitor = MonitorFromPoint(monitorPoint, MONITOR_DEFAULTTONEAREST);
+        int gap = S(4);
+        int childTop = std::max<int>(0, static_cast<int>(parentItemRect.top) - S(3));
+        int parentWidth = g_themedMenuBaseWindowRect.right;
+        int parentHeight = g_themedMenuBaseWindowRect.bottom;
+        int childLeft = parentWidth + gap;
+        int totalWidth = childLeft + width;
+        int totalHeight = std::max(parentHeight, childTop + height);
+        int x = g_themedMenuBaseWindowRect.left;
+        int y = g_themedMenuBaseWindowRect.top;
+        HMONITOR monitor = MonitorFromPoint(POINT{ x, y }, MONITOR_DEFAULTTONEAREST);
         MONITORINFO monitorInfo{};
         monitorInfo.cbSize = sizeof(monitorInfo);
         GetMonitorInfoW(monitor, &monitorInfo);
-        if (x + width > monitorInfo.rcWork.right - S(4))
-            x = parentWindowRect.left - width + S(1);
-        if (y + height > monitorInfo.rcWork.bottom - S(4))
-            y = monitorInfo.rcWork.bottom - height - S(4);
-        x = std::max<int>(static_cast<int>(monitorInfo.rcWork.left) + S(4), x);
-        y = std::max<int>(static_cast<int>(monitorInfo.rcWork.top) + S(4), y);
 
-        HWND popup = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            L"QuietPDF.ThemedPopupMenu",
-            L"",
-            WS_POPUP,
-            x,
-            y,
-            width,
-            height,
-            hwnd,
-            nullptr,
-            GetModuleHandleW(nullptr),
-            nullptr);
-        if (!popup)
+        bool openToLeft = x + totalWidth > monitorInfo.rcWork.right - S(4);
+        if (openToLeft)
         {
-            g_themedSearchMenuItems.clear();
-            g_themedSearchMenuItemRects.clear();
-            return;
+            childLeft = gap + width;
+            totalWidth = childLeft + parentWidth;
+            x = g_themedMenuBaseWindowRect.left - width - gap;
         }
+        if (x + totalWidth > monitorInfo.rcWork.right - S(4))
+            x = monitorInfo.rcWork.right - totalWidth - S(4);
+        if (x < monitorInfo.rcWork.left + S(4))
+            x = monitorInfo.rcWork.left + S(4);
+        if (y + totalHeight > monitorInfo.rcWork.bottom - S(4))
+            y = monitorInfo.rcWork.bottom - totalHeight - S(4);
+        if (y < monitorInfo.rcWork.top + S(4))
+            y = monitorInfo.rcWork.top + S(4);
 
-        g_themedSearchMenuPopup = popup;
-        int cornerPreference = 3;
-        DwmSetWindowAttribute(popup, 33, &cornerPreference, sizeof(cornerPreference));
-        DWORD borderColor = 0xFFFFFFFE;
-        DwmSetWindowAttribute(popup, 34, &borderColor, sizeof(borderColor));
-        int ncRenderingPolicy = 1;
-        DwmSetWindowAttribute(popup, 2, &ncRenderingPolicy, sizeof(ncRenderingPolicy));
-        HRGN popupRegion = CreateRoundRectRgn(0, 0, width + 1, height + 1, S(12), S(12));
-        SetWindowRgn(popup, popupRegion, FALSE);
-        ShowWindow(popup, SW_SHOWNOACTIVATE);
-        UpdateWindow(popup);
+        g_themedMenuParentOffset = openToLeft ? POINT{ childLeft, 0 } : POINT{};
+        int childPanelLeft = openToLeft ? 0 : childLeft;
+        g_themedSearchMenuInlineRect = RECT{ childPanelLeft, childTop,
+            childPanelLeft + width, childTop + height };
+        g_themedSearchMenuInline = true;
+        SetWindowPos(g_themedMenuPopup, HWND_TOPMOST, x, y, totalWidth, totalHeight,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+        HRGN parentRegion = CreateRoundRectRgn(
+            g_themedMenuParentOffset.x,
+            g_themedMenuParentOffset.y,
+            g_themedMenuParentOffset.x + parentWidth + 1,
+            g_themedMenuParentOffset.y + parentHeight + 1,
+            S(12), S(12));
+        HRGN childRegion = CreateRoundRectRgn(
+            g_themedSearchMenuInlineRect.left,
+            g_themedSearchMenuInlineRect.top,
+            g_themedSearchMenuInlineRect.right + 1,
+            g_themedSearchMenuInlineRect.bottom + 1,
+            S(12), S(12));
+        CombineRgn(parentRegion, parentRegion, childRegion, RGN_OR);
+        DeleteObject(childRegion);
+        SetWindowRgn(g_themedMenuPopup, parentRegion, FALSE);
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        if (g_themedMenuPopup) SetCapture(g_themedMenuPopup);
+        InvalidateRect(g_themedMenuPopup, nullptr, FALSE);
+        UpdateWindow(g_themedMenuPopup);
+        SetCapture(g_themedMenuPopup);
     }
     void ShowThemeMenu(HWND hwnd)
     {
@@ -14592,46 +14623,21 @@ namespace
         if (!menu) return;
 
         const wchar_t* copyText = imageOnly ? L"\u590d\u5236\u56fe\u7247" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9";
-        AppendThemedMenuItem(menu, 2501, withShortcuts ? (imageOnly ? L"\u590d\u5236\u56fe\u7247\tCtrl + C" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9\tCtrl + C") : copyText);
+        AppendThemedMenuItem(menu, 2501,
+            withShortcuts ? (imageOnly ? L"\u590d\u5236\u56fe\u7247\tCtrl + C" : L"\u590d\u5236\u9009\u62e9\u5185\u5bb9\tCtrl + C") : copyText);
         if (!imageOnly)
         {
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, withShortcuts ? L"\u9ad8\u4eae\tCtrl + H" : L"\u9ad8\u4eae");
             AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
-            AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u9664\u7ebf");
+            AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u7ebf");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
-
-            HMENU searchMenu = CreatePopupMenu();
-            if (searchMenu)
-            {
-                AppendThemedMenuItem(searchMenu, 2512, L"\u8c37\u6b4c\u641c\u7d22");
-                AppendThemedMenuItem(searchMenu, 2513, L"\u767e\u5ea6\u641c\u7d22");
-                AppendThemedMenuSubmenu(menu, searchMenu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22  >");
-            }
+            AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22");
         }
-
-        HBRUSH backgroundBrush = CreateSolidBrush(MenuPopupFill());
-        if (backgroundBrush)
-        {
-            MENUINFO info{};
-            info.cbSize = sizeof(info);
-            info.fMask = MIM_BACKGROUND | MIM_STYLE | MIM_APPLYTOSUBMENUS;
-            info.hbrBack = backgroundBrush;
-            info.dwStyle = MNS_CHECKORBMP;
-            SetMenuInfo(menu, &info);
-        }
-
-        int command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN, x, y, 0, hwnd, nullptr);
-        if (backgroundBrush) DeleteObject(backgroundBrush);
-        DestroyMenu(menu);
-        g_themedMenuItems.clear();
-        g_themedMenuItemRects.clear();
-        g_themedMenuHover = -1;
-        g_themedMenuPressed = -1;
-        if (command) SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+        ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
     void ShowSelectionMenu(HWND hwnd, int x, int y, bool imageOnly)
