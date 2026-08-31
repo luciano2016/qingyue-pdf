@@ -1,0 +1,35 @@
+name: 功能建议
+description: 提议一个与专注阅读相关的新能力或交互改进
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与问题
+      description: 请先描述实际工作流，不要只描述控件或实现。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 替代方案或参考产品
+  - type: textarea
+    id: impact
+    attributes:
+      label: 对性能与界面的影响
+      description: 说明该功能是否可能增加常驻内存、CPU、后台任务或界面复杂度。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索现有 Issue，未发现相同建议。
+          required: true

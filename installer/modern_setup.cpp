@@ -27,6 +27,10 @@ constexpr wchar_t kPayloadExe[] = L"QuietPDF.Win32.exe";
 constexpr wchar_t kPayloadUninstaller[] = L"QingYuePDF.Uninstaller.exe";
 constexpr wchar_t kDllName[] = L"quietmupdf.dll";
 constexpr wchar_t kRuntimeName[] = L"vcruntime140.dll";
+constexpr wchar_t kLicenseName[] = L"LICENSE";
+constexpr wchar_t kNoticesName[] = L"THIRD_PARTY_NOTICES.md";
+constexpr wchar_t kThirdPartyLicensesName[] = L"MUPDF_THIRD_PARTY_LICENSES.txt";
+constexpr wchar_t kGplName[] = L"GPL-3.0.txt";
 constexpr wchar_t kUninstallName[] = L"\u5378\u8f7d\u8f7b\u9605PDF.exe";
 constexpr wchar_t kWindowClass[] = L"QingYuePDFSetupWindow";
 constexpr wchar_t kUninstallKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\QingYuePDF";
@@ -38,7 +42,7 @@ constexpr UINT kMsgComplete = WM_APP + 32;
 constexpr UINT_PTR kTimer = 1;
 constexpr int kPathEdit = 1001;
 constexpr ULONGLONG kEstimatedInstalledBytes =
-    1044992ULL + 18015744ULL + 178616ULL + 258560ULL;
+    1044992ULL + 18015744ULL + 178616ULL + 258560ULL + 180000ULL;
 
 enum class Page { Welcome, Options, Installing, Complete, Failed, UninstallConfirm, Uninstalling, UninstallComplete, UninstallFailed };
 enum class Hot { None, Minimize, Close, Back, Primary, WelcomeCancel, OptionsCancel, Browse, Desktop, DeleteData, Launch };
@@ -667,7 +671,7 @@ std::wstring InstallPackage(const std::filesystem::path& request,bool desktop) {
         std::filesystem::create_directories(dir/L"Cache"/L"HomeThumbs");
         PostProgress(62,L"\u6b63\u5728\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6");
         auto exe=dir/kExeName;
-        if(!ReplaceFileFrom(staging/kPayloadExe,exe)||!ReplaceFileFrom(staging/kDllName,dir/kDllName)||!ReplaceFileFrom(staging/kRuntimeName,dir/kRuntimeName))return L"\u65e0\u6cd5\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6\uff0c\u8bf7\u68c0\u67e5\u5b89\u88c5\u76ee\u5f55\u6743\u9650\u540e\u91cd\u8bd5\u3002";
+        if(!ReplaceFileFrom(staging/kPayloadExe,exe)||!ReplaceFileFrom(staging/kDllName,dir/kDllName)||!ReplaceFileFrom(staging/kRuntimeName,dir/kRuntimeName)||!ReplaceFileFrom(staging/kLicenseName,dir/kLicenseName)||!ReplaceFileFrom(staging/kNoticesName,dir/kNoticesName)||!ReplaceFileFrom(staging/kThirdPartyLicensesName,dir/kThirdPartyLicensesName)||!ReplaceFileFrom(staging/kGplName,dir/kGplName))return L"\u65e0\u6cd5\u66f4\u65b0\u7a0b\u5e8f\u6587\u4ef6\uff0c\u8bf7\u68c0\u67e5\u5b89\u88c5\u76ee\u5f55\u6743\u9650\u540e\u91cd\u8bd5\u3002";
         if(!ReplaceFileFrom(staging/kPayloadUninstaller,dir/kUninstallName))return L"\u65e0\u6cd5\u521b\u5efa\u5378\u8f7d\u7a0b\u5e8f\u3002";
         PostProgress(82,L"\u6b63\u5728\u521b\u5efa\u5feb\u6377\u65b9\u5f0f");
         if(desktop&&!CreateShortcut(DesktopLink(),exe,dir))return L"\u65e0\u6cd5\u521b\u5efa\u684c\u9762\u5feb\u6377\u65b9\u5f0f\u3002";

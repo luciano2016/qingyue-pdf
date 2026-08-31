@@ -1,0 +1,21 @@
+* text=auto
+
+*.cpp text eol=crlf
+*.c text eol=crlf
+*.h text eol=crlf
+*.rc text eol=crlf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.md text eol=lf
+*.yml text eol=lf
+
+*.dll binary
+*.lib binary
+*.exe binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pdf binary

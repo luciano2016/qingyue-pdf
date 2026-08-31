@@ -1,5 +1,6 @@
 build/
 dist/
+.vs/
 *.user
 *.suo
 *.VC.db
@@ -10,6 +11,7 @@ dist/
 *.obj
 *.exp
 *.log
+*.tlog
+*.lastbuildstate
 third_party/
-native/quietmupdf/out/*.obj
-native/quietmupdf/out/*.exp
+native/quietmupdf/out/

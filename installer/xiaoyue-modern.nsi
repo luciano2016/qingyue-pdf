@@ -1,3 +1,4 @@
+; Legacy NSIS installer retained for reference. The supported release path is build_setup.cmd.
 Unicode true
 ManifestDPIAware true
 ManifestDPIAwareness PerMonitorV2
@@ -9,8 +10,8 @@ RequestExecutionLevel user
 !include WinMessages.nsh
 
 !define APP_NAME "轻阅PDF"
-!define APP_VERSION "0.6.15"
-!define APP_VERSION_FULL "0.6.15.0"
+!define APP_VERSION "0.8.6"
+!define APP_VERSION_FULL "0.8.6.0"
 !define APP_PUBLISHER "轻阅"
 !define APP_EXE_NAME "轻阅PDF.exe"
 !define APP_UNINSTALL_NAME "卸载轻阅PDF.exe"
@@ -20,10 +21,14 @@ RequestExecutionLevel user
 !define APP_OPENWITH_KEY "Software\Classes\Applications\${APP_EXE_NAME}"
 !define APP_CAPABILITIES_KEY "Software\QingYuePDF\Capabilities"
 !define APP_REGISTERED_NAME "QingYuePDF"
-!define ROOT_DIR "E:\dev\New\SuccSystem\quietpdf-win32"
+!define ROOT_DIR "${__FILEDIR__}\.."
 !define SOURCE_EXE "${ROOT_DIR}\build\x64\Release\QuietPDF.Win32.exe"
 !define SOURCE_DLL "${ROOT_DIR}\build\x64\Release\quietmupdf.dll"
-!define SOURCE_VCRUNTIME140 "E:\dev\Microsoft Visual Studio18\BuildTools\VC\Redist\MSVC\14.51.36231\x64\Microsoft.VC145.CRT\vcruntime140.dll"
+!define SOURCE_VCRUNTIME140 "${ROOT_DIR}\build\setup-input\vcruntime140.dll"
+!define SOURCE_LICENSE "${ROOT_DIR}\LICENSE"
+!define SOURCE_NOTICES "${ROOT_DIR}\THIRD_PARTY_NOTICES.md"
+!define SOURCE_MUPDF_LICENSES "${ROOT_DIR}\LICENSES\MUPDF_THIRD_PARTY_LICENSES.txt"
+!define SOURCE_GPL "${ROOT_DIR}\LICENSES\GPL-3.0.txt"
 !define APP_ICON "${ROOT_DIR}\assets\xiaoyue.ico"
 !define SETUP_OUT "${ROOT_DIR}\dist\轻阅PDF-Setup-x64.exe"
 
@@ -95,6 +100,10 @@ Function EnsureInstallFilesWritable
     Delete "$INSTDIR\${APP_EXE_NAME}"
     Delete "$INSTDIR\quietmupdf.dll"
     Delete "$INSTDIR\vcruntime140.dll"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
+  Delete "$INSTDIR\MUPDF_THIRD_PARTY_LICENSES.txt"
+  Delete "$INSTDIR\GPL-3.0.txt"
     IfErrors locked done
 
   locked:
@@ -107,6 +116,10 @@ Function EnsureInstallFilesWritable
     Delete "$INSTDIR\${APP_EXE_NAME}"
     Delete "$INSTDIR\quietmupdf.dll"
     Delete "$INSTDIR\vcruntime140.dll"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
+  Delete "$INSTDIR\MUPDF_THIRD_PARTY_LICENSES.txt"
+  Delete "$INSTDIR\GPL-3.0.txt"
     IfErrors ask done
 
   ask:
@@ -126,6 +139,10 @@ Section "${APP_NAME}" SecMain
   File "/oname=${APP_EXE_NAME}" "${SOURCE_EXE}"
   File "${SOURCE_DLL}"
   File "${SOURCE_VCRUNTIME140}"
+  File "${SOURCE_LICENSE}"
+  File "${SOURCE_NOTICES}"
+  File "${SOURCE_MUPDF_LICENSES}"
+  File "${SOURCE_GPL}"
 
   WriteUninstaller "$INSTDIR\${APP_UNINSTALL_NAME}"
   WriteRegStr HKCU "${APP_INSTALL_REG_KEY}" "InstallLocation" "$INSTDIR"
@@ -177,6 +194,10 @@ Section "un.卸载 ${APP_NAME} 程序文件" SecProgramFiles
   RMDir "$SMPROGRAMS\${APP_NAME}"
   Delete "$INSTDIR\quietmupdf.dll"
   Delete "$INSTDIR\vcruntime140.dll"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
+  Delete "$INSTDIR\MUPDF_THIRD_PARTY_LICENSES.txt"
+  Delete "$INSTDIR\GPL-3.0.txt"
   Delete "$INSTDIR\${APP_EXE_NAME}"
   Delete "$INSTDIR\${APP_UNINSTALL_NAME}"
   RMDir "$INSTDIR"

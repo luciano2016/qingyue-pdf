@@ -12,3 +12,8 @@
 "build\setup-input\quietmupdf.dll" "quietmupdf.dll"
 "build\setup-input\vcruntime140.dll" "vcruntime140.dll"
 "build\setup-input\QingYuePDF.Uninstaller.exe" "QingYuePDF.Uninstaller.exe"
+
+"build\setup-input\LICENSE" "LICENSE"
+"build\setup-input\THIRD_PARTY_NOTICES.md" "THIRD_PARTY_NOTICES.md"
+"build\setup-input\MUPDF_THIRD_PARTY_LICENSES.txt" "MUPDF_THIRD_PARTY_LICENSES.txt"
+"build\setup-input\GPL-3.0.txt" "GPL-3.0.txt"
