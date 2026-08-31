@@ -40,12 +40,12 @@ git branch -M main
 git push -u origin main
 ```
 
-## 发布 0.8.6
+## 发布 0.8.7
 
 1. 完成 [发布检查清单](../RELEASE_CHECKLIST.md)。
-2. 创建注释 tag：`git tag -a v0.8.6 -m "轻阅PDF 0.8.6"`。
+2. 创建注释 tag：`git tag -a v0.8.7 -m "轻阅PDF 0.8.7"`。
 3. 推送分支和 tag。
-4. 在 GitHub Releases 中使用 [0.8.6 发布说明](RELEASE_NOTES_0.8.6.md)。
+4. 在 GitHub Releases 中使用 [0.8.7 发布说明](RELEASE_NOTES_0.8.7.md)。
 5. 上传 `轻阅PDF-Setup-x64.exe`、`QingYuePDF-Setup-x64.exe` 和对应 SHA256 文件。
 6. 明确安装包是否有数字签名。未签名安装包可能触发 Windows SmartScreen，这是正常的信誉机制，不应通过关闭安全功能规避。
 

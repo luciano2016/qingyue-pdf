@@ -1959,8 +1959,8 @@ namespace
 
     int PdfRenderThemeForUiTheme(int theme)
     {
-        int clampedTheme = std::clamp(theme, 0, static_cast<int>(std::size(g_themes)) - 1);
-        return clampedTheme == 2 ? 2 : 0;
+        (void)theme;
+        return 0;
     }
 
     int PdfRenderTheme()
@@ -12569,7 +12569,7 @@ namespace
                     {
                         AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
                     }
-                    else if (IsAuroraTheme())
+                    else if (IsAuroraTheme() || IsBeigeTheme())
                     {
                         AlphaFill(dc, pageRect, T().accent, 12);
                     }
