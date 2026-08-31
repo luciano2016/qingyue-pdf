@@ -12675,7 +12675,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        if (g_pageNavigationPending && missingVisiblePage && !paintedRenderable)
+        if (g_pageNavigationPending && missingVisiblePage)
             return false;
         if (g_pageNavigationPending && !missingVisiblePage)
             g_pageNavigationPending = false;
