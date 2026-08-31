@@ -1676,7 +1676,7 @@ namespace
         { L"\u62a4\u773c\u7c73", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
         { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
         { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"\u6781\u5149\u7eff", RGB(6,49,45), RGB(6,49,45), RGB(9,58,52), RGB(6,49,45), RGB(6,49,45), RGB(231,255,244), RGB(142,214,196), RGB(36,100,90), RGB(45,245,143) }
+        { L"\u677e\u5f71\u9752", RGB(31,51,47), RGB(39,65,58), RGB(49,78,69), RGB(25,43,40), RGB(44,69,61), RGB(226,239,232), RGB(157,184,171), RGB(73,103,92), RGB(119,174,141) }
     };
 
     Theme const& T()
@@ -1907,7 +1907,7 @@ namespace
 
     COLORREF ChromeBarColor()
     {
-        if (IsAuroraTheme()) return RGB(6, 49, 45);
+        if (IsAuroraTheme()) return T().panel;
         if (IsGlassTheme()) return RGB(244, 247, 250);
         if (IsDarkTheme()) return T().panel;
         return T().panel;
@@ -1915,7 +1915,7 @@ namespace
 
     COLORREF ChromeDividerColor()
     {
-        if (IsAuroraTheme()) return RGB(38, 114, 101);
+        if (IsAuroraTheme()) return T().line;
         return T().line;
     }
     COLORREF ScrollTrackColor()
@@ -2141,8 +2141,8 @@ namespace
 
         if (IsAuroraTheme())
         {
-            Fill(dc, r, RGB(6, 49, 45));
-            AlphaFill(dc, r, RGB(40, 220, 145), 2);
+            Fill(dc, r, T().bg);
+            AlphaFill(dc, r, T().accent, 2);
             return;
         }
 
@@ -2214,7 +2214,7 @@ namespace
         else if (IsAuroraTheme())
         {
             Fill(dc, r, T().panel);
-            AlphaFill(dc, r, RGB(42, 245, 143), std::min<BYTE>(alpha / 22, 8));
+            AlphaFill(dc, r, T().accent, std::min<BYTE>(alpha / 22, 8));
             HPEN highlight = CreatePen(PS_SOLID, std::max(1, S(1)), ChromeDividerColor());
             HGDIOBJ oldPen = SelectObject(dc, highlight);
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -2511,7 +2511,7 @@ namespace
         FillGdiRoundRect(g, topWash, Rf(top), std::max(1.0f, radius - S(2.0f)));
 
         RECT lower{ r.left + S(4), r.top + (r.bottom - r.top) / 2, r.right - S(4), r.bottom - S(2) };
-        Gdiplus::SolidBrush lowerTint(GdiColor(IsAuroraTheme() ? RGB(80, 255, 176) : RGB(178, 212, 246), IsDarkTheme() ? 14 : 22));
+        Gdiplus::SolidBrush lowerTint(GdiColor(IsAuroraTheme() ? T().accent : RGB(178, 212, 246), IsDarkTheme() ? 14 : 22));
         FillGdiRoundRect(g, lowerTint, Rf(lower), std::max(1.0f, radius - S(3.0f)));
 
         RECT shine{ r.left + S(12), r.top + S(4), r.left + S(72), r.top + S(9) };
@@ -2537,7 +2537,7 @@ namespace
         Gdiplus::SolidBrush baseBrush(GdiColor(base, IsDarkTheme() ? 218 : 224));
         FillGdiRoundRect(g, baseBrush, pill, radius);
         RECT inner{ r.left + S(1), r.top + S(1), r.right - S(1), r.bottom - S(1) };
-        COLORREF frost = IsAuroraTheme() ? MixColor(T().panel2, T().accent, 0.09)
+        COLORREF frost = IsAuroraTheme() ? MixColor(T().panel2, T().accent, 0.12)
             : (IsDarkTheme() ? MixColor(T().panel2, T().muted, 0.10)
                 : MixColor(RGB(248, 251, 254), T().accent, 0.025));
         Gdiplus::SolidBrush frostBrush(GdiColor(frost, IsDarkTheme() ? 92 : 116));
@@ -2546,7 +2546,7 @@ namespace
         Gdiplus::SolidBrush upperBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 22 : 76));
         FillGdiRoundRect(g, upperBrush, Rf(upper), std::max(1.0f, radius - S(3.0f)));
         RECT lower{ r.left + S(4), r.top + (r.bottom - r.top) / 2, r.right - S(4), r.bottom - S(3) };
-        COLORREF lowerColor = IsAuroraTheme() ? T().accent : (IsDarkTheme() ? T().accent : RGB(156, 195, 232));
+        COLORREF lowerColor = IsAuroraTheme() ? MixColor(T().accent, T().panel2, 0.18) : (IsDarkTheme() ? T().accent : RGB(156, 195, 232));
         Gdiplus::SolidBrush lowerBrush(GdiColor(lowerColor, pressed ? 22 : (hovered ? 16 : 10)));
         FillGdiRoundRect(g, lowerBrush, Rf(lower), std::max(1.0f, radius - S(3.0f)));
         COLORREF edge = MixColor(T().line, IsDarkTheme() ? RGB(255, 255, 255) : RGB(126, 145, 164),
@@ -2563,14 +2563,14 @@ namespace
     {
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        COLORREF base = IsAuroraTheme() ? RGB(7, 34, 39) : (IsGlassTheme() ? RGB(255, 255, 255) : T().panel);
-        COLORREF line = IsAuroraTheme() ? RGB(43, 112, 105) : (IsGlassTheme() ? RGB(207, 216, 226) : T().line);
+        COLORREF base = IsAuroraTheme() ? T().panel2 : (IsGlassTheme() ? RGB(255, 255, 255) : T().panel);
+        COLORREF line = IsAuroraTheme() ? T().line : (IsGlassTheme() ? RGB(207, 216, 226) : T().line);
         Gdiplus::SolidBrush fill(GdiColor(base, alpha));
         Gdiplus::Pen border(GdiColor(line, IsGlassTheme() ? 170 : 140), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
         FillGdiRoundRect(g, fill, Rf(r), radius);
 
         RECT top{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + std::max<int>(S(2), (r.bottom - r.top) / 2) };
-        Gdiplus::SolidBrush wash(GdiColor(IsAuroraTheme() ? RGB(66, 255, 163) : RGB(255, 255, 255), IsAuroraTheme() ? 20 : 42));
+        Gdiplus::SolidBrush wash(GdiColor(IsAuroraTheme() ? T().accent : RGB(255, 255, 255), IsAuroraTheme() ? 12 : 42));
         FillGdiRoundRect(g, wash, Rf(top), std::max(1.0f, radius - S(1.0f)));
         DrawGdiRoundRect(g, border, Rf(r), radius);
     }
@@ -2990,10 +2990,10 @@ namespace
             BYTE alpha = pressed ? 188 : (hovered ? 136 : 0);
             if (alpha > 0)
             {
-                AlphaFill(dc, b.rect, RGB(10, 42, 46), alpha);
+                AlphaFill(dc, b.rect, T().stage, alpha);
                 RoundFill(dc, b.rect, S(8),
-                    pressed ? RGB(12, 56, 58) : RGB(9, 42, 46),
-                    pressed ? RGB(38, 132, 107) : RGB(28, 78, 76));
+                    pressed ? MixColor(T().panel2, T().accent, 0.12) : T().stage,
+                    pressed ? MixColor(T().line, T().accent, 0.28) : MixColor(T().line, T().accent, 0.12));
             }
         }
         else if (IsGlassTheme())
@@ -6923,7 +6923,7 @@ namespace
         if (IsBeigeTheme()) return RGB(220, 230, 188);
         if (g_theme == 3) return RGB(142, 176, 255);
         if (g_theme == 4) return RGB(238, 205, 145);
-        if (IsAuroraTheme()) return RGB(141, 226, 188);
+        if (IsAuroraTheme()) return RGB(181, 213, 192);
         return MixColor(T().paper, T().accent, 0.36);
     }
 
@@ -6934,7 +6934,7 @@ namespace
         if (IsBeigeTheme()) return RGB(152, 166, 103);
         if (g_theme == 3) return RGB(104, 139, 220);
         if (g_theme == 4) return RGB(207, 158, 82);
-        if (IsAuroraTheme()) return RGB(66, 194, 134);
+        if (IsAuroraTheme()) return RGB(113, 166, 132);
         return T().accent;
     }
 
@@ -12135,7 +12135,7 @@ namespace
 
     COLORREF PdfOverlayColor()
     {
-        if (IsAuroraTheme()) return RGB(0, 42, 30);
+        if (IsAuroraTheme()) return RGB(22, 38, 33);
         if (g_theme == 4) return RGB(28, 25, 22);
         return RGB(7, 10, 20);
     }
