@@ -15929,14 +15929,26 @@ namespace
         case CmdFirst:
             if (tab)
             {
-                if (g_continuousRead) ScrollStageTo(hwnd, 0);
+                if (g_continuousRead)
+                {
+                    int oldScroll = g_scrollY;
+                    g_pageNavigationPending = true;
+                    ScrollStageTo(hwnd, 0);
+                    if (g_scrollY == oldScroll) g_pageNavigationPending = false;
+                }
                 else { tab->currentPage = 0; g_scrollY = 0; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdPrev:
             if (tab)
             {
-                if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY - std::max(S(60), PageH(*tab, tab->currentPage) + PageGap()));
+                if (g_continuousRead)
+                {
+                    int oldScroll = g_scrollY;
+                    g_pageNavigationPending = true;
+                    ScrollStageTo(hwnd, g_scrollY - std::max(S(60), PageH(*tab, tab->currentPage) + PageGap()));
+                    if (g_scrollY == oldScroll) g_pageNavigationPending = false;
+                }
                 else
                 {
                     int previous = 0;
@@ -15951,7 +15963,13 @@ namespace
         case CmdNext:
             if (tab)
             {
-                if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY + std::max(S(60), PageH(*tab, tab->currentPage) + PageGap()));
+                if (g_continuousRead)
+                {
+                    int oldScroll = g_scrollY;
+                    g_pageNavigationPending = true;
+                    ScrollStageTo(hwnd, g_scrollY + std::max(S(60), PageH(*tab, tab->currentPage) + PageGap()));
+                    if (g_scrollY == oldScroll) g_pageNavigationPending = false;
+                }
                 else
                 {
                     tab->currentPage = std::min(tab->pageCount - 1, NextSpreadStart(*tab, FirstPageInSpread(tab->currentPage)));
@@ -15963,7 +15981,13 @@ namespace
         case CmdLast:
             if (tab)
             {
-                if (g_continuousRead) ScrollStageTo(hwnd, ContinuousContentHeight(*tab));
+                if (g_continuousRead)
+                {
+                    int oldScroll = g_scrollY;
+                    g_pageNavigationPending = true;
+                    ScrollStageTo(hwnd, ContinuousContentHeight(*tab));
+                    if (g_scrollY == oldScroll) g_pageNavigationPending = false;
+                }
                 else tab->currentPage = tab->pageCount - 1;
                 if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
@@ -16230,7 +16254,16 @@ namespace
                 }
                 if (inserted && i == g_active)
                 {
-                    if (request.tile)
+                    if (g_pageNavigationPending)
+                    {
+                        // A discrete navigation is presented only after the
+                        // complete visible viewport is available. Do not
+                        // expose individual tile completions as flashing
+                        // strips while the target page is still rendering.
+                        if (CurrentZoomVisibleContentReady(tab))
+                            InvalidateRect(hwnd, &g_stage, FALSE);
+                    }
+                    else if (request.tile)
                     {
                         ULONGLONG now = GetTickCount64();
                         bool visibleTile = !IsRectEmpty(&dirtyRect);
