@@ -1676,7 +1676,7 @@ namespace
         { L"\u62a4\u773c\u7c73", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
         { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
         { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"\u677e\u96fe\u7eff", RGB(232,241,234), RGB(241,247,242), RGB(248,251,248), RGB(225,236,228), RGB(253,254,252), RGB(42,56,47), RGB(104,122,110), RGB(198,215,202), RGB(102,157,119) }
+        { L"\u6d45\u8349\u7eff", RGB(232,241,234), RGB(241,247,242), RGB(248,251,248), RGB(225,236,228), RGB(253,254,252), RGB(42,56,47), RGB(104,122,110), RGB(198,215,202), RGB(102,157,119) }
     };
 
     Theme const& T()
@@ -3022,16 +3022,13 @@ namespace
 
     void DrawStatusHotArea(HDC dc, RECT r, int radius = 6)
     {
-        if (Hit(r, g_mousePos.x, g_mousePos.y))
+        bool hovered = Hit(r, g_mousePos.x, g_mousePos.y);
+        bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
+        if (hovered || pressed)
         {
-            if (IsGlassTheme())
-            {
-                RoundFill(dc, r, S(radius), RGB(255, 255, 255), RGB(228, 234, 241));
-            }
-            else
-            {
-                RoundFill(dc, r, S(radius), T().panel2, T().line);
-            }
+            COLORREF fill = pressed ? SidebarSelectedFill() : SidebarHoverFill();
+            COLORREF line = pressed ? SidebarSelectedBorder() : SidebarHoverFill();
+            RoundFill(dc, r, S(radius), fill, line);
         }
     }
 
@@ -9790,7 +9787,10 @@ namespace
         }
         else
         {
-            RequestStageRepaint(hwnd, pageChanged);
+            // Preserve the existing viewport while scrolling. Only the newly
+            // exposed strip should be painted; a full stage invalidation makes
+            // the document visibly flash on every wheel or touch-pan frame.
+            ScrollStagePixels(hwnd, 0, dy, pageChanged);
         }
         UpdateVertScrollBar(hwnd);
         RedrawMainScrollBarNow(hwnd);
@@ -10173,7 +10173,7 @@ namespace
                 TouchRecentProgress(tab, false);
                 KeepThumbnailSelectionVisible(hwnd, tab);
                 UpdateVertScrollBar(hwnd);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                RequestStageRepaint(hwnd, false);
                 SchedulePagePrefetch(hwnd);
             }
             return true;
@@ -12443,7 +12443,8 @@ namespace
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
-        Fill(dc, stageDirty, T().stage);
+        COLORREF stageFill = IsAuroraTheme() ? MixColor(T().stage, T().accent, 0.08) : T().stage;
+        Fill(dc, stageDirty, stageFill);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -12496,7 +12497,7 @@ namespace
                             usingZoomFallback = image != nullptr;
                             if (!ZoomRenderDeferred()) QueuePageRender(g_hwnd, tab, i, 0);
                         }
-                        Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, stageFill);
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -12518,7 +12519,7 @@ namespace
                     }
                     else
                     {
-                        Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, stageFill);
                         bool fallbackPainted = false;
                         PageImage* fallback = FindZoomFallbackPage(tab, i);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
@@ -12670,6 +12671,7 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
+        if (missingVisiblePage == true && paintedRenderable == false) return false;
         return true;
     }
 
@@ -13102,7 +13104,7 @@ namespace
         RECT left{ S(10), bar.top, S(184), bar.bottom };
         Text(dc, pageSize, left, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
         int x = std::max<int>(S(188), client.right / 2 - S(190));
-        COLORREF iconColor = IsAuroraTheme() ? RGB(154, 223, 202) : RGB(128, 136, 145);
+        COLORREF iconColor = SidebarIconColor();
         auto addIcon = [&](int id, StatusIcon icon, const wchar_t* tip, COLORREF color = RGB(120, 126, 134))
         {
             RECT r{ x, bar.top + S(7), x + S(20), bar.bottom - S(7) };
@@ -13186,8 +13188,11 @@ namespace
         std::wstring zoomText = zoom == L"100%" ? L"\u5b9e\u9645\u5927\u5c0f" : zoom;
         RECT zr{ rx + S(3), bar.top + S(7), rx + S(108), bar.bottom - S(7) };
         AddButton(CmdZoomMenu, zr, zoomText, L"\u5f53\u524d\u7f29\u653e\u6bd4\u4f8b");
-        DrawStatusHotArea(dc, zr, 8);
-        RoundFill(dc, zr, S(9), T().paper, T().line);
+        bool zoomHovered = Hit(zr, g_mousePos.x, g_mousePos.y);
+        bool zoomPressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &zr);
+        COLORREF zoomFill = zoomPressed ? SidebarSelectedFill() : (zoomHovered ? SidebarHoverFill() : T().paper);
+        COLORREF zoomLine = zoomPressed ? SidebarSelectedBorder() : (zoomHovered ? SidebarHoverFill() : T().line);
+        RoundFill(dc, zr, S(9), zoomFill, zoomLine);
         RECT zoomLabel{ zr.left + S(14), zr.top, zr.right - S(24), zr.bottom };
         HFONT zoomFont = Font(9);
         HGDIOBJ oldZoomFont = SelectObject(dc, zoomFont);
@@ -15913,7 +15918,7 @@ namespace
             if (tab)
             {
                 if (g_continuousRead) ScrollStageTo(hwnd, 0);
-                else { tab->currentPage = 0; g_scrollY = 0; InvalidateRect(hwnd, nullptr, FALSE); }
+                else { tab->currentPage = 0; g_scrollY = 0; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdPrev:
@@ -15928,7 +15933,7 @@ namespace
                     tab->currentPage = previous;
                     g_scrollY = 0;
                 }
-                if (!g_continuousRead) InvalidateRect(hwnd, nullptr, FALSE);
+                if (!g_continuousRead) RequestStageRepaint(hwnd, false);
             }
             break;
         case CmdNext:
@@ -15940,7 +15945,7 @@ namespace
                     tab->currentPage = std::min(tab->pageCount - 1, NextSpreadStart(*tab, FirstPageInSpread(tab->currentPage)));
                     g_scrollY = 0;
                 }
-                if (!g_continuousRead) InvalidateRect(hwnd, nullptr, FALSE);
+                if (!g_continuousRead) RequestStageRepaint(hwnd, false);
             }
             break;
         case CmdLast:
@@ -15948,7 +15953,7 @@ namespace
             {
                 if (g_continuousRead) ScrollStageTo(hwnd, ContinuousContentHeight(*tab));
                 else tab->currentPage = tab->pageCount - 1;
-                if (!g_continuousRead) InvalidateRect(hwnd, nullptr, FALSE);
+                if (!g_continuousRead) RequestStageRepaint(hwnd, false);
             }
             break;
         case CmdOutlineToggleAll:
