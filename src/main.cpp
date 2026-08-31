@@ -12675,10 +12675,18 @@ namespace
         RestoreDC(dc, savedDc);
         g_contentHeight = content;
         g_contentWidth = ReadingContentWidth(tab);
-        if (g_pageNavigationPending && missingVisiblePage)
-            return false;
-        if (g_pageNavigationPending && !missingVisiblePage)
+        if (g_pageNavigationPending)
+        {
+            // Render completions invalidate small tile rectangles. During a
+            // discrete page change, wait for the whole visible spread and
+            // schedule one full-stage paint so the new page is committed as
+            // a complete frame instead of appearing from left to right.
+            if (!CurrentZoomVisibleContentReady(tab))
+                return false;
             g_pageNavigationPending = false;
+            InvalidateRect(g_hwnd, &g_stage, FALSE);
+            return false;
+        }
         return true;
     }
 
