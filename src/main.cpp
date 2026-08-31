@@ -1676,7 +1676,7 @@ namespace
         { L"\u62a4\u773c\u7c73", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
         { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
         { L"\u77f3\u58a8\u9ed1", RGB(29,30,32), RGB(48,49,52), RGB(59,60,64), RGB(20,20,21), RGB(43,42,39), RGB(244,240,232), RGB(184,177,168), RGB(78,79,84), RGB(240,189,103) },
-        { L"\u677e\u5f71\u9752", RGB(31,51,47), RGB(39,65,58), RGB(49,78,69), RGB(25,43,40), RGB(44,69,61), RGB(226,239,232), RGB(157,184,171), RGB(73,103,92), RGB(119,174,141) }
+        { L"\u677e\u96fe\u7eff", RGB(232,241,234), RGB(241,247,242), RGB(248,251,248), RGB(225,236,228), RGB(253,254,252), RGB(42,56,47), RGB(104,122,110), RGB(198,215,202), RGB(102,157,119) }
     };
 
     Theme const& T()
@@ -1711,7 +1711,7 @@ namespace
 
     bool UsesBackdropTheme()
     {
-        return IsGlassTheme() || IsAuroraTheme();
+        return IsGlassTheme();
     }
 
     int Luma(std::uint8_t r, std::uint8_t g, std::uint8_t b)
@@ -1735,7 +1735,7 @@ namespace
 
     bool IsDarkTheme()
     {
-        return g_theme >= 3 && g_theme <= 5;
+        return g_theme >= 3 && g_theme <= 4;
     }
 
     COLORREF ForegroundOn(COLORREF bg)
@@ -1747,7 +1747,7 @@ namespace
 
     COLORREF SidebarHoverFill()
     {
-        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.045);
         if (IsGlassTheme()) return MixColor(T().panel2, T().accent, 0.115);
         if (IsIdeaLightTheme()) return RGB(235, 237, 240);
         if (IsBeigeTheme()) return MixColor(RGB(246, 241, 231), RGB(0, 0, 0), 0.03);
@@ -1757,7 +1757,7 @@ namespace
 
     COLORREF SidebarSelectedFill()
     {
-        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.075);
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.085);
         if (IsGlassTheme()) return MixColor(T().accent, RGB(255, 255, 255), 0.18);
         if (IsIdeaLightTheme()) return RGB(221, 232, 244);
         if (IsBeigeTheme()) return T().panel2;
@@ -1767,16 +1767,16 @@ namespace
 
     COLORREF SidebarSelectedBorder()
     {
-        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.055);
+        if (IsAuroraTheme()) return MixColor(T().panel, T().accent, 0.045);
         if (IsIdeaLightTheme()) return RGB(190, 209, 231);
-        if (IsDarkTheme() && !IsAuroraTheme()) return MixColor(T().accent, T().panel2, 0.25);
+        if (IsDarkTheme()) return MixColor(T().accent, T().panel2, 0.25);
         if (IsBeigeTheme()) return T().line;
         return SidebarSelectedFill();
     }
 
     COLORREF SidebarTreeColor()
     {
-        if (IsAuroraTheme()) return MixColor(T().line, T().accent, 0.30);
+        if (IsAuroraTheme()) return MixColor(T().line, T().accent, 0.22);
         if (IsIdeaLightTheme()) return RGB(205, 210, 216);
         if (IsDarkTheme()) return MixColor(T().line, T().muted, 0.28);
         return MixColor(T().line, T().muted, 0.44);
@@ -1801,7 +1801,7 @@ namespace
 
     COLORREF SidebarIconColor()
     {
-        if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.34);
+        if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.20);
         if (IsIdeaLightTheme()) return RGB(100, 109, 118);
         if (IsBeigeTheme()) return RGB(111, 106, 99);
         return MixColor(T().muted, T().text, IsDarkTheme() ? 0.18 : 0.10);
@@ -1929,7 +1929,7 @@ namespace
     COLORREF ScrollThumbColor(bool active)
     {
         if (active) return T().accent;
-        if (IsAuroraTheme()) return MixColor(T().accent, T().paper, 0.26);
+        if (IsAuroraTheme()) return MixColor(T().accent, T().paper, 0.20);
         if (IsDarkTheme()) return MixColor(T().muted, T().text, 0.22);
         return MixColor(T().muted, T().text, 0.14);
     }
@@ -1942,7 +1942,7 @@ namespace
     {
         int clampedTheme = std::clamp(theme, 0, static_cast<int>(std::size(g_themes)) - 1);
         if (clampedTheme == 0 || clampedTheme == 1) return;
-        if (clampedTheme >= 3 && clampedTheme <= 5) return;
+        if (clampedTheme >= 3 && clampedTheme <= 4) return;
 
         int lum = Luma(r, g, b);
         COLORREF paper = g_themes[clampedTheme].paper;
@@ -2524,7 +2524,7 @@ namespace
     void PaintImmersiveFrostedPill(HDC dc, RECT r, bool hovered, bool pressed)
     {
         float radius = static_cast<float>(r.bottom - r.top) * 0.48f;
-        BYTE shadowAlpha = IsDarkTheme() || IsAuroraTheme() ? 22 : 16;
+        BYTE shadowAlpha = IsDarkTheme() ? 22 : 16;
         DrawRoundedShadow(dc, r, radius, S(1), S(2), S(3), shadowAlpha);
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -3649,8 +3649,8 @@ namespace
         if (hovered || pressed)
         {
             COLORREF fill = pressed
-                ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.14)
-                : MixColor(T().panel2, T().paper, IsDarkTheme() || IsAuroraTheme() ? 0.18 : 0.48);
+                ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.24 : 0.14)
+                : MixColor(T().panel2, T().paper, IsDarkTheme() ? 0.18 : 0.48);
             COLORREF line = pressed ? MixColor(T().line, T().accent, 0.34) : MixColor(T().line, T().text, 0.08);
             RoundFill(dc, hotRect, S(6), fill, line);
         }
@@ -3719,10 +3719,10 @@ namespace
         bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &r);
         bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
         bool primary = id == CmdSearchRun;
-        COLORREF idleFill = primary ? MixColor(T().paper, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.10 : 0.055) : T().paper;
+        COLORREF idleFill = primary ? MixColor(T().paper, T().accent, IsDarkTheme() ? 0.10 : 0.055) : T().paper;
         COLORREF fill = pressed
-            ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.14)
-            : (hovered ? MixColor(idleFill, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.10 : 0.06) : idleFill);
+            ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.24 : 0.14)
+            : (hovered ? MixColor(idleFill, T().accent, IsDarkTheme() ? 0.10 : 0.06) : idleFill);
         COLORREF line = pressed
             ? MixColor(T().line, T().accent, 0.38)
             : (hovered || primary ? MixColor(T().line, T().accent, primary ? 0.16 : 0.10) : T().line);
@@ -3755,8 +3755,8 @@ namespace
 
         int hx = textRect.left + beforeSize.cx;
         RECT mark{ hx - S(2), textRect.top + S(6), hx + hitSize.cx + S(4), textRect.bottom - S(6) };
-        COLORREF markFill = IsDarkTheme() || IsAuroraTheme() ? MixColor(T().panel2, RGB(245, 164, 72), 0.24) : RGB(255, 250, 235);
-        COLORREF markLine = IsDarkTheme() || IsAuroraTheme() ? MixColor(T().accent, RGB(245, 164, 72), 0.55) : RGB(239, 174, 70);
+        COLORREF markFill = IsDarkTheme() ? MixColor(T().panel2, RGB(245, 164, 72), 0.24) : RGB(255, 250, 235);
+        COLORREF markLine = IsDarkTheme() ? MixColor(T().accent, RGB(245, 164, 72), 0.55) : RGB(239, 174, 70);
         RoundFill(dc, mark, S(4), markFill, markLine);
         RECT hitText{ hx, textRect.top, hx + hitSize.cx + S(2), textRect.bottom };
         Text(dc, hit, hitText, DT_LEFT | DT_VCENTER | DT_SINGLELINE, textColor);
@@ -6923,7 +6923,7 @@ namespace
         if (IsBeigeTheme()) return RGB(220, 230, 188);
         if (g_theme == 3) return RGB(142, 176, 255);
         if (g_theme == 4) return RGB(238, 205, 145);
-        if (IsAuroraTheme()) return RGB(181, 213, 192);
+        if (IsAuroraTheme()) return RGB(195, 227, 201);
         return MixColor(T().paper, T().accent, 0.36);
     }
 
@@ -6934,20 +6934,20 @@ namespace
         if (IsBeigeTheme()) return RGB(152, 166, 103);
         if (g_theme == 3) return RGB(104, 139, 220);
         if (g_theme == 4) return RGB(207, 158, 82);
-        if (IsAuroraTheme()) return RGB(113, 166, 132);
+        if (IsAuroraTheme()) return RGB(111, 157, 122);
         return T().accent;
     }
 
     BYTE TextSelectionAlpha()
     {
-        if (IsDarkTheme() || IsAuroraTheme()) return 72;
+        if (IsDarkTheme()) return 72;
         if (IsGlassTheme()) return 92;
         return 78;
     }
 
     BYTE TextSelectionOverlayAlpha()
     {
-        if (IsDarkTheme() || IsAuroraTheme()) return 178;
+        if (IsDarkTheme()) return 178;
         if (IsIdeaLightTheme()) return 214;
         if (IsGlassTheme()) return 255;
         return 222;
@@ -6968,7 +6968,7 @@ namespace
             static_cast<Gdiplus::REAL>(r.right - r.left) + 1.0f,
             static_cast<Gdiplus::REAL>(r.bottom - r.top) + 1.0f);
         path.AddRectangle(rect);
-        Gdiplus::Pen border(GdiColor(TextSelectionBorderColor(), IsDarkTheme() || IsAuroraTheme() ? 58 : 66), 1.0f);
+        Gdiplus::Pen border(GdiColor(TextSelectionBorderColor(), IsDarkTheme() ? 58 : 66), 1.0f);
         g.DrawPath(&border, &path);
     }
 
@@ -10747,8 +10747,8 @@ namespace
             RECT r{ x, top, x + tabW, bottom };
             if (actualIndex < 0)
             {
-                COLORREF gapFill = MixColor(T().panel, T().stage, IsDarkTheme() || IsAuroraTheme() ? 0.34 : 0.58);
-                COLORREF gapLine = MixColor(T().line, T().panel, IsDarkTheme() || IsAuroraTheme() ? 0.30 : 0.42);
+                COLORREF gapFill = MixColor(T().panel, T().stage, IsDarkTheme() ? 0.34 : 0.58);
+                COLORREF gapLine = MixColor(T().line, T().panel, IsDarkTheme() ? 0.30 : 0.42);
                 RoundFill(dc, r, S(9), gapFill, gapLine);
                 continue;
             }
@@ -10814,7 +10814,7 @@ namespace
                 RECT mark{ r.right - S(42), r.top + S(2), r.right - S(27), r.bottom - S(2) };
                 HFONT markFont = Font(10, FW_SEMIBOLD);
                 HGDIOBJ oldMarkFont = SelectObject(dc, markFont);
-                Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() || IsAuroraTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
+                Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
                 SelectObject(dc, oldMarkFont);
                 DeleteObject(markFont);
             }
@@ -10856,7 +10856,7 @@ namespace
         {
             bool hover = Hit(r, g_mousePos.x, g_mousePos.y);
             bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
-            COLORREF fill = active ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.24 : 0.10) : T().panel;
+            COLORREF fill = active ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.24 : 0.10) : T().panel;
             COLORREF line = active ? MixColor(T().line, T().accent, 0.40) : T().line;
             if (IsGlassTheme() || IsAuroraTheme())
             {
@@ -10918,7 +10918,7 @@ namespace
 
         RECT r = g_tabDragCurrentRect;
         OffsetRect(&r, 0, g_tabDetachArmed ? S(2) : 0);
-        DrawRoundedShadow(dc, r, S(10.0f), S(2), S(5), S(8), IsDarkTheme() || IsAuroraTheme() ? 54 : 32);
+        DrawRoundedShadow(dc, r, S(10.0f), S(2), S(5), S(8), IsDarkTheme() ? 54 : 32);
         COLORREF floatFill = IsAuroraTheme() ? MixColor(T().panel2, T().accent, 0.06) : T().panel2;
         COLORREF floatLine = MixColor(T().line, T().accent, g_tabDetachArmed ? 0.46 : 0.22);
         RoundFill(dc, r, S(9), floatFill, floatLine);
@@ -10932,7 +10932,7 @@ namespace
             RECT mark{ r.right - S(42), r.top + S(2), r.right - S(27), r.bottom - S(2) };
             HFONT markFont = Font(10, FW_SEMIBOLD);
             HGDIOBJ oldMarkFont = SelectObject(dc, markFont);
-            Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() || IsAuroraTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
+            Text(dc, L"*", mark, DT_CENTER | DT_VCENTER | DT_SINGLELINE, IsDarkTheme() ? RGB(255, 210, 92) : RGB(216, 143, 35));
             SelectObject(dc, oldMarkFont);
             DeleteObject(markFont);
         }
@@ -10961,8 +10961,8 @@ namespace
         g_tabListRect = RECT{ left, g_tabCountRect.bottom + S(6), left + panelW, g_tabCountRect.bottom + S(6) + panelH };
         g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
 
-        DrawRoundedShadow(dc, g_tabListRect, S(10.0f), S(1), S(4), S(5), IsDarkTheme() || IsAuroraTheme() ? 42 : 22);
-        GlassRoundedSurface(dc, g_tabListRect, IsDarkTheme() || IsAuroraTheme() ? 224 : 242, S(11.0f));
+        DrawRoundedShadow(dc, g_tabListRect, S(10.0f), S(1), S(4), S(5), IsDarkTheme() ? 42 : 22);
+        GlassRoundedSurface(dc, g_tabListRect, IsDarkTheme() ? 224 : 242, S(11.0f));
 
         RECT content{ g_tabListRect.left + S(8), g_tabListRect.top + S(6), g_tabListRect.right - S(8), g_tabListRect.bottom - S(6) };
         bool needsScroll = g_tabListContentHeight > (content.bottom - content.top);
@@ -10984,7 +10984,7 @@ namespace
                 bool hover = i == g_hoverTabListItem;
                 if (active || hover)
                 {
-                    COLORREF fill = active ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.22 : 0.10) : SidebarHoverFill();
+                    COLORREF fill = active ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.22 : 0.10) : SidebarHoverFill();
                     COLORREF line = active ? MixColor(T().line, T().accent, 0.36) : fill;
                     RoundFill(dc, row, S(8), fill, line);
                 }
@@ -11298,7 +11298,7 @@ namespace
                 if (drawTile && g_homeScrollLightPaint)
                     RoundFill(dc, dock, S(11), MixColor(T().panel, T().paper, 0.36), MixColor(T().line, T().paper, 0.18));
                 else
-                    GlassRoundedSurface(dc, dock, IsDarkTheme() || IsAuroraTheme() ? 196 : 208, S(11.0f));
+                    GlassRoundedSurface(dc, dock, IsDarkTheme() ? 196 : 208, S(11.0f));
             }
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
             const wchar_t* tips[] = { item.pinned ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u7f6e\u9876", L"\u6253\u5f00\u6587\u4ef6\u5939", L"\u5220\u9664\u8bb0\u5f55" };
@@ -11421,7 +11421,7 @@ namespace
         int h = S(214);
         RECT panel{ (client.right - w) / 2, (client.bottom - h) / 2, (client.right + w) / 2, (client.bottom + h) / 2 };
         DrawRoundedShadow(dc, panel, S(14.0f), S(1), S(5), S(7), IsDarkTheme() ? 58 : 38);
-        GlassRoundedSurface(dc, panel, IsDarkTheme() || IsAuroraTheme() ? 232 : 248, S(14.0f));
+        GlassRoundedSurface(dc, panel, IsDarkTheme() ? 232 : 248, S(14.0f));
 
         g_clearDialogCloseRect = RECT{ panel.right - S(42), panel.top + S(14), panel.right - S(14), panel.top + S(42) };
         if (Hit(g_clearDialogCloseRect, g_mousePos.x, g_mousePos.y)) RoundFill(dc, g_clearDialogCloseRect, S(7), SidebarHoverFill(), SidebarHoverFill());
@@ -11489,7 +11489,7 @@ namespace
         g_zoomDialogRect = RECT{ left, top, left + panelW, top + panelH };
 
         DrawRoundedShadow(dc, g_zoomDialogRect, S(12.0f), S(1), S(3), S(4), IsDarkTheme() ? 40 : 22);
-        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() || IsAuroraTheme() ? 234 : 244, S(12.0f));
+        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() ? 234 : 244, S(12.0f));
 
         RECT topGleam{ g_zoomDialogRect.left + S(18), g_zoomDialogRect.top + S(5), g_zoomDialogRect.right - S(64), g_zoomDialogRect.top + S(8) };
         Gdiplus::SolidBrush gleamBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 16 : 48));
@@ -11710,7 +11710,7 @@ namespace
                 Gdiplus::Graphics g(dc);
                 g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
                 float radius = S(6.4f);
-                Gdiplus::SolidBrush glow(GdiColor(T().accent, IsDarkTheme() || IsAuroraTheme() ? 34 : 24));
+                Gdiplus::SolidBrush glow(GdiColor(T().accent, IsDarkTheme() ? 34 : 24));
                 g.FillEllipse(&glow, knobX - radius - S(2.0f), cy - radius - S(1.0f), (radius + S(2.0f)) * 2.0f, (radius + S(2.0f)) * 2.0f);
                 Gdiplus::SolidBrush knob(GdiColor(T().accent));
                 g.FillEllipse(&knob, knobX - radius, cy - radius, radius * 2.0f, radius * 2.0f);
@@ -11743,7 +11743,7 @@ namespace
                     g_sidebarRowIds.push_back(-1);
                     if (i == tab.currentPage)
                     {
-                        const double selectedTint = IsDarkTheme() || IsAuroraTheme() ? 0.08 : 0.035;
+                        const double selectedTint = IsDarkTheme() ? 0.08 : 0.035;
                         COLORREF selectedFill = MixColor(T().panel, T().accent, selectedTint);
                         RoundFill(dc, item, S(6), selectedFill, T().accent);
                     }
@@ -11765,7 +11765,7 @@ namespace
             g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(48) };
             constexpr int searchInputRadius = 11;
             if (g_searchInputFocused)
-                DrawSoftGlowRect(dc, g_searchInputRect, searchInputRadius, T().accent, IsDarkTheme() || IsAuroraTheme() ? 84 : 70);
+                DrawSoftGlowRect(dc, g_searchInputRect, searchInputRadius, T().accent, IsDarkTheme() ? 84 : 70);
             RoundFill(dc, g_searchInputRect, S(searchInputRadius), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
             RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
@@ -11830,7 +11830,7 @@ namespace
                     bool hovered = static_cast<int>(i) == g_hoverSearchResult;
                     if (selected || hovered)
                     {
-                        COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.20 : 0.10) : T().panel2;
+                        COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.20 : 0.10) : T().panel2;
                         COLORREF line = selected ? MixColor(T().line, T().accent, 0.45) : T().line;
                         RoundFill(dc, row, S(7), fill, line);
                     }
@@ -11869,7 +11869,7 @@ namespace
                 { CmdNoteDelete, L"\u5220\u9664\u5f53\u524d\u6ce8\u91ca" },
                 { CmdNoteDeleteAll, L"\u5220\u9664\u6240\u6709\u6ce8\u91ca" }
             };
-            COLORREF noteIcon = MixColor(T().muted, T().text, IsDarkTheme() || IsAuroraTheme() ? 0.14 : 0.08);
+            COLORREF noteIcon = MixColor(T().muted, T().text, IsDarkTheme() ? 0.14 : 0.08);
             HPEN sepPen = CreatePen(PS_SOLID, std::max(1, S(1)), MixColor(T().line, T().panel, 0.25));
             HGDIOBJ oldPen = SelectObject(dc, sepPen);
             int x = buttonLeft;
@@ -11956,7 +11956,7 @@ namespace
                     bool hovered = Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered || selected)
                     {
-                        COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() || IsAuroraTheme() ? 0.22 : 0.12) : T().panel2;
+                        COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.22 : 0.12) : T().panel2;
                         COLORREF line = selected ? T().accent : T().line;
                         RoundFill(dc, row, S(8), fill, line);
                     }
@@ -12008,8 +12008,8 @@ namespace
                 else
                 {
                     fill = togglePressed
-                        ? MixColor(T().panel2, T().line, IsDarkTheme() || IsAuroraTheme() ? 0.34 : 0.48)
-                        : MixColor(T().panel2, T().paper, IsDarkTheme() || IsAuroraTheme() ? 0.18 : 0.50);
+                        ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.48)
+                        : MixColor(T().panel2, T().paper, IsDarkTheme() ? 0.18 : 0.50);
                     line = togglePressed ? T().line : MixColor(T().line, T().text, 0.08);
                 }
                 RoundFill(dc, toggleAll, S(5), fill, line);
@@ -12577,7 +12577,7 @@ namespace
                             RECT visibleHit{};
                             if (IntersectRect(&visibleHit, &hitRect, &pageRect))
                             {
-                                AlphaFill(dc, visibleHit, RGB(255, 205, 64), IsDarkTheme() || IsAuroraTheme() ? 108 : 122);
+                                AlphaFill(dc, visibleHit, RGB(255, 205, 64), IsDarkTheme() ? 108 : 122);
                                 RECT top{ visibleHit.left, visibleHit.top, visibleHit.right, visibleHit.top + 1 };
                                 RECT bottom{ visibleHit.left, visibleHit.bottom - 1, visibleHit.right, visibleHit.bottom };
                                 RECT left{ visibleHit.left, visibleHit.top, visibleHit.left + 1, visibleHit.bottom };
@@ -12605,7 +12605,7 @@ namespace
                                     visibleMark.right,
                                     std::min(pageRect.bottom, visibleMark.bottom + S(1))
                                 };
-                                MultiplyHighlightFill(dc, fillMark, annotationColor, IsDarkTheme() || IsAuroraTheme() ? 88 : 122);
+                                MultiplyHighlightFill(dc, fillMark, annotationColor, IsDarkTheme() ? 88 : 122);
                             }
                             else
                             {
@@ -12867,7 +12867,7 @@ namespace
         g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
 
         DrawRoundedShadow(dc, g_annotationToolbarRect, S(11.0f), S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
-        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() || IsAuroraTheme() ? 214 : 236, S(11.0f));
+        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() ? 214 : 236, S(11.0f));
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -12975,7 +12975,7 @@ namespace
         panelTop = std::max<int>(static_cast<int>(g_stage.top) + S(14), panelTop);
         g_annotationNotePanelRect = RECT{ panelLeft, panelTop, panelLeft + panelW, panelTop + panelH };
         DrawRoundedShadow(dc, g_annotationNotePanelRect, S(12.0f), S(2), S(3), S(5), IsDarkTheme() ? 42 : 30);
-        GlassRoundedSurface(dc, g_annotationNotePanelRect, IsDarkTheme() || IsAuroraTheme() ? 224 : 242, S(12.0f));
+        GlassRoundedSurface(dc, g_annotationNotePanelRect, IsDarkTheme() ? 224 : 242, S(12.0f));
 
         HFONT titleFont = Font(10, FW_SEMIBOLD);
         oldFont = SelectObject(dc, titleFont);
@@ -13053,7 +13053,7 @@ namespace
             fill = MixColor(fill, T().accent, 0.10);
             line = MixColor(line, T().accent, 0.30);
         }
-        DrawRoundedShadow(dc, r, S(8.0f), S(1), S(3), S(3), IsDarkTheme() || IsAuroraTheme() ? 20 : 12);
+        DrawRoundedShadow(dc, r, S(8.0f), S(1), S(3), S(3), IsDarkTheme() ? 20 : 12);
         RoundFill(dc, r, S(8), fill, line);
         DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
     }
@@ -13311,13 +13311,13 @@ namespace
 
     COLORREF MenuPopupText(bool disabled)
     {
-        if (disabled) return MixColor(T().muted, MenuPopupFill(), IsDarkTheme() || IsAuroraTheme() ? 0.38 : 0.28);
+        if (disabled) return MixColor(T().muted, MenuPopupFill(), IsDarkTheme() ? 0.38 : 0.28);
         return T().text;
     }
 
     COLORREF MenuPopupShortcutText(bool disabled)
     {
-        if (disabled) return MixColor(T().muted, MenuPopupFill(), IsDarkTheme() || IsAuroraTheme() ? 0.46 : 0.36);
+        if (disabled) return MixColor(T().muted, MenuPopupFill(), IsDarkTheme() ? 0.46 : 0.36);
         if (IsAuroraTheme()) return MixColor(T().muted, T().accent, 0.20);
         return T().muted;
     }
