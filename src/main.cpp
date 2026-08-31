@@ -12569,6 +12569,10 @@ namespace
                     {
                         AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
                     }
+                    else if (IsAuroraTheme())
+                    {
+                        AlphaFill(dc, pageRect, T().accent, 12);
+                    }
                     if (g_searchCurrent >= 0 && g_searchCurrent < static_cast<int>(g_searchResults.size()))
                     {
                         SearchResult const& current = g_searchResults[static_cast<size_t>(g_searchCurrent)];
@@ -13107,7 +13111,7 @@ namespace
         RECT left{ S(10), bar.top, S(184), bar.bottom };
         Text(dc, pageSize, left, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
         int x = std::max<int>(S(188), client.right / 2 - S(190));
-        COLORREF iconColor = IsAuroraTheme() ? RGB(154, 223, 202) : RGB(128, 136, 145);
+        COLORREF iconColor = IsAuroraTheme() ? SidebarIconColor() : RGB(128, 136, 145);
         auto addIcon = [&](int id, StatusIcon icon, const wchar_t* tip, COLORREF color = RGB(120, 126, 134))
         {
             RECT r{ x, bar.top + S(7), x + S(20), bar.bottom - S(7) };
