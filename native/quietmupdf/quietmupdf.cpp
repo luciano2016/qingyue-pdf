@@ -323,147 +323,21 @@ extern "C" int quietmupdf_anchor()
 }
 namespace
 {
-    struct quiet_theme_device
-    {
-        fz_device super{};
-    };
-
-    constexpr int kQuietThemeLightGreen = 5;
     thread_local int quiet_render_theme = 0;
 
-    static float quiet_theme_clamp(float value)
+    static void quiet_clear_theme_pixmap(fz_context* ctx, fz_pixmap* pix, int theme)
     {
-        return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
-    }
-
-    static float quiet_theme_smoothstep(float edge0, float edge1, float value)
-    {
-        float t = quiet_theme_clamp((value - edge0) / (edge1 - edge0));
-        return t * t * (3.0f - 2.0f * t);
-    }
-
-    // Apply the theme while replaying cached display lists. Images and saturated artwork stay original.
-    static void quiet_theme_map_color(fz_context* ctx, fz_colorspace* colorspace, const float* color,
-        fz_color_params params, float* mapped)
-    {
-        if (!color || !colorspace)
-        {
-            mapped[0] = mapped[1] = mapped[2] = 0.0f;
-            return;
-        }
-        float rgb[3]{};
-        fz_convert_color(ctx, colorspace, color, fz_device_rgb(ctx), rgb, nullptr, params);
-        float r = quiet_theme_clamp(rgb[0]);
-        float g = quiet_theme_clamp(rgb[1]);
-        float b = quiet_theme_clamp(rgb[2]);
-        float maxColor = std::max({ r, g, b });
-        float minColor = std::min({ r, g, b });
-        float chroma = maxColor - minColor;
-        float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-        float chromaLimit = luminance > 0.88f ? 0.18f : (luminance > 0.72f ? 0.13f : 0.10f);
-        if (chroma >= chromaLimit)
-        {
-            mapped[0] = r;
-            mapped[1] = g;
-            mapped[2] = b;
-            return;
-        }
-
-        constexpr float paperR = 245.0f / 255.0f;
-        constexpr float paperG = 250.0f / 255.0f;
-        constexpr float paperB = 246.0f / 255.0f;
-        constexpr float inkR = 42.0f / 255.0f;
-        constexpr float inkG = 56.0f / 255.0f;
-        constexpr float inkB = 47.0f / 255.0f;
-        float paperWeight = quiet_theme_smoothstep(0.28f, 0.96f, luminance);
-        mapped[0] = inkR * (1.0f - paperWeight) + paperR * paperWeight;
-        mapped[1] = inkG * (1.0f - paperWeight) + paperG * paperWeight;
-        mapped[2] = inkB * (1.0f - paperWeight) + paperB * paperWeight;
-    }
-
-    static void quiet_theme_fill_path(fz_context* ctx, fz_device* dev, const fz_path* path, int evenOdd,
-        fz_matrix ctm, fz_colorspace* colorspace, const float* color, float alpha, fz_color_params params)
-    {
-        float mapped[3]{};
-        quiet_theme_map_color(ctx, colorspace, color, params, mapped);
-        fz_fill_path(ctx, dev->passthrough, path, evenOdd, ctm, fz_device_rgb(ctx), mapped, alpha, params);
-    }
-
-    static void quiet_theme_stroke_path(fz_context* ctx, fz_device* dev, const fz_path* path,
-        const fz_stroke_state* stroke, fz_matrix ctm, fz_colorspace* colorspace, const float* color,
-        float alpha, fz_color_params params)
-    {
-        float mapped[3]{};
-        quiet_theme_map_color(ctx, colorspace, color, params, mapped);
-        fz_stroke_path(ctx, dev->passthrough, path, stroke, ctm, fz_device_rgb(ctx), mapped, alpha, params);
-    }
-
-    static void quiet_theme_fill_text(fz_context* ctx, fz_device* dev, const fz_text* text, fz_matrix ctm,
-        fz_colorspace* colorspace, const float* color, float alpha, fz_color_params params)
-    {
-        float mapped[3]{};
-        quiet_theme_map_color(ctx, colorspace, color, params, mapped);
-        fz_fill_text(ctx, dev->passthrough, text, ctm, fz_device_rgb(ctx), mapped, alpha, params);
-    }
-
-    static void quiet_theme_stroke_text(fz_context* ctx, fz_device* dev, const fz_text* text,
-        const fz_stroke_state* stroke, fz_matrix ctm, fz_colorspace* colorspace, const float* color,
-        float alpha, fz_color_params params)
-    {
-        float mapped[3]{};
-        quiet_theme_map_color(ctx, colorspace, color, params, mapped);
-        fz_stroke_text(ctx, dev->passthrough, text, stroke, ctm, fz_device_rgb(ctx), mapped, alpha, params);
-    }
-
-    static void quiet_theme_fill_image_mask(fz_context* ctx, fz_device* dev, fz_image* image, fz_matrix ctm,
-        fz_colorspace* colorspace, const float* color, float alpha, fz_color_params params)
-    {
-        float mapped[3]{};
-        quiet_theme_map_color(ctx, colorspace, color, params, mapped);
-        fz_fill_image_mask(ctx, dev->passthrough, image, ctm, fz_device_rgb(ctx), mapped, alpha, params);
+        (void)theme;
+        if (pix) fz_clear_pixmap_with_value(ctx, pix, 255);
     }
 
     static fz_device* quiet_wrap_theme_device(fz_context* ctx, fz_device* inner, int theme)
     {
-        if (theme != kQuietThemeLightGreen)
-            return inner;
-        auto* themed = fz_new_derived_passthrough_device(ctx, inner, quiet_theme_device);
-        themed->super.fill_path = quiet_theme_fill_path;
-        themed->super.stroke_path = quiet_theme_stroke_path;
-        themed->super.fill_text = quiet_theme_fill_text;
-        themed->super.stroke_text = quiet_theme_stroke_text;
-        themed->super.fill_image_mask = quiet_theme_fill_image_mask;
-        return &themed->super;
-    }
-
-    static void quiet_clear_theme_pixmap(fz_context* ctx, fz_pixmap* pix, int theme)
-    {
-        if (!pix || !pix->samples)
-            return;
-        if (theme != kQuietThemeLightGreen)
-        {
-            fz_clear_pixmap_with_value(ctx, pix, 255);
-            return;
-        }
-        constexpr unsigned char paperB = 246;
-        constexpr unsigned char paperG = 250;
-        constexpr unsigned char paperR = 245;
-        for (int y = 0; y < pix->h; ++y)
-        {
-            unsigned char* row = pix->samples + static_cast<size_t>(y) * pix->stride;
-            for (int x = 0; x < pix->w; ++x)
-            {
-                unsigned char* pixel = row + static_cast<size_t>(x) * pix->n;
-                if (pix->n >= 3)
-                {
-                    pixel[0] = paperB;
-                    pixel[1] = paperG;
-                    pixel[2] = paperR;
-                }
-                if (pix->alpha && pix->n >= 4)
-                    pixel[3] = 255;
-            }
-        }
+        // Theme colors are applied once to the completed page bitmap by the
+        // Win32 renderer, which also includes ordinary PDF images.
+        (void)ctx;
+        (void)theme;
+        return inner;
     }
 }
 

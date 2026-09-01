@@ -1948,6 +1948,24 @@ namespace
         if (clampedTheme == 0 || clampedTheme == 1) return;
         if (clampedTheme >= 3 && clampedTheme <= 4) return;
 
+        if (clampedTheme == 5)
+        {
+            // Match SumatraPDF's page-bitmap recoloring model: one linear
+            // channel mapping includes text, vectors, scans and images.
+            COLORREF text = g_themes[clampedTheme].text;
+            COLORREF paper = RGB(245, 250, 246);
+            auto recolor = [](std::uint8_t sample, std::uint8_t ink, std::uint8_t background)
+            {
+                int value = static_cast<int>(ink) +
+                    (static_cast<int>(sample) * (static_cast<int>(background) - static_cast<int>(ink)) + 127) / 255;
+                return static_cast<std::uint8_t>(std::clamp(value, 0, 255));
+            };
+            b = recolor(b, GetBValue(text), GetBValue(paper));
+            g = recolor(g, GetGValue(text), GetGValue(paper));
+            r = recolor(r, GetRValue(text), GetRValue(paper));
+            return;
+        }
+
         int lum = Luma(r, g, b);
         COLORREF paper = g_themes[clampedTheme].paper;
 
@@ -4863,7 +4881,7 @@ namespace
                     }
                     if (rendered)
                     {
-                        if (applyTheme && effectiveTheme == 2)
+                        if (applyTheme && (effectiveTheme == 2 || effectiveTheme == 5))
                         {
                             for (int y = 0; y < image.height; ++y)
                             {
@@ -4932,7 +4950,7 @@ namespace
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
-        if (components == 4 && (!applyTheme || effectiveTheme != 2))
+        if (components == 4 && (!applyTheme || (effectiveTheme != 2 && effectiveTheme != 5)))
         {
             for (int y = 0; y < image.height; ++y)
                 std::memcpy((dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4,
@@ -5061,7 +5079,7 @@ namespace
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
-        if (components == 4 && renderTheme != 2)
+        if (components == 4 && renderTheme != 2 && renderTheme != 5)
         {
             for (int y = 0; y < image.height; ++y)
                 std::memcpy((dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4,
@@ -5124,7 +5142,7 @@ namespace
                 }
                 if (rendered)
                 {
-                    if (renderTheme == 2)
+                    if (renderTheme == 2 || renderTheme == 5)
                     {
                         for (int y = 0; y < image.height; ++y)
                         {
