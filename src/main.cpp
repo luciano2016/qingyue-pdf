@@ -3323,21 +3323,20 @@ namespace
             }
             else
             {
-                float radius = S(6.1f);
-                Gdiplus::GraphicsPath moon;
-                moon.StartFigure();
-                moon.AddBezier(
-                    gcx - S(2.2f), gcy - radius,
-                    gcx + S(5.8f), gcy - S(5.3f),
-                    gcx + S(5.8f), gcy + S(5.3f),
-                    gcx - S(2.2f), gcy + radius);
-                moon.AddBezier(
-                    gcx + S(1.5f), gcy + S(4.3f),
-                    gcx + S(1.5f), gcy - S(4.3f),
-                    gcx - S(2.2f), gcy - radius,
-                    gcx - S(2.2f), gcy - radius);
+                float outerRadius = S(6.2f);
+                float innerRadius = S(5.5f);
+                Gdiplus::GraphicsPath outer;
+                outer.AddEllipse(gcx - outerRadius, gcy - outerRadius,
+                    outerRadius * 2.0f, outerRadius * 2.0f);
+                Gdiplus::GraphicsPath inner;
+                float innerCenterX = gcx - S(3.2f);
+                float innerCenterY = gcy - S(2.4f);
+                inner.AddEllipse(innerCenterX - innerRadius, innerCenterY - innerRadius,
+                    innerRadius * 2.0f, innerRadius * 2.0f);
+                Gdiplus::Region moonRegion(&outer);
+                moonRegion.Exclude(&inner);
                 Gdiplus::SolidBrush moonBrush(GdiColor(color, 238));
-                g.FillPath(&moonBrush, &moon);
+                g.FillRegion(&moonBrush, &moonRegion);
             }
             return;
         }
