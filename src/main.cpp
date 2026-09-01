@@ -3323,34 +3323,34 @@ namespace
             }
             else
             {
-                // The reference is one continuous, constant-width crescent stroke.
-                // Drawing its centerline avoids the uneven band thickness and the
-                // unclosed bottom that appeared when a filled outline was used.
-                const float scale = S(0.055f);
+                // This is the supplied icon's geometry: the opening faces upper
+                // right, with one constant-width outer arc and an inward return arc.
+                // A centerline stroke keeps the band uniform at every DPI.
+                const float scale = S(0.012f);
                 auto point = [&](float x, float y)
                 {
                     return Gdiplus::PointF(
-                        gcx + (x - 102.0f) * scale,
-                        gcy + (y - 100.0f) * scale);
+                        gcx + (x - 512.0f) * scale,
+                        gcy + (y - 512.0f) * scale);
                 };
                 Gdiplus::GraphicsPath moon;
                 moon.StartFigure();
                 moon.AddBezier(
-                    point(105, 8), point(108, 19), point(110, 34), point(108, 49));
+                    point(512, 114), point(292, 114), point(114, 292), point(114, 512));
                 moon.AddBezier(
-                    point(108, 49), point(105, 76), point(93, 99), point(75, 113));
+                    point(114, 512), point(114, 732), point(292, 910), point(512, 910));
                 moon.AddBezier(
-                    point(75, 113), point(56, 123), point(36, 126), point(19, 125));
+                    point(512, 910), point(732, 910), point(910, 732), point(910, 512));
                 moon.AddBezier(
-                    point(19, 125), point(28, 154), point(54, 179), point(90, 189));
+                    point(910, 512), point(850, 545), point(785, 536), point(735, 500));
                 moon.AddBezier(
-                    point(90, 189), point(124, 198), point(157, 181), point(178, 152));
+                    point(735, 500), point(650, 454), point(610, 365), point(620, 275));
                 moon.AddBezier(
-                    point(178, 152), point(195, 127), point(200, 96), point(190, 66));
+                    point(620, 275), point(625, 235), point(611, 190), point(585, 159));
                 moon.AddBezier(
-                    point(190, 66), point(178, 31), point(148, 10), point(105, 8));
+                    point(585, 159), point(565, 139), point(540, 114), point(512, 114));
                 moon.CloseFigure();
-                Gdiplus::Pen moonPen(GdiColor(color, 255), std::max<Gdiplus::REAL>(1.25f, S(1.35f)));
+                Gdiplus::Pen moonPen(GdiColor(color, 255), std::max<Gdiplus::REAL>(1.0f, S(0.92f)));
                 moonPen.SetStartCap(Gdiplus::LineCapRound);
                 moonPen.SetEndCap(Gdiplus::LineCapRound);
                 moonPen.SetLineJoin(Gdiplus::LineJoinRound);
