@@ -68,6 +68,7 @@ RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welco
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_uninstallMode = false, g_uninstallWorker = false, g_deleteAppData = true;
 bool g_pathFocused = false;
+bool g_completionPending = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
 int g_shine = 0;
 std::wstring g_stage, g_error;
@@ -802,15 +803,40 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         return 0;
     }
     case WM_TIMER:
-        if(w==kTimer&&(g_page==Page::Installing||g_page==Page::Uninstalling)) { g_progress+=(g_targetProgress-g_progress)*.18f; if(g_targetProgress-g_progress<.003f)g_progress=g_targetProgress; g_shine=(g_shine+S(4))%std::max(1,S(100)); InvalidateRect(h,nullptr,FALSE); }
+        if(w==kTimer&&(g_page==Page::Installing||g_page==Page::Uninstalling)) {
+            g_progress+=(g_targetProgress-g_progress)*.18f;
+            if(g_targetProgress-g_progress<.003f)g_progress=g_targetProgress;
+            g_shine=(g_shine+S(4))%std::max(1,S(100));
+            InvalidateRect(h,nullptr,FALSE);
+            if(g_completionPending&&g_progress>=.999f) {
+                g_progress=g_targetProgress=1.0f;
+                g_completionPending=false;
+                g_installing=false;
+                KillTimer(h,kTimer);
+                g_page=g_uninstallMode?Page::UninstallComplete:Page::Complete;
+                Layout(h);
+                InvalidateRect(h,nullptr,FALSE);
+            }
+        }
         return 0;
     case kMsgProgress: {
         auto* progress=reinterpret_cast<ProgressMessage*>(w); if(progress){g_targetProgress=std::clamp(progress->percent/100.0f,0.0f,1.0f);g_stage=std::move(progress->text);delete progress;} return 0;
     }
     case kMsgComplete: {
-        std::unique_ptr<InstallResult> result(reinterpret_cast<InstallResult*>(w)); KillTimer(h,kTimer); g_installing=false;
-        if(g_uninstallMode) { if(result&&result->success){g_page=Page::UninstallComplete;g_progress=g_targetProgress=1;}else{g_page=Page::UninstallFailed;g_error=result?result->error:L"\u5378\u8f7d\u5931\u8d25\u3002";} }
-        else { if(result&&result->success){g_page=Page::Complete;g_progress=g_targetProgress=1;}else{g_page=Page::Failed;g_error=result?result->error:L"\u5b89\u88c5\u5931\u8d25\u3002";} }
+        std::unique_ptr<InstallResult> result(reinterpret_cast<InstallResult*>(w));
+        if(result&&result->success) {
+            g_completionPending=true;
+            g_targetProgress=1.0f;
+            g_stage=g_uninstallMode?L"\u5378\u8f7d\u5b8c\u6210":L"\u5b89\u88c5\u5b8c\u6210";
+            SetTimer(h,kTimer,16,nullptr);
+            InvalidateRect(h,nullptr,FALSE);
+            return 0;
+        }
+        g_completionPending=false;
+        KillTimer(h,kTimer);
+        g_installing=false;
+        if(g_uninstallMode) { g_page=Page::UninstallFailed;g_error=result?result->error:L"\u5378\u8f7d\u5931\u8d25\u3002"; }
+        else { g_page=Page::Failed;g_error=result?result->error:L"\u5b89\u88c5\u5931\u8d25\u3002"; }
         Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
     }
     case WM_CLOSE: if(g_installing)return 0; DestroyWindow(h); return 0;
