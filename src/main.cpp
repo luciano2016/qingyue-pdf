@@ -3402,7 +3402,10 @@ namespace
                     point(538.236480f, 430.302208f), point(598.904314f, 510.711694f),
                     point(693.838497f, 557.929918f), point(794.567111f, 557.795556f));
                 moon.CloseFigure();
-                Gdiplus::SolidBrush moonBrush(GdiColor(color, 238));
+                // The SVG is a filled band (wider than the neighboring stroked
+                // glyph), so a calibrated alpha gives it the same perceived
+                // darkness on high-DPI displays.
+                Gdiplus::SolidBrush moonBrush(GdiColor(color, 210));
                 g.FillPath(&moonBrush, &moon);
             }
             return;
