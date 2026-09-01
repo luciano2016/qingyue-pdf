@@ -2617,24 +2617,14 @@ namespace
                 : MixColor(RGB(248, 251, 254), T().accent, 0.025));
         Gdiplus::SolidBrush frostBrush(GdiColor(frost, IsDarkTheme() ? 92 : 116));
         FillGdiRoundRect(g, frostBrush, Rf(inner), std::max(1.0f, radius - S(1.0f)));
-        RECT upper{ r.left + S(3), r.top + S(2), r.right - S(3), r.top + (r.bottom - r.top) / 2 };
-        Gdiplus::SolidBrush upperBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 22 : 76));
-        FillGdiRoundRect(g, upperBrush, Rf(upper), std::max(1.0f, radius - S(3.0f)));
-        RECT lower{ r.left + S(4), r.top + (r.bottom - r.top) / 2, r.right - S(4), r.bottom - S(3) };
-        COLORREF lowerColor = IsAuroraTheme() ? MixColor(T().accent, T().panel2, 0.18) : (IsDarkTheme() ? T().accent : RGB(156, 195, 232));
-        Gdiplus::SolidBrush lowerBrush(GdiColor(lowerColor, pressed ? 22 : (hovered ? 16 : 10)));
-        FillGdiRoundRect(g, lowerBrush, Rf(lower), std::max(1.0f, radius - S(3.0f)));
         COLORREF edge = MixColor(T().line, IsDarkTheme() ? RGB(255, 255, 255) : RGB(126, 145, 164),
             pressed ? 0.28 : (hovered ? 0.20 : 0.12));
         Gdiplus::Pen edgePen(GdiColor(edge, IsDarkTheme() ? 146 : 164), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
         DrawGdiRoundRect(g, edgePen, pill, radius);
-        RECT highlight{ r.left + S(8), r.top + S(2), r.right - S(8), r.top + S(4) };
-        Gdiplus::SolidBrush highlightBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 42 : 116));
-        FillGdiRoundRect(g, highlightBrush, Rf(highlight), S(1.5f));
     }
 
 
-    void GlassRoundedSurface(HDC dc, RECT r, BYTE alpha, float radius)
+    void GlassRoundedSurface(HDC dc, RECT r, BYTE alpha, float radius, bool showTopWash = true)
     {
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -2644,9 +2634,12 @@ namespace
         Gdiplus::Pen border(GdiColor(line, IsGlassTheme() ? 170 : 140), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
         FillGdiRoundRect(g, fill, Rf(r), radius);
 
-        RECT top{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + std::max<int>(S(2), (r.bottom - r.top) / 2) };
-        Gdiplus::SolidBrush wash(GdiColor(IsAuroraTheme() ? T().accent : RGB(255, 255, 255), IsAuroraTheme() ? 12 : 42));
-        FillGdiRoundRect(g, wash, Rf(top), std::max(1.0f, radius - S(1.0f)));
+        if (showTopWash)
+        {
+            RECT top{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + std::max<int>(S(2), (r.bottom - r.top) / 2) };
+            Gdiplus::SolidBrush wash(GdiColor(IsAuroraTheme() ? T().accent : RGB(255, 255, 255), IsAuroraTheme() ? 12 : 42));
+            FillGdiRoundRect(g, wash, Rf(top), std::max(1.0f, radius - S(1.0f)));
+        }
         DrawGdiRoundRect(g, border, Rf(r), radius);
     }
 
@@ -11096,7 +11089,8 @@ namespace
             }
             else if (active)
             {
-                DrawFilledCircle(dc, closeCx, closeCy, S(3.2f), T().accent);
+                COLORREF activeDot = IsGraphiteTheme() ? RGB(254, 105, 0) : T().accent;
+                DrawFilledCircle(dc, closeCx, closeCy, S(3.2f), activeDot);
             }
             if (false && closeHover)
             {
@@ -13153,7 +13147,7 @@ namespace
         g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
 
         DrawRoundedShadow(dc, g_annotationToolbarRect, S(11.0f), S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
-        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() ? 214 : 236, S(11.0f));
+        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() ? 214 : 236, S(11.0f), false);
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
