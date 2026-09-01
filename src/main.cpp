@@ -2224,17 +2224,19 @@ namespace
         auto backdropColorAt = [&](int y)
         {
             double ty = std::clamp(static_cast<double>(y - client.top) / static_cast<double>(fullH), 0.0, 1.0);
-            COLORREF color = MixColor(RGB(247, 250, 252), RGB(232, 239, 246), ty);
+            // Keep the backdrop visibly layered so the DWM mica surface is not
+            // flattened by a near-white client background.
+            COLORREF color = MixColor(RGB(239, 244, 249), RGB(216, 226, 237), ty);
             auto smoothStep = [](double edge0, double edge1, double value)
             {
                 double t = std::clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
                 return t * t * (3.0 - 2.0 * t);
             };
-            double warmMix = 0.20 * (1.0 - smoothStep(0.34, 0.58, ty));
-            double coolMix = 0.24 * smoothStep(0.44, 0.70, ty);
-            double topLightMix = 0.16 * (1.0 - smoothStep(0.10, 0.46, ty));
-            color = MixColor(color, RGB(255, 248, 241), warmMix);
-            color = MixColor(color, RGB(229, 242, 253), coolMix);
+            double warmMix = 0.11 * (1.0 - smoothStep(0.34, 0.58, ty));
+            double coolMix = 0.18 * smoothStep(0.44, 0.70, ty);
+            double topLightMix = 0.08 * (1.0 - smoothStep(0.10, 0.46, ty));
+            color = MixColor(color, RGB(255, 249, 243), warmMix);
+            color = MixColor(color, RGB(224, 238, 251), coolMix);
             color = MixColor(color, RGB(255, 255, 255), topLightMix);
             return color;
         };
@@ -2265,19 +2267,19 @@ namespace
         int clientW = static_cast<int>(client.right - client.left);
         RECT leftWash{ client.left, client.top, client.left + std::max<int>(1, clientW / 3), client.bottom };
         RECT wash{};
-        if (IntersectRect(&wash, &r, &leftWash)) AlphaFill(dc, wash, RGB(226, 244, 239), 30);
+        if (IntersectRect(&wash, &r, &leftWash)) AlphaFill(dc, wash, RGB(219, 238, 231), 20);
     }
 
     void GlassFill(HDC dc, RECT r, COLORREF fallback, BYTE alpha = 205)
     {
         if (IsGlassTheme())
         {
-            AlphaFill(dc, r, RGB(255, 255, 255), std::min<BYTE>(alpha, 166));
+            AlphaFill(dc, r, RGB(255, 255, 255), std::min<BYTE>(alpha, 126));
             int halfH = std::max<int>(1, static_cast<int>(r.bottom - r.top) / 2);
             RECT topWash{ r.left, r.top, r.right, r.top + halfH };
-            AlphaFill(dc, topWash, RGB(255, 255, 255), 56);
+            AlphaFill(dc, topWash, RGB(255, 255, 255), 24);
             RECT coolWash{ r.left, r.top + halfH, r.right, r.bottom };
-            AlphaFill(dc, coolWash, RGB(229, 242, 253), 18);
+            AlphaFill(dc, coolWash, RGB(224, 238, 251), 12);
             HPEN highlight = CreatePen(PS_SOLID, std::max(1, S(1)), RGB(255, 255, 255));
             HGDIOBJ oldPen = SelectObject(dc, highlight);
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -2313,9 +2315,9 @@ namespace
             Fill(dc, r, T().panel);
             return;
         }
-        AlphaFill(dc, r, RGB(255, 255, 255), alpha);
+        AlphaFill(dc, r, RGB(255, 255, 255), std::min<BYTE>(alpha, 116));
         RECT top{ r.left, r.top, r.right, r.top + std::max<int>(1, (r.bottom - r.top) / 2) };
-        AlphaFill(dc, top, RGB(255, 255, 255), 34);
+        AlphaFill(dc, top, RGB(255, 255, 255), 18);
     }
 
     void GlassDivider(HDC dc, RECT r)
@@ -4762,7 +4764,9 @@ namespace
         if (!g_hwnd) return;
         BOOL dark = IsDarkTheme();
         DwmSetWindowAttribute(g_hwnd, 20, &dark, sizeof(dark));
-        int backdrop = IsGlassTheme() ? 4 : 2;
+        // 2 is DWMSBT_MAINWINDOW (Mica). 4 is Tabbed Mica and is intended for
+        // tabbed title bars, which is not the visual surface used here.
+        int backdrop = 2;
         DwmSetWindowAttribute(g_hwnd, 38, &backdrop, sizeof(backdrop));
         COLORREF caption = ChromeBarColor();
         COLORREF captionText = T().text;
