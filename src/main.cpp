@@ -479,7 +479,8 @@ namespace
         CmdTabNavPrev,
         CmdTabNavNext,
         CmdTabListToggle,
-        CmdSidebarPanelToggle
+        CmdSidebarPanelToggle,
+        CmdColorMode
     };
 
     std::string ToUtf8(const std::wstring& text)
@@ -1394,6 +1395,8 @@ namespace
     int g_homeScrollY{};
     int g_homeContentHeight{};
     int g_theme{};
+    int g_lastLightTheme{ 0 };
+    int g_lastDarkTheme{ 4 };
     int g_viewMode{};
     int g_contextTab{ -1 };
     int g_contextRecent{ -1 };
@@ -1745,6 +1748,26 @@ namespace
     bool IsDarkTheme()
     {
         return g_theme >= 3 && g_theme <= 4;
+    }
+
+    bool IsLightThemeIndex(int theme)
+    {
+        return theme == 0 || theme == 1 || theme == 2 || theme == 5;
+    }
+
+    bool IsDarkThemeIndex(int theme)
+    {
+        return theme == 3 || theme == 4;
+    }
+
+    int LastLightTheme()
+    {
+        return IsLightThemeIndex(g_lastLightTheme) ? g_lastLightTheme : 0;
+    }
+
+    int LastDarkTheme()
+    {
+        return IsDarkThemeIndex(g_lastDarkTheme) ? g_lastDarkTheme : 4;
     }
 
     COLORREF ForegroundOn(COLORREF bg)
@@ -3112,6 +3135,7 @@ namespace
         Last,
         RotateLeft,
         RotateRight,
+        ColorMode,
         Theme,
         View,
         Actual,
@@ -3266,6 +3290,57 @@ namespace
             MoveToEx(dc, cx + S(8), cy, nullptr);
             LineTo(dc, cx + S(4), cy - S(3));
             break;
+        case StatusIcon::ColorMode:
+        {
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+
+            Gdiplus::Graphics g(dc);
+            g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+            float gcx = static_cast<float>(cx);
+            float gcy = static_cast<float>(cy);
+            Gdiplus::Pen modePen(GdiColor(color, 238), std::max<Gdiplus::REAL>(1.25f, S(1.0f)));
+            modePen.SetStartCap(Gdiplus::LineCapRound);
+            modePen.SetEndCap(Gdiplus::LineCapRound);
+            modePen.SetLineJoin(Gdiplus::LineJoinRound);
+
+            if (IsDarkTheme())
+            {
+                float radius = S(4.8f);
+                g.DrawEllipse(&modePen, gcx - radius, gcy - radius, radius * 2.0f, radius * 2.0f);
+                for (int ray = 0; ray < 8; ++ray)
+                {
+                    constexpr float pi = 3.14159265358979323846f;
+                    float angle = static_cast<float>(ray) * pi / 4.0f;
+                    float inner = S(7.0f);
+                    float outer = S(9.2f);
+                    g.DrawLine(&modePen,
+                        gcx + std::cos(angle) * inner, gcy + std::sin(angle) * inner,
+                        gcx + std::cos(angle) * outer, gcy + std::sin(angle) * outer);
+                }
+            }
+            else
+            {
+                float radius = S(6.7f);
+                Gdiplus::GraphicsPath moon;
+                moon.StartFigure();
+                moon.AddBezier(
+                    gcx - S(1.0f), gcy - radius,
+                    gcx + S(7.8f), gcy - S(5.9f),
+                    gcx + S(7.8f), gcy + S(5.9f),
+                    gcx - S(1.0f), gcy + radius);
+                moon.AddBezier(
+                    gcx + S(3.0f), gcy + S(4.7f),
+                    gcx + S(3.0f), gcy - S(4.7f),
+                    gcx - S(1.0f), gcy - radius,
+                    gcx - S(1.0f), gcy - radius);
+                Gdiplus::SolidBrush moonBrush(GdiColor(color, 238));
+                g.FillPath(&moonBrush, &moon);
+            }
+            return;
+        }
         case StatusIcon::Theme:
         {
             float size = S(13.2f);
@@ -4060,6 +4135,8 @@ namespace
         while (std::getline(in, line)) lines.push_back(line);
         bool themeSchema3 = std::find(lines.begin(), lines.end(), "themeSchema=3") != lines.end();
         bool themeSchema2 = std::find(lines.begin(), lines.end(), "themeSchema=2") != lines.end();
+        bool sawLastLightTheme = false;
+        bool sawLastDarkTheme = false;
         for (auto const& line : lines)
         {
             if (line.rfind("theme=", 0) == 0)
@@ -4090,6 +4167,16 @@ namespace
                 case 5: g_theme = 0; break; // legacy frosted mica -> mica white
                 default: g_theme = 0; break;
                 }
+            }
+            else if (line.rfind("lastLightTheme=", 0) == 0)
+            {
+                g_lastLightTheme = std::atoi(line.c_str() + 15);
+                sawLastLightTheme = true;
+            }
+            else if (line.rfind("lastDarkTheme=", 0) == 0)
+            {
+                g_lastDarkTheme = std::atoi(line.c_str() + 14);
+                sawLastDarkTheme = true;
             }
             else if (line.rfind("sidebar=", 0) == 0)
             {
@@ -4140,6 +4227,10 @@ namespace
             }
         }
         SortRecent();
+        if (!sawLastLightTheme && IsLightThemeIndex(g_theme)) g_lastLightTheme = g_theme;
+        if (!sawLastDarkTheme && IsDarkThemeIndex(g_theme)) g_lastDarkTheme = g_theme;
+        g_lastLightTheme = LastLightTheme();
+        g_lastDarkTheme = LastDarkTheme();
         if (g_recent.size() > 80) g_recent.resize(80);
         if (g_lastSessionActive < 0 || g_lastSessionActive >= static_cast<int>(g_lastSessionTabs.size()))
             g_lastSessionActive = g_lastSessionTabs.empty() ? -1 : 0;
@@ -4150,6 +4241,8 @@ namespace
         std::ofstream out(StatePath(), std::ios::binary | std::ios::trunc);
         out << "themeSchema=3\n";
         out << "theme=" << g_theme << "\n";
+        out << "lastLightTheme=" << LastLightTheme() << "\n";
+        out << "lastDarkTheme=" << LastDarkTheme() << "\n";
         out << "sidebar=" << std::max(g_sidebarExpandedWidth, g_sidebarWidth) << "\n";
         out << "outline=" << g_outlineFont << "\n";
         out << "view=" << g_viewMode << "\n";
@@ -13276,7 +13369,7 @@ namespace
         addIcon(CmdNext, StatusIcon::Next, L"\u4e0b\u4e00\u9875", iconColor);
         addIcon(CmdLast, StatusIcon::Last, L"\u6700\u540e\u4e00\u9875", iconColor);
 
-        int rx = std::max<int>(x + S(36), client.right - S(384));
+        int rx = std::max<int>(x + S(36), client.right - S(413));
         auto separator = [&]()
         {
             RECT line{ rx + S(8), bar.top + S(7), rx + S(9), bar.bottom - S(7) };
@@ -13302,6 +13395,8 @@ namespace
             if (g_zoomButtonMode == 2404) return StatusIcon::CustomZoom;
             return StatusIcon::Actual;
         };
+        addStatusIcon(CmdColorMode, StatusIcon::ColorMode,
+            IsDarkTheme() ? L"\u5207\u6362\u5230\u6d45\u8272\u6a21\u5f0f" : L"\u5207\u6362\u5230\u6df1\u8272\u6a21\u5f0f", 26, iconColor);
         addStatusIcon(CmdTheme, StatusIcon::Theme, L"\u4e3b\u9898\uff1a" + std::wstring(T().name), 34, iconColor);
         addStatusIcon(CmdView, StatusIcon::View, L"\u9605\u8bfb\u89c6\u56fe", 34, iconColor);
         addStatusIcon(CmdZoomMenu, zoomStatusIcon(), L"\u9875\u9762\u7f29\u653e", 34, iconColor);
@@ -14778,8 +14873,10 @@ namespace
         HMENU menu = CreatePopupMenu();
         AppendThemedMenuItem(menu, 2101, L"\u5173\u95ed");
         AppendThemedMenuItem(menu, 2102, L"\u5173\u95ed\u5176\u4ed6\u6807\u7b7e");
-        AppendThemedMenuItem(menu, 2103, L"\u5173\u95ed\u53f3\u4fa7\u6807\u7b7e");
-        AppendThemedMenuItem(menu, 2104, L"\u5173\u95ed\u5de6\u4fa7\u6807\u7b7e");
+        if (g_contextTab >= 0 && g_contextTab + 1 < static_cast<int>(g_tabs.size()))
+            AppendThemedMenuItem(menu, 2103, L"\u5173\u95ed\u53f3\u4fa7\u6807\u7b7e");
+        if (g_contextTab > 0 && g_contextTab < static_cast<int>(g_tabs.size()))
+            AppendThemedMenuItem(menu, 2104, L"\u5173\u95ed\u5de6\u4fa7\u6807\u7b7e");
         AppendThemedMenuSeparator(menu);
         AppendThemedMenuItem(menu, 2105, L"\u590d\u5236\u6587\u4ef6\u8def\u5f84");
         AppendThemedMenuItem(menu, 2106, L"\u6253\u5f00\u6240\u5728\u6587\u4ef6\u5939");
@@ -15684,29 +15781,48 @@ namespace
         }
     }
 
+    void ApplyThemeSelection(HWND hwnd, int newTheme)
+    {
+        if (newTheme < 0 || newTheme >= static_cast<int>(std::size(g_themes))) return;
+        int oldTheme = g_theme;
+        if (oldTheme == newTheme) return;
+
+        if (IsDarkThemeIndex(oldTheme)) g_lastDarkTheme = oldTheme;
+        else if (IsLightThemeIndex(oldTheme)) g_lastLightTheme = oldTheme;
+
+        int oldRenderTheme = PdfRenderTheme();
+        g_theme = newTheme;
+        if (IsDarkThemeIndex(newTheme)) g_lastDarkTheme = newTheme;
+        else if (IsLightThemeIndex(newTheme)) g_lastLightTheme = newTheme;
+        int newRenderTheme = PdfRenderTheme();
+        if (oldRenderTheme != newRenderTheme)
+        {
+            for (auto& ownedTab : g_tabs)
+                PreservePageCacheForThemeTransition(*ownedTab, oldRenderTheme, newRenderTheme);
+        }
+        ClearHomeThumbCacheState();
+        {
+            std::lock_guard<std::mutex> lock(g_homeThumbMutex);
+            g_homeThumbPending.clear();
+            g_homeThumbQueue.clear();
+        }
+        SaveState();
+        ApplyWindowChrome();
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
+        DwmFlush();
+    }
+
     void Command(HWND hwnd, int id)
     {
         PdfTab* tab = Active();
+        if (id == CmdColorMode)
+        {
+            ApplyThemeSelection(hwnd, IsDarkTheme() ? LastLightTheme() : LastDarkTheme());
+            return;
+        }
         if (id >= 2200 && id < 2200 + static_cast<int>(std::size(g_themes)))
         {
-            int oldRenderTheme = PdfRenderTheme();
-            g_theme = id - 2200;
-            int newRenderTheme = PdfRenderTheme();
-            if (oldRenderTheme != newRenderTheme)
-            {
-                for (auto& ownedTab : g_tabs)
-                    PreservePageCacheForThemeTransition(*ownedTab, oldRenderTheme, newRenderTheme);
-            }
-            ClearHomeThumbCacheState();
-            {
-                std::lock_guard<std::mutex> lock(g_homeThumbMutex);
-                g_homeThumbPending.clear();
-                g_homeThumbQueue.clear();
-            }
-            SaveState();
-            ApplyWindowChrome();
-            RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
-            DwmFlush();
+            ApplyThemeSelection(hwnd, id - 2200);
             return;
         }
         if (id >= 2300 && id <= 2302)
