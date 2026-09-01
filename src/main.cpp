@@ -1993,6 +1993,16 @@ namespace
         ApplyPdfThemeFor(PdfRenderTheme(), b, g, r);
     }
 
+    COLORREF PdfPageBackgroundColor(int renderTheme = -1)
+    {
+        int theme = renderTheme >= 0 ? renderTheme : PdfRenderTheme();
+        // This is the white-pixel destination of the浅草绿 Plus-style
+        // document palette.  Fallback painting must use the same color as a
+        // completed page, otherwise a missing render briefly flashes white.
+        if (theme == 5) return RGB(245, 250, 246);
+        return RGB(255, 255, 255);
+    }
+
     int S(int value)
     {
         return MulDiv(value, static_cast<int>(g_dpi), 96);
@@ -5290,6 +5300,22 @@ namespace
         if (tab.zoomFallbackCache.empty() || tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme()) return nullptr;
         auto found = tab.zoomFallbackCache.find(index);
         return found == tab.zoomFallbackCache.end() ? nullptr : &found->second;
+    }
+
+    void PreservePageCacheForThemeTransition(PdfTab& tab, int oldTheme, int newTheme)
+    {
+        if (oldTheme == newTheme || tab.cache.empty()) return;
+        if (tab.cachedZoom != tab.zoom || tab.cachedDpi != g_dpi || tab.cachedTheme != oldTheme) return;
+
+        // Keep the last complete generation visible while the new document
+        // palette is rendered. This is the same presentation rule used by
+        // SumatraPDF-plus: a color change replaces a finished page, never a
+        // white or partially rendered surface.
+        tab.zoomFallbackCache = std::move(tab.cache);
+        tab.zoomFallbackZoom = tab.cachedZoom;
+        tab.zoomFallbackDpi = tab.cachedDpi;
+        tab.zoomFallbackTheme = newTheme;
+        tab.zoomFallbackUntil = GetTickCount64() + 1600;
     }
 
     void TrimZoomFallbackCache(PdfTab& tab, int protectedPage)
@@ -12519,7 +12545,7 @@ namespace
                             usingZoomFallback = image != nullptr;
                             if (!ZoomRenderDeferred()) QueuePageRender(g_hwnd, tab, i, 0);
                         }
-                        Fill(dc, drawRect, IsAuroraTheme() ? T().paper : RGB(255, 255, 255));
+                        Fill(dc, drawRect, PdfPageBackgroundColor());
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -12541,7 +12567,7 @@ namespace
                     }
                     else
                     {
-                        Fill(dc, drawRect, IsAuroraTheme() ? T().paper : RGB(255, 255, 255));
+                        Fill(dc, drawRect, PdfPageBackgroundColor());
                         bool fallbackPainted = false;
                         PageImage* fallback = FindZoomFallbackPage(tab, i);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
@@ -15596,7 +15622,14 @@ namespace
         PdfTab* tab = Active();
         if (id >= 2200 && id < 2200 + static_cast<int>(std::size(g_themes)))
         {
+            int oldRenderTheme = PdfRenderTheme();
             g_theme = id - 2200;
+            int newRenderTheme = PdfRenderTheme();
+            if (oldRenderTheme != newRenderTheme)
+            {
+                for (auto& ownedTab : g_tabs)
+                    PreservePageCacheForThemeTransition(*ownedTab, oldRenderTheme, newRenderTheme);
+            }
             ClearHomeThumbCacheState();
             {
                 std::lock_guard<std::mutex> lock(g_homeThumbMutex);

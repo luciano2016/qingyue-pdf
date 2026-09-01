@@ -327,8 +327,30 @@ namespace
 
     static void quiet_clear_theme_pixmap(fz_context* ctx, fz_pixmap* pix, int theme)
     {
+        if (!pix) return;
+
+        // Match the completed bitmap remap used by the Win32 view.  Plus keeps
+        // the page background part of the render profile, so an unfinished
+        // page never exposes a white MuPDF surface before the final bitmap is
+        // ready.  deviceBgr() stores B, G, R, alpha.
+        if (theme == 5 && pix->samples && pix->n >= 3)
+        {
+            for (int y = 0; y < pix->h; ++y)
+            {
+                unsigned char* row = pix->samples + static_cast<size_t>(y) * pix->stride;
+                for (int x = 0; x < pix->w; ++x)
+                {
+                    unsigned char* p = row + static_cast<size_t>(x) * pix->n;
+                    p[0] = 246; // B
+                    p[1] = 250; // G
+                    p[2] = 245; // R
+                    if (pix->alpha && pix->n >= 4) p[3] = 255;
+                }
+            }
+            return;
+        }
         (void)theme;
-        if (pix) fz_clear_pixmap_with_value(ctx, pix, 255);
+        fz_clear_pixmap_with_value(ctx, pix, 255);
     }
 
     static fz_device* quiet_wrap_theme_device(fz_context* ctx, fz_device* inner, int theme)
