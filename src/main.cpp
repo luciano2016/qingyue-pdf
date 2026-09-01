@@ -3323,66 +3323,38 @@ namespace
             }
             else
             {
-                // Match the supplied moon: a hollow crescent with a continuous
-                // outer arc and a rounded inward arc, rather than two offset circles.
-                const float scale = S(0.062f);
+                // The reference is one continuous, constant-width crescent stroke.
+                // Drawing its centerline avoids the uneven band thickness and the
+                // unclosed bottom that appeared when a filled outline was used.
+                const float scale = S(0.055f);
                 auto point = [&](float x, float y)
                 {
                     return Gdiplus::PointF(
-                        gcx + (x - 102.5f) * scale,
+                        gcx + (x - 102.0f) * scale,
                         gcy + (y - 100.0f) * scale);
                 };
                 Gdiplus::GraphicsPath moon;
                 moon.StartFigure();
                 moon.AddBezier(
-                    point(97, 0), point(91, -1), point(86, 1), point(84, 7));
+                    point(105, 8), point(108, 19), point(110, 34), point(108, 49));
                 moon.AddBezier(
-                    point(84, 7), point(81, 14), point(88, 22), point(90, 35));
+                    point(108, 49), point(105, 76), point(93, 99), point(75, 113));
                 moon.AddBezier(
-                    point(90, 35), point(94, 57), point(88, 79), point(76, 94));
+                    point(75, 113), point(56, 123), point(36, 126), point(19, 125));
                 moon.AddBezier(
-                    point(76, 94), point(67, 104), point(56, 109), point(43, 112));
+                    point(19, 125), point(28, 154), point(54, 179), point(90, 189));
                 moon.AddBezier(
-                    point(43, 112), point(31, 115), point(19, 111), point(11, 117));
+                    point(90, 189), point(124, 198), point(157, 181), point(178, 152));
                 moon.AddBezier(
-                    point(11, 117), point(4, 122), point(5, 131), point(8, 139));
+                    point(178, 152), point(195, 127), point(200, 96), point(190, 66));
                 moon.AddBezier(
-                    point(8, 139), point(16, 160), point(31, 177), point(51, 188));
-                moon.AddBezier(
-                    point(51, 188), point(72, 199), point(95, 202), point(116, 198));
-                moon.AddBezier(
-                    point(116, 198), point(143, 194), point(163, 179), point(179, 158));
-                moon.AddBezier(
-                    point(179, 158), point(196, 136), point(201, 111), point(199, 88));
-                moon.AddBezier(
-                    point(199, 88), point(197, 59), point(184, 37), point(165, 22));
-                moon.AddBezier(
-                    point(165, 22), point(151, 10), point(133, 3), point(113, 0));
-                moon.AddBezier(
-                    point(113, 0), point(128, 3), point(143, 9), point(155, 19));
-                moon.AddBezier(
-                    point(155, 19), point(174, 35), point(184, 59), point(188, 84));
-                moon.AddBezier(
-                    point(188, 84), point(191, 112), point(183, 137), point(166, 157));
-                moon.AddBezier(
-                    point(166, 157), point(151, 174), point(132, 183), point(111, 180));
-                moon.AddBezier(
-                    point(111, 180), point(103, 184), point(95, 184), point(87, 180));
-                moon.AddBezier(
-                    point(87, 180), point(67, 174), point(46, 160), point(33, 144));
-                moon.AddBezier(
-                    point(33, 144), point(27, 137), point(23, 133), point(26, 130));
-                moon.AddBezier(
-                    point(26, 130), point(33, 127), point(46, 126), point(58, 121));
-                moon.AddBezier(
-                    point(58, 121), point(78, 113), point(91, 98), point(99, 81));
-                moon.AddBezier(
-                    point(99, 81), point(109, 60), point(110, 39), point(106, 24));
-                moon.AddBezier(
-                    point(106, 24), point(104, 15), point(99, 8), point(97, 0));
+                    point(190, 66), point(178, 31), point(148, 10), point(105, 8));
                 moon.CloseFigure();
-                Gdiplus::SolidBrush moonBrush(GdiColor(color, 255));
-                g.FillPath(&moonBrush, &moon);
+                Gdiplus::Pen moonPen(GdiColor(color, 255), std::max<Gdiplus::REAL>(1.25f, S(1.35f)));
+                moonPen.SetStartCap(Gdiplus::LineCapRound);
+                moonPen.SetEndCap(Gdiplus::LineCapRound);
+                moonPen.SetLineJoin(Gdiplus::LineJoinRound);
+                g.DrawPath(&moonPen, &moon);
             }
             return;
         }
