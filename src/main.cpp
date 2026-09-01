@@ -3325,7 +3325,7 @@ namespace
             {
                 // The supplied SVG's arc commands are expanded to cubic curves so
                 // the original two-subpath geometry can be rendered natively.
-                const float scale = S(0.012f);
+                const float scale = S(0.0125f);
                 auto point = [&](float x, float y)
                 {
                     return Gdiplus::PointF(
