@@ -3308,14 +3308,14 @@ namespace
 
             if (IsDarkTheme())
             {
-                float radius = S(4.8f);
+                float radius = S(3.8f);
                 g.DrawEllipse(&modePen, gcx - radius, gcy - radius, radius * 2.0f, radius * 2.0f);
                 for (int ray = 0; ray < 8; ++ray)
                 {
                     constexpr float pi = 3.14159265358979323846f;
                     float angle = static_cast<float>(ray) * pi / 4.0f;
-                    float inner = S(7.0f);
-                    float outer = S(9.2f);
+                    float inner = S(5.7f);
+                    float outer = S(7.0f);
                     g.DrawLine(&modePen,
                         gcx + std::cos(angle) * inner, gcy + std::sin(angle) * inner,
                         gcx + std::cos(angle) * outer, gcy + std::sin(angle) * outer);
@@ -3323,19 +3323,19 @@ namespace
             }
             else
             {
-                float radius = S(6.7f);
+                float radius = S(6.1f);
                 Gdiplus::GraphicsPath moon;
                 moon.StartFigure();
                 moon.AddBezier(
-                    gcx - S(1.0f), gcy - radius,
-                    gcx + S(7.8f), gcy - S(5.9f),
-                    gcx + S(7.8f), gcy + S(5.9f),
-                    gcx - S(1.0f), gcy + radius);
+                    gcx - S(2.2f), gcy - radius,
+                    gcx + S(5.8f), gcy - S(5.3f),
+                    gcx + S(5.8f), gcy + S(5.3f),
+                    gcx - S(2.2f), gcy + radius);
                 moon.AddBezier(
-                    gcx + S(3.0f), gcy + S(4.7f),
-                    gcx + S(3.0f), gcy - S(4.7f),
-                    gcx - S(1.0f), gcy - radius,
-                    gcx - S(1.0f), gcy - radius);
+                    gcx + S(1.5f), gcy + S(4.3f),
+                    gcx + S(1.5f), gcy - S(4.3f),
+                    gcx - S(2.2f), gcy - radius,
+                    gcx - S(2.2f), gcy - radius);
                 Gdiplus::SolidBrush moonBrush(GdiColor(color, 238));
                 g.FillPath(&moonBrush, &moon);
             }
@@ -13369,7 +13369,7 @@ namespace
         addIcon(CmdNext, StatusIcon::Next, L"\u4e0b\u4e00\u9875", iconColor);
         addIcon(CmdLast, StatusIcon::Last, L"\u6700\u540e\u4e00\u9875", iconColor);
 
-        int rx = std::max<int>(x + S(36), client.right - S(413));
+        int rx = std::max<int>(x + S(36), client.right - S(418));
         auto separator = [&]()
         {
             RECT line{ rx + S(8), bar.top + S(7), rx + S(9), bar.bottom - S(7) };
@@ -13385,7 +13385,8 @@ namespace
             DrawStatusHotArea(dc, r, 5);
             DrawStatusIcon(dc, r, icon, color);
             rx += S(w + 3);
-            if (id == CmdTheme || id == CmdView) rx += S(5);
+            if (id == CmdColorMode) rx += S(5);
+            else if (id == CmdTheme || id == CmdView) rx += S(5);
         };
         auto zoomStatusIcon = []()
         {
