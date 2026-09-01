@@ -1980,7 +1980,9 @@ namespace
 
     int PdfRenderThemeForUiTheme(int theme)
     {
-        return theme == 5 ? 5 : 0;
+        if (theme == 2) return 2;
+        if (theme == 5) return 5;
+        return 0;
     }
 
     int PdfRenderTheme()
@@ -1999,6 +2001,7 @@ namespace
         // This is the white-pixel destination of the浅草绿 Plus-style
         // document palette.  Fallback painting must use the same color as a
         // completed page, otherwise a missing render briefly flashes white.
+        if (theme == 2) return RGB(255, 249, 233);
         if (theme == 5) return RGB(245, 250, 246);
         return RGB(255, 255, 255);
     }
@@ -12616,10 +12619,6 @@ namespace
                     if (IsDarkTheme())
                     {
                         AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
-                    }
-                    else if (IsBeigeTheme())
-                    {
-                        AlphaFill(dc, pageRect, T().accent, 12);
                     }
                     if (g_searchCurrent >= 0 && g_searchCurrent < static_cast<int>(g_searchResults.size()))
                     {
