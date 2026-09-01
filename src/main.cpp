@@ -1981,7 +1981,11 @@ namespace
         }
 
         int lum = Luma(r, g, b);
-        COLORREF paper = g_themes[clampedTheme].paper;
+        // Keep near-white image areas on the same paper as the page surface.
+        // The green document mode uses a shared page background instead of a
+        // separate white paper color, otherwise image rectangles remain
+        // visibly brighter than text-only areas.
+        COLORREF paper = clampedTheme == 5 ? RGB(245, 250, 246) : g_themes[clampedTheme].paper;
 
         if (lum > 185)
         {
@@ -2620,6 +2624,18 @@ namespace
         RECT top{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + std::max<int>(S(2), (r.bottom - r.top) / 2) };
         Gdiplus::SolidBrush wash(GdiColor(IsAuroraTheme() ? T().accent : RGB(255, 255, 255), IsAuroraTheme() ? 12 : 42));
         FillGdiRoundRect(g, wash, Rf(top), std::max(1.0f, radius - S(1.0f)));
+        DrawGdiRoundRect(g, border, Rf(r), radius);
+    }
+
+    void FlatRoundedSurface(HDC dc, RECT r, float radius)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        COLORREF base = IsAuroraTheme() ? T().panel2 : (IsGlassTheme() ? RGB(255, 255, 255) : T().panel);
+        COLORREF line = IsGlassTheme() ? RGB(207, 216, 226) : T().line;
+        Gdiplus::SolidBrush fill(GdiColor(base));
+        Gdiplus::Pen border(GdiColor(line, IsGlassTheme() ? 170 : 140), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
+        FillGdiRoundRect(g, fill, Rf(r), radius);
         DrawGdiRoundRect(g, border, Rf(r), radius);
     }
 
@@ -11051,7 +11067,10 @@ namespace
         g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
 
         DrawRoundedShadow(dc, g_tabListRect, S(10.0f), S(1), S(4), S(5), IsDarkTheme() ? 42 : 22);
-        GlassRoundedSurface(dc, g_tabListRect, IsDarkTheme() ? 224 : 242, S(11.0f));
+        // The tab list spans multiple surfaces (tab bar and reader area). A
+        // flat opaque surface prevents the underlying surfaces from showing
+        // through as an unintended horizontal color split.
+        FlatRoundedSurface(dc, g_tabListRect, S(11.0f));
 
         RECT content{ g_tabListRect.left + S(8), g_tabListRect.top + S(6), g_tabListRect.right - S(8), g_tabListRect.bottom - S(6) };
         bool needsScroll = g_tabListContentHeight > (content.bottom - content.top);
