@@ -34,6 +34,7 @@ EXPORTS
     quiet_new_pixmap_from_page_number_clip
     quiet_new_render_cookie
     quiet_abort_render_cookie
+    quiet_set_render_theme
 
     quiet_new_page_contents_display_list_cookie
     quiet_drop_display_list

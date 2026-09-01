@@ -1036,6 +1036,7 @@ namespace
         using RenderDisplayListClipToBufferFn = int(__cdecl*)(fz_context*, fz_display_list*, fz_matrix, fz_colorspace*, int, int, int, int, int, unsigned char*, int, void*);
         using RenderPageNumberClipToBufferFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_matrix, fz_colorspace*, int, int, int, int, int, unsigned char*, int, void*);
         using AbortRenderCookieFn = void(__cdecl*)(void*);
+        using SetRenderThemeFn = void(__cdecl*)(int);
 
         using DropRenderCookieFn = void(__cdecl*)(void*);
         using SearchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int);
@@ -1088,6 +1089,7 @@ namespace
             GetOptional(renderDisplayListClipToBuffer, "quiet_render_display_list_clip_to_buffer");
             GetOptional(renderPageNumberClipToBuffer, "quiet_render_page_number_clip_to_buffer");
             Get(abortRenderCookie, "quiet_abort_render_cookie");
+            GetOptional(setRenderTheme, "quiet_set_render_theme");
 
             Get(dropRenderCookie, "quiet_drop_render_cookie");
             Get(searchPageNumber, "fz_search_page_number");
@@ -1140,6 +1142,7 @@ namespace
         RenderDisplayListClipToBufferFn renderDisplayListClipToBuffer{};
         RenderPageNumberClipToBufferFn renderPageNumberClipToBuffer{};
         AbortRenderCookieFn abortRenderCookie{};
+        SetRenderThemeFn setRenderTheme{};
 
         DropRenderCookieFn dropRenderCookie{};
         SearchPageNumberFn searchPageNumber{};
@@ -1959,8 +1962,7 @@ namespace
 
     int PdfRenderThemeForUiTheme(int theme)
     {
-        (void)theme;
-        return 0;
+        return theme == 5 ? 5 : 0;
     }
 
     int PdfRenderTheme()
@@ -4829,6 +4831,7 @@ namespace
         fz_pixmap* pixmap = nullptr;
         PageImage image;
         int effectiveTheme = renderTheme >= 0 ? renderTheme : PdfRenderTheme();
+        if (g_pdf.setRenderTheme) g_pdf.setRenderTheme(effectiveTheme);
         {
             PdfDocumentLock pdfLock(tab);
             if (g_pdf.newPixmapFromPageNumberClip)
@@ -5092,6 +5095,7 @@ namespace
 
     PageImage RenderPageTileAtScale(PdfTab& tab, int index, RECT tile, double renderScale, int renderTheme, bool renderToDib = false, void* renderCookie = nullptr)
     {
+        if (g_pdf.setRenderTheme) g_pdf.setRenderTheme(renderTheme);
         fz_matrix matrix = g_pdf.scale(static_cast<float>(renderScale), static_cast<float>(renderScale));
         fz_pixmap* pixmap = nullptr;
         PageImage image;
@@ -12497,7 +12501,7 @@ namespace
                             usingZoomFallback = image != nullptr;
                             if (!ZoomRenderDeferred()) QueuePageRender(g_hwnd, tab, i, 0);
                         }
-                        Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, IsAuroraTheme() ? T().paper : RGB(255, 255, 255));
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -12519,7 +12523,7 @@ namespace
                     }
                     else
                     {
-                        Fill(dc, drawRect, RGB(255, 255, 255));
+                        Fill(dc, drawRect, IsAuroraTheme() ? T().paper : RGB(255, 255, 255));
                         bool fallbackPainted = false;
                         PageImage* fallback = FindZoomFallbackPage(tab, i);
                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
@@ -12569,7 +12573,7 @@ namespace
                     {
                         AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
                     }
-                    else if (IsAuroraTheme() || IsBeigeTheme())
+                    else if (IsBeigeTheme())
                     {
                         AlphaFill(dc, pageRect, T().accent, 12);
                     }
