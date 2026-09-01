@@ -369,9 +369,9 @@ namespace
             return;
         }
 
-        constexpr float paperR = 253.0f / 255.0f;
-        constexpr float paperG = 254.0f / 255.0f;
-        constexpr float paperB = 252.0f / 255.0f;
+        constexpr float paperR = 245.0f / 255.0f;
+        constexpr float paperG = 250.0f / 255.0f;
+        constexpr float paperB = 246.0f / 255.0f;
         constexpr float inkR = 42.0f / 255.0f;
         constexpr float inkG = 56.0f / 255.0f;
         constexpr float inkB = 47.0f / 255.0f;
@@ -445,9 +445,9 @@ namespace
             fz_clear_pixmap_with_value(ctx, pix, 255);
             return;
         }
-        constexpr unsigned char paperB = 252;
-        constexpr unsigned char paperG = 254;
-        constexpr unsigned char paperR = 253;
+        constexpr unsigned char paperB = 246;
+        constexpr unsigned char paperG = 250;
+        constexpr unsigned char paperR = 245;
         for (int y = 0; y < pix->h; ++y)
         {
             unsigned char* row = pix->samples + static_cast<size_t>(y) * pix->stride;

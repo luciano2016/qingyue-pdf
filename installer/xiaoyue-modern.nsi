@@ -10,8 +10,8 @@ RequestExecutionLevel user
 !include WinMessages.nsh
 
 !define APP_NAME "轻阅PDF"
-!define APP_VERSION "0.8.8"
-!define APP_VERSION_FULL "0.8.8.0"
+!define APP_VERSION "0.8.9"
+!define APP_VERSION_FULL "0.8.9.0"
 !define APP_PUBLISHER "轻阅"
 !define APP_EXE_NAME "轻阅PDF.exe"
 !define APP_UNINSTALL_NAME "卸载轻阅PDF.exe"
