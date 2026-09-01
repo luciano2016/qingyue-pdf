@@ -329,29 +329,9 @@ namespace
     {
         if (!pix) return;
 
-        // Match the completed bitmap remap used by the Win32 view.  Plus keeps
-        // the page background part of the render profile, so an unfinished
-        // page never exposes a white MuPDF surface before the final bitmap is
-        // ready.  deviceBgr() stores B, G, R, alpha.
-        if ((theme == 2 || theme == 5) && pix->samples && pix->n >= 3)
-        {
-            unsigned char blue = theme == 2 ? 233 : 246;
-            unsigned char green = theme == 2 ? 249 : 250;
-            unsigned char red = theme == 2 ? 255 : 245;
-            for (int y = 0; y < pix->h; ++y)
-            {
-                unsigned char* row = pix->samples + static_cast<size_t>(y) * pix->stride;
-                for (int x = 0; x < pix->w; ++x)
-                {
-                    unsigned char* p = row + static_cast<size_t>(x) * pix->n;
-                    p[0] = blue;
-                    p[1] = green;
-                    p[2] = red;
-                    if (pix->alpha && pix->n >= 4) p[3] = 255;
-                }
-            }
-            return;
-        }
+        // The Win32 layer applies the document palette exactly once after
+        // rendering. Keep MuPDF's destination white here so images, vectors,
+        // and text all take the same final mapping path.
         (void)theme;
         fz_clear_pixmap_with_value(ctx, pix, 255);
     }

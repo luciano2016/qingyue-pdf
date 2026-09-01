@@ -10159,6 +10159,8 @@ namespace
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         InvalidateRect(hwnd, &status, FALSE);
         SchedulePagePrefetch(hwnd);
+        if (UseTiledPageRendering(tab))
+            HighZoomVisiblePagesReady(hwnd, tab);
         ScheduleIdleCacheTrim(hwnd);
     }
 
