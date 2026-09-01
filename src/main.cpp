@@ -3325,7 +3325,7 @@ namespace
             {
                 // The supplied SVG's arc commands are expanded to cubic curves so
                 // the original two-subpath geometry can be rendered natively.
-                const float scale = S(0.0125f);
+                const float scale = S(0.014f);
                 auto point = [&](float x, float y)
                 {
                     return Gdiplus::PointF(
@@ -13451,7 +13451,7 @@ namespace
             DrawStatusHotArea(dc, r, 5);
             DrawStatusIcon(dc, r, icon, color);
             rx += S(w + 3);
-            if (id == CmdColorMode) rx += S(5);
+            if (id == CmdColorMode) rx += S(7);
             else if (id == CmdTheme || id == CmdView) rx += S(5);
         };
         auto zoomStatusIcon = []()
