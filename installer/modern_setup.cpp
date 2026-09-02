@@ -22,6 +22,7 @@
 
 namespace {
 constexpr wchar_t kAppName[] = L"\u8f7b\u9605PDF";
+constexpr wchar_t kLicenseAgreeText[] = L"\u6211\u5df2\u9605\u8bfb\u5e76\u540c\u610f GNU Affero General Public License v3.0";
 constexpr wchar_t kExeName[] = L"\u8f7b\u9605PDF.exe";
 constexpr wchar_t kPayloadExe[] = L"QuietPDF.Win32.exe";
 constexpr wchar_t kPayloadUninstaller[] = L"QingYuePDF.Uninstaller.exe";
@@ -64,7 +65,7 @@ ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
-RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseBox{}, g_licenseAgree{};
+RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseBox{}, g_licenseAgree{}, g_licenseScrollTrack{}, g_licenseScrollThumb{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_uninstallMode = false, g_uninstallWorker = false, g_deleteAppData = true;
 bool g_licenseAccepted = true;
@@ -73,6 +74,8 @@ bool g_completionPending = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
 int g_shine = 0;
 int g_licenseScrollY = 0, g_licenseContentHeight = 0;
+bool g_licenseDragging = false;
+int g_licenseDragOffset = 0;
 std::wstring g_stage, g_error;
 std::wstring g_spacePath, g_availableSpaceText;
 std::wstring g_licenseText;
@@ -233,8 +236,17 @@ void Layout(HWND h) {
     g_desktop={S(48),S(268),S(672),S(310)};
     g_deleteData={S(48),S(210),S(672),S(278)};
     g_launch={S(110),S(310),S(610),S(360)};
-    g_licenseBox={S(48),S(174),c.right-S(48),S(303)};
-    g_licenseAgree={S(48),S(314),S(672),S(374)};
+    g_licenseBox={S(48),S(170),c.right-S(48),S(326)};
+    g_licenseAgree={S(48),S(334),S(248),S(374)};
+    if(g_uiFont) {
+        HDC dc=GetDC(h);
+        HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
+        SIZE textSize{};
+        GetTextExtentPoint32W(dc,kLicenseAgreeText,_countof(kLicenseAgreeText)-1,&textSize);
+        SelectObject(dc,oldFont);
+        ReleaseDC(h,dc);
+        g_licenseAgree.right=std::min(c.right-S(48),std::max(g_licenseAgree.left+S(190),g_licenseAgree.left+S(58)+textSize.cx+S(16)));
+    }
     if(g_pathEdit) {
         HDC dc=GetDC(g_pathEdit);
         HGDIOBJ oldFont=SelectObject(dc,g_uiFont);
@@ -267,9 +279,11 @@ void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags)
 }
 void DrawText(Gdiplus::Graphics& g,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) { HDC dc=g.GetHDC(); DrawText(dc,s,r,f,c,flags); g.ReleaseHDC(dc); }
 void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
-    RECT viewport{box.left+S(12),box.top+S(10),box.right-S(18),box.bottom-S(10)};
+    RECT viewport{box.left+S(12),box.top+S(10),box.right-S(14),box.bottom-S(10)};
+    g_licenseScrollTrack=RECT{};
+    g_licenseScrollThumb=RECT{};
     HDC dc=g.GetHDC();
-    HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
+    HGDIOBJ oldFont=SelectObject(dc,g_uiFont);
     RECT measure{0,0,viewport.right-viewport.left,0};
     DrawTextW(dc,g_licenseText.c_str(),static_cast<int>(g_licenseText.size()),&measure,DT_LEFT|DT_WORDBREAK|DT_CALCRECT);
     g_licenseContentHeight=std::max<int>(0,static_cast<int>(measure.bottom));
@@ -287,12 +301,14 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
     g.ReleaseHDC(dc);
 
     if(g_licenseContentHeight>viewportHeight) {
-        RECT track{box.right-S(9),viewport.top,box.right-S(6),viewport.bottom};
+        RECT track{box.right-S(9),viewport.top,box.right-S(5),viewport.bottom};
+        g_licenseScrollTrack=track;
         FillRound(g,track,Sf(2),RGB(236,231,226));
         const int thumbHeight=std::max<int>(S(18),static_cast<int>(viewportHeight*viewportHeight/g_licenseContentHeight));
         const int thumbTravel=viewportHeight-thumbHeight;
         const int thumbTop=viewport.top+(maxScroll?thumbTravel*g_licenseScrollY/maxScroll:0);
-        FillRound(g,{track.left,thumbTop,track.right,thumbTop+thumbHeight},Sf(2),RGB(205,195,186));
+        g_licenseScrollThumb={track.left,thumbTop,track.right,thumbTop+thumbHeight};
+        FillRound(g,g_licenseScrollThumb,Sf(2),RGB(185,172,160));
     }
 }
 void DrawLogo(Gdiplus::Graphics& g) {
@@ -452,7 +468,7 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
         FillRound(g,g_licenseAgree,Sf(9),g_hover==Hot::LicenseAgree?kWarmPanelHover:kWarmPanel);
         StrokeRound(g,g_licenseAgree,Sf(9),RGB(229,224,218),205);
         DrawCheckbox(g,{g_licenseAgree.left+S(18),g_licenseAgree.top,g_licenseAgree.left+S(45),g_licenseAgree.bottom},g_licenseAccepted,g_hover==Hot::LicenseAgree||g_pressed==Hot::LicenseAgree);
-        DrawText(g,L"\u6211\u5df2\u9605\u8bfb\u5e76\u540c\u610f GNU Affero General Public License v3.0",{g_licenseAgree.left+S(58),g_licenseAgree.top,g_licenseAgree.right-S(16),g_licenseAgree.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,kLicenseAgreeText,{g_licenseAgree.left+S(58),g_licenseAgree.top,g_licenseAgree.right-S(16),g_licenseAgree.bottom},g_smallFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawBackButton(g,g_back);
         DrawButton(g,g_primary,L"\u7ee7\u7eed",Hot::Primary,true,g_licenseAccepted); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
     }
@@ -823,7 +839,20 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(LOWORD(w)==kPathEdit&&HIWORD(w)==EN_CHANGE) { g_spacePath.clear(); g_availableSpaceText.clear(); InvalidateRect(h,nullptr,FALSE); return 0; }
         if(LOWORD(w)==kPathEdit&&(HIWORD(w)==EN_SETFOCUS||HIWORD(w)==EN_KILLFOCUS)) { g_pathFocused=HIWORD(w)==EN_SETFOCUS; InvalidateRect(h,nullptr,FALSE); return 0; }
         return 0;
-    case WM_MOUSEMOVE: UpdateHover(h,{GET_X_LPARAM(l),GET_Y_LPARAM(l)}); return 0;
+    case WM_MOUSEMOVE: {
+        POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+        if(g_licenseDragging) {
+            const int thumbHeight=g_licenseScrollThumb.bottom-g_licenseScrollThumb.top;
+            const int top=std::clamp(point.y-g_licenseDragOffset,g_licenseScrollTrack.top,g_licenseScrollTrack.bottom-thumbHeight);
+            const int travel=g_licenseScrollTrack.bottom-g_licenseScrollTrack.top-thumbHeight;
+            const int viewportHeight=g_licenseBox.bottom-g_licenseBox.top-S(20);
+            const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
+            g_licenseScrollY=travel>0?((top-g_licenseScrollTrack.top)*maxScroll/travel):0;
+            InvalidateRect(h,nullptr,FALSE);
+            return 0;
+        }
+        UpdateHover(h,point); return 0;
+    }
     case WM_MOUSEWHEEL:
         if(g_page==Page::License) {
             POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)}; ScreenToClient(h,&point);
@@ -839,12 +868,20 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_MOUSELEAVE: g_hover=Hot::None; InvalidateRect(h,nullptr,FALSE); return 0;
     case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr,IDC_ARROW)); return TRUE;
     case WM_LBUTTONDOWN: {
-        POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)}; Hot hot=HotAt(p);
+        POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+        if(g_page==Page::License&&Hit(g_licenseScrollThumb,p)) {
+            g_licenseDragging=true;
+            g_licenseDragOffset=p.y-g_licenseScrollThumb.top;
+            SetCapture(h);
+            return 0;
+        }
+        Hot hot=HotAt(p);
         if(hot!=Hot::None) { g_pressed=hot; SetCapture(h); InvalidateRect(h,nullptr,FALSE); return 0; }
         if(!g_installing&&p.y<S(70)) { ReleaseCapture(); SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0); }
         return 0;
     }
     case WM_LBUTTONUP: {
+        if(g_licenseDragging) { g_licenseDragging=false; g_licenseDragOffset=0; ReleaseCapture(); InvalidateRect(h,nullptr,FALSE); return 0; }
         POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)}; Hot pressed=g_pressed; g_pressed=Hot::None; ReleaseCapture();
         if(pressed==Hot::Close&&Hit(g_close,p)) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
         if(pressed==Hot::None||pressed!=HotAt(p)||g_installing) return 0;
