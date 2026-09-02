@@ -480,7 +480,8 @@ namespace
         CmdTabNavNext,
         CmdTabListToggle,
         CmdSidebarPanelToggle,
-        CmdColorMode
+        CmdColorMode,
+        CmdSave
     };
 
     std::string ToUtf8(const std::wstring& text)
@@ -1603,6 +1604,7 @@ namespace
     HFONT g_annotationNoteEditFont{};
     HBRUSH g_annotationNoteEditBrush{};
     COLORREF g_annotationNoteEditBrushColor{ CLR_INVALID };
+    WNDPROC g_annotationNoteEditProc{};
     bool g_syncingAnnotationNoteEdit{};
     int g_annotationNoteEditAnnotation{ -1 };
     RECT g_annotationHitRect{};
@@ -2072,7 +2074,7 @@ namespace
         return CreateFontIndirectW(&lf);
     }
 
-    HFONT SystemUiFont(int pt)
+    HFONT SystemUiFont(int pt, int weight = FW_NORMAL)
     {
         NONCLIENTMETRICSW metrics{ sizeof(metrics) };
         LOGFONTW lf{};
@@ -2081,7 +2083,7 @@ namespace
         else
             wcscpy_s(lf.lfFaceName, L"Segoe UI");
         lf.lfHeight = -MulDiv(pt, static_cast<int>(g_dpi), 72);
-        lf.lfWeight = FW_NORMAL;
+        lf.lfWeight = weight;
         lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
         return CreateFontIndirectW(&lf);
     }
@@ -11687,7 +11689,7 @@ namespace
         int h = S(214);
         RECT panel{ (client.right - w) / 2, (client.bottom - h) / 2, (client.right + w) / 2, (client.bottom + h) / 2 };
         DrawRoundedShadow(dc, panel, S(14.0f), S(1), S(5), S(7), IsDarkTheme() ? 58 : 38);
-        GlassRoundedSurface(dc, panel, IsDarkTheme() ? 232 : 248, S(14.0f));
+        GlassRoundedSurface(dc, panel, IsDarkTheme() ? 232 : 248, S(14.0f), false);
 
         g_clearDialogCloseRect = RECT{ panel.right - S(42), panel.top + S(14), panel.right - S(14), panel.top + S(42) };
         if (Hit(g_clearDialogCloseRect, g_mousePos.x, g_mousePos.y)) RoundFill(dc, g_clearDialogCloseRect, S(7), SidebarHoverFill(), SidebarHoverFill());
@@ -11706,14 +11708,14 @@ namespace
         SelectObject(dc, oldBang);
         DeleteObject(bangFont);
 
-        HFONT titleFont = Font(8, FW_SEMIBOLD);
+        HFONT titleFont = SystemUiFont(10, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
         RECT title{ panel.left + S(112), panel.top + S(60), panel.right - S(34), panel.top + S(92) };
         const wchar_t* dialogTitle = g_confirmDeleteAllAnnotations ? L"确定要删除所有注释吗？" : L"确定要清空最近使用记录吗？";
         Text(dc, dialogTitle, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
-        HFONT bodyFont = Font(9);
+        HFONT bodyFont = SystemUiFont(10);
         oldFont = SelectObject(dc, bodyFont);
         RECT body{ panel.left + S(112), panel.top + S(92), panel.right - S(34), panel.top + S(130) };
         const wchar_t* dialogBody = g_confirmDeleteAllAnnotations
@@ -12960,6 +12962,19 @@ namespace
         return text.substr(0, maxChars - 1) + L"...";
     }
 
+    LRESULT CALLBACK AnnotationNoteEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (message == WM_KEYDOWN && wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            HWND owner = GetParent(hwnd);
+            if (owner) PostMessageW(owner, WM_COMMAND, MAKEWPARAM(CmdSave, 0), 0);
+            return 0;
+        }
+        return g_annotationNoteEditProc
+            ? CallWindowProcW(g_annotationNoteEditProc, hwnd, message, wParam, lParam)
+            : DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
     void EnsureAnnotationNoteEdit(HWND hwnd)
     {
         if (!g_annotationNoteEdit)
@@ -12975,6 +12990,10 @@ namespace
                 GetModuleHandleW(nullptr),
                 nullptr);
             if (!g_annotationNoteEdit) return;
+            g_annotationNoteEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+                g_annotationNoteEdit,
+                GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(AnnotationNoteEditProc)));
             SendMessageW(g_annotationNoteEdit, EM_SETLIMITTEXT, 1000, 0);
             SendMessageW(g_annotationNoteEdit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(2), S(2)));
             SendMessageW(g_annotationNoteEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"点击输入注释..."));
@@ -15987,6 +16006,12 @@ namespace
             g_searchMatchCase = !g_searchMatchCase;
             if (g_searchHasRun) RunSearch();
             InvalidateRect(hwnd, nullptr, FALSE);
+            return;
+        }
+
+        if (id == CmdSave)
+        {
+            if (PdfTab* activeTab = Active()) SaveAnnotationsToPdf(hwnd, *activeTab);
             return;
         }
 
