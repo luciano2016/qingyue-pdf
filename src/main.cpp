@@ -16031,8 +16031,15 @@ namespace
         if (id == 2504) { AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout); return; }
         if (id == 2505)
         {
+            size_t annotationCount = tab ? tab->annotations.size() : 0;
             AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
-            if (tab && !tab->annotations.empty()) tab->annotations.back().note = L"";
+            if (tab && tab->annotations.size() > annotationCount)
+            {
+                g_annotationNoteOpen = true;
+                g_annotationNoteFocused = true;
+                g_annotationNoteEditAnnotation = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             return;
         }
 
