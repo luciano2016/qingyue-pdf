@@ -65,7 +65,7 @@ ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
-RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseBox{}, g_licenseAgree{}, g_licenseScrollTrack{}, g_licenseScrollThumb{};
+RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseBox{}, g_licenseAgree{}, g_licenseScrollTrack{}, g_licenseScrollThumb{}, g_licenseScrollHit{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_uninstallMode = false, g_uninstallWorker = false, g_deleteAppData = true;
 bool g_licenseAccepted = true;
@@ -236,8 +236,8 @@ void Layout(HWND h) {
     g_desktop={S(48),S(268),S(672),S(310)};
     g_deleteData={S(48),S(210),S(672),S(278)};
     g_launch={S(110),S(310),S(610),S(360)};
-    g_licenseBox={S(48),S(170),c.right-S(48),S(326)};
-    g_licenseAgree={S(48),S(334),S(248),S(374)};
+    g_licenseBox={S(48),S(170),c.right-S(48),S(346)};
+    g_licenseAgree={S(48),S(354),S(248),S(394)};
     if(g_uiFont) {
         HDC dc=GetDC(h);
         HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
@@ -282,8 +282,9 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
     RECT viewport{box.left+S(12),box.top+S(10),box.right-S(14),box.bottom-S(10)};
     g_licenseScrollTrack=RECT{};
     g_licenseScrollThumb=RECT{};
+    g_licenseScrollHit=RECT{};
     HDC dc=g.GetHDC();
-    HGDIOBJ oldFont=SelectObject(dc,g_uiFont);
+    HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
     RECT measure{0,0,viewport.right-viewport.left,0};
     DrawTextW(dc,g_licenseText.c_str(),static_cast<int>(g_licenseText.size()),&measure,DT_LEFT|DT_WORDBREAK|DT_CALCRECT);
     g_licenseContentHeight=std::max<int>(0,static_cast<int>(measure.bottom));
@@ -303,6 +304,7 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
     if(g_licenseContentHeight>viewportHeight) {
         RECT track{box.right-S(9),viewport.top,box.right-S(5),viewport.bottom};
         g_licenseScrollTrack=track;
+        g_licenseScrollHit={box.right-S(24),viewport.top,box.right-S(1),viewport.bottom};
         FillRound(g,track,Sf(2),RGB(236,231,226));
         const int thumbHeight=std::max<int>(S(18),static_cast<int>(viewportHeight*viewportHeight/g_licenseContentHeight));
         const int thumbTravel=viewportHeight-thumbHeight;
@@ -310,6 +312,17 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
         g_licenseScrollThumb={track.left,thumbTop,track.right,thumbTop+thumbHeight};
         FillRound(g,g_licenseScrollThumb,Sf(2),RGB(185,172,160));
     }
+}
+void UpdateLicenseScrollFromPointer(int y) {
+    if(IsRectEmpty(&g_licenseScrollTrack)||IsRectEmpty(&g_licenseScrollThumb)) return;
+    const int thumbHeight=g_licenseScrollThumb.bottom-g_licenseScrollThumb.top;
+    const int trackTop=static_cast<int>(g_licenseScrollTrack.top);
+    const int trackBottom=static_cast<int>(g_licenseScrollTrack.bottom);
+    const int top=std::clamp(y-g_licenseDragOffset,trackTop,trackBottom-thumbHeight);
+    const int travel=trackBottom-trackTop-thumbHeight;
+    const int viewportHeight=static_cast<int>(g_licenseBox.bottom-g_licenseBox.top-S(20));
+    const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
+    g_licenseScrollY=travel>0?((top-trackTop)*maxScroll/travel):0;
 }
 void DrawLogo(Gdiplus::Graphics& g) {
     if(!g_headerIcon)return;
@@ -842,12 +855,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_MOUSEMOVE: {
         POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
         if(g_licenseDragging) {
-            const int thumbHeight=g_licenseScrollThumb.bottom-g_licenseScrollThumb.top;
-            const int top=std::clamp(point.y-g_licenseDragOffset,g_licenseScrollTrack.top,g_licenseScrollTrack.bottom-thumbHeight);
-            const int travel=g_licenseScrollTrack.bottom-g_licenseScrollTrack.top-thumbHeight;
-            const int viewportHeight=g_licenseBox.bottom-g_licenseBox.top-S(20);
-            const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
-            g_licenseScrollY=travel>0?((top-g_licenseScrollTrack.top)*maxScroll/travel):0;
+            UpdateLicenseScrollFromPointer(point.y);
             InvalidateRect(h,nullptr,FALSE);
             return 0;
         }
@@ -869,10 +877,13 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr,IDC_ARROW)); return TRUE;
     case WM_LBUTTONDOWN: {
         POINT p{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
-        if(g_page==Page::License&&Hit(g_licenseScrollThumb,p)) {
+        if(g_page==Page::License&&Hit(g_licenseScrollHit,p)) {
             g_licenseDragging=true;
-            g_licenseDragOffset=p.y-g_licenseScrollThumb.top;
+            const int thumbHeight=g_licenseScrollThumb.bottom-g_licenseScrollThumb.top;
+            g_licenseDragOffset=Hit(g_licenseScrollThumb,p)?p.y-g_licenseScrollThumb.top:thumbHeight/2;
             SetCapture(h);
+            UpdateLicenseScrollFromPointer(p.y);
+            InvalidateRect(h,nullptr,FALSE);
             return 0;
         }
         Hot hot=HotAt(p);
