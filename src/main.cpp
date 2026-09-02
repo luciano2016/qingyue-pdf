@@ -11757,11 +11757,7 @@ namespace
         g_zoomDialogRect = RECT{ left, top, left + panelW, top + panelH };
 
         DrawRoundedShadow(dc, g_zoomDialogRect, S(12.0f), S(1), S(3), S(4), IsDarkTheme() ? 40 : 22);
-        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() ? 234 : 244, S(12.0f));
-
-        RECT topGleam{ g_zoomDialogRect.left + S(18), g_zoomDialogRect.top + S(5), g_zoomDialogRect.right - S(64), g_zoomDialogRect.top + S(8) };
-        Gdiplus::SolidBrush gleamBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 16 : 48));
-        FillGdiRoundRect(g, gleamBrush, Rf(topGleam), S(2.0f));
+        GlassRoundedSurface(dc, g_zoomDialogRect, IsDarkTheme() ? 234 : 244, S(12.0f), false);
 
         HFONT titleFont = Font(10, FW_SEMIBOLD);
         HGDIOBJ oldFont = SelectObject(dc, titleFont);
