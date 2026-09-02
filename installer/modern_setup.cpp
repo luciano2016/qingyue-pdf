@@ -44,8 +44,8 @@ constexpr int kPathEdit = 1001;
 constexpr ULONGLONG kEstimatedInstalledBytes =
     1044992ULL + 18015744ULL + 178616ULL + 258560ULL + 180000ULL;
 
-enum class Page { Welcome, Options, Installing, Complete, Failed, UninstallConfirm, Uninstalling, UninstallComplete, UninstallFailed };
-enum class Hot { None, Minimize, Close, Back, Primary, WelcomeCancel, OptionsCancel, Browse, Desktop, DeleteData, Launch };
+enum class Page { Welcome, License, Options, Installing, Complete, Failed, UninstallConfirm, Uninstalling, UninstallComplete, UninstallFailed };
+enum class Hot { None, Minimize, Close, Back, Primary, WelcomeCancel, OptionsCancel, Browse, Desktop, DeleteData, Launch, LicenseAgree };
 struct InstallResult { bool success; std::wstring error; };
 struct ProgressMessage { int percent; std::wstring text; };
 struct CabinetContext { std::filesystem::path target; };
@@ -64,9 +64,10 @@ ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
-RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{};
+RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseAgree{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_uninstallMode = false, g_uninstallWorker = false, g_deleteAppData = true;
+bool g_licenseAccepted = false;
 bool g_pathFocused = false;
 bool g_completionPending = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
@@ -217,6 +218,7 @@ void Layout(HWND h) {
     g_desktop={S(48),S(268),S(672),S(310)};
     g_deleteData={S(48),S(210),S(672),S(278)};
     g_launch={S(110),S(310),S(610),S(360)};
+    g_licenseAgree={S(48),S(314),S(672),S(374)};
     if(g_pathEdit) {
         HDC dc=GetDC(g_pathEdit);
         HGDIOBJ oldFont=SelectObject(dc,g_uiFont);
@@ -275,30 +277,36 @@ void DrawMinimize(Gdiplus::Graphics& g) {
     const float cy=static_cast<float>(g_minimize.top+g_minimize.bottom)/2.0f;
     g.DrawLine(&p,cx-S(5),cy,cx+S(5),cy);
 }
-void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bool primary) {
-    const bool hover=g_hover==hot;
-    const bool pressed=g_pressed==hot;
+void DrawButton(Gdiplus::Graphics& g,RECT r,const std::wstring& label,Hot hot,bool primary,bool enabled=true) {
+    const bool hover=enabled&&g_hover==hot;
+    const bool pressed=enabled&&g_pressed==hot;
     RECT body=r;
-    if(!pressed) {
+    if(enabled&&!pressed) {
         RECT shadow{r.left,r.top+S(2),r.right,r.bottom+S(2)};
         FillRound(g,shadow,Sf(9),primary?RGB(189,82,27):RGB(72,61,53),primary?34:10);
     }
     if(primary) {
-        Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate); AddRoundPath(path,body,Sf(9));
-        const COLORREF left=pressed?kAccentOrangeDark:(hover?RGB(255,112,25):kAccentOrange);
-        const COLORREF right=pressed?RGB(239,119,24):(hover?RGB(255,155,36):kAccentOrange2);
-        Gdiplus::LinearGradientBrush brush(Rf(body),Gc(left),Gc(right),Gdiplus::LinearGradientModeHorizontal);
-        g.FillPath(&brush,&path);
-        StrokeRound(g,body,Sf(9),pressed?RGB(215,80,20):RGB(247,116,24),190);
+        if(enabled) {
+            Gdiplus::GraphicsPath path(Gdiplus::FillModeAlternate); AddRoundPath(path,body,Sf(9));
+            const COLORREF left=pressed?kAccentOrangeDark:(hover?RGB(255,112,25):kAccentOrange);
+            const COLORREF right=pressed?RGB(239,119,24):(hover?RGB(255,155,36):kAccentOrange2);
+            Gdiplus::LinearGradientBrush brush(Rf(body),Gc(left),Gc(right),Gdiplus::LinearGradientModeHorizontal);
+            g.FillPath(&brush,&path);
+            StrokeRound(g,body,Sf(9),pressed?RGB(215,80,20):RGB(247,116,24),190);
+        } else {
+            FillRound(g,body,Sf(9),RGB(220,221,220));
+            StrokeRound(g,body,Sf(9),RGB(206,207,205),220);
+        }
     } else {
         const COLORREF fill=pressed?kWarmPanelPressed:(hover?kWarmPanelHover:kWarmPanel);
         FillRound(g,body,Sf(9),fill);
         StrokeRound(g,body,Sf(9),pressed?RGB(226,184,155):(hover?RGB(239,170,125):RGB(220,217,212)),210);
     }
     RECT textRect=body;
-    const bool arrow=primary&&(label==L"\u7ee7\u7eed"||label==L"\u5f00\u59cb\u5b89\u88c5");
+    const bool arrow=enabled&&primary&&(label==L"\u7ee7\u7eed"||label==L"\u5f00\u59cb\u5b89\u88c5");
     if(arrow) textRect.right-=S(30);
-    DrawText(g,label,textRect,g_emphasisFont,primary?RGB(255,255,255):RGB(56,55,52),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    const COLORREF labelColor=primary?(enabled?RGB(255,255,255):RGB(145,146,144)):RGB(56,55,52);
+    DrawText(g,label,textRect,g_emphasisFont,labelColor,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     if(arrow) {
         const float x=static_cast<float>(body.right-S(29)), y=static_cast<float>((body.top+body.bottom)/2);
         Gdiplus::Pen pen(Gc(RGB(255,255,255)),Sf(1.8f));
@@ -390,6 +398,20 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
         DrawText(g,L"\u7248\u672c " QINGYUE_VERSION_STRING_W L"   \u00b7   Windows 10 / 11   \u00b7   x64",{S(60),S(365),c.right-S(60),S(393)},g_smallFont,RGB(146,141,134),DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawButton(g,g_welcomePrimary,L"\u7ee7\u7eed",Hot::Primary,true); DrawButton(g,g_welcomeCancel,L"\u53d6\u6d88",Hot::WelcomeCancel,false); return;
     }
+    if(g_page==Page::License) {
+        DrawText(g,L"\u8f6f\u4ef6\u8bb8\u53ef\u534f\u8bae",{S(55),S(88),c.right-S(55),S(130)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawText(g,L"\u8bf7\u9605\u8bfb\u5e76\u540c\u610f\u4ee5\u4e0b\u8bb8\u53ef\u6761\u6b3e",{S(57),S(133),c.right-S(55),S(162)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        RECT licenseBox{S(48),S(174),c.right-S(48),S(303)};
+        FillRound(g,licenseBox,Sf(10),kWarmPanel);
+        StrokeRound(g,licenseBox,Sf(10),RGB(229,224,218),205);
+        DrawText(g,L"\u8f7b\u9605PDF \u6309 GNU Affero General Public License v3.0\uff08AGPLv3\uff09\u53d1\u5e03\u3002\n\n\u4f60\u53ef\u4ee5\u81ea\u7531\u4f7f\u7528\u3001\u590d\u5236\u3001\u4fee\u6539\u548c\u518d\u5206\u53d1\u672c\u8f6f\u4ef6\uff0c\u4f46\u518d\u5206\u53d1\u65f6\u5fc5\u987b\u9075\u5b88 AGPLv3 \u7684\u6761\u6b3e\u3002\n\n\u672c\u5b89\u88c5\u5305\u5305\u542b MuPDF \u548c\u5176\u4ed6\u7b2c\u4e09\u65b9\u7ec4\u4ef6\uff0c\u76f8\u5173\u7248\u6743\u548c\u8bb8\u53ef\u8bc1\u6587\u672c\u4f1a\u4e00\u5e76\u5b89\u88c5\u3002\n\n\u5b8c\u6574\u534f\u8bae\u6587\u4ef6\u4f4d\u4e8e\u5b89\u88c5\u76ee\u5f55\\LICENSE\u3002",{S(66),S(185),c.right-S(66),S(294)},g_smallFont,muted,DT_LEFT|DT_WORDBREAK);
+        FillRound(g,g_licenseAgree,Sf(9),g_hover==Hot::LicenseAgree?kWarmPanelHover:kWarmPanel);
+        StrokeRound(g,g_licenseAgree,Sf(9),RGB(229,224,218),205);
+        DrawCheckbox(g,{g_licenseAgree.left+S(18),g_licenseAgree.top,g_licenseAgree.left+S(45),g_licenseAgree.bottom},g_licenseAccepted,g_hover==Hot::LicenseAgree||g_pressed==Hot::LicenseAgree);
+        DrawText(g,L"\u6211\u5df2\u9605\u8bfb\u5e76\u540c\u610f GNU Affero General Public License v3.0",{g_licenseAgree.left+S(58),g_licenseAgree.top,g_licenseAgree.right-S(16),g_licenseAgree.bottom},g_uiFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawBackButton(g,g_back);
+        DrawButton(g,g_primary,L"\u7ee7\u7eed",Hot::Primary,true,g_licenseAccepted); DrawButton(g,g_optionsCancel,L"\u53d6\u6d88",Hot::OptionsCancel,false); return;
+    }
     if(g_page==Page::Options) {
         DrawText(g,L"\u5b89\u88c5\u8f7b\u9605PDF",{S(55),S(88),c.right-S(55),S(130)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u786e\u8ba4\u5b89\u88c5\u4f4d\u7f6e\u548c\u5feb\u6377\u65b9\u5f0f",{S(57),S(133),c.right-S(55),S(162)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
@@ -439,6 +461,7 @@ Hot HotAt(POINT p) {
     if(g_page==Page::UninstallConfirm){if(Hit(g_optionsCancel,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_deleteData,p))return Hot::DeleteData;return Hot::None;}
     if(g_page==Page::UninstallComplete||g_page==Page::UninstallFailed)return Hit(g_primary,p)?Hot::Primary:Hot::None;
     if(g_page==Page::Welcome){if(Hit(g_welcomePrimary,p))return Hot::Primary;if(Hit(g_welcomeCancel,p))return Hot::WelcomeCancel;return Hot::None;}
+    if(g_page==Page::License){if(Hit(g_back,p))return Hot::Back;if(g_licenseAccepted&&Hit(g_primary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_licenseAgree,p))return Hot::LicenseAgree;return Hot::None;}
     if(g_page==Page::Options){if(Hit(g_back,p))return Hot::Back;if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_optionsCancel,p))return Hot::OptionsCancel;if(Hit(g_browse,p))return Hot::Browse;if(Hit(g_desktop,p))return Hot::Desktop;}
     if(g_page==Page::Complete){if(Hit(g_primary,p))return Hot::Primary;if(Hit(g_launch,p))return Hot::Launch;}
     if(g_page==Page::Failed)return Hit(g_primary,p)?Hot::Primary:Hot::None; return Hot::None;
@@ -737,6 +760,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         SendMessageW(g_pathEdit,WM_SETFONT,reinterpret_cast<WPARAM>(g_uiFont),TRUE); Layout(h); return 0;
     case WM_PAINT: Paint(h); return 0;
     case WM_KEYDOWN:
+        if(w==VK_SPACE&&g_page==Page::License&&!g_installing) { g_licenseAccepted=!g_licenseAccepted; InvalidateRect(h,nullptr,FALSE); return 0; }
         if(w==VK_RETURN&&!g_installing) {
             RECT target=g_page==Page::Welcome?g_welcomePrimary:g_primary;
             POINT center{(target.left+target.right)/2,(target.top+target.bottom)/2};
@@ -770,7 +794,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(pressed==Hot::None||pressed!=HotAt(p)||g_installing) return 0;
         if(pressed==Hot::Minimize) { ShowWindow(h,SW_MINIMIZE); return 0; }
         if(pressed==Hot::WelcomeCancel&&g_page==Page::Welcome) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
-        if(pressed==Hot::OptionsCancel&&g_page==Page::Options) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
+        if(pressed==Hot::OptionsCancel&&(g_page==Page::Options||g_page==Page::License)) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
         if(g_uninstallMode) {
             if(pressed==Hot::Back&&g_page==Page::UninstallConfirm) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
             if(pressed==Hot::DeleteData&&g_page==Page::UninstallConfirm) { g_deleteAppData=!g_deleteAppData; InvalidateRect(h,nullptr,FALSE); return 0; }
@@ -784,7 +808,8 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
             return 0;
         }
         if(pressed==Hot::Primary) {
-            if(g_page==Page::Welcome) { g_page=Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE); }
+            if(g_page==Page::Welcome) { g_page=Page::License; Layout(h); InvalidateRect(h,nullptr,FALSE); }
+            else if(g_page==Page::License) { g_page=Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE); }
             else if(g_page==Page::Options) {
                 auto requestedPath=std::filesystem::path(WindowText(g_pathEdit));
                 auto absolutePath=requestedPath.empty()?requestedPath:std::filesystem::absolute(requestedPath);
@@ -795,10 +820,11 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
             } else if(g_page==Page::Complete) { if(g_launchAfterInstall) LaunchInstalled(); PostMessageW(h,WM_CLOSE,0,0); }
             else if(g_page==Page::Failed) { g_page=Page::Options; g_error.clear(); Layout(h); InvalidateRect(h,nullptr,FALSE); }
         } else if(pressed==Hot::Back) {
-            g_page=g_page==Page::Options?Page::Welcome:Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE);
+            g_page=(g_page==Page::Options||g_page==Page::License)?Page::Welcome:Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE);
         } else if(pressed==Hot::Browse) {
             std::filesystem::path selected; if(BrowseForFolder(h,selected)) SetWindowTextW(g_pathEdit,selected.c_str());
         } else if(pressed==Hot::Desktop) { g_desktopShortcut=!g_desktopShortcut; InvalidateRect(h,nullptr,FALSE); }
+        else if(pressed==Hot::LicenseAgree) { g_licenseAccepted=!g_licenseAccepted; InvalidateRect(h,nullptr,FALSE); }
         else if(pressed==Hot::Launch) { g_launchAfterInstall=!g_launchAfterInstall; InvalidateRect(h,nullptr,FALSE); }
         return 0;
     }
