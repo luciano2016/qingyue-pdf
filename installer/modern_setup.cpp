@@ -64,16 +64,18 @@ ULONG_PTR g_gdiplusToken{};
 UINT g_dpi = 96;
 Page g_page = Page::Welcome;
 Hot g_hover = Hot::None, g_pressed = Hot::None;
-RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseAgree{};
+RECT g_minimize{}, g_close{}, g_back{}, g_primary{}, g_welcomePrimary{}, g_welcomeCancel{}, g_optionsCancel{}, g_browse{}, g_desktop{}, g_deleteData{}, g_launch{}, g_editFrame{}, g_licenseBox{}, g_licenseAgree{};
 bool g_desktopShortcut = true, g_launchAfterInstall = true, g_installing = false;
 bool g_uninstallMode = false, g_uninstallWorker = false, g_deleteAppData = true;
-bool g_licenseAccepted = false;
+bool g_licenseAccepted = true;
 bool g_pathFocused = false;
 bool g_completionPending = false;
 float g_progress = 0.0f, g_targetProgress = 0.0f;
 int g_shine = 0;
+int g_licenseScrollY = 0, g_licenseContentHeight = 0;
 std::wstring g_stage, g_error;
 std::wstring g_spacePath, g_availableSpaceText;
+std::wstring g_licenseText;
 std::filesystem::path g_installedDir;
 std::filesystem::path g_uninstallDir;
 
@@ -142,6 +144,19 @@ void LoadWelcomeArt() {
     if(!bitmap||bitmap->GetLastStatus()!=Gdiplus::Ok){stream->Release();return;}
     g_welcomeArtStream=stream;
     g_welcomeArt=std::move(bitmap);
+}
+void LoadLicenseText() {
+    HRSRC resource=FindResourceW(g_instance,MAKEINTRESOURCEW(IDR_LICENSE_TEXT),RT_RCDATA);
+    if(!resource)return;
+    HGLOBAL loaded=LoadResource(g_instance,resource);
+    DWORD size=SizeofResource(g_instance,resource);
+    const char* source=loaded?static_cast<const char*>(LockResource(loaded)):nullptr;
+    if(!source||size==0)return;
+    int length=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,source,static_cast<int>(size),nullptr,0);
+    if(length<=0)return;
+    g_licenseText.resize(static_cast<size_t>(length));
+    if(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,source,static_cast<int>(size),g_licenseText.data(),length)<=0)
+        g_licenseText.clear();
 }
 std::filesystem::path KnownFolder(REFKNOWNFOLDERID id) {
     PWSTR value=nullptr; if (FAILED(SHGetKnownFolderPath(id,0,nullptr,&value))) return {};
@@ -218,6 +233,7 @@ void Layout(HWND h) {
     g_desktop={S(48),S(268),S(672),S(310)};
     g_deleteData={S(48),S(210),S(672),S(278)};
     g_launch={S(110),S(310),S(610),S(360)};
+    g_licenseBox={S(48),S(174),c.right-S(48),S(303)};
     g_licenseAgree={S(48),S(314),S(672),S(374)};
     if(g_pathEdit) {
         HDC dc=GetDC(g_pathEdit);
@@ -250,6 +266,35 @@ void DrawText(HDC dc,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags)
     HGDIOBJ old=SelectObject(dc,f); SetBkMode(dc,TRANSPARENT); SetTextColor(dc,c); DrawTextW(dc,s.c_str(),static_cast<int>(s.size()),&r,flags); SelectObject(dc,old);
 }
 void DrawText(Gdiplus::Graphics& g,const std::wstring& s,RECT r,HFONT f,COLORREF c,UINT flags) { HDC dc=g.GetHDC(); DrawText(dc,s,r,f,c,flags); g.ReleaseHDC(dc); }
+void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
+    RECT viewport{box.left+S(12),box.top+S(10),box.right-S(18),box.bottom-S(10)};
+    HDC dc=g.GetHDC();
+    HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
+    RECT measure{0,0,viewport.right-viewport.left,0};
+    DrawTextW(dc,g_licenseText.c_str(),static_cast<int>(g_licenseText.size()),&measure,DT_LEFT|DT_WORDBREAK|DT_CALCRECT);
+    g_licenseContentHeight=std::max<int>(0,static_cast<int>(measure.bottom));
+    const int viewportHeight=viewport.bottom-viewport.top;
+    const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
+    g_licenseScrollY=std::clamp(g_licenseScrollY,0,maxScroll);
+    int saved=SaveDC(dc);
+    IntersectClipRect(dc,viewport.left,viewport.top,viewport.right,viewport.bottom);
+    SetBkMode(dc,TRANSPARENT);
+    SetTextColor(dc,RGB(113,112,107));
+    RECT textRect{viewport.left,viewport.top-g_licenseScrollY,viewport.right,viewport.top-g_licenseScrollY+g_licenseContentHeight};
+    DrawTextW(dc,g_licenseText.c_str(),static_cast<int>(g_licenseText.size()),&textRect,DT_LEFT|DT_WORDBREAK);
+    RestoreDC(dc,saved);
+    SelectObject(dc,oldFont);
+    g.ReleaseHDC(dc);
+
+    if(g_licenseContentHeight>viewportHeight) {
+        RECT track{box.right-S(9),viewport.top,box.right-S(6),viewport.bottom};
+        FillRound(g,track,Sf(2),RGB(236,231,226));
+        const int thumbHeight=std::max<int>(S(18),static_cast<int>(viewportHeight*viewportHeight/g_licenseContentHeight));
+        const int thumbTravel=viewportHeight-thumbHeight;
+        const int thumbTop=viewport.top+(maxScroll?thumbTravel*g_licenseScrollY/maxScroll:0);
+        FillRound(g,{track.left,thumbTop,track.right,thumbTop+thumbHeight},Sf(2),RGB(205,195,186));
+    }
+}
 void DrawLogo(Gdiplus::Graphics& g) {
     if(!g_headerIcon)return;
     HDC dc=g.GetHDC();DrawIconEx(dc,S(38),S(17),g_headerIcon,S(36),S(36),0,nullptr,DI_NORMAL);g.ReleaseHDC(dc);
@@ -401,10 +446,9 @@ void DrawCompactPage(Gdiplus::Graphics& g,RECT c) {
     if(g_page==Page::License) {
         DrawText(g,L"\u8f6f\u4ef6\u8bb8\u53ef\u534f\u8bae",{S(55),S(88),c.right-S(55),S(130)},g_displayFont,text,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawText(g,L"\u8bf7\u9605\u8bfb\u5e76\u540c\u610f\u4ee5\u4e0b\u8bb8\u53ef\u6761\u6b3e",{S(57),S(133),c.right-S(55),S(162)},g_uiFont,muted,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        RECT licenseBox{S(48),S(174),c.right-S(48),S(303)};
-        FillRound(g,licenseBox,Sf(10),kWarmPanel);
-        StrokeRound(g,licenseBox,Sf(10),RGB(229,224,218),205);
-        DrawText(g,L"\u8f7b\u9605PDF \u6309 GNU Affero General Public License v3.0\uff08AGPLv3\uff09\u53d1\u5e03\u3002\n\n\u4f60\u53ef\u4ee5\u81ea\u7531\u4f7f\u7528\u3001\u590d\u5236\u3001\u4fee\u6539\u548c\u518d\u5206\u53d1\u672c\u8f6f\u4ef6\uff0c\u4f46\u518d\u5206\u53d1\u65f6\u5fc5\u987b\u9075\u5b88 AGPLv3 \u7684\u6761\u6b3e\u3002\n\n\u672c\u5b89\u88c5\u5305\u5305\u542b MuPDF \u548c\u5176\u4ed6\u7b2c\u4e09\u65b9\u7ec4\u4ef6\uff0c\u76f8\u5173\u7248\u6743\u548c\u8bb8\u53ef\u8bc1\u6587\u672c\u4f1a\u4e00\u5e76\u5b89\u88c5\u3002\n\n\u5b8c\u6574\u534f\u8bae\u6587\u4ef6\u4f4d\u4e8e\u5b89\u88c5\u76ee\u5f55\\LICENSE\u3002",{S(66),S(185),c.right-S(66),S(294)},g_smallFont,muted,DT_LEFT|DT_WORDBREAK);
+        FillRound(g,g_licenseBox,Sf(10),kWarmPanel);
+        StrokeRound(g,g_licenseBox,Sf(10),RGB(229,224,218),205);
+        DrawLicenseDocument(g,g_licenseBox);
         FillRound(g,g_licenseAgree,Sf(9),g_hover==Hot::LicenseAgree?kWarmPanelHover:kWarmPanel);
         StrokeRound(g,g_licenseAgree,Sf(9),RGB(229,224,218),205);
         DrawCheckbox(g,{g_licenseAgree.left+S(18),g_licenseAgree.top,g_licenseAgree.left+S(45),g_licenseAgree.bottom},g_licenseAccepted,g_hover==Hot::LicenseAgree||g_pressed==Hot::LicenseAgree);
@@ -780,6 +824,18 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(LOWORD(w)==kPathEdit&&(HIWORD(w)==EN_SETFOCUS||HIWORD(w)==EN_KILLFOCUS)) { g_pathFocused=HIWORD(w)==EN_SETFOCUS; InvalidateRect(h,nullptr,FALSE); return 0; }
         return 0;
     case WM_MOUSEMOVE: UpdateHover(h,{GET_X_LPARAM(l),GET_Y_LPARAM(l)}); return 0;
+    case WM_MOUSEWHEEL:
+        if(g_page==Page::License) {
+            POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)}; ScreenToClient(h,&point);
+            if(Hit(g_licenseBox,point)) {
+                const int viewportHeight=g_licenseBox.bottom-g_licenseBox.top-S(20);
+                const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
+                const int wheelSteps=GET_WHEEL_DELTA_WPARAM(w)/WHEEL_DELTA;
+                g_licenseScrollY=std::clamp(g_licenseScrollY-wheelSteps*S(32),0,maxScroll);
+                InvalidateRect(h,nullptr,FALSE);
+            }
+        }
+        return 0;
     case WM_MOUSELEAVE: g_hover=Hot::None; InvalidateRect(h,nullptr,FALSE); return 0;
     case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr,IDC_ARROW)); return TRUE;
     case WM_LBUTTONDOWN: {
@@ -820,7 +876,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
             } else if(g_page==Page::Complete) { if(g_launchAfterInstall) LaunchInstalled(); PostMessageW(h,WM_CLOSE,0,0); }
             else if(g_page==Page::Failed) { g_page=Page::Options; g_error.clear(); Layout(h); InvalidateRect(h,nullptr,FALSE); }
         } else if(pressed==Hot::Back) {
-            g_page=(g_page==Page::Options||g_page==Page::License)?Page::Welcome:Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE);
+            g_page=g_page==Page::Options?Page::License:(g_page==Page::License?Page::Welcome:Page::Options); Layout(h); InvalidateRect(h,nullptr,FALSE);
         } else if(pressed==Hot::Browse) {
             std::filesystem::path selected; if(BrowseForFolder(h,selected)) SetWindowTextW(g_pathEdit,selected.c_str());
         } else if(pressed==Hot::Desktop) { g_desktopShortcut=!g_desktopShortcut; InvalidateRect(h,nullptr,FALSE); }
@@ -871,8 +927,8 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
     }
 }
 int ShowWizard(HINSTANCE instance,int show) {
-    g_instance=instance;g_page=g_uninstallMode?Page::UninstallConfirm:Page::Welcome;g_dpi=GetDpiForSystem();
-    g_headerIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_APP_ICON),IMAGE_ICON,S(36),S(36),LR_DEFAULTCOLOR)); LoadWelcomeArt();
+    g_instance=instance;g_page=g_uninstallMode?Page::UninstallConfirm:Page::Welcome;g_licenseAccepted=true;g_licenseScrollY=0;g_dpi=GetDpiForSystem();
+    g_headerIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(IDI_APP_ICON),IMAGE_ICON,S(36),S(36),LR_DEFAULTCOLOR)); LoadWelcomeArt(); LoadLicenseText();
     WNDCLASSW wc{};wc.style=CS_DBLCLKS|CS_DROPSHADOW;wc.lpfnWndProc=WindowProc;wc.hInstance=instance;wc.hIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_APP_ICON));wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.lpszClassName=kWindowClass;if(!RegisterClassW(&wc)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return 1;
     HWND h=CreateWindowExW(WS_EX_APPWINDOW,kWindowClass,kAppName,WS_POPUP|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,S(720),S(500),nullptr,nullptr,instance,nullptr);if(!h)return 1;ApplyWindowChrome(h);RECT work{};SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0);SetWindowPos(h,nullptr,work.left+(work.right-work.left-S(720))/2,work.top+(work.bottom-work.top-S(500))/2,0,0,SWP_NOSIZE|SWP_NOZORDER);ShowWindow(h,show);UpdateWindow(h);MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(msg.message==WM_KEYDOWN&&msg.wParam==VK_RETURN&&msg.hwnd!=h&&IsChild(h,msg.hwnd)){SendMessageW(h,WM_KEYDOWN,msg.wParam,msg.lParam);continue;}TranslateMessage(&msg);DispatchMessageW(&msg);}return static_cast<int>(msg.wParam);
 }

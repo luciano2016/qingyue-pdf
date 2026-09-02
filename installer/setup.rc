@@ -3,6 +3,7 @@
 IDI_APP_ICON ICON "..\\assets\\xiaoyue.ico"
 IDR_PAYLOAD_CAB RCDATA "..\\build\\setup-payload\\quietpdf-payload.cab"
 IDR_WELCOME_ART RCDATA "assets\\welcome_pdf.png"
+IDR_LICENSE_TEXT RCDATA "..\\LICENSE"
 
 #include "..\version.h"
 
