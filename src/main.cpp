@@ -11784,9 +11784,6 @@ namespace
             GdiColor(inputLine, g_customZoomFocused ? 220 : (inputHover ? 180 : 138)),
             std::max<Gdiplus::REAL>(1.0f, S(g_customZoomFocused ? 1.2f : 1.0f)));
         FillGdiRoundRect(g, inputBrush, Rf(g_zoomDialogInputRect), S(8.0f));
-        RECT inputWash{ g_zoomDialogInputRect.left + S(1), g_zoomDialogInputRect.top + S(1), g_zoomDialogInputRect.right - S(1), g_zoomDialogInputRect.top + S(18) };
-        Gdiplus::SolidBrush inputWashBrush(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 12 : 38));
-        FillGdiRoundRect(g, inputWashBrush, Rf(inputWash), S(7.0f));
         DrawGdiRoundRect(g, inputBorder, Rf(g_zoomDialogInputRect), S(8.0f));
 
         RECT inputTextRect{ g_zoomDialogInputRect.left + S(14), g_zoomDialogInputRect.top, g_zoomDialogInputRect.right - S(48), g_zoomDialogInputRect.bottom };
