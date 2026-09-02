@@ -79,6 +79,7 @@ int g_licenseDragOffset = 0;
 std::wstring g_stage, g_error;
 std::wstring g_spacePath, g_availableSpaceText;
 std::wstring g_licenseText;
+std::wstring g_licenseDisplayText;
 std::filesystem::path g_installedDir;
 std::filesystem::path g_uninstallDir;
 
@@ -160,6 +161,26 @@ void LoadLicenseText() {
     g_licenseText.resize(static_cast<size_t>(length));
     if(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,source,static_cast<int>(size),g_licenseText.data(),length)<=0)
         g_licenseText.clear();
+    g_licenseDisplayText.clear();
+    size_t start=0;
+    while(start<=g_licenseText.size()) {
+        size_t end=g_licenseText.find(L'\n',start);
+        if(end==std::wstring::npos)end=g_licenseText.size();
+        std::wstring line=g_licenseText.substr(start,end-start);
+        if(!line.empty()&&line.back()==L'\r')line.pop_back();
+        const size_t first=line.find_first_not_of(L" \t");
+        const size_t last=line.find_last_not_of(L" \t");
+        if(first==std::wstring::npos) {
+            while(g_licenseDisplayText.size()>=1&&g_licenseDisplayText.back()==L' ')g_licenseDisplayText.pop_back();
+            if(!g_licenseDisplayText.empty()&&g_licenseDisplayText.back()!=L'\n')g_licenseDisplayText.push_back(L'\n');
+        } else {
+            line=line.substr(first,last-first+1);
+            if(!g_licenseDisplayText.empty()&&g_licenseDisplayText.back()!=L'\n'&&g_licenseDisplayText.back()!=L' ')g_licenseDisplayText.push_back(L' ');
+            g_licenseDisplayText+=line;
+        }
+        if(end==g_licenseText.size())break;
+        start=end+1;
+    }
 }
 std::filesystem::path KnownFolder(REFKNOWNFOLDERID id) {
     PWSTR value=nullptr; if (FAILED(SHGetKnownFolderPath(id,0,nullptr,&value))) return {};
@@ -286,7 +307,8 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
     HDC dc=g.GetHDC();
     HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
     RECT measure{0,0,viewport.right-viewport.left,0};
-    DrawTextW(dc,g_licenseText.c_str(),static_cast<int>(g_licenseText.size()),&measure,DT_LEFT|DT_WORDBREAK|DT_CALCRECT);
+    const std::wstring& displayText=g_licenseDisplayText.empty()?g_licenseText:g_licenseDisplayText;
+    DrawTextW(dc,displayText.c_str(),static_cast<int>(displayText.size()),&measure,DT_LEFT|DT_WORDBREAK|DT_CALCRECT);
     g_licenseContentHeight=std::max<int>(0,static_cast<int>(measure.bottom));
     const int viewportHeight=viewport.bottom-viewport.top;
     const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
@@ -296,7 +318,7 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
     SetBkMode(dc,TRANSPARENT);
     SetTextColor(dc,RGB(113,112,107));
     RECT textRect{viewport.left,viewport.top-g_licenseScrollY,viewport.right,viewport.top-g_licenseScrollY+g_licenseContentHeight};
-    DrawTextW(dc,g_licenseText.c_str(),static_cast<int>(g_licenseText.size()),&textRect,DT_LEFT|DT_WORDBREAK);
+    DrawTextW(dc,displayText.c_str(),static_cast<int>(displayText.size()),&textRect,DT_LEFT|DT_WORDBREAK);
     RestoreDC(dc,saved);
     SelectObject(dc,oldFont);
     g.ReleaseHDC(dc);
@@ -857,6 +879,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(g_licenseDragging) {
             UpdateLicenseScrollFromPointer(point.y);
             InvalidateRect(h,nullptr,FALSE);
+            UpdateWindow(h);
             return 0;
         }
         UpdateHover(h,point); return 0;
@@ -884,6 +907,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
             SetCapture(h);
             UpdateLicenseScrollFromPointer(p.y);
             InvalidateRect(h,nullptr,FALSE);
+            UpdateWindow(h);
             return 0;
         }
         Hot hot=HotAt(p);
@@ -932,6 +956,9 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
         else if(pressed==Hot::Launch) { g_launchAfterInstall=!g_launchAfterInstall; InvalidateRect(h,nullptr,FALSE); }
         return 0;
     }
+    case WM_CAPTURECHANGED:
+        if(g_licenseDragging) { g_licenseDragging=false; g_licenseDragOffset=0; InvalidateRect(h,nullptr,FALSE); }
+        return 0;
     case WM_TIMER:
         if(w==kTimer&&(g_page==Page::Installing||g_page==Page::Uninstalling)) {
             g_progress+=(g_targetProgress-g_progress)*.18f;
