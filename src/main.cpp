@@ -13274,7 +13274,7 @@ namespace
         panelTop = std::max<int>(static_cast<int>(g_stage.top) + S(14), panelTop);
         g_annotationNotePanelRect = RECT{ panelLeft, panelTop, panelLeft + panelW, panelTop + panelH };
         DrawRoundedShadow(dc, g_annotationNotePanelRect, S(12.0f), S(2), S(3), S(5), IsDarkTheme() ? 42 : 30);
-        GlassRoundedSurface(dc, g_annotationNotePanelRect, IsDarkTheme() ? 224 : 242, S(12.0f));
+        GlassRoundedSurface(dc, g_annotationNotePanelRect, IsDarkTheme() ? 224 : 242, S(12.0f), false);
 
         HFONT titleFont = Font(10, FW_SEMIBOLD);
         oldFont = SelectObject(dc, titleFont);
