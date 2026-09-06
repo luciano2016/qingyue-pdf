@@ -1362,6 +1362,7 @@ namespace
     constexpr UINT WM_QUIETPDF_HOME_THUMB_READY = WM_APP + 44;
     constexpr UINT WM_QUIETPDF_HOME_SCROLL_FRAME = WM_APP + 45;
     constexpr UINT WM_QUIETPDF_REFRESH_FILE_WATCH = WM_APP + 46;
+    constexpr UINT WM_QUIETPDF_RETRY_OUTLINE = WM_APP + 47;
 
     struct PageRenderRequest
     {
@@ -1406,6 +1407,7 @@ namespace
     void LoadPageGeometry(PdfTab& tab);
     void CollectOutline(PdfTab& tab, fz_outline* item, int depth);
     void LoadAnnotationsFromPdf(PdfTab& tab);
+    void ResetSuspendedMetadataRequest(PageRenderRequest const& request);
 
     std::mutex g_pageRenderMutex;
     std::condition_variable g_pageRenderCv;
@@ -6318,7 +6320,7 @@ namespace
 
     bool SamePageRenderRequest(PageRenderRequest const& a, PageRenderRequest const& b)
     {
-        return a.documentVersion == b.documentVersion &&
+        return a.session == b.session && a.documentVersion == b.documentVersion &&
             a.page == b.page && a.tile == b.tile && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h &&
             a.zoom == b.zoom && a.renderZoom == b.renderZoom && a.metadata == b.metadata &&
             a.metadataPageCount == b.metadataPageCount && a.metadataPageStart == b.metadataPageStart &&
@@ -6451,16 +6453,35 @@ namespace
             }
 
             bool stale = false;
+            bool stopping = false;
             {
                 std::lock_guard<std::mutex> lock(g_pageRenderMutex);
                 g_pageRenderActive = false;
                 stale = g_pageRenderStop || g_pageRenderCanceledSerial == request.serial;
+                stopping = g_pageRenderStop;
+                if (stale && request.metadata && request.metadataPhase == 1)
+                    ResetSuspendedMetadataRequest(request);
                 if (g_pageRenderCanceledSerial == request.serial)
                     g_pageRenderCanceledSerial = 0;
                 g_pageRenderActiveCookie = nullptr;
                 g_pageRenderActiveRequest = {};
             }
             g_pdf.dropRenderCookie(renderCookie);
+            if (stale)
+            {
+                // An outline request can be aborted while the user switches
+                // tabs. Its request flag must be released after the worker
+                // has actually finished unwinding. The retry message is
+                // handled on the UI thread and only requeues the active tab,
+                // so cancellation does not create background work for tabs
+                // the user is not looking at.
+                if (request.metadata && request.metadataPhase == 1 && !stopping)
+                {
+                    if (IsWindow(request.target))
+                        PostMessageW(request.target, WM_QUIETPDF_RETRY_OUTLINE, 0, 0);
+                }
+                continue;
+            }
             bool hasMetadata = request.metadata &&
                 (request.metadataPhase == 0 ? !result->metadataPages.empty()
                  : true);
@@ -6470,7 +6491,14 @@ namespace
                 if (!request.metadata && !result->image.bgra.empty())
                     EnsureImageDib(result->image);
                 if (!PostMessageW(request.target, WM_QUIETPDF_PAGE_RENDERED, 0, reinterpret_cast<LPARAM>(result.get())))
+                {
+                    if (request.metadata && request.metadataPhase == 1)
+                    {
+                        ResetSuspendedMetadataRequest(request);
+                        PostMessageW(request.target, WM_QUIETPDF_RETRY_OUTLINE, 0, 0);
+                    }
                     continue;
+                }
                 result.release();
             }
         }
@@ -6488,8 +6516,6 @@ namespace
         }
         g_pageRenderThread = std::thread(PageRenderWorkerMain);
     }
-
-    void ResetSuspendedMetadataRequest(PageRenderRequest const& request);
 
     void AbortActivePageRenderLocked()
     {
@@ -18673,6 +18699,15 @@ namespace
             g_homeScrollFramePosted = false;
             PresentHomeScrollFrame(hwnd);
             return 0;
+        case WM_QUIETPDF_RETRY_OUTLINE:
+        {
+            // A canceled outline request is retried only for the document
+            // currently shown. Inactive tabs resume when activated, keeping
+            // the single renderer focused and avoiding extra background work.
+            if (PdfTab* tab = Active(); tab && !tab->outlineMetadataLoaded && !tab->outlineMetadataRequested)
+                RequestOutlineMetadata(hwnd, *tab);
+            return 0;
+        }
         case WM_QUIETPDF_PAGE_RENDERED:
         {
             std::unique_ptr<PageRenderResult> result(reinterpret_cast<PageRenderResult*>(lParam));
@@ -18681,7 +18716,8 @@ namespace
             {
                 PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
                 PageRenderRequest const& request = result->request;
-                if (_wcsicmp(tab.path.c_str(), request.path.c_str()) != 0 ||
+                if (tab.renderSession != request.session ||
+                    _wcsicmp(tab.path.c_str(), request.path.c_str()) != 0 ||
                     tab.renderVersion != request.documentVersion || request.dpi != g_dpi ||
                     (!request.metadata && request.theme != PdfRenderTheme()))
                     continue;
@@ -18729,6 +18765,7 @@ namespace
                         {
                             tab.outline = std::move(result->metadataOutline);
                             tab.outlineMetadataRetryCount = 0;
+                            tab.outlineMetadataRequested = false;
                             tab.outlineMetadataLoaded = true;
                             if (i == g_active)
                             {
