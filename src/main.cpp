@@ -369,8 +369,9 @@ namespace
         int selectedOutlineRow{ -1 };
         std::set<int> collapsedOutlineRows;
         double zoom{ 1.0 };
-        // Tiled high-zoom rendering keeps the previous complete generation
-        // visible until the new viewport coverage is complete.
+        // Every zoom transition keeps the previous complete generation visible
+        // until the new viewport coverage is ready. The raster strategy may be
+        // a whole page or tiles, but presentation must not branch on that.
         bool zoomPresentationPending{};
         double cachedZoom{};
         unsigned cachedDpi{};
@@ -6078,10 +6079,11 @@ namespace
     void PruneZoomFallbackCache(PdfTab& tab)
     {
         ULONGLONG now = GetTickCount64();
-        // Keep the last committed generation briefly, then release it even if
-        // a render was canceled or the user stopped zooming midway.
+        // Keep the last committed generation while the target is pending. The
+        // deadline only prunes an already-finished/abandoned transition; a
+        // live transition must not lose its only stable presentation frame.
         if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme() ||
-            (tab.zoomFallbackUntil != 0 && now >= tab.zoomFallbackUntil))
+            (!tab.zoomPresentationPending && tab.zoomFallbackUntil != 0 && now >= tab.zoomFallbackUntil))
         {
             tab.zoomFallbackCache.clear();
             tab.zoomFallbackDpi = 0;
@@ -6140,7 +6142,7 @@ namespace
             // Keep the same committed source while a gesture produces several
             // consecutive zoom values. Replacing it with a partial new tile
             // generation is what causes local flashes at high zoom.
-            tab.zoomFallbackUntil = GetTickCount64() + 1400;
+            tab.zoomFallbackUntil = GetTickCount64() + 8000;
             return;
         }
         if (tab.cachedZoom != oldZoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme()) return;
@@ -6159,7 +6161,7 @@ namespace
                 tab.zoomFallbackDpi = tab.cachedDpi;
                 tab.zoomFallbackTheme = PdfRenderTheme();
                 tab.zoomFallbackZoom = oldZoom;
-                tab.zoomFallbackUntil = GetTickCount64() + 1400;
+                tab.zoomFallbackUntil = GetTickCount64() + 8000;
             }
             return;
         }
@@ -6170,7 +6172,7 @@ namespace
         tab.zoomFallbackDpi = tab.cachedDpi;
         tab.zoomFallbackTheme = PdfRenderTheme();
         tab.zoomFallbackZoom = oldZoom;
-        tab.zoomFallbackUntil = GetTickCount64() + 1400;
+        tab.zoomFallbackUntil = GetTickCount64() + 8000;
     }
 
     void ReleaseZoomFallback(PdfTab& tab)
@@ -11950,11 +11952,13 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         CancelObsoletePageRendersForZoom(tab);
-        g_zoomRenderDeferUntil = GetTickCount64() + 140;
         KillTimer(hwnd, 21);
-        SetTimer(hwnd, 21, 140, nullptr);
+        g_zoomRenderDeferUntil = 0;
         tab.zoom = clampedZoom;
-        tab.zoomPresentationPending = UseTiledPageRendering(tab);
+        // Keep one presentation rule for both whole-page and tiled rendering.
+        // The old complete result is the interactive frame; the new result is
+        // committed only after the visible viewport is complete.
+        tab.zoomPresentationPending = true;
         g_pageNavigationPending = false;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
@@ -14692,6 +14696,12 @@ namespace
     bool CurrentZoomVisibleContentReady(PdfTab& tab)
     {
         if (tab.pageCount <= 0) return true;
+        // `cache` can still contain the previous generation until the first
+        // paint after a zoom change. Never treat that image as the target
+        // generation, otherwise the fallback is released before the new
+        // frame exists and the page briefly paints only its background.
+        bool currentPageCacheGeneration = tab.cachedZoom == tab.zoom &&
+            tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme();
         int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
             FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
         int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
@@ -14715,15 +14725,12 @@ namespace
                 bool committedReady = committed != tab.cache.end() &&
                     committed->second.width > 0 && committed->second.height > 0 &&
                     (committed->second.dib || !committed->second.bgra.empty());
-                if (committedReady) continue;
+                if (currentPageCacheGeneration && committedReady) continue;
                 if (!UseTiledPageRendering(tab))
                 {
-                    auto found = tab.cache.find(page);
-                    bool pageReady = found != tab.cache.end() &&
-                        (found->second.dib || !found->second.bgra.empty()) &&
-                        found->second.width > 0 && found->second.height > 0;
-                    if (!pageReady && !TileLevelFullyCached(tab, page, pageRect, visible, 0))
-                        return false;
+                    // Whole-page mode commits only a whole-page image. A tile
+                    // cache from an earlier mode is not a valid ready signal.
+                    return false;
                 }
                 else if (!TileLevelFullyCached(tab, page, pageRect, visible, 0))
                 {
@@ -14798,7 +14805,7 @@ namespace
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
-        if (tab.zoomPresentationPending && !ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
+        if (tab.zoomPresentationPending && CurrentZoomVisibleContentReady(tab))
         {
             tab.zoomPresentationPending = false;
             ReleaseZoomFallback(tab);
@@ -14870,16 +14877,26 @@ namespace
                              if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy))
                                  paintedRenderable = true;
                          }
-                         else if (fallback && DrawCommittedPageImage(dc, *fallback, pageRect, drawRect))
-                         {
-                             // Keep the last complete frame visible while the
-                             // new zoom generation is rendered. The image is
-                             // scaled as one unit, never exposed tile by tile.
-                             paintedRenderable = true;
-                         }
-                         else
-                         {
-                             missingVisiblePage = true;
+                          else if (fallback && DrawCommittedPageImage(dc, *fallback, pageRect, drawRect))
+                          {
+                              // Keep the last complete frame visible while the
+                              // new zoom generation is rendered. The image is
+                              // scaled as one unit, never exposed tile by tile.
+                              paintedRenderable = true;
+                          }
+                          else if (tab.zoomPresentationPending &&
+                              DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect))
+                          {
+                              // A transition can cross the whole-page/Tile
+                              // threshold in either direction. When the old
+                              // generation consists of tiles, use one complete
+                              // old tile level as the presentation frame even
+                              // though the target mode is whole-page.
+                              paintedRenderable = true;
+                          }
+                          else
+                          {
+                              missingVisiblePage = true;
                          }
                     }
                     else
@@ -19099,7 +19116,16 @@ namespace
                         // transition. The next full-stage paint is requested
                         // only after all visible target tiles are present.
                         if (CurrentZoomVisibleContentReady(tab))
+                        {
+                            // Commit at render completion rather than waiting
+                            // for the next paint message. The old frame is
+                            // still on screen until that paint, while its
+                            // pixels are released immediately to bound the
+                            // transition's memory peak.
+                            tab.zoomPresentationPending = false;
+                            ReleaseZoomFallback(tab);
                             InvalidateRect(hwnd, &g_stage, FALSE);
+                        }
                         else
                             SchedulePagePrefetch(hwnd);
                     }
