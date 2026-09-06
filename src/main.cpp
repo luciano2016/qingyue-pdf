@@ -10502,6 +10502,32 @@ namespace
         int restoreSidebarScrollY = recent == g_recent.end() ? 0 : recent->sidebarScrollY;
         int restoreSelectedOutlineRow = recent == g_recent.end() ? -1 : recent->selectedOutlineRow;
         LoadInitialPageGeometry(*tab);
+        if (openedFromHome)
+        {
+            // A document opened from the home page must not show a permanent
+            // empty outline while waiting for the worker message. Read this
+            // small, user-visible metadata payload once on the open path;
+            // geometry, page images, and annotations remain asynchronous.
+            bool outlineRead = false;
+            try
+            {
+                PdfDocumentLock lock(*tab);
+                fz_outline* outline = g_pdf.loadOutline(tab->ctx, tab->doc);
+                if (outline)
+                {
+                    try { CollectOutline(*tab, outline, 0); }
+                    catch (...) { tab->outline.clear(); }
+                    g_pdf.dropOutline(tab->ctx, outline);
+                }
+                outlineRead = true;
+            }
+            catch (...)
+            {
+                tab->outline.clear();
+            }
+            tab->outlineMetadataLoaded = outlineRead;
+            tab->outlineMetadataRequested = outlineRead;
+        }
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
@@ -10538,10 +10564,10 @@ namespace
         // policy and prevents several large PDFs from warming concurrently.
         PrioritizePageRendersForTab(*Active());
         TrimBackgroundRenderCaches();
-        // The outline is the first sidebar payload for a newly opened Tab.
-        // Queue it before the preview so the worker cannot start the preview
-        // first and leave a large document's directory waiting behind it.
-        RequestOutlineMetadata(hwnd, *Active());
+        // The home-page path reads the outline before the tab is published;
+        // other tab opens continue to use the asynchronous metadata pipeline.
+        if (!Active()->outlineMetadataLoaded)
+            RequestOutlineMetadata(hwnd, *Active());
         QueueInitialViewportPreview(hwnd, *Active());
         SchedulePagePrefetch(hwnd);
         // Geometry is deliberately queued behind the outline and the visible
