@@ -1440,7 +1440,6 @@ namespace
     LONG_PTR g_preImmersiveExStyle{};
     int g_active{ -1 };
     bool g_pageNavigationPending{};
-    bool g_zoomPresentationPending{};
     int g_scrollY{};
     int g_scrollX{};
     int g_stageScrollTarget{};
@@ -11042,7 +11041,6 @@ namespace
             : SinglePageContentHeight(tab);
         g_contentWidth = ReadingContentWidth(tab);
         g_pageNavigationPending = waitForComplete;
-        g_zoomPresentationPending = false;
         UpdateVertScrollBar(hwnd);
 
         if (UseTiledPageRendering(tab))
@@ -11326,7 +11324,6 @@ namespace
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
         PdfTab* tab = Active();
-        g_zoomPresentationPending = false;
         // A real document scroll means the user's viewport is authoritative;
         // stop carrying a previous directory click through that scroll.
         if (g_outlineNavigationRow >= 0)
@@ -11449,7 +11446,6 @@ namespace
         // dragging flag has been cleared. Set the atomic presentation gate
         // here as well so that release-time movement cannot reveal partial
         // tiles.
-        g_zoomPresentationPending = false;
         g_pageNavigationPending = true;
         ScrollStageTo(hwnd, target, true, false);
         if (PdfTab* tab = Active())
@@ -11634,34 +11630,12 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
-        if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() &&
-            !UseTiledPageRendering(tab) && !tab.cache.empty())
-        {
-            tab.zoomFallbackCache = std::move(tab.cache);
-            tab.zoomFallbackDpi = tab.cachedDpi;
-            tab.zoomFallbackTheme = tab.cachedTheme;
-        }
-
-        // During a pinch, the input stream is the priority. Cancel stale
-        // raster work once, then keep painting the last committed generation
-        // scaled to the live zoom value. Re-canceling and re-queuing on every
-        // finger update makes the UI thread compete with the renderer.
-        bool interactiveZoom = g_gestureZooming;
-        if (!interactiveZoom || !g_gestureZoomRenderSuppressed)
-        {
-            CancelObsoletePageRendersForZoom(tab);
-            if (interactiveZoom)
-                g_gestureZoomRenderSuppressed = true;
-        }
-        // Do not delay the target render. The old committed frame is kept on
-        // screen until the new zoom generation is complete, so a timer-based
-        // preview window only makes the transition less stable.
+        CancelObsoletePageRendersForZoom(tab);
         tab.zoom = clampedZoom;
-        // PaintPages renders the target generation into the existing back
-        // buffer, but does not present it until the visible page is complete.
-        // This keeps partial tiles from replacing the last stable frame.
-        g_zoomPresentationPending = true;
-        g_pageNavigationPending = true;
+        // Zoom input must update the geometry immediately. The paint pass may
+        // show the target page background while the current-scale raster is
+        // produced, but it must never hold the viewport at the old scale.
+        g_pageNavigationPending = false;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
 
@@ -11715,13 +11689,9 @@ namespace
         GetClientRect(hwnd, &client);
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         InvalidateRect(hwnd, &status, FALSE);
-        if (!interactiveZoom)
-        {
-            SchedulePagePrefetch(hwnd);
-            if (UseTiledPageRendering(tab))
-                HighZoomVisiblePagesReady(hwnd, tab);
-            ScheduleIdleCacheTrim(hwnd);
-        }
+        // The invalidated paint pass queues only the current-scale page or
+        // tiles. Do not synchronously preflight other render generations from
+        // the input handler; that makes rapid mouse-wheel zoom feel frozen.
     }
 
     void FinishGestureZoom(HWND hwnd)
@@ -12375,7 +12345,6 @@ namespace
         // A pending page-navigation commit belongs to the previous Tab. Do
         // not make the new Tab wait for that old viewport to become complete.
         g_pageNavigationPending = false;
-        g_zoomPresentationPending = false;
         g_stageIdleRefreshPending = false;
         g_stageLightPaintUntil = 0;
         g_smoothStageScroll = false;
@@ -14404,12 +14373,10 @@ namespace
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
         bool currentContentReady = g_pageNavigationPending && CurrentZoomVisibleContentReady(tab);
-        bool zoomPreviewReady = g_zoomPresentationPending && !currentContentReady && ZoomPreviewVisibleContentReady(tab);
-        bool holdPartialFrame = g_pageNavigationPending && !currentContentReady && !zoomPreviewReady;
+        bool holdPartialFrame = g_pageNavigationPending && !currentContentReady;
         if (currentContentReady)
         {
             g_pageNavigationPending = false;
-            g_zoomPresentationPending = false;
             holdPartialFrame = false;
         }
         bool lightPaint = StageLightPaintActive();
@@ -14463,13 +14430,9 @@ namespace
                     if (!UseTiledPageRendering(tab))
                     {
                         PageImage* image = FindCachedPage(tab, i);
-                        bool usingZoomFallback = false;
                         if (!image)
                         {
-                            image = FindZoomFallbackPage(tab, i);
-                            usingZoomFallback = image != nullptr;
-                            if (!g_gestureZooming)
-                                QueuePageRender(g_hwnd, tab, i, 0);
+                            QueuePageRender(g_hwnd, tab, i, 0);
                         }
                         Fill(dc, drawRect, PdfPageBackgroundColor());
                         bool currentTilesPainted = false;
@@ -14486,16 +14449,11 @@ namespace
                             int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), sx + 1, image->width);
                             int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), sy + 1, image->height);
                             if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy))
-                            {
                                 paintedRenderable = true;
-                                if (usingZoomFallback) QueuePageRender(g_hwnd, tab, i, 0);
-                            }
                         }
                         else
                         {
-                            bool oldZoomPainted = !currentTilesPainted && DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
-                            if (oldZoomPainted) paintedRenderable = true;
-                            else if (!currentTilesPainted) missingVisiblePage = true;
+                            if (!currentTilesPainted) missingVisiblePage = true;
                         }
                     }
                     else
@@ -14518,58 +14476,24 @@ namespace
                         }
                         else if (!holdPartialFrame)
                         {
-                            bool fallbackPainted = false;
-                            PageImage* fallback = FindZoomFallbackPage(tab, i);
-                            if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
-                            {
-                                int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
-                                int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
-                                int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
-                                int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
-                                fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
-                            }
-                            int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
                             bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
-                            bool oldZoomPainted = false;
-                            if (targetMissing && !fallbackPainted)
-                                oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
-
-                            // A zoom generation is presented atomically whenever
-                            // an older generation is already visible. Mixing
-                            // old and new tiles is what creates the visible
-                            // left-to-right flash during a zoom gesture.
-                            bool holdStableFrame = fallbackPainted || oldZoomPainted;
-                            bool coarseComplete = false;
-                            bool coarsePainted = false;
                             bool targetPainted = false;
                             if (!targetMissing)
                             {
                                 bool ignoredMissing = false;
                                 targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
                             }
-                            else if (!holdStableFrame)
-                            {
-                                for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
-                                    coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
-                                for (int level = targetLevel; level >= 1; --level)
-                                {
-                                    bool ignoredMissing = false;
-                                    coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
-                                }
-                                bool ignoredMissing = false;
-                                targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
-                            }
-                            if (targetMissing && !g_gestureZooming)
+                            if (targetMissing)
                             {
                                 int queueBudget = stageScrolling ? 4 : 12;
                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
                             }
-                            if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
-                            if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
+                            if (targetPainted) paintedRenderable = true;
+                            if (targetMissing && !targetPainted) missingVisiblePage = true;
                         }
                         else
                         {
-                            if (!g_gestureZooming && !CanCacheWholePageAtCurrentZoom(tab, i))
+                            if (!CanCacheWholePageAtCurrentZoom(tab, i))
                             {
                                 int queueBudget = 8;
                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
@@ -14700,14 +14624,8 @@ namespace
             if (CurrentZoomVisibleContentReady(tab))
             {
                 g_pageNavigationPending = false;
-                g_zoomPresentationPending = false;
                 return true;
             }
-            // During zoom, a complete previous generation is a valid
-            // presentation frame. It follows the pointer immediately while
-            // the target generation is rendered off-screen.
-            if (g_zoomPresentationPending && ZoomPreviewVisibleContentReady(tab))
-                return true;
             return false;
         }
         return true;
@@ -18152,7 +18070,7 @@ namespace
                     ScrollStageTo(hwnd, 0);
                     if (g_scrollY == oldScroll) g_pageNavigationPending = false;
                 }
-                else { tab->currentPage = 0; g_scrollY = 0; g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                else { tab->currentPage = 0; g_scrollY = 0; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdPrev:
@@ -18173,7 +18091,7 @@ namespace
                     tab->currentPage = previous;
                     g_scrollY = 0;
                 }
-                if (!g_continuousRead) { g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdNext:
@@ -18191,7 +18109,7 @@ namespace
                     tab->currentPage = std::min(tab->pageCount - 1, NextSpreadStart(*tab, FirstPageInSpread(tab->currentPage)));
                     g_scrollY = 0;
                 }
-                if (!g_continuousRead) { g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdLast:
@@ -18205,7 +18123,7 @@ namespace
                     if (g_scrollY == oldScroll) g_pageNavigationPending = false;
                 }
                 else tab->currentPage = tab->pageCount - 1;
-                if (!g_continuousRead) { g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdOutlineToggleAll:
