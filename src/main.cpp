@@ -11592,6 +11592,10 @@ namespace
         // screen until the new zoom generation is complete, so a timer-based
         // preview window only makes the transition less stable.
         tab.zoom = clampedZoom;
+        // PaintPages renders the target generation into the existing back
+        // buffer, but does not present it until the visible page is complete.
+        // This keeps partial tiles from replacing the last stable frame.
+        g_pageNavigationPending = true;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
 
