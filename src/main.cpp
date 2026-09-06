@@ -1558,6 +1558,11 @@ namespace
     bool g_sidebarProgressRefreshPending{};
     bool g_gesturePanning{};
     bool g_gestureSidebar{};
+    bool g_gestureZooming{};
+    bool g_gestureZoomRenderSuppressed{};
+    double g_gestureZoomStartDistance{};
+    double g_gestureZoomStartValue{};
+    POINT g_gestureZoomPoint{};
     bool g_touchPanQueued{};
     bool g_touchMomentum{};
     bool g_pagePrefetchPending{};
@@ -6470,11 +6475,14 @@ namespace
                 g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& request)
                 {
-                    return request.documentVersion == tab.renderVersion &&
+                    // Metadata is independent of the zoom generation. A
+                    // pinch must not discard the pending outline request.
+                    return !request.metadata &&
+                        request.documentVersion == tab.renderVersion &&
                         _wcsicmp(request.path.c_str(), tab.path.c_str()) == 0;
                 }),
             g_pageRenderQueue.end());
-        if (g_pageRenderActive &&
+        if (g_pageRenderActive && !g_pageRenderActiveRequest.metadata &&
             g_pageRenderActiveRequest.documentVersion == tab.renderVersion &&
             _wcsicmp(g_pageRenderActiveRequest.path.c_str(), tab.path.c_str()) == 0)
         {
@@ -11565,7 +11573,17 @@ namespace
             tab.zoomFallbackTheme = tab.cachedTheme;
         }
 
-        CancelObsoletePageRendersForZoom(tab);
+        // During a pinch, the input stream is the priority. Cancel stale
+        // raster work once, then keep painting the last committed generation
+        // scaled to the live zoom value. Re-canceling and re-queuing on every
+        // finger update makes the UI thread compete with the renderer.
+        bool interactiveZoom = g_gestureZooming;
+        if (!interactiveZoom || !g_gestureZoomRenderSuppressed)
+        {
+            CancelObsoletePageRendersForZoom(tab);
+            if (interactiveZoom)
+                g_gestureZoomRenderSuppressed = true;
+        }
         // Do not delay the target render. The old committed frame is kept on
         // screen until the new zoom generation is complete, so a timer-based
         // preview window only makes the transition less stable.
@@ -11628,10 +11646,33 @@ namespace
         GetClientRect(hwnd, &client);
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         InvalidateRect(hwnd, &status, FALSE);
-        SchedulePagePrefetch(hwnd);
-        if (UseTiledPageRendering(tab))
-            HighZoomVisiblePagesReady(hwnd, tab);
-        ScheduleIdleCacheTrim(hwnd);
+        if (!interactiveZoom)
+        {
+            SchedulePagePrefetch(hwnd);
+            if (UseTiledPageRendering(tab))
+                HighZoomVisiblePagesReady(hwnd, tab);
+            ScheduleIdleCacheTrim(hwnd);
+        }
+    }
+
+    void FinishGestureZoom(HWND hwnd)
+    {
+        if (!g_gestureZooming) return;
+        g_gestureZooming = false;
+        g_gestureZoomRenderSuppressed = false;
+        g_gestureZoomStartDistance = 0.0;
+        g_gestureZoomStartValue = 0.0;
+        if (PdfTab* tab = Active())
+        {
+            // Only the final gesture value enters the normal render queue.
+            // The committed frame remains visible until this generation is
+            // complete, so the release cannot expose partially rendered tiles.
+            SchedulePagePrefetch(hwnd);
+            if (UseTiledPageRendering(*tab))
+                HighZoomVisiblePagesReady(hwnd, *tab);
+            ScheduleIdleCacheTrim(hwnd);
+        }
+        RequestStageRepaint(hwnd, true);
     }
 
     void CloseCustomZoomDialog(HWND hwnd)
@@ -14353,7 +14394,8 @@ namespace
                         {
                             image = FindZoomFallbackPage(tab, i);
                             usingZoomFallback = image != nullptr;
-                            QueuePageRender(g_hwnd, tab, i, 0);
+                            if (!g_gestureZooming)
+                                QueuePageRender(g_hwnd, tab, i, 0);
                         }
                         Fill(dc, drawRect, PdfPageBackgroundColor());
                         bool currentTilesPainted = false;
@@ -14443,7 +14485,7 @@ namespace
                                 bool ignoredMissing = false;
                                 targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
                             }
-                            if (targetMissing)
+                            if (targetMissing && !g_gestureZooming)
                             {
                                 int queueBudget = stageScrolling ? 4 : 12;
                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
@@ -14453,7 +14495,7 @@ namespace
                         }
                         else
                         {
-                            if (!CanCacheWholePageAtCurrentZoom(tab, i))
+                            if (!g_gestureZooming && !CanCacheWholePageAtCurrentZoom(tab, i))
                             {
                                 int queueBudget = 8;
                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
@@ -18323,7 +18365,12 @@ namespace
                 panConfig.dwID = GID_PAN;
                 panConfig.dwWant = GC_PAN | GC_PAN_WITH_GUTTER | GC_PAN_WITH_INERTIA | GC_PAN_WITH_SINGLE_FINGER_VERTICALLY;
                 panConfig.dwBlock = 0;
-                SetGestureConfig(hwnd, 0, 1, &panConfig, sizeof(panConfig));
+                GESTURECONFIG zoomConfig{};
+                zoomConfig.dwID = GID_ZOOM;
+                zoomConfig.dwWant = GC_ZOOM;
+                zoomConfig.dwBlock = 0;
+                GESTURECONFIG configs[] = { panConfig, zoomConfig };
+                SetGestureConfig(hwnd, 0, static_cast<UINT>(std::size(configs)), configs, sizeof(configs[0]));
             }
             return 0;
         case WM_MOUSEACTIVATE:
@@ -20478,6 +20525,7 @@ namespace
             info.cbSize = sizeof(info);
             if (!GetGestureInfo(reinterpret_cast<HGESTUREINFO>(lParam), &info))
             {
+                CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(lParam));
                 break;
             }
             POINT pt{ info.ptsLocation.x, info.ptsLocation.y };
@@ -20486,6 +20534,11 @@ namespace
             {
                 StopTouchMomentum(hwnd);
                 g_gesturePanning = false;
+                g_gestureSidebar = false;
+                g_gestureZooming = false;
+                g_gestureZoomRenderSuppressed = false;
+                g_gestureZoomStartDistance = 0.0;
+                g_gestureZoomStartValue = 0.0;
                 g_pageWheelDeltaAccum = 0;
                 g_gestureLastX = pt.x;
                 g_gestureLastY = pt.y;
@@ -20493,12 +20546,42 @@ namespace
             else if (info.dwID == GID_END)
             {
                 FlushTouchPan(hwnd);
+                FinishGestureZoom(hwnd);
                 g_gesturePanning = false;
                 g_gestureSidebar = false;
                 g_pageWheelDeltaAccum = 0;
             }
+            else if (info.dwID == GID_ZOOM)
+            {
+                PdfTab* tab = Active();
+                double distance = std::max(1.0, static_cast<double>(info.ullArguments));
+                bool begins = (info.dwFlags & GF_BEGIN) != 0 || !g_gestureZooming;
+                if (tab && Hit(g_stage, pt.x, pt.y))
+                {
+                    if (begins)
+                    {
+                        g_gestureZooming = true;
+                        g_gestureZoomStartDistance = distance;
+                        g_gestureZoomStartValue = tab->zoom;
+                        g_gestureZoomPoint = pt;
+                    }
+                    else if (g_gestureZoomStartDistance > 0.0 && g_gestureZoomStartValue > 0.0)
+                    {
+                        double ratio = distance / g_gestureZoomStartDistance;
+                        ApplyZoomAtPoint(hwnd, *tab, g_gestureZoomPoint, g_gestureZoomStartValue * ratio);
+                    }
+                }
+                g_gesturePanning = false;
+                if ((info.dwFlags & GF_END) != 0)
+                    FinishGestureZoom(hwnd);
+            }
             else if (info.dwID == GID_PAN)
             {
+                if (g_gestureZooming)
+                {
+                    CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(lParam));
+                    return 0;
+                }
                 if ((info.dwFlags & GF_BEGIN) != 0 || !g_gesturePanning)
                 {
                     g_gesturePanning = true;
