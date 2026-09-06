@@ -1797,15 +1797,7 @@ namespace
     bool SidebarVisible()
     {
         if (!g_sidebarOpen || (g_immersive && !g_immersiveSidebarOpen)) return false;
-        if (g_sideMode == 0)
-        {
-            if (g_active < 0 || g_active >= static_cast<int>(g_tabs.size())) return false;
-            PdfTab const& tab = *g_tabs[static_cast<size_t>(g_active)];
-            // Do not expose a synthetic page-number list while the outline is
-            // loading, or for PDFs that have no usable outline at all.
-            if (!tab.outlineMetadataLoaded || tab.outline.empty()) return false;
-        }
-        return true;
+        return g_active >= 0 && g_active < static_cast<int>(g_tabs.size());
     }
 
     bool UsesBackdropTheme()
@@ -12353,12 +12345,7 @@ namespace
     void SwitchSidebarMode(HWND hwnd, int mode)
     {
         mode = std::clamp(mode, 0, 3);
-        if (mode == 0)
-        {
-            PdfTab* tab = Active();
-            if (!tab || !tab->outlineMetadataLoaded || tab->outline.empty())
-                return;
-        }
+        if (!Active()) return;
         if (mode == g_sideMode) return;
         if (PdfTab* tab = Active()) SaveActiveTabSidebarState(*tab);
         g_sideMode = mode;
@@ -17953,8 +17940,7 @@ namespace
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdBookmark:
-            if (PdfTab* tab = Active(); !tab || !tab->outlineMetadataLoaded || tab->outline.empty())
-                return;
+            if (!Active()) return;
             if (g_sidebarOpen && g_sideMode == 0) StartSidebarPanelAnimation(hwnd, false);
             else
             {
