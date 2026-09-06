@@ -441,6 +441,8 @@ namespace
         long long pinnedAt{};
         bool pinned{};
         bool favorite{};
+        int sidebarScrollY{};
+        int selectedOutlineRow{ -1 };
     };
 
     struct LastSessionItem
@@ -4697,6 +4699,8 @@ namespace
                     if (parts.size() >= 4) item.favorite = std::atoi(parts[3].c_str()) != 0;
                     if (parts.size() >= 5) item.pinned = std::atoi(parts[4].c_str()) != 0;
                     if (parts.size() >= 6) item.pinnedAt = std::atoll(parts[5].c_str());
+                    if (parts.size() >= 7) item.sidebarScrollY = std::max(0, std::atoi(parts[6].c_str()));
+                    if (parts.size() >= 8) item.selectedOutlineRow = std::atoi(parts[7].c_str());
                     g_recent.push_back(item);
                 }
             }
@@ -4735,7 +4739,8 @@ namespace
         for (auto const& item : g_recent)
         {
             out << "recent=" << item.openedAt << '\t' << item.page << '\t' << ToUtf8(item.path) << '\t'
-                << (item.favorite ? 1 : 0) << '\t' << (item.pinned ? 1 : 0) << '\t' << item.pinnedAt << "\n";
+                << (item.favorite ? 1 : 0) << '\t' << (item.pinned ? 1 : 0) << '\t' << item.pinnedAt << '\t'
+                << item.sidebarScrollY << '\t' << item.selectedOutlineRow << "\n";
         }
     }
 
@@ -5326,6 +5331,8 @@ namespace
         auto it = std::find_if(g_recent.begin(), g_recent.end(), [&](auto const& i) { return i.path == tab.path; });
         if (it != g_recent.end())
         {
+            item.sidebarScrollY = it->sidebarScrollY;
+            item.selectedOutlineRow = it->selectedOutlineRow;
             item.favorite = it->favorite;
             item.pinned = it->pinned;
             item.pinnedAt = it->pinnedAt;
@@ -5350,13 +5357,18 @@ namespace
         auto it = std::find_if(g_recent.begin(), g_recent.end(), [&](auto const& item) { return item.path == tab.path; });
         if (it == g_recent.end())
         {
-            g_recent.insert(g_recent.begin(), RecentItem{ tab.path, tab.name, page, NowMs() });
+            RecentItem item{ tab.path, tab.name, page, NowMs() };
+            item.sidebarScrollY = std::max(0, tab.sidebarScrollY[0]);
+            item.selectedOutlineRow = tab.selectedOutlineRow;
+            g_recent.insert(g_recent.begin(), std::move(item));
             SortRecent();
             if (g_recent.size() > 80) g_recent.resize(80);
         }
         else
         {
             it->page = page;
+            it->sidebarScrollY = std::max(0, tab.sidebarScrollY[0]);
+            it->selectedOutlineRow = tab.selectedOutlineRow;
         }
         if (saveNow) SaveState();
     }
@@ -10658,11 +10670,16 @@ namespace
         tab->name = std::filesystem::path(path).filename().wstring();
         UpdateTabFileStamp(*tab);
         int restorePage = RecentPageForPath(path);
+        auto recent = std::find_if(g_recent.begin(), g_recent.end(), [&](auto const& item) { return item.path == path; });
+        int restoreSidebarScrollY = recent == g_recent.end() ? 0 : recent->sidebarScrollY;
+        int restoreSelectedOutlineRow = recent == g_recent.end() ? -1 : recent->selectedOutlineRow;
         LoadInitialPageGeometry(*tab);
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
         g_tabs.back()->lastActivatedSerial = ++g_tabActivationSerial;
+        g_tabs.back()->sidebarScrollY[0] = std::max(0, restoreSidebarScrollY);
+        g_tabs.back()->selectedOutlineRow = restoreSelectedOutlineRow;
         g_sidebarKeyboardFocus = false;
         EnsureTabWindowVisible(g_active);
         g_tabListOpen = false;
