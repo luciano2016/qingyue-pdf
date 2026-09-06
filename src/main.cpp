@@ -7776,6 +7776,54 @@ namespace
         }
     }
 
+    bool TryLoadSmallDocumentOutline(PdfTab& tab)
+    {
+        // Outline data is tiny compared with page rasters. Resolve it during
+        // the open transaction for small documents so a recent-file reopen
+        // cannot paint an empty sidebar while a queue request is being
+        // canceled or reordered. Large documents keep the asynchronous path
+        // so opening them never waits on outline parsing.
+        constexpr int synchronousPageLimit = 128;
+        if (!tab.renderSession || !tab.doc || tab.pageCount <= 0 || tab.pageCount > synchronousPageLimit)
+            return false;
+
+        fz_outline* outline = nullptr;
+        bool read = false;
+        {
+            PdfDocumentLock lock(tab);
+            try
+            {
+                outline = g_pdf.loadOutline(tab.ctx, tab.doc);
+                if (outline)
+                    CollectOutline(tab, outline, 0);
+                read = true;
+            }
+            catch (...)
+            {
+                tab.outline.clear();
+            }
+            if (outline)
+            {
+                try { g_pdf.dropOutline(tab.ctx, outline); }
+                catch (...) {}
+            }
+        }
+
+        if (!read)
+        {
+            tab.outline.clear();
+            return false;
+        }
+
+        // An empty result is still a valid document fact: this PDF has no
+        // usable outline. Keeping that state explicit prevents the same file
+        // from oscillating between "empty" and "loading" on reopen.
+        tab.outlineMetadataRequested = false;
+        tab.outlineMetadataLoaded = true;
+        tab.outlineMetadataRetryCount = 0;
+        return true;
+    }
+
     void ScrollToPage(PdfTab& tab, int page)
     {
         page = std::clamp(page, 0, tab.pageCount - 1);
@@ -10822,6 +10870,7 @@ namespace
         int restoreSidebarScrollY = recent == g_recent.end() ? 0 : recent->sidebarScrollY;
         int restoreSelectedOutlineRow = recent == g_recent.end() ? -1 : recent->selectedOutlineRow;
         LoadInitialPageGeometry(*tab);
+        bool outlineLoadedSynchronously = TryLoadSmallDocumentOutline(*tab);
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
@@ -10870,10 +10919,12 @@ namespace
         // policy and prevents several large PDFs from warming concurrently.
         PrioritizePageRendersForTab(*Active());
         TrimBackgroundRenderCaches();
-        // Outline parsing is always asynchronous. In particular, opening a
-        // recent large document must not wait for the complete outline before
-        // its first page can be shown.
-        RequestOutlineMetadata(hwnd, *Active());
+        // Small documents have their real MuPDF outline ready before the Tab
+        // is published, so reopening them from Recent never shows a false
+        // empty sidebar. Large documents stay asynchronous to preserve fast
+        // first paint and responsive opening.
+        if (!outlineLoadedSynchronously)
+            RequestOutlineMetadata(hwnd, *Active());
         QueueInitialViewportPreview(hwnd, *Active());
         SchedulePagePrefetch(hwnd);
         // Geometry is deliberately queued behind the outline and the visible
@@ -14034,6 +14085,47 @@ namespace
         }
         else
         {
+            if (!tab.outlineMetadataLoaded)
+            {
+                // Keep the unresolved state visibly distinct from a PDF that
+                // genuinely has no outline. Reuse the sidebar repaint timer
+                // at a low rate for a small native spinner; no worker or
+                // document cache is added for this visual state.
+                SetTimer(g_hwnd, 7, 80, nullptr);
+                RECT loadingArea{
+                    g_sidebar.left + S(18),
+                    g_sidebar.top + S(74),
+                    g_sidebar.right - S(18),
+                    g_sidebar.top + S(138) };
+                int cx = (loadingArea.left + loadingArea.right) / 2;
+                int cy = loadingArea.top + S(18);
+                Gdiplus::Graphics loadingGraphics(dc);
+                loadingGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                Gdiplus::Pen loadingPen(GdiColor(T().accent, 190), std::max<Gdiplus::REAL>(S(1.6f), S(2.0f)));
+                float diameter = static_cast<float>(S(16));
+                float angle = static_cast<float>(GetTickCount64() % 1000) * 0.36f;
+                loadingGraphics.DrawArc(
+                    &loadingPen,
+                    static_cast<float>(cx) - diameter / 2.0f,
+                    static_cast<float>(cy) - diameter / 2.0f,
+                    diameter,
+                    diameter,
+                    angle,
+                    270.0f);
+                RECT loadingText{
+                    g_sidebar.left + S(12),
+                    g_sidebar.top + S(102),
+                    g_sidebar.right - S(12),
+                    g_sidebar.top + S(132) };
+                Text(dc, L"正在加载目录…", loadingText,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+                g_sidebarContentHeight = 0;
+                KillTimer(g_hwnd, 5);
+                SelectObject(dc, oldFont);
+                DeleteObject(f);
+                return;
+            }
+            KillTimer(g_hwnd, 7);
             RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(8), g_sidebar.right - S(12), g_sidebar.top + S(36) };
             Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
 
