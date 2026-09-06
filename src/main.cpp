@@ -369,9 +369,6 @@ namespace
         int selectedOutlineRow{ -1 };
         std::set<int> collapsedOutlineRows;
         double zoom{ 1.0 };
-        // A zoom generation is presented as one unit. While its target
-        // raster is incomplete, keep the last complete generation visible.
-        bool zoomPresentationPending{};
         double cachedZoom{};
         unsigned cachedDpi{};
         std::wstring path;
@@ -6134,13 +6131,6 @@ namespace
     void PreservePageCacheForZoomTransition(PdfTab& tab, double oldZoom)
     {
         if (oldZoom <= 0.0) return;
-        if (tab.zoomFallbackZoom > 0.0 &&
-            tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == PdfRenderTheme())
-        {
-            // Keep a usable whole-frame fallback alive during a slow render
-            // when the user continues changing the zoom value.
-            tab.zoomFallbackUntil = GetTickCount64() + 8000;
-        }
         if (tab.cachedZoom != oldZoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme()) return;
 
         // Oversized pages use tiles instead of a whole-page bitmap. Keep the
@@ -6157,7 +6147,7 @@ namespace
                 tab.zoomFallbackDpi = tab.cachedDpi;
                 tab.zoomFallbackTheme = PdfRenderTheme();
                 tab.zoomFallbackZoom = oldZoom;
-                tab.zoomFallbackUntil = GetTickCount64() + 8000;
+                tab.zoomFallbackUntil = GetTickCount64() + 1400;
             }
             return;
         }
@@ -6168,7 +6158,7 @@ namespace
         tab.zoomFallbackDpi = tab.cachedDpi;
         tab.zoomFallbackTheme = PdfRenderTheme();
         tab.zoomFallbackZoom = oldZoom;
-        tab.zoomFallbackUntil = GetTickCount64() + 8000;
+        tab.zoomFallbackUntil = GetTickCount64() + 1400;
     }
 
     void ReleaseZoomFallback(PdfTab& tab)
@@ -11952,7 +11942,6 @@ namespace
         KillTimer(hwnd, 21);
         SetTimer(hwnd, 21, 140, nullptr);
         tab.zoom = clampedZoom;
-        tab.zoomPresentationPending = true;
         g_pageNavigationPending = false;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
@@ -14796,16 +14785,6 @@ namespace
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
-        // Zoom input changes the geometry immediately, but a render result is
-        // not presented until the visible target generation is complete. This
-        // is the same atomic presentation rule used by SumatraPDF: the user
-        // sees one scaled frame, never a mixture of tile generations.
-        if (tab.zoomPresentationPending && !ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
-        {
-            tab.zoomPresentationPending = false;
-            ReleaseZoomFallback(tab);
-        }
-        bool zoomPresentationPending = tab.zoomPresentationPending;
         bool lightPaint = StageLightPaintActive();
         bool stageScrolling = StageScrollPaintInProgress();
         bool hadVisiblePage = false;
@@ -14899,45 +14878,36 @@ namespace
                          }
                          int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
                          bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
-                         bool oldZoomPainted = false;
-                         bool coarsePainted = false;
-                         bool targetPainted = false;
-                         if (zoomPresentationPending)
-                         {
-                             // During zoom, only a complete old frame is a
-                             // valid fallback. Never paint old and new tiles
-                             // into the same page while the target is pending.
-                             if (!fallbackPainted)
-                                 oldZoomPainted = DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect);
-                             if (targetMissing)
-                             {
-                                 int queueBudget = stageScrolling ? 4 : 12;
-                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                             }
-                         }
-                         else
-                         {
-                             bool coarseComplete = false;
-                             for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
-                                 coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
-                             if (!fallbackPainted && targetMissing && !coarseComplete)
-                                 oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
-                             if (targetMissing)
-                             {
-                                 for (int level = targetLevel; level >= 1; --level)
-                                 {
-                                     bool ignoredMissing = false;
-                                     coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
-                                 }
-                             }
-                             bool ignoredMissing = false;
-                             targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
-                             if (targetMissing)
-                             {
-                                 int queueBudget = stageScrolling ? 4 : 12;
-                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                             }
-                         }
+                          bool paintTiles = !ZoomRenderDeferred() || !fallbackPainted;
+                          bool coarseComplete = false;
+                          if (paintTiles)
+                          {
+                              for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
+                                  coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
+                          }
+                          bool oldZoomPainted = false;
+                          if (paintTiles && !fallbackPainted && targetMissing && !coarseComplete)
+                              oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
+                          bool coarsePainted = false;
+                          if (paintTiles && targetMissing)
+                          {
+                              for (int level = targetLevel; level >= 1; --level)
+                              {
+                                  bool ignoredMissing = false;
+                                  coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
+                              }
+                          }
+                          bool targetPainted = false;
+                          if (paintTiles)
+                          {
+                              bool ignoredMissing = false;
+                              targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                          }
+                          if (targetMissing && !ZoomRenderDeferred())
+                          {
+                              int queueBudget = stageScrolling ? 4 : 12;
+                              QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                          }
                          if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
                          if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                      }
@@ -19072,16 +19042,6 @@ namespace
                         // an oversized page, is presented atomically.
                         if (CurrentZoomVisibleContentReady(tab))
                             InvalidateRect(hwnd, &g_stage, FALSE);
-                    }
-                    else if (tab.zoomPresentationPending)
-                    {
-                        // Refill the bounded queue without repainting the
-                        // viewport for every tile. Only the final complete
-                        // target generation is allowed to reach the screen.
-                        if (!ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
-                            InvalidateRect(hwnd, &g_stage, FALSE);
-                        else
-                            SchedulePagePrefetch(hwnd);
                     }
                     else if (request.tile)
                     {
