@@ -1586,6 +1586,9 @@ namespace
     ULONGLONG g_lastTouchFollowPaintMs{};
     ULONGLONG g_lastMainScrollDragMoveMs{};
     ULONGLONG g_stageLightPaintUntil{};
+    // Debounce only the presentation of zoom generations. The current
+    // complete frame stays visible while a continuous gesture is active.
+    ULONGLONG g_zoomRenderDeferUntil{};
     ULONGLONG g_sidebarAnimationStartMs{};
     HBITMAP g_glassBackdrop{};
     HDC g_paintBufferDc{};
@@ -6131,6 +6134,13 @@ namespace
     void PreservePageCacheForZoomTransition(PdfTab& tab, double oldZoom)
     {
         if (oldZoom <= 0.0) return;
+        if (tab.zoomFallbackZoom > 0.0 &&
+            tab.zoomFallbackDpi == g_dpi && tab.zoomFallbackTheme == PdfRenderTheme())
+        {
+            // Keep a usable whole-frame fallback alive during a slow render
+            // when the user continues changing the zoom value.
+            tab.zoomFallbackUntil = GetTickCount64() + 8000;
+        }
         if (tab.cachedZoom != oldZoom || tab.cachedDpi != g_dpi || tab.cachedTheme != PdfRenderTheme()) return;
 
         // Oversized pages use tiles instead of a whole-page bitmap. Keep the
@@ -6147,7 +6157,7 @@ namespace
                 tab.zoomFallbackDpi = tab.cachedDpi;
                 tab.zoomFallbackTheme = PdfRenderTheme();
                 tab.zoomFallbackZoom = oldZoom;
-                tab.zoomFallbackUntil = GetTickCount64() + 1400;
+                tab.zoomFallbackUntil = GetTickCount64() + 8000;
             }
             return;
         }
@@ -6158,7 +6168,7 @@ namespace
         tab.zoomFallbackDpi = tab.cachedDpi;
         tab.zoomFallbackTheme = PdfRenderTheme();
         tab.zoomFallbackZoom = oldZoom;
-        tab.zoomFallbackUntil = GetTickCount64() + 1400;
+        tab.zoomFallbackUntil = GetTickCount64() + 8000;
     }
 
     void ReleaseZoomFallback(PdfTab& tab)
@@ -11315,6 +11325,11 @@ namespace
         }
     }
 
+    bool ZoomRenderDeferred()
+    {
+        return g_zoomRenderDeferUntil != 0 && GetTickCount64() < g_zoomRenderDeferUntil;
+    }
+
     void RequestStageRepaint(HWND hwnd, bool includeStatus)
     {
         RECT client{};
@@ -11933,6 +11948,9 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         CancelObsoletePageRendersForZoom(tab);
+        g_zoomRenderDeferUntil = GetTickCount64() + 140;
+        KillTimer(hwnd, 21);
+        SetTimer(hwnd, 21, 140, nullptr);
         tab.zoom = clampedZoom;
         tab.zoomPresentationPending = true;
         g_pageNavigationPending = false;
@@ -14782,7 +14800,7 @@ namespace
         // not presented until the visible target generation is complete. This
         // is the same atomic presentation rule used by SumatraPDF: the user
         // sees one scaled frame, never a mixture of tile generations.
-        if (tab.zoomPresentationPending && CurrentZoomVisibleContentReady(tab))
+        if (tab.zoomPresentationPending && !ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
         {
             tab.zoomPresentationPending = false;
             ReleaseZoomFallback(tab);
@@ -19060,7 +19078,7 @@ namespace
                         // Refill the bounded queue without repainting the
                         // viewport for every tile. Only the final complete
                         // target generation is allowed to reach the screen.
-                        if (CurrentZoomVisibleContentReady(tab))
+                        if (!ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
                             InvalidateRect(hwnd, &g_stage, FALSE);
                         else
                             SchedulePagePrefetch(hwnd);
@@ -20930,8 +20948,23 @@ namespace
                 }
                 if (renderBusy)
                     SetTimer(hwnd, 20, 250, nullptr);
-                else if (!StageScrollPaintInProgress())
+                else if (!StageScrollPaintInProgress() && !ZoomRenderDeferred())
                     TrimIdleRenderCaches(hwnd);
+                return 0;
+            }
+            if (wParam == 21)
+            {
+                ULONGLONG now = GetTickCount64();
+                if (now < g_zoomRenderDeferUntil)
+                {
+                    SetTimer(hwnd, 21, static_cast<UINT>(std::max<ULONGLONG>(10, g_zoomRenderDeferUntil - now)), nullptr);
+                    return 0;
+                }
+                KillTimer(hwnd, 21);
+                g_zoomRenderDeferUntil = 0;
+                InvalidateRect(hwnd, &g_stage, FALSE);
+                SchedulePagePrefetch(hwnd);
+                ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
             if (wParam == 22)
