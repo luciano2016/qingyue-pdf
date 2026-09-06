@@ -289,6 +289,13 @@ namespace
         std::wstring author{ L"10726" };
     };
 
+    struct TextSelectionSegment
+    {
+        int page{ -1 };
+        std::vector<fz_quad> quads;
+        std::wstring text;
+    };
+
     struct QuietPdfAnnotation
     {
         int page{};
@@ -372,6 +379,7 @@ namespace
         std::map<int, PageImage> zoomFallbackCache;
         std::map<TileKey, PageImage> tileCache;
         std::map<int, PageImage> thumbCache;
+        std::set<int> thumbRenderPending;
         std::map<int, std::vector<fz_rect>> textBoxes;
         std::map<int, std::vector<PdfLink>> links;
         std::set<int> linksReady;
@@ -397,6 +405,31 @@ namespace
         bool initialStoreTrimPending{ true };
         unsigned long renderVersion{};
         std::shared_ptr<PageRenderSession> renderSession;
+        ULONGLONG lastActivatedSerial{};
+        // Geometry-only layout index. It avoids rescanning all preceding pages
+        // whenever a tab is activated or the viewport asks for its first page.
+        mutable int layoutCacheViewMode{ -1 };
+        mutable double layoutCacheZoom{};
+        mutable unsigned layoutCacheDpi{};
+        mutable std::vector<int> layoutSpreadStarts;
+        mutable std::vector<int> layoutSpreadTops;
+        mutable std::vector<int> layoutSpreadEnds;
+        mutable int layoutMaxSpreadWidth{};
+        mutable int layoutContentExtent{};
+        bool outlineMetadataRequested{};
+        bool outlineMetadataLoaded{};
+        int outlineMetadataRetryCount{};
+        int metadataPagesLoaded{};
+        bool metadataGeometryComplete{};
+        int outlineCollapseVersion{};
+        // Startup restoration initially uses a fallback page-size index. Keep
+        // the saved position as an offset from its page so the final geometry
+        // pass can re-anchor it without jumping to the page top.
+        bool pendingSessionPosition{};
+        int pendingSessionPage{};
+        int pendingSessionOffsetY{};
+        bool pendingSessionPageOffset{};
+        int pendingSessionPageOffsetY{};
     };
 
     struct RecentItem
@@ -416,6 +449,10 @@ namespace
         int page{ 1 };
         int scrollY{};
         double zoom{ 1.0 };
+        int pageOffsetY{};
+        int sidebarScrollY{};
+        int selectedOutlineRow{ -1 };
+        bool hasPageOffset{};
     };
 
     enum class HomeAction
@@ -1046,7 +1083,9 @@ namespace
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
         using PageBoundsFn = int(__cdecl*)(fz_context*, fz_document*, fz_rect*, int);
+        using PageBoundsRangeFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_rect*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
+        using SelectTextWithMarginsFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, int, int, fz_quad*, int, char*, int);
         using SelectWordAtPointFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, fz_quad*, int, char*, int);
         using TextCharBoxesFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_rect*, int);
         using GetLinksFn = int(__cdecl*)(fz_context*, fz_document*, int, QuietPdfLinkInfo*, int, fz_rect*, int, int*);
@@ -1099,7 +1138,9 @@ namespace
             Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(loadAnnotations, "quiet_pdf_load_annotations");
             Get(pageBounds, "quiet_pdf_get_page_bounds");
+            GetOptional(pageBoundsRange, "quiet_pdf_get_page_bounds_range");
             Get(selectText, "quiet_pdf_select_text");
+            Get(selectTextWithMargins, "quiet_pdf_select_text_with_margins");
             GetOptional(selectWordAtPoint, "quiet_pdf_select_word_at_point");
             Get(getLinks, "quiet_pdf_get_links");
             GetOptional(textCharBoxes, "quiet_pdf_get_text_char_boxes");
@@ -1152,7 +1193,9 @@ namespace
         SaveAnnotationsFn saveAnnotations{};
         LoadAnnotationsFn loadAnnotations{};
         PageBoundsFn pageBounds{};
+        PageBoundsRangeFn pageBoundsRange{};
         SelectTextFn selectText{};
+        SelectTextWithMarginsFn selectTextWithMargins{};
         GetLinksFn getLinks{};
         SelectWordAtPointFn selectWordAtPoint{};
         TextCharBoxesFn textCharBoxes{};
@@ -1216,6 +1259,7 @@ namespace
 
     MuPdf g_pdf;
     bool g_sharedStoreTrimPending{};
+    ULONGLONG g_tabActivationSerial{};
 
     PageRenderSession::~PageRenderSession()
     {
@@ -1297,6 +1341,7 @@ namespace
     std::vector<int> g_sidebarRowIds;
     std::vector<RECT> g_outlineToggleRects;
     std::vector<int> g_outlineToggleRowIds;
+    bool g_outlineClickHandledOnDown{};
     std::vector<RECT> g_sideTabRects;
     std::vector<RECT> g_searchResultRects;
     std::vector<int> g_searchResultIds;
@@ -1307,6 +1352,7 @@ namespace
     constexpr UINT WM_QUIETPDF_PAGE_RENDERED = WM_APP + 43;
     constexpr UINT WM_QUIETPDF_HOME_THUMB_READY = WM_APP + 44;
     constexpr UINT WM_QUIETPDF_HOME_SCROLL_FRAME = WM_APP + 45;
+    constexpr UINT WM_QUIETPDF_REFRESH_FILE_WATCH = WM_APP + 46;
 
     struct PageRenderRequest
     {
@@ -1323,6 +1369,12 @@ namespace
         int h{};
         double zoom{};
         double renderZoom{};
+        bool metadata{};
+        int metadataPageCount{};
+        int metadataPageStart{};
+        int metadataPhase{};
+        int metadataBatchSize{};
+        bool thumbnail{};
         int level{};
         unsigned long long viewportGeneration{};
         unsigned dpi{};
@@ -1334,10 +1386,17 @@ namespace
     {
         PageRenderRequest request;
         PageImage image;
+        std::vector<PageInfo> metadataPages;
+        std::vector<OutlineItem> metadataOutline;
+        std::vector<PdfAnnotation> metadataAnnotations;
+        bool metadataOutlineRead{};
     };
     bool EnsureImageDib(PageImage& image);
     bool DrawCachedImagePart(HDC dc, PageImage& image, RECT dest, int sx, int sy, int sw, int sh);
     bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
+    void LoadPageGeometry(PdfTab& tab);
+    void CollectOutline(PdfTab& tab, fz_outline* item, int depth);
+    void LoadAnnotationsFromPdf(PdfTab& tab);
 
     std::mutex g_pageRenderMutex;
     std::condition_variable g_pageRenderCv;
@@ -1354,6 +1413,8 @@ namespace
     std::thread g_fileWatchThread;
     HANDLE g_fileWatchDirHandle{};
     HANDLE g_fileWatchStopEvent{};
+    std::filesystem::path g_fileWatchDirectory;
+    std::atomic<bool> g_fileWatchRunning{};
     std::atomic<unsigned long> g_fileWatchGeneration{ 0 };
     RECT g_mainScrollTrackRect{};
     RECT g_mainScrollThumbRect{};
@@ -1404,6 +1465,9 @@ namespace
     int g_lastSessionActive{ -1 };
     int g_searchCurrent{};
     int g_selectedOutlineRow{ -1 };
+    int g_dragOutlinePreviewRow{ -1 };
+    int g_outlineNavigationRow{ -1 };
+    unsigned long g_outlineNavigationRenderVersion{};
     int g_tabVisibleStart{};
     int g_hoverTab{ -1 };
     int g_hoverTabClose{ -1 };
@@ -1413,7 +1477,6 @@ namespace
     int g_hoverHomeHit{ -1 };
     int g_hoverRecentRect{ -1 };
     int g_hoverTabListItem{ -1 };
-    int g_outlineCollapseVersion{};
     RECT g_pressedButtonRect{};
     RECT g_hoverButtonRect{};
     RECT g_hoverTipRect{};
@@ -1436,6 +1499,7 @@ namespace
     bool g_resizingSidebar{};
     bool g_draggingThumbSlider{};
     bool g_draggingTab{};
+    bool g_tabPressPending{};
     bool g_tabDetachArmed{};
     int g_draggingTabIndex{ -1 };
     POINT g_tabDragStart{};
@@ -1454,6 +1518,7 @@ namespace
     bool g_searchHasRun{};
     bool g_searchCaretVisible{ true };
     bool g_searchMatchCase{};
+    bool g_sidebarKeyboardFocus{};
     RECT g_searchOptionsButtonRect{};
     int g_zoomButtonMode{ 2400 };
     bool g_hasPressedButton{};
@@ -1566,11 +1631,14 @@ namespace
     bool g_hasContentSelection{};
     bool g_selectionIsImage{};
     int g_selectionPage{ -1 };
+    int g_selectionEndPage{ -1 };
     POINT g_selectionStart{};
     POINT g_selectionEnd{};
     RECT g_selectionPageRect{};
+    fz_point g_selectionStartNorm{};
     fz_rect g_selectionNorm{};
     std::vector<fz_quad> g_selectionQuads;
+    std::vector<TextSelectionSegment> g_selectionSegments;
     std::wstring g_selectionText;
     bool g_pdfLinkPressPending{};
     int g_pdfLinkPressPage{ -1 };
@@ -1589,13 +1657,19 @@ namespace
     void NotifyUiaSelectionChanged();
     void NotifyUiaFocusChanged();
     bool HasUiaTextSelection();
+    void UpdateSelectionAutoScroll(HWND hwnd, int x, int y);
+    void StepSelectionAutoScroll(HWND hwnd);
     bool g_selectionHadTextDuringDrag{};
     POINT g_lastDragSelectionStart{};
     POINT g_lastDragSelectionEnd{};
     RECT g_lastDragSelectionPageRect{};
+    fz_point g_lastDragSelectionStartNorm{};
     fz_rect g_lastDragSelectionNorm{};
     std::vector<fz_quad> g_lastDragSelectionQuads;
+    std::vector<TextSelectionSegment> g_lastDragSelectionSegments;
     std::wstring g_lastDragSelectionText;
+    int g_lastDragSelectionEndPage{ -1 };
+    bool g_selectionAutoScroll{};
     int g_activeAnnotation{ -1 };
     bool g_annotationToolbarOpen{};
     bool g_annotationNoteOpen{};
@@ -1720,7 +1794,16 @@ namespace
 
     bool SidebarVisible()
     {
-        return g_sidebarOpen && (!g_immersive || g_immersiveSidebarOpen);
+        if (!g_sidebarOpen || (g_immersive && !g_immersiveSidebarOpen)) return false;
+        if (g_sideMode == 0)
+        {
+            if (g_active < 0 || g_active >= static_cast<int>(g_tabs.size())) return false;
+            PdfTab const& tab = *g_tabs[static_cast<size_t>(g_active)];
+            // Do not expose a synthetic page-number list while the outline is
+            // loading, or for PDFs that have no usable outline at all.
+            if (!tab.outlineMetadataLoaded || tab.outline.empty()) return false;
+        }
+        return true;
     }
 
     bool UsesBackdropTheme()
@@ -2382,6 +2465,9 @@ namespace
             RedrawWindow(hwnd, &redraw, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
     }
 
+    PdfTab* Active();
+    void SyncSidebarProgressFromScrollFast(HWND hwnd, PdfTab& tab, int scrollY);
+
     void UpdateMainScrollDragStateFromPointer(HWND hwnd, int pointerY, bool redrawNow)
     {
         if (!g_draggingMainScroll || g_active < 0) return;
@@ -2414,6 +2500,11 @@ namespace
         if (g_dragScrollTarget != oldTarget)
         {
             g_lastMainScrollDragMoveMs = GetTickCount64();
+            if (g_continuousRead)
+            {
+                if (PdfTab* tab = Active())
+                    SyncSidebarProgressFromScrollFast(hwnd, *tab, g_dragScrollTarget);
+            }
             if (!g_dragScrollPosted)
             {
                 g_dragScrollPosted = true;
@@ -2724,6 +2815,78 @@ namespace
         return size.cx;
     }
 
+    std::wstring FitHomeTitleToLines(HDC dc, const std::wstring& title, int width, int maxLines)
+    {
+        if (title.empty() || width <= 0 || maxLines <= 0) return title;
+
+        std::vector<std::wstring> lines;
+        lines.reserve(static_cast<size_t>(maxLines));
+        std::wstring line;
+        constexpr wchar_t ellipsis[] = L"...";
+        auto fitEllipsis = [&]()
+        {
+            while (!line.empty())
+            {
+                std::wstring candidate = line + ellipsis;
+                if (TextWidthCurrentFont(dc, candidate, static_cast<int>(candidate.size())) <= width)
+                    break;
+                line.pop_back();
+            }
+            line += ellipsis;
+        };
+
+        for (size_t i = 0; i < title.size(); ++i)
+        {
+            wchar_t ch = title[i];
+            if (ch == L'\r') continue;
+            if (ch == L'\n')
+            {
+                lines.push_back(line);
+                line.clear();
+                if (static_cast<int>(lines.size()) >= maxLines && i + 1 < title.size())
+                {
+                    line = lines.back();
+                    lines.pop_back();
+                    fitEllipsis();
+                    lines.push_back(line);
+                    line.clear();
+                    break;
+                }
+                continue;
+            }
+
+            std::wstring candidate = line;
+            candidate.push_back(ch);
+            if (line.empty() || TextWidthCurrentFont(dc, candidate, static_cast<int>(candidate.size())) <= width)
+            {
+                line = std::move(candidate);
+                continue;
+            }
+
+            if (static_cast<int>(lines.size()) >= maxLines - 1)
+            {
+                fitEllipsis();
+                lines.push_back(line);
+                line.clear();
+                break;
+            }
+            lines.push_back(std::move(line));
+            line.clear();
+            line.push_back(ch);
+        }
+
+        if (!line.empty() || lines.empty()) lines.push_back(std::move(line));
+        if (static_cast<int>(lines.size()) > maxLines) lines.resize(static_cast<size_t>(maxLines));
+
+        std::wstring result;
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            if (i > 0) result.push_back(L'\n');
+            result += lines[i];
+        }
+        return result;
+    }
+
     int CaretXCurrentFont(HDC dc, const std::wstring& text, RECT r, int index, bool centered)
     {
         index = std::clamp(index, 0, static_cast<int>(text.size()));
@@ -2801,7 +2964,8 @@ namespace
 
     void EnsureOutlineLayout(HDC dc, PdfTab& tab, int layoutWidth)
     {
-        int rows = tab.outline.empty() ? std::min(tab.pageCount, 300) : static_cast<int>(tab.outline.size());
+        int rows = static_cast<int>(tab.outline.size());
+        bool compactOutline = rows > 512;
         if ((g_resizingSidebar || g_sidebarAnimating) && !tab.outlineLayout.empty())
         {
             g_sidebarContentHeight = tab.outlineLayoutContentHeight;
@@ -2811,7 +2975,7 @@ namespace
             tab.outlineLayoutFont == EffectiveOutlineFont() &&
             tab.outlineLayoutDpi == g_dpi &&
             tab.outlineLayoutRows == rows &&
-            tab.outlineLayoutCollapseVersion == g_outlineCollapseVersion)
+            tab.outlineLayoutCollapseVersion == tab.outlineCollapseVersion)
         {
             g_sidebarContentHeight = tab.outlineLayoutContentHeight;
             return;
@@ -2823,7 +2987,7 @@ namespace
         int collapsedDepth = -1;
         for (int i = 0; i < rows; ++i)
         {
-            int depth = tab.outline.empty() ? 0 : tab.outline[static_cast<size_t>(i)].depth;
+            int depth = tab.outline[static_cast<size_t>(i)].depth;
             if (collapsedDepth >= 0)
             {
                 if (depth > collapsedDepth) continue;
@@ -2834,11 +2998,13 @@ namespace
             int iconLeft = lineX + S(12);
             int pageLeft = g_sidebar.right - S(30);
             int textWidth = std::max(24, pageLeft - (iconLeft + S(10) + S(5)) - S(4));
-                std::wstring label = tab.outline.empty() ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875") : tab.outline[static_cast<size_t>(i)].title;
-            int textH = MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            std::wstring label = tab.outline[static_cast<size_t>(i)].title;
+            int textH = compactOutline
+                ? S(16)
+                : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
             int rowH = std::max(baseRowH, textH + S(8));
-            int page = tab.outline.empty() ? i : tab.outline[static_cast<size_t>(i)].page;
-            bool hasChildren = !tab.outline.empty() && i + 1 < rows && tab.outline[static_cast<size_t>(i + 1)].depth > depth;
+            int page = tab.outline[static_cast<size_t>(i)].page;
+            bool hasChildren = i + 1 < rows && tab.outline[static_cast<size_t>(i + 1)].depth > depth;
             tab.outlineLayout.push_back(OutlineLayoutRow{ y, rowH, page, i, depth, textH, hasChildren });
             y += rowH + S(4);
             if (hasChildren && g_collapsedOutlineRows.find(i) != g_collapsedOutlineRows.end())
@@ -2851,9 +3017,157 @@ namespace
         tab.outlineLayoutFont = EffectiveOutlineFont();
         tab.outlineLayoutDpi = g_dpi;
         tab.outlineLayoutRows = rows;
-        tab.outlineLayoutCollapseVersion = g_outlineCollapseVersion;
+        tab.outlineLayoutCollapseVersion = tab.outlineCollapseVersion;
         tab.outlineLayoutContentHeight = std::max(0, y);
         g_sidebarContentHeight = tab.outlineLayoutContentHeight;
+    }
+
+    int ClampSidebarScrollValue(int value);
+    RECT SidebarScrollRect();
+    void UpdateSidebarScrollRects();
+    void ScrollToOutline(PdfTab& tab, int outlineRow);
+    void CancelStageMotion(HWND hwnd);
+    void TouchRecentProgress(PdfTab const& tab, bool forceSave);
+    void UpdateVertScrollBar(HWND hwnd);
+    void RequestPageNavigationRepaint(HWND hwnd, PdfTab& tab, bool waitForComplete = true);
+    void RestoreActiveTabSidebarState(HWND hwnd);
+
+    void RefreshReaderHitGeometry(HWND hwnd)
+    {
+        if (!hwnd) return;
+        // Hit testing must use the same scale as the most recent paint. The
+        // WM_DPICHANGED handler updates g_dpi and invalidates the window; doing
+        // another DPI change inside a mouse event can mix old painted rows with
+        // newly scaled geometry and make an otherwise visible row miss.
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int top = g_immersive ? 0 : S(76);
+        int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+        int side = SidebarVisible() ? g_sidebarWidth : 0;
+        int rail = side ? std::min<int>(S(44), side) : 0;
+        g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
+        g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
+    }
+
+    bool FindOutlineHitAtPoint(HWND hwnd, int x, int y, int& rowId, bool& toggle)
+    {
+        rowId = -1;
+        toggle = false;
+        PdfTab* tab = Active();
+        if (!tab || !tab->outlineMetadataLoaded || tab->outline.empty()) return false;
+
+        RefreshReaderHitGeometry(hwnd);
+        if (g_sideMode != 0 || !SidebarVisible() ||
+            x < g_sidebar.left || x >= g_sidebar.right ||
+            y < g_sidebar.top || y >= g_sidebar.bottom)
+            return false;
+
+        // The scrollbar occupies the right edge of the sidebar and overlaps
+        // the row's horizontal extent. Let the dedicated scrollbar handler
+        // receive those clicks instead of treating them as outline rows.
+        if (g_sideMode == 0 || g_sideMode == 1)
+        {
+            UpdateSidebarScrollRects();
+            if (Hit(g_sidebarScrollTrackRect, x, y)) return false;
+        }
+
+        HDC dc = GetDC(hwnd);
+        if (!dc) return false;
+        HFONT outlineFont = Font(EffectiveOutlineFont());
+        HGDIOBJ oldFont = SelectObject(dc, outlineFont);
+        EnsureOutlineLayout(dc, *tab, g_sidebar.right - g_sidebar.left);
+
+        int scrollTop = SidebarScrollRect().top;
+        int visibleHeight = std::max<int>(1, g_sidebar.bottom - scrollTop);
+        int maxScroll = std::max<int>(0, g_sidebarContentHeight - visibleHeight);
+        int scrollY = std::clamp(g_sidebarScrollY, 0, maxScroll);
+        for (auto const& layoutRow : tab->outlineLayout)
+        {
+            if (layoutRow.top + layoutRow.height < scrollY) continue;
+            if (layoutRow.top > scrollY + visibleHeight + S(8)) break;
+
+            int rowTop = scrollTop + layoutRow.top - scrollY;
+            RECT row{ g_sidebar.left + S(3), rowTop,
+                g_sidebar.right - S(3), rowTop + layoutRow.height };
+            // Include the small visual gap between adjacent rows in the hit
+            // target so a boundary click cannot fall through.
+            RECT hitRow = row;
+            hitRow.top = std::max<int>(scrollTop, hitRow.top - S(2));
+            hitRow.bottom = std::min<int>(g_sidebar.bottom, hitRow.bottom + S(2));
+            if (!Hit(hitRow, x, y)) continue;
+
+            rowId = layoutRow.id;
+            if (layoutRow.hasChildren)
+            {
+                int lineX = g_sidebar.left + S(10 + layoutRow.depth * 18);
+                TEXTMETRICW tm{};
+                GetTextMetricsW(dc, &tm);
+                int textH = layoutRow.textHeight;
+                int textTop = row.top + (layoutRow.height - textH) / 2;
+                int firstLineCenterY = textTop + std::max<int>(1, tm.tmHeight) / 2;
+                RECT twist{ lineX - S(5), firstLineCenterY - S(5),
+                    lineX + S(5), firstLineCenterY + S(5) };
+                toggle = Hit(twist, x, y);
+            }
+            SelectObject(dc, oldFont);
+            DeleteObject(outlineFont);
+            ReleaseDC(hwnd, dc);
+            return true;
+        }
+
+        SelectObject(dc, oldFont);
+        DeleteObject(outlineFont);
+        ReleaseDC(hwnd, dc);
+        return false;
+    }
+
+    bool HandleOutlineClick(HWND hwnd, int x, int y)
+    {
+        PdfTab* tab = Active();
+        if (!tab) return false;
+
+        auto applyClick = [&](int rowId, bool toggle) -> bool
+        {
+            if (rowId < 0 || rowId >= static_cast<int>(tab->outline.size())) return false;
+            if (toggle)
+            {
+                if (g_collapsedOutlineRows.find(rowId) != g_collapsedOutlineRows.end())
+                    g_collapsedOutlineRows.erase(rowId);
+                else
+                    g_collapsedOutlineRows.insert(rowId);
+                ++tab->outlineCollapseVersion;
+                g_sidebarScrollY = ClampSidebarScrollValue(g_sidebarScrollY);
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
+                return true;
+            }
+            // A directory jump is a new viewport transaction. Any pending
+            // wheel/drag state must be stopped before publishing the target,
+            // otherwise a late scroll frame can put the old viewport back.
+            CancelStageMotion(hwnd);
+            g_sidebarKeyboardFocus = false;
+            g_selectedOutlineRow = rowId;
+            tab->selectedOutlineRow = rowId;
+            ScrollToOutline(*tab, rowId);
+            TouchRecentProgress(*tab, false);
+            UpdateVertScrollBar(hwnd);
+            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            // Do not hold the visible frame until every target raster is
+            // complete. Paint the committed viewport immediately and let
+            // render completions refresh only the missing page region.
+            RequestPageNavigationRepaint(hwnd, *tab, false);
+            return true;
+        };
+
+        // Resolve against the current layout only. This intentionally avoids
+        // the old painted-row cache, whose coordinates can belong to the
+        // previous DPI, sidebar width, scroll position, or active tab.
+        int directRowId = -1;
+        bool directToggle = false;
+        if (FindOutlineHitAtPoint(hwnd, x, y, directRowId, directToggle))
+        {
+            return applyClick(directRowId, directToggle);
+        }
+        return false;
     }
 
     void DrawBookmarkIcon(HDC dc, RECT r, COLORREF color, bool filled)
@@ -3450,9 +3764,6 @@ namespace
         }
         case StatusIcon::View:
         {
-            int size = S(12);
-            int left = r.left + S(4);
-            int top = cy - size / 2;
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(pen);
@@ -3464,6 +3775,97 @@ namespace
             aaPen.SetStartCap(Gdiplus::LineCapRound);
             aaPen.SetEndCap(Gdiplus::LineCapRound);
             aaPen.SetLineJoin(Gdiplus::LineJoinRound);
+
+            if (!g_continuousRead && (g_viewMode == 1 || g_viewMode == 2))
+            {
+                // These two glyphs follow the supplied Alibaba vector icons,
+                // scaled into the same compact toolbar box as the other icons.
+                const float glyphWidth = S(14.0f);
+                const float glyphHeight = S(13.0f);
+                const float originX = static_cast<float>(r.left) + S(4.0f);
+                const float originY = static_cast<float>(cy) - glyphHeight * 0.5f;
+                auto point = [&](float x, float y)
+                {
+                    return Gdiplus::PointF(
+                        originX + x * glyphWidth / 1024.0f,
+                        originY + y * glyphHeight / 1024.0f);
+                };
+
+                if (g_viewMode == 1)
+                {
+                    // 双页-01.svg contains two symmetric page contours. Keep
+                    // the original two contours separate so no extra outer
+                    // frame changes the supplied silhouette.
+                    Gdiplus::GraphicsPath leftPage;
+                    leftPage.StartFigure();
+                    leftPage.AddLine(point(96.0f, 194.816f), point(96.0f, 829.12f));
+                    leftPage.AddBezier(point(96.0f, 829.12f), point(96.0f, 848.32f),
+                        point(111.616f, 864.0f), point(130.816f, 864.0f));
+                    leftPage.AddLine(point(130.816f, 864.0f), point(480.0f, 864.0f));
+                    leftPage.AddLine(point(480.0f, 864.0f), point(480.0f, 261.696f));
+                    leftPage.AddBezier(point(480.0f, 261.696f), point(480.0f, 205.504f),
+                        point(434.496f, 160.0f), point(378.304f, 160.0f));
+                    leftPage.AddLine(point(378.304f, 160.0f), point(130.816f, 160.0f));
+                    leftPage.AddBezier(point(130.816f, 160.0f), point(111.616f, 160.0f),
+                        point(96.0f, 175.616f), point(96.0f, 194.816f));
+                    leftPage.CloseFigure();
+                    g.DrawPath(&aaPen, &leftPage);
+
+                    Gdiplus::GraphicsPath rightPage;
+                    rightPage.StartFigure();
+                    rightPage.AddLine(point(544.0f, 261.696f), point(544.0f, 864.0f));
+                    rightPage.AddLine(point(544.0f, 864.0f), point(893.184f, 864.0f));
+                    rightPage.AddBezier(point(893.184f, 864.0f), point(912.384f, 864.0f),
+                        point(927.872f, 848.32f), point(927.872f, 829.12f));
+                    rightPage.AddLine(point(927.872f, 829.12f), point(927.872f, 194.816f));
+                    rightPage.AddBezier(point(927.872f, 194.816f), point(927.872f, 175.616f),
+                        point(912.384f, 160.0f), point(893.12f, 160.0f));
+                    rightPage.AddLine(point(893.12f, 160.0f), point(645.696f, 160.0f));
+                    rightPage.AddBezier(point(645.696f, 160.0f), point(589.504f, 160.0f),
+                        point(544.0f, 205.504f), point(544.0f, 261.696f));
+                    rightPage.CloseFigure();
+                    g.DrawPath(&aaPen, &rightPage);
+                }
+                else
+                {
+                    // 书本.svg: rounded book frame, center rule, and the four
+                    // right-page text rules from the supplied icon.
+                    Gdiplus::GraphicsPath book;
+                    float l = 65.8f;
+                    float t = 64.2f;
+                    float rr = 958.2f;
+                    float b = 959.8f;
+                    float radius = 97.0f;
+                    float rectX = originX + l * glyphWidth / 1024.0f;
+                    float rectY = originY + t * glyphHeight / 1024.0f;
+                    float rectW = (rr - l) * glyphWidth / 1024.0f;
+                    float rectH = (b - t) * glyphHeight / 1024.0f;
+                    float radiusX = radius * glyphWidth / 1024.0f;
+                    float radiusY = radius * glyphHeight / 1024.0f;
+                    book.StartFigure();
+                    book.AddArc(rectX, rectY, radiusX * 2.0f, radiusY * 2.0f, 180.0f, 90.0f);
+                    book.AddLine(rectX + radiusX, rectY, rectX + rectW - radiusX, rectY);
+                    book.AddArc(rectX + rectW - radiusX * 2.0f, rectY, radiusX * 2.0f, radiusY * 2.0f, 270.0f, 90.0f);
+                    book.AddLine(rectX + rectW, rectY + radiusY, rectX + rectW, rectY + rectH - radiusY);
+                    book.AddArc(rectX + rectW - radiusX * 2.0f, rectY + rectH - radiusY * 2.0f, radiusX * 2.0f, radiusY * 2.0f, 0.0f, 90.0f);
+                    book.AddLine(rectX + rectW - radiusX, rectY + rectH, rectX + radiusX, rectY + rectH);
+                    book.AddArc(rectX, rectY + rectH - radiusY * 2.0f, radiusX * 2.0f, radiusY * 2.0f, 90.0f, 90.0f);
+                    book.AddLine(rectX, rectY + rectH - radiusY, rectX, rectY + radiusY);
+                    book.CloseFigure();
+                    g.DrawPath(&aaPen, &book);
+
+                    g.DrawLine(&aaPen, point(451.13f, 185.21f), point(451.13f, 817.62f));
+                    constexpr float lines[] = { 312.31f, 445.43f, 578.56f, 711.69f };
+                    for (float y : lines)
+                        g.DrawLine(&aaPen, point(557.58f, y), point(819.87f, y));
+                }
+                DrawDownCaret(dc, r.left + S(24), cy, color);
+                return;
+            }
+
+            int size = S(12);
+            int left = r.left + S(4);
+            int top = cy - size / 2;
             Gdiplus::RectF box{
                 static_cast<Gdiplus::REAL>(left) + S(0.5f),
                 static_cast<Gdiplus::REAL>(top) + S(0.5f),
@@ -4017,6 +4419,8 @@ namespace
     void RestoreActiveTabPosition(HWND hwnd);
     void ActivateTab(HWND hwnd, int index);
     void RestoreActiveTabSidebarState(HWND hwnd);
+    bool PresentCachedTabFrame(HWND hwnd);
+    void PresentTabChrome(HWND hwnd);
 
     std::filesystem::path RoamingStorageDir()
     {
@@ -4269,6 +4673,13 @@ namespace
                     item.page = std::max(1, std::atoi(parts[0].c_str()));
                     item.scrollY = std::max(0, std::atoi(parts[1].c_str()));
                     item.zoom = std::clamp(std::atof(parts[2].c_str()), 0.0833, 64.0);
+                    if (parts.size() >= 5)
+                    {
+                        item.pageOffsetY = std::atoi(parts[4].c_str());
+                        item.hasPageOffset = true;
+                    }
+                    if (parts.size() >= 6) item.sidebarScrollY = std::max(0, std::atoi(parts[5].c_str()));
+                    if (parts.size() >= 7) item.selectedOutlineRow = std::atoi(parts[6].c_str());
                     item.path = FromUtf8(parts[3]);
                     if (!item.path.empty()) g_lastSessionTabs.push_back(item);
                 }
@@ -4317,7 +4728,9 @@ namespace
         out << "lastSessionActive=" << g_lastSessionActive << "\n";
         for (auto const& item : g_lastSessionTabs)
         {
-            out << "lastSessionTab=" << item.page << '\t' << item.scrollY << '\t' << item.zoom << '\t' << ToUtf8(item.path) << "\n";
+            out << "lastSessionTab=" << item.page << '\t' << item.scrollY << '\t' << item.zoom << '\t'
+                << ToUtf8(item.path) << '\t' << item.pageOffsetY << '\t' << item.sidebarScrollY << '\t'
+                << item.selectedOutlineRow << "\n";
         }
         for (auto const& item : g_recent)
         {
@@ -4348,6 +4761,10 @@ namespace
         for (auto const& entry : images) total += entry.second.CacheBytes();
         return total;
     }
+
+    int FirstPageInSpread(int page);
+    int SpreadPageCount(PdfTab const& tab, int start);
+    int PageFromScroll(PdfTab const& tab, int scrollY);
 
     constexpr size_t kHomeThumbMemoryBudgetBytes = 8ull * 1024ull * 1024ull;
 
@@ -4512,14 +4929,114 @@ namespace
 
     void TrimBackgroundRenderCaches()
     {
+        // Sumatra keeps a bounded process-wide render cache. The old code
+        // reserved only 4 MiB for all inactive Tabs, which guaranteed that a
+        // return to an older Tab would need a new raster. Keep completed
+        // native page images in memory instead, but evict them globally by
+        // Tab recency and distance from the saved viewport.
+        constexpr size_t backgroundCacheBudget = 128ull * 1024ull * 1024ull;
+
+        struct RasterCandidate
+        {
+            PdfTab* tab{};
+            int page{};
+            TileKey tile{};
+            size_t bytes{};
+            bool tiled{};
+            bool inSavedSpread{};
+            ULONGLONG lastUsed{};
+            int distance{};
+        };
+        std::vector<RasterCandidate> candidates;
+
         for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
         {
             if (i == g_active) continue;
             PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
-            tab.cache.clear();
-            tab.zoomFallbackCache.clear();
-            tab.tileCache.clear();
             tab.thumbCache.clear();
+            tab.thumbRenderPending.clear();
+
+            // Text hit-test data is cheap to rebuild and is not useful for a
+            // background Tab. Releasing it keeps this policy focused on the
+            // pages the user can actually see after a switch.
+            tab.textBoxes.clear();
+            tab.textBoxesReady.clear();
+            tab.links.clear();
+            tab.linksReady.clear();
+
+            tab.zoomFallbackCache.clear();
+            tab.zoomFallbackZoom = 0.0;
+            tab.zoomFallbackDpi = 0;
+            tab.zoomFallbackTheme = -1;
+            tab.zoomFallbackUntil = 0;
+
+            int anchorPage = tab.pageCount > 0
+                ? std::clamp(tab.currentPage, 0, tab.pageCount - 1)
+                : 0;
+            if (tab.pageCount > 0 && g_continuousRead)
+                anchorPage = std::clamp(PageFromScroll(tab, tab.savedScrollY), 0, tab.pageCount - 1);
+            int keepStart = tab.pageCount > 0 ? FirstPageInSpread(anchorPage) : 0;
+            int keepEnd = tab.pageCount > 0
+                ? std::min(tab.pageCount, keepStart + SpreadPageCount(tab, keepStart))
+                : 0;
+
+            for (auto const& entry : tab.cache)
+            {
+                PageImage const& image = entry.second;
+                if (image.CacheBytes() == 0) continue;
+                bool inSpread = entry.first >= keepStart && entry.first < keepEnd;
+                candidates.push_back(RasterCandidate{
+                    &tab, entry.first, {}, image.CacheBytes(), false, inSpread,
+                    tab.lastActivatedSerial, std::abs(entry.first - anchorPage) });
+            }
+            for (auto const& entry : tab.tileCache)
+            {
+                PageImage const& image = entry.second;
+                if (image.CacheBytes() == 0) continue;
+                bool inSpread = entry.first.page >= keepStart && entry.first.page < keepEnd;
+                candidates.push_back(RasterCandidate{
+                    &tab, entry.first.page, entry.first, image.CacheBytes(), true, inSpread,
+                    tab.lastActivatedSerial, std::abs(entry.first.page - anchorPage) });
+            }
+        }
+
+        std::sort(candidates.begin(), candidates.end(),
+            [](RasterCandidate const& left, RasterCandidate const& right)
+            {
+                if (left.inSavedSpread != right.inSavedSpread)
+                    return left.inSavedSpread > right.inSavedSpread;
+                if (left.lastUsed != right.lastUsed)
+                    return left.lastUsed > right.lastUsed;
+                if (left.distance != right.distance)
+                    return left.distance < right.distance;
+                return left.bytes < right.bytes;
+            });
+
+        std::set<std::pair<PdfTab*, int>> keptPages;
+        std::set<std::pair<PdfTab*, TileKey>> keptTiles;
+        size_t retainedBytes = 0;
+        for (auto const& candidate : candidates)
+        {
+            if (retainedBytes + candidate.bytes > backgroundCacheBudget) continue;
+            retainedBytes += candidate.bytes;
+            if (candidate.tiled) keptTiles.emplace(candidate.tab, candidate.tile);
+            else keptPages.emplace(candidate.tab, candidate.page);
+        }
+
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            if (i == g_active) continue;
+            PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
+            for (auto it = tab.cache.begin(); it != tab.cache.end(); )
+            {
+                if (keptPages.find({ &tab, it->first }) != keptPages.end()) ++it;
+                else it = tab.cache.erase(it);
+            }
+            for (auto it = tab.tileCache.begin(); it != tab.tileCache.end(); )
+            {
+                if (keptTiles.find({ &tab, it->first }) != keptTiles.end()) ++it;
+                else it = tab.tileCache.erase(it);
+            }
         }
 
         TrimHomeThumbCache();
@@ -4556,6 +5073,7 @@ namespace
             tab.zoomFallbackCache.clear();
             tab.tileCache.clear();
             tab.thumbCache.clear();
+            tab.thumbRenderPending.clear();
             TrimDisplayLists(tab, -1);
         }
         TrimHomeThumbCache();
@@ -4630,6 +5148,7 @@ namespace
 
     void FileWatchThreadProc(HWND hwnd, HANDLE directoryHandle, HANDLE stopEvent, unsigned long generation)
     {
+        g_fileWatchRunning.store(true, std::memory_order_release);
         std::vector<BYTE> buffer(64 * 1024);
         HANDLE events[2] = { stopEvent, nullptr };
 
@@ -4676,11 +5195,15 @@ namespace
 
             if (changed)
             {
-                Sleep(180);
+                // Keep the debounce delay, but make tab switches and shutdown
+                // interrupt it immediately instead of waiting in join().
+                if (WaitForSingleObject(stopEvent, 180) == WAIT_OBJECT_0)
+                    break;
                 PostMessageW(hwnd, WM_QUIETPDF_FILE_CHANGED, static_cast<WPARAM>(generation), 0);
             }
         }
 
+        g_fileWatchRunning.store(false, std::memory_order_release);
         CloseHandle(directoryHandle);
         CloseHandle(stopEvent);
     }
@@ -4700,20 +5223,41 @@ namespace
             oldThread = std::move(g_fileWatchThread);
             g_fileWatchStopEvent = nullptr;
             g_fileWatchDirHandle = nullptr;
+            g_fileWatchDirectory.clear();
         }
-        if (oldThread.joinable()) oldThread.join();
+        // The directory watcher is auxiliary state. Its overlapped read is
+        // cancelled above, but Windows can take several seconds to complete
+        // that I/O on a busy or removable volume. Never make a visible Tab
+        // switch wait for watcher teardown; the watcher owns the handles it
+        // closes when its stop event is observed.
+        if (oldThread.joinable()) oldThread.detach();
     }
 
     void StartActiveFileWatcher(HWND hwnd)
     {
-        StopFileWatcher();
-
         PdfTab* tab = Active();
-        if (!hwnd || !tab || tab->path.empty()) return;
+        if (!hwnd || !tab || tab->path.empty())
+        {
+            StopFileWatcher();
+            return;
+        }
 
         std::filesystem::path filePath(tab->path);
         std::filesystem::path directory = filePath.parent_path();
         if (directory.empty() || filePath.filename().wstring().empty()) return;
+
+        // ReadDirectoryChangesW watches the directory, while the refresh path
+        // filters the notification against the active file. Switching between
+        // files in the same directory therefore needs no watcher restart.
+        {
+            std::lock_guard<std::mutex> lock(g_fileWatchMutex);
+            if (g_fileWatchThread.joinable() &&
+                g_fileWatchDirHandle &&
+                SameStoragePath(g_fileWatchDirectory, directory))
+                return;
+        }
+
+        StopFileWatcher();
 
         HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!stopEvent) return;
@@ -4748,6 +5292,7 @@ namespace
         std::lock_guard<std::mutex> lock(g_fileWatchMutex);
         g_fileWatchDirHandle = directoryHandle;
         g_fileWatchStopEvent = stopEvent;
+        g_fileWatchDirectory = directory;
         g_fileWatchThread = std::move(thread);
     }
 
@@ -4894,12 +5439,52 @@ namespace
         return height;
     }
 
+    void EnsureLayoutCache(PdfTab const& tab)
+    {
+        if (tab.layoutCacheViewMode == g_viewMode &&
+            tab.layoutCacheZoom == tab.zoom &&
+            tab.layoutCacheDpi == g_dpi &&
+            tab.layoutSpreadStarts.size() == tab.layoutSpreadTops.size() &&
+            tab.layoutSpreadStarts.size() == tab.layoutSpreadEnds.size())
+            return;
+
+        tab.layoutCacheViewMode = g_viewMode;
+        tab.layoutCacheZoom = tab.zoom;
+        tab.layoutCacheDpi = g_dpi;
+        tab.layoutSpreadStarts.clear();
+        tab.layoutSpreadTops.clear();
+        tab.layoutSpreadEnds.clear();
+        tab.layoutSpreadStarts.reserve(static_cast<size_t>((tab.pageCount + 1) / (g_viewMode == 0 ? 1 : 2)));
+        tab.layoutSpreadTops.reserve(tab.layoutSpreadStarts.capacity());
+        tab.layoutSpreadEnds.reserve(tab.layoutSpreadStarts.capacity());
+        tab.layoutMaxSpreadWidth = 0;
+
+        int gap = PageGap();
+        int top = S(28);
+        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
+        {
+            int spreadHeight = SpreadHeight(tab, start);
+            int spreadWidth = 0;
+            int count = SpreadPageCount(tab, start);
+            for (int i = 0; i < count; ++i)
+            {
+                if (i) spreadWidth += FacingPageGap();
+                spreadWidth += PageW(tab, start + i);
+            }
+
+            tab.layoutSpreadStarts.push_back(start);
+            tab.layoutSpreadTops.push_back(top);
+            tab.layoutSpreadEnds.push_back(top + spreadHeight + gap / 2);
+            tab.layoutMaxSpreadWidth = std::max(tab.layoutMaxSpreadWidth, spreadWidth);
+            top += spreadHeight + gap;
+        }
+        tab.layoutContentExtent = top + S(28);
+    }
+
     int MaxSpreadWidth(PdfTab const& tab)
     {
-        int maxWidth = 0;
-        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
-            maxWidth = std::max(maxWidth, SpreadWidth(tab, start));
-        return maxWidth;
+        EnsureLayoutCache(tab);
+        return tab.layoutMaxSpreadWidth;
     }
 
     int ReadingContentWidth(PdfTab const& tab)
@@ -4920,12 +5505,13 @@ namespace
 
     int SpreadTopScroll(PdfTab const& tab, int targetPage)
     {
+        EnsureLayoutCache(tab);
         targetPage = std::clamp(targetPage, 0, std::max(0, tab.pageCount - 1));
         int targetStart = FirstPageInSpread(targetPage);
-        int scroll = S(28);
-        for (int start = 0; start < tab.pageCount && start < targetStart; start = NextSpreadStart(tab, start))
-            scroll += SpreadHeight(tab, start) + PageGap();
-        return scroll;
+        auto found = std::lower_bound(tab.layoutSpreadStarts.begin(), tab.layoutSpreadStarts.end(), targetStart);
+        if (found == tab.layoutSpreadStarts.end())
+            return tab.layoutSpreadTops.empty() ? S(28) : tab.layoutSpreadTops.back();
+        return tab.layoutSpreadTops[static_cast<size_t>(found - tab.layoutSpreadStarts.begin())];
     }
 
     int SpreadVisualTop(PdfTab const& tab, int start)
@@ -4935,23 +5521,13 @@ namespace
 
     int FirstVisibleSpreadStart(PdfTab const& tab)
     {
-        int first = 0;
+        EnsureLayoutCache(tab);
+        if (tab.layoutSpreadStarts.empty()) return 0;
         int threshold = std::max(0, g_scrollY - S(96));
-        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
-        {
-            int nextStart = NextSpreadStart(tab, start);
-            int nextTop = nextStart < tab.pageCount
-                ? SpreadTopScroll(tab, nextStart)
-                : SpreadTopScroll(tab, start) + SpreadHeight(tab, start) + PageGap();
-            if (nextTop >= threshold) break;
-            if (nextStart >= tab.pageCount)
-            {
-                first = start;
-                break;
-            }
-            first = nextStart;
-        }
-        return first;
+        auto found = std::lower_bound(tab.layoutSpreadTops.begin(), tab.layoutSpreadTops.end(), threshold);
+        if (found == tab.layoutSpreadTops.begin()) return tab.layoutSpreadStarts.front();
+        --found;
+        return tab.layoutSpreadStarts[static_cast<size_t>(found - tab.layoutSpreadTops.begin())];
     }
 
     bool BuildSpreadPageRect(PdfTab const& tab, int start, int y, int page, RECT& pageRect)
@@ -5603,9 +6179,11 @@ namespace
     }
 
 
+    size_t CommittedPageCacheByteLimit();
+
     size_t DynamicPageCacheByteLimit(PdfTab const& tab)
     {
-        if (UseTiledPageRendering(tab)) return 4ull * 1024ull * 1024ull;
+        if (UseTiledPageRendering(tab)) return CommittedPageCacheByteLimit();
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         size_t visibleBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
@@ -5622,7 +6200,7 @@ namespace
             return total;
         };
         size_t maxBytes = DynamicPageCacheByteLimit(tab);
-        size_t maxPages = UseTiledPageRendering(tab) ? 1ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 4 : 0), 1, 16));
+        size_t maxPages = UseTiledPageRendering(tab) ? 2ull : static_cast<size_t>(std::clamp(VisiblePageCountForCache(tab) + (tab.zoom < 0.35 ? 4 : 0), 1, 16));
         while (tab.cache.size() > maxPages || cacheBytes() > maxBytes)
         {
             auto victim = tab.cache.end();
@@ -5655,13 +6233,19 @@ namespace
     {
         return a.documentVersion == b.documentVersion &&
             a.page == b.page && a.tile == b.tile && a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h &&
-            a.zoom == b.zoom && a.renderZoom == b.renderZoom && a.level == b.level &&
+            a.zoom == b.zoom && a.renderZoom == b.renderZoom && a.metadata == b.metadata &&
+            a.metadataPageCount == b.metadataPageCount && a.metadataPageStart == b.metadataPageStart &&
+            a.metadataPhase == b.metadataPhase && a.metadataBatchSize == b.metadataBatchSize &&
+            a.thumbnail == b.thumbnail && a.level == b.level &&
             a.dpi == b.dpi && a.theme == b.theme &&
             _wcsicmp(a.path.c_str(), b.path.c_str()) == 0;
     }
 
     void PageRenderWorkerMain()
     {
+        // Keep document work responsive to the UI thread while preserving a
+        // single renderer and the shared MuPDF resource store.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;)
         {
             PageRenderRequest request;
@@ -5689,21 +6273,93 @@ namespace
                 renderTab.ctx = request.session->renderContext;
                 renderTab.doc = request.session->document;
                 renderTab.renderSession = request.session;
-                renderTab.zoom = request.zoom;
-                double renderZoom = request.renderZoom > 0.0 ? request.renderZoom : request.zoom;
-                double renderScale = renderZoom * static_cast<double>(request.dpi) / 72.0;
-                if (request.tile)
+                if (request.metadata)
                 {
-                    RECT tile{ request.x, request.y, request.x + request.w, request.y + request.h };
-                    result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme, true, renderCookie);
+                    renderTab.pageCount = request.metadataPageCount;
+                    if (request.metadataPhase == 0)
+                    {
+                        int start = std::clamp(request.metadataPageStart, 0, renderTab.pageCount);
+                        int batch = std::clamp(request.metadataBatchSize, 1, 64);
+                        int count = std::min(batch, renderTab.pageCount - start);
+                        std::vector<fz_rect> bounds(static_cast<size_t>(std::max(0, count)));
+                        int loaded = 0;
+                        {
+                            PdfDocumentLock pdfLock(renderTab);
+                            if (count > 0 && g_pdf.pageBoundsRange)
+                                loaded = g_pdf.pageBoundsRange(renderTab.ctx, renderTab.doc, start, bounds.data(), count);
+                            else if (start == 0 && count > 0)
+                                loaded = g_pdf.pageBounds(renderTab.ctx, renderTab.doc, bounds.data(), count);
+                        }
+                        PageInfo fallback{ 612.0, 792.0 };
+                        if (start > 0)
+                            fallback = PageInfo{};
+                        result->metadataPages.reserve(static_cast<size_t>(std::max(0, count)));
+                        for (int i = 0; i < count; ++i)
+                        {
+                            if (i < loaded)
+                            {
+                                fz_rect const& bound = bounds[static_cast<size_t>(i)];
+                                double width = static_cast<double>(bound.x1 - bound.x0);
+                                double height = static_cast<double>(bound.y1 - bound.y0);
+                                if (std::isfinite(width) && std::isfinite(height) && width >= 1.0 && height >= 1.0)
+                                    fallback = PageInfo{ width, height };
+                            }
+                            result->metadataPages.push_back(fallback);
+                        }
+                    }
+                    else if (request.metadataPhase == 1)
+                    {
+                        PdfDocumentLock pdfLock(renderTab);
+                        renderTab.outline.reserve(1024);
+                        fz_outline* outline = g_pdf.loadOutline(renderTab.ctx, renderTab.doc);
+                        if (outline)
+                        {
+                            CollectOutline(renderTab, outline, 0);
+                            g_pdf.dropOutline(renderTab.ctx, outline);
+                        }
+                        result->metadataOutline = std::move(renderTab.outline);
+                        // A null outline is a valid successful result. Keep
+                        // that distinct from an exception so the UI can
+                        // retry transient/document-specific failures.
+                        result->metadataOutlineRead = true;
+                    }
+                    else
+                    {
+                        LoadAnnotationsFromPdf(renderTab);
+                        result->metadataAnnotations = std::move(renderTab.annotations);
+                    }
                 }
                 else
                 {
-                    result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme, true, renderCookie);
+                    renderTab.zoom = request.zoom;
+                    double renderZoom = request.renderZoom > 0.0 ? request.renderZoom : request.zoom;
+                    double renderScale = renderZoom * static_cast<double>(request.dpi) / 72.0;
+                    if (request.tile)
+                    {
+                        RECT tile{ request.x, request.y, request.x + request.w, request.y + request.h };
+                        result->image = RenderPageTileAtScale(renderTab, request.page, tile, renderScale, request.theme, true, renderCookie);
+                    }
+                    else
+                    {
+                        result->image = RenderPageAtScale(renderTab, request.page, renderScale, true, request.theme, true, renderCookie);
+                    }
                 }
             }
             catch (...)
             {
+                // A malformed page tree or an unavailable optional MuPDF
+                // operation must not strand the metadata pipeline. Geometry
+                // is only an optimization for layout; safe fallback pages
+                // let the outline phase continue and keep the sidebar usable.
+                if (request.metadata && request.metadataPhase == 0)
+                {
+                    int start = std::clamp(request.metadataPageStart, 0, request.metadataPageCount);
+                    int count = std::min(
+                        std::clamp(request.metadataBatchSize, 1, 64),
+                        std::max(0, request.metadataPageCount - start));
+                    result->metadataPages.assign(
+                        static_cast<size_t>(count), PageInfo{ 612.0, 792.0 });
+                }
                 result->image = {};
             }
 
@@ -5718,9 +6374,13 @@ namespace
                 g_pageRenderActiveRequest = {};
             }
             g_pdf.dropRenderCookie(renderCookie);
-            if (!stale && (result->image.dib || !result->image.bgra.empty()) && IsWindow(request.target))
+            bool hasMetadata = request.metadata &&
+                (request.metadataPhase == 0 ? !result->metadataPages.empty()
+                 : true);
+            bool hasImage = result->image.dib || !result->image.bgra.empty();
+            if (!stale && (hasMetadata || hasImage) && IsWindow(request.target))
             {
-                if (!result->image.bgra.empty())
+                if (!request.metadata && !result->image.bgra.empty())
                     EnsureImageDib(result->image);
                 if (!PostMessageW(request.target, WM_QUIETPDF_PAGE_RENDERED, 0, reinterpret_cast<LPARAM>(result.get())))
                     continue;
@@ -5741,6 +6401,8 @@ namespace
         }
         g_pageRenderThread = std::thread(PageRenderWorkerMain);
     }
+
+    void ResetSuspendedMetadataRequest(PageRenderRequest const& request);
 
     void AbortActivePageRenderLocked()
     {
@@ -5766,9 +6428,110 @@ namespace
     void CancelQueuedPageRenders()
     {
         std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        if (g_pageRenderActive)
+            ResetSuspendedMetadataRequest(g_pageRenderActiveRequest);
+        for (auto const& request : g_pageRenderQueue)
+            ResetSuspendedMetadataRequest(request);
         g_pageRenderQueue.clear();
         AbortActivePageRenderLocked();
         ++g_pageRenderSerial;
+    }
+
+    bool CurrentZoomVisibleContentReady(PdfTab& tab);
+
+    bool HasReusableTabPage(PdfTab const& tab)
+    {
+        int page = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
+        auto usable = [](PageImage const& image)
+        {
+            return image.width > 0 && image.height > 0 && (image.dib || !image.bgra.empty());
+        };
+        auto found = tab.cache.find(page);
+        if (found != tab.cache.end() && usable(found->second)) return true;
+        found = tab.zoomFallbackCache.find(page);
+        if (found != tab.zoomFallbackCache.end() && usable(found->second)) return true;
+        for (auto const& entry : tab.tileCache)
+        {
+            if (entry.first.page == page && usable(entry.second)) return true;
+        }
+        return false;
+    }
+
+    int PageTopScroll(PdfTab const& tab, int page)
+    {
+        page = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
+        int start = FirstPageInSpread(page);
+        int spreadTop = SpreadTopScroll(tab, start);
+        RECT pageRect{};
+        if (!BuildSpreadPageRect(tab, start, spreadTop, page, pageRect))
+            return spreadTop;
+        return spreadTop + (pageRect.top - spreadTop);
+    }
+
+    int PageOffsetFromScroll(PdfTab const& tab, int page, int scrollY)
+    {
+        if (!g_continuousRead) return std::max(0, scrollY);
+        return scrollY - PageTopScroll(tab, page);
+    }
+
+    void ResetSuspendedMetadataRequest(PageRenderRequest const& request)
+    {
+        if (!request.metadata) return;
+        for (auto& ownedTab : g_tabs)
+        {
+            if (!ownedTab || ownedTab->renderSession != request.session ||
+                ownedTab->renderVersion != request.documentVersion)
+                continue;
+            if (request.thumbnail)
+                ownedTab->thumbRenderPending.erase(request.page);
+            else if (request.metadataPhase == 1 && !ownedTab->outlineMetadataLoaded)
+                ownedTab->outlineMetadataRequested = false;
+        }
+    }
+
+    void PrioritizePageRendersForTab(PdfTab& keepTab)
+    {
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+
+        // There is one MuPDF worker. Letting an inactive Tab finish a large
+        // render or outline pass here makes the next click wait behind work
+        // the user can no longer see. Keep completed per-Tab caches, but
+        // suspend all queued work for other Tabs and abort the active request.
+        if (g_pageRenderActive && g_pageRenderActiveRequest.session != keepTab.renderSession)
+        {
+            ResetSuspendedMetadataRequest(g_pageRenderActiveRequest);
+            AbortActivePageRenderLocked();
+        }
+        for (auto it = g_pageRenderQueue.begin(); it != g_pageRenderQueue.end(); )
+        {
+            if (it->session != keepTab.renderSession)
+            {
+                ResetSuspendedMetadataRequest(*it);
+                it = g_pageRenderQueue.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        for (auto& request : g_pageRenderQueue)
+        {
+            if (request.metadata && request.metadataPhase == 1)
+                request.priority = -28;
+            else if (request.metadata)
+                request.priority = -20;
+            else
+                request.priority = -24;
+        }
+        std::stable_sort(
+            g_pageRenderQueue.begin(),
+            g_pageRenderQueue.end(),
+            [](PageRenderRequest const& left, PageRenderRequest const& right)
+            {
+                if (left.priority != right.priority) return left.priority < right.priority;
+                return left.viewportGeneration > right.viewportGeneration;
+            });
     }
 
     void CancelObsoletePageRendersForZoom(PdfTab const& tab)
@@ -5874,9 +6637,31 @@ namespace
         g_homeThumbCv.notify_all();
         if (g_homeThumbThread.joinable()) g_homeThumbThread.join();
     }
+    size_t CommittedPageCacheByteLimit()
+    {
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        size_t viewportBytes = static_cast<size_t>(stageW) * static_cast<size_t>(stageH) * 4ull;
+        return std::clamp<size_t>(viewportBytes + 6ull * 1024ull * 1024ull,
+            12ull * 1024ull * 1024ull, 24ull * 1024ull * 1024ull);
+    }
+
+    bool CanCacheWholePageAtCurrentZoom(PdfTab const& tab, int page)
+    {
+        if (page < 0 || page >= static_cast<int>(tab.pages.size())) return false;
+        PageInfo const& info = tab.pages[static_cast<size_t>(page)];
+        double scale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
+        double width = std::max(1.0, info.widthPt * scale);
+        double height = std::max(1.0, info.heightPt * scale);
+        double pixels = width * height;
+        if (!std::isfinite(pixels) || pixels <= 0.0) return false;
+        return pixels * 4.0 <= static_cast<double>(CommittedPageCacheByteLimit());
+    }
+
     void QueuePageRender(HWND hwnd, PdfTab const& tab, int page, int priority = 0)
     {
-        if (page < 0 || page >= tab.pageCount || UseTiledPageRendering(tab)) return;
+        if (page < 0 || page >= tab.pageCount) return;
+        if (UseTiledPageRendering(tab) && !CanCacheWholePageAtCurrentZoom(tab, page)) return;
         if (tab.cachedZoom == tab.zoom && tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme() && tab.cache.find(page) != tab.cache.end()) return;
         EnsurePageRenderWorker();
         PageRenderRequest request;
@@ -5928,12 +6713,79 @@ namespace
                 auto victim = std::find_if(
                     g_pageRenderQueue.rbegin(),
                     g_pageRenderQueue.rend(),
-                    [](PageRenderRequest const& queued) { return queued.priority > 0; });
+                    [](PageRenderRequest const& queued) { return queued.priority > 0 && !queued.metadata; });
                 if (victim == g_pageRenderQueue.rend()) g_pageRenderQueue.pop_back();
                 else g_pageRenderQueue.erase(std::next(victim).base());
             }
         }
         g_pageRenderCv.notify_one();
+    }
+
+    void QueuePageMetadata(HWND hwnd, PdfTab const& tab, int pageStart = 0, int phase = 0)
+    {
+        if (!hwnd || !tab.renderSession || tab.pageCount <= 0) return;
+        EnsurePageRenderWorker();
+
+        PageRenderRequest request;
+        request.documentVersion = tab.renderVersion;
+        request.session = tab.renderSession;
+        request.target = hwnd;
+        request.path = tab.path;
+        request.metadata = true;
+        request.metadataPageCount = tab.pageCount;
+        request.metadataPageStart = std::clamp(pageStart, 0, tab.pageCount);
+        request.metadataPhase = std::clamp(phase, 0, 2);
+        request.metadataBatchSize = 48;
+        request.dpi = g_dpi;
+        request.theme = PdfRenderTheme();
+        // Outline parsing is cheap compared with page-geometry indexing and
+        // should be available as soon as a Tab is shown. Geometry batches stay
+        // background work so a large document never monopolizes the renderer.
+        // The outline is the first user-visible sidebar payload. It must run
+        // before normal page prefetch and before the full geometry index; the
+        // latter is only needed to refine scrolling after the first paint.
+        request.priority = phase == 1 ? -16 : 24;
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            for (auto const& queued : g_pageRenderQueue)
+            {
+                if (SamePageRenderRequest(queued, request)) return;
+            }
+            request.serial = ++g_pageRenderSerial;
+            auto insertAt = std::find_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& queued)
+                { return queued.priority > request.priority; });
+            g_pageRenderQueue.insert(insertAt, std::move(request));
+        }
+        g_pageRenderCv.notify_one();
+    }
+
+    void RequestOutlineMetadata(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.outlineMetadataRequested || tab.outlineMetadataLoaded || tab.outlineMetadataRetryCount >= 2)
+            return;
+        tab.outlineMetadataRequested = true;
+        QueuePageMetadata(hwnd, tab, tab.pageCount, 1);
+    }
+
+    void ResumeActiveTabMetadata(HWND hwnd, PdfTab& tab)
+    {
+        if (!tab.metadataGeometryComplete)
+            QueuePageMetadata(hwnd, tab, tab.metadataPagesLoaded, 0);
+
+        // A request may have been suspended while another Tab was active.
+        // Re-arm the flag here; QueuePageMetadata still de-duplicates an
+        // already queued or active request.
+        if (!tab.outlineMetadataLoaded)
+        {
+            tab.outlineMetadataRequested = false;
+            if (tab.outlineMetadataRetryCount >= 2)
+                tab.outlineMetadataRetryCount = 0;
+            RequestOutlineMetadata(hwnd, tab);
+        }
     }
 
     void QueueZoomPreviewRender(HWND hwnd, PdfTab& tab, int page, int priority = 0)
@@ -6142,6 +6994,14 @@ namespace
             tab->zoomFallbackCache.erase(victim);
         }
         TrimBackgroundRenderCaches();
+        for (int i = 0; i < static_cast<int>(g_tabs.size()); ++i)
+        {
+            if (i == g_active) continue;
+            // Display lists are useful while a Tab is visible, but keeping
+            // three lists for every background large PDF defeats the shared
+            // resource-store policy. They are cheap to rebuild on return.
+            TrimDisplayLists(*g_tabs[static_cast<size_t>(i)], -1);
+        }
         if (!tab->zoomFallbackCache.empty() && CurrentZoomVisibleContentReady(*tab))
         {
             tab->zoomFallbackCache.clear();
@@ -6150,7 +7010,6 @@ namespace
             tab->zoomFallbackTheme = -1;
             tab->zoomFallbackUntil = 0;
         }
-
         // Keep the current page parsed so the first input after an idle trim
         // does not have to rebuild its display list on the UI-visible path.
         TrimDisplayLists(*tab, 0);
@@ -6473,6 +7332,8 @@ namespace
     bool RenderRequestStillUseful(PdfTab const& tab, PageRenderRequest const& request, RECT& dirtyRect)
     {
         dirtyRect = {};
+        if (request.thumbnail)
+            return request.page >= 0 && request.page < tab.pageCount;
         if (request.tile)
         {
             TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level,
@@ -6562,20 +7423,100 @@ namespace
         return it->second;
     }
 
+    void QueueThumbRender(HWND hwnd, PdfTab const& tab, int index, double thumbZoom)
+    {
+        if (!hwnd || index < 0 || index >= tab.pageCount || !tab.renderSession || thumbZoom <= 0.0)
+            return;
+        EnsurePageRenderWorker();
+
+        PageRenderRequest request;
+        request.documentVersion = tab.renderVersion;
+        request.session = tab.renderSession;
+        request.target = hwnd;
+        request.path = tab.path;
+        request.page = index;
+        request.zoom = tab.zoom;
+        request.renderZoom = thumbZoom;
+        request.thumbnail = true;
+        request.viewportGeneration = g_viewportGeneration;
+        request.dpi = g_dpi;
+        request.theme = PdfRenderTheme();
+        request.priority = 24;
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            for (auto const& queued : g_pageRenderQueue)
+            {
+                if (SamePageRenderRequest(queued, request)) return;
+            }
+            request.serial = ++g_pageRenderSerial;
+            auto insertAt = std::find_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& queued) { return queued.priority > request.priority; });
+            g_pageRenderQueue.insert(insertAt, std::move(request));
+
+            constexpr size_t maxQueuedThumbRenders = 2;
+            size_t queuedThumbs = static_cast<size_t>(std::count_if(
+                g_pageRenderQueue.begin(), g_pageRenderQueue.end(),
+                [](PageRenderRequest const& queued) { return queued.thumbnail; }));
+            while (queuedThumbs > maxQueuedThumbRenders)
+            {
+                auto victim = std::find_if(
+                    g_pageRenderQueue.rbegin(),
+                    g_pageRenderQueue.rend(),
+                    [](PageRenderRequest const& queued) { return queued.thumbnail; });
+                if (victim == g_pageRenderQueue.rend()) break;
+                unsigned long version = victim->documentVersion;
+                int page = victim->page;
+                auto session = victim->session;
+                g_pageRenderQueue.erase(std::next(victim).base());
+                for (auto& ownedTab : g_tabs)
+                {
+                    if (ownedTab && ownedTab->renderSession == session && ownedTab->renderVersion == version)
+                        ownedTab->thumbRenderPending.erase(page);
+                }
+                --queuedThumbs;
+            }
+        }
+        g_pageRenderCv.notify_one();
+    }
+
+    void QueueInitialViewportPreview(HWND hwnd, PdfTab& tab)
+    {
+        if (!hwnd || tab.pageCount <= 0) return;
+        int anchorPage = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+        if (UseTiledPageRendering(tab))
+            QueuePageRender(hwnd, tab, anchorPage, -32);
+        else
+            QueueZoomPreviewRender(hwnd, tab, anchorPage, -32);
+        if (!g_continuousRead && SpreadPageCount(tab, FirstPageInSpread(anchorPage)) > 1)
+        {
+            if (UseTiledPageRendering(tab))
+                QueuePageRender(hwnd, tab, std::min(anchorPage + 1, tab.pageCount - 1), -31);
+            else
+                QueueZoomPreviewRender(hwnd, tab, std::min(anchorPage + 1, tab.pageCount - 1), -31);
+        }
+    }
+
     PageImage& EnsureThumb(PdfTab& tab, int index)
     {
         if (tab.cachedThumbSize != g_thumbSize || tab.cachedThumbTheme != PdfRenderTheme())
         {
             tab.thumbCache.clear();
+            tab.thumbRenderPending.clear();
             tab.cachedThumbSize = g_thumbSize;
             tab.cachedThumbTheme = PdfRenderTheme();
         }
         auto it = tab.thumbCache.find(index);
         if (it == tab.thumbCache.end())
         {
-            double pageWidthPixelsAtZoom1 = tab.pages[static_cast<size_t>(index)].widthPt * static_cast<double>(g_dpi) / 72.0;
-            double thumbZoom = std::max(0.04, static_cast<double>(g_thumbSize) / std::max(1.0, pageWidthPixelsAtZoom1));
-            it = tab.thumbCache.emplace(index, RenderPageAtZoom(tab, index, thumbZoom)).first;
+            double ratioH = tab.pages[static_cast<size_t>(index)].heightPt /
+                std::max(1.0, tab.pages[static_cast<size_t>(index)].widthPt);
+            PageImage placeholder;
+            placeholder.width = std::max(1, g_thumbSize);
+            placeholder.height = std::max<int>(S(56), static_cast<int>(placeholder.width * ratioH + 0.5));
+            it = tab.thumbCache.emplace(index, std::move(placeholder)).first;
             while (tab.thumbCache.size() > 12)
             {
                 auto victim = tab.thumbCache.end();
@@ -6591,8 +7532,15 @@ namespace
                     }
                 }
                 if (victim == tab.thumbCache.end()) break;
+                tab.thumbRenderPending.erase(victim->first);
                 tab.thumbCache.erase(victim);
             }
+        }
+        if (!it->second.dib && it->second.bgra.empty() && tab.thumbRenderPending.insert(index).second)
+        {
+            double pageWidthPixelsAtZoom1 = tab.pages[static_cast<size_t>(index)].widthPt * static_cast<double>(g_dpi) / 72.0;
+            double thumbZoom = std::max(0.04, static_cast<double>(g_thumbSize) / std::max(1.0, pageWidthPixelsAtZoom1));
+            QueueThumbRender(g_hwnd, tab, index, thumbZoom);
         }
         return it->second;
     }
@@ -6668,7 +7616,26 @@ namespace
     {
         for (fz_outline* current = item; current; current = current->next)
         {
-            int page = g_pdf.pageNumberFromLocation(tab.ctx, tab.doc, current->page);
+            int page = -1;
+            try
+            {
+                page = g_pdf.pageNumberFromLocation(tab.ctx, tab.doc, current->page);
+            }
+            catch (...)
+            {
+                // Some MuPDF builds throw for a destination that cannot be
+                // mapped. PDF destinations normally use chapter zero and
+                // already carry the document page index.
+            }
+            // Other builds report the same failure with an invalid return
+            // value instead of throwing. Treat both forms identically so a
+            // valid outline is not discarded on only one machine.
+            if ((page < 0 || page >= tab.pageCount) &&
+                current->page.chapter == 0 &&
+                current->page.page >= 0 && current->page.page < tab.pageCount)
+            {
+                page = current->page.page;
+            }
             if (page >= 0 && page < tab.pageCount)
             {
                 std::wstring title = current->title ? FromUtf8(current->title) : L"\u672a\u547d\u540d\u76ee\u5f55";
@@ -6676,7 +7643,14 @@ namespace
             }
             if (current->down)
             {
-                CollectOutline(tab, current->down, depth + 1);
+                try
+                {
+                    CollectOutline(tab, current->down, depth + 1);
+                }
+                catch (...)
+                {
+                    // A broken child branch must not discard sibling entries.
+                }
             }
         }
     }
@@ -6826,13 +7800,8 @@ namespace
 
     int ContinuousContentHeight(PdfTab const& tab)
     {
-        int gap = PageGap();
-        int content = S(28);
-        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
-        {
-            content += SpreadHeight(tab, start) + gap;
-        }
-        return std::max<int>(content + S(28), g_stage.bottom - g_stage.top);
+        EnsureLayoutCache(tab);
+        return std::max<int>(tab.layoutContentExtent, g_stage.bottom - g_stage.top);
     }
 
     int SinglePageContentHeight(PdfTab const& tab)
@@ -7328,7 +8297,11 @@ namespace
                 if (r.right <= r.left || r.bottom <= r.top)
                     continue;
 
-                if (!merged.empty() && r.left <= merged.back().right + S(2))
+                // Match native's visual-line grouping. This bridges wide
+                // punctuation spacing, while a true column gap remains much
+                // larger than one line height and stays separate.
+                int joinGap = std::max(S(4), line.height);
+                if (!merged.empty() && r.left <= merged.back().right + joinGap)
                 {
                     merged.back().right = std::max(merged.back().right, r.right);
                     merged.back().top = std::min(merged.back().top, r.top);
@@ -7391,6 +8364,91 @@ namespace
         return true;
     }
 
+    void MergeAnnotationSegments(std::vector<AnnotationSegment>& segments)
+    {
+        struct SegmentLine
+        {
+            std::vector<AnnotationSegment> segments;
+            double centerY{};
+            double height{};
+        };
+
+        std::vector<SegmentLine> lines;
+        lines.reserve(segments.size());
+        for (AnnotationSegment const& segment : segments)
+        {
+            if (segment.x1 <= segment.x0 || segment.y1 <= segment.y0)
+                continue;
+
+            double centerY = (segment.y0 + segment.y1) * 0.5;
+            double height = std::max(0.001, segment.y1 - segment.y0);
+            SegmentLine* best = nullptr;
+            double bestDistance = 1.0e9;
+            for (SegmentLine& line : lines)
+            {
+                double tolerance = std::max(0.002, std::min(line.height, height) * 0.30);
+                double distance = std::abs(centerY - line.centerY);
+                if (distance <= tolerance && distance < bestDistance)
+                {
+                    best = &line;
+                    bestDistance = distance;
+                }
+            }
+
+            if (!best)
+            {
+                SegmentLine line;
+                line.centerY = centerY;
+                line.height = height;
+                line.segments.push_back(segment);
+                lines.push_back(std::move(line));
+            }
+            else
+            {
+                best->segments.push_back(segment);
+                best->centerY = (best->centerY * (best->segments.size() - 1) + centerY) /
+                    static_cast<double>(best->segments.size());
+                best->height = std::max(best->height, height);
+            }
+        }
+
+        std::sort(lines.begin(), lines.end(), [](SegmentLine const& a, SegmentLine const& b)
+        {
+            return a.centerY < b.centerY;
+        });
+
+        segments.clear();
+        for (SegmentLine& line : lines)
+        {
+            std::sort(line.segments.begin(), line.segments.end(), [](AnnotationSegment const& a, AnnotationSegment const& b)
+            {
+                return a.x0 < b.x0;
+            });
+
+            // Bridge ordinary word spaces, but preserve a real column gap.
+            // Keep annotation marks continuous across ordinary same-line
+            // spacing, including PDF-encoded bracket pairs. A column gap is
+            // normally several line heights and remains a separate segment.
+            double joinGap = std::max(0.003, line.height * 1.15);
+            for (AnnotationSegment const& segment : line.segments)
+            {
+                if (!segments.empty() &&
+                    std::abs((segments.back().y0 + segments.back().y1) * 0.5 - line.centerY) <= line.height * 0.30 &&
+                    segment.x0 <= segments.back().x1 + joinGap)
+                {
+                    segments.back().x0 = std::min(segments.back().x0, segment.x0);
+                    segments.back().y0 = std::min(segments.back().y0, segment.y0);
+                    segments.back().x1 = std::max(segments.back().x1, segment.x1);
+                    segments.back().y1 = std::max(segments.back().y1, segment.y1);
+                }
+                else
+                {
+                    segments.push_back(segment);
+                }
+            }
+        }
+    }
+
     bool NearlySameAnnotation(PdfAnnotation const& a, PdfAnnotation const& b)
     {
         if (a.page != b.page || a.kind != b.kind || a.colorIndex != b.colorIndex ||
@@ -7411,6 +8469,127 @@ namespace
             existing.createdAt == incoming.createdAt &&
             existing.author == incoming.author &&
             existing.note == incoming.note;
+    }
+
+    bool PageRectForSelectionPoint(PdfTab const& tab, int px, int py, int& page, RECT& pageRect, int verticalDirection = 0)
+    {
+        if (PageRectAtPoint(tab, px, py, page, pageRect))
+            return true;
+        if (tab.pageCount <= 0) return false;
+
+        int first = g_continuousRead ? 0 : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int last = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, first);
+
+        // A drag endpoint often lands in the gap between two pages. The
+        // closest-page rule is unstable there: a downward drag can remain on
+        // the old page until the cursor is much closer to the next page. Keep
+        // the endpoint in the direction of travel, like a document caret.
+        if (g_continuousRead && verticalDirection != 0)
+        {
+            struct SpreadCandidate
+            {
+                int start{};
+                int y{};
+                int height{};
+            };
+            std::vector<SpreadCandidate> spreads;
+            for (int start = first; start < last; start = NextSpreadStart(tab, start))
+            {
+                int y = SpreadVisualTop(tab, start);
+                spreads.push_back(SpreadCandidate{ start, y, SpreadHeight(tab, start) });
+            }
+
+            auto choosePageInSpread = [&](SpreadCandidate const& spread, int& chosenPage, RECT& chosenRect)
+            {
+                int count = SpreadPageCount(tab, spread.start);
+                int bestXDistance = 0x7fffffff;
+                bool found = false;
+                for (int i = 0; i < count; ++i)
+                {
+                    int candidatePage = spread.start + i;
+                    RECT candidate{};
+                    if (!BuildSpreadPageRect(tab, spread.start, spread.y, candidatePage, candidate))
+                        continue;
+                    int xDistance = px < candidate.left ? candidate.left - px :
+                        (px > candidate.right ? px - candidate.right : 0);
+                    if (!found || xDistance < bestXDistance)
+                    {
+                        found = true;
+                        bestXDistance = xDistance;
+                        chosenPage = candidatePage;
+                        chosenRect = candidate;
+                    }
+                }
+                return found;
+            };
+
+            if (verticalDirection > 0)
+            {
+                for (SpreadCandidate const& spread : spreads)
+                {
+                    if (py < spread.y)
+                    {
+                        if (choosePageInSpread(spread, page, pageRect))
+                            return true;
+                    }
+                    if (py <= spread.y + spread.height)
+                        break;
+                }
+            }
+            else
+            {
+                for (auto it = spreads.rbegin(); it != spreads.rend(); ++it)
+                {
+                    SpreadCandidate const& spread = *it;
+                    if (py > spread.y + spread.height)
+                    {
+                        if (choosePageInSpread(spread, page, pageRect))
+                            return true;
+                    }
+                    if (py >= spread.y)
+                        break;
+                }
+            }
+        }
+
+        int bestDistance = 0x7fffffff;
+        int bestPage = -1;
+        RECT bestRect{};
+        for (int start = first; start < last; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            int count = SpreadPageCount(tab, start);
+            for (int i = 0; i < count; ++i)
+            {
+                int candidatePage = start + i;
+                RECT candidate{};
+                if (!BuildSpreadPageRect(tab, start, y, candidatePage, candidate)) continue;
+                int dx = px < candidate.left ? candidate.left - px : (px > candidate.right ? px - candidate.right : 0);
+                int dy = py < candidate.top ? candidate.top - py : (py > candidate.bottom ? py - candidate.bottom : 0);
+                int distance = dx + dy;
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    bestPage = candidatePage;
+                    bestRect = candidate;
+                }
+            }
+        }
+        if (bestPage < 0 || bestDistance > S(96)) return false;
+        page = bestPage;
+        pageRect = bestRect;
+        return true;
+    }
+
+    void UpdateSelectionEndpointPage(PdfTab const& tab, int x, int y)
+    {
+        int page = -1;
+        RECT pageRect{};
+        int verticalDirection = 0;
+        if (y > g_selectionStart.y) verticalDirection = 1;
+        else if (y < g_selectionStart.y) verticalDirection = -1;
+        if (PageRectForSelectionPoint(tab, x, y, page, pageRect, verticalDirection))
+            g_selectionEndPage = page;
     }
 
     RECT CurrentSelectionRect()
@@ -7442,9 +8621,12 @@ namespace
         g_lastDragSelectionStart = {};
         g_lastDragSelectionEnd = {};
         g_lastDragSelectionPageRect = {};
+        g_lastDragSelectionStartNorm = {};
         g_lastDragSelectionNorm = {};
         g_lastDragSelectionQuads.clear();
+        g_lastDragSelectionSegments.clear();
         g_lastDragSelectionText.clear();
+        g_lastDragSelectionEndPage = -1;
     }
 
     void RememberDragTextSelection()
@@ -7454,9 +8636,12 @@ namespace
         g_lastDragSelectionStart = g_selectionStart;
         g_lastDragSelectionEnd = g_selectionEnd;
         g_lastDragSelectionPageRect = g_selectionPageRect;
+        g_lastDragSelectionStartNorm = g_selectionStartNorm;
         g_lastDragSelectionNorm = g_selectionNorm;
         g_lastDragSelectionQuads = g_selectionQuads;
+        g_lastDragSelectionSegments = g_selectionSegments;
         g_lastDragSelectionText = g_selectionText;
+        g_lastDragSelectionEndPage = g_selectionEndPage;
     }
 
     bool RestoreLastDragTextSelection()
@@ -7465,9 +8650,12 @@ namespace
         g_selectionStart = g_lastDragSelectionStart;
         g_selectionEnd = g_lastDragSelectionEnd;
         g_selectionPageRect = g_lastDragSelectionPageRect;
+        g_selectionStartNorm = g_lastDragSelectionStartNorm;
         g_selectionNorm = g_lastDragSelectionNorm;
         g_selectionQuads = g_lastDragSelectionQuads;
+        g_selectionSegments = g_lastDragSelectionSegments;
         g_selectionText = g_lastDragSelectionText;
+        g_selectionEndPage = g_lastDragSelectionEndPage;
         g_selectionIsImage = false;
         return true;
     }
@@ -7475,38 +8663,101 @@ namespace
     bool RefreshTextSelection(PdfTab& tab)
     {
         g_selectionQuads.clear();
+        g_selectionSegments.clear();
         g_selectionText.clear();
         if (!g_pdf.selectText || g_selectionPage < 0 || g_selectionPage >= tab.pageCount)
             return false;
 
-        PdfDocumentLock pdfLock(tab);
-        fz_point start = NormalizeSelectionPoint(g_selectionPageRect, g_selectionStart);
-        fz_point end = NormalizeSelectionPoint(g_selectionPageRect, g_selectionEnd);
-        if (std::abs(start.x - end.x) < 0.001f && std::abs(start.y - end.y) < 0.001f)
-            return false;
+        int endPage = g_selectionEndPage >= 0 ? g_selectionEndPage : g_selectionPage;
+        endPage = std::clamp(endPage, 0, tab.pageCount - 1);
+        bool forward = endPage > g_selectionPage ||
+            (endPage == g_selectionPage && (g_selectionEnd.y > g_selectionStart.y ||
+                (g_selectionEnd.y == g_selectionStart.y && g_selectionEnd.x >= g_selectionStart.x)));
+        int firstPage = std::min(g_selectionPage, endPage);
+        int lastPage = std::max(g_selectionPage, endPage);
 
-        std::vector<fz_quad> quads(256);
-        std::string text(65536, '\0');
-        int count = g_pdf.selectText(
-            tab.ctx,
-            tab.doc,
-            g_selectionPage,
-            start.x,
-            start.y,
-            end.x,
-            end.y,
-            quads.data(),
-            static_cast<int>(quads.size()),
-            text.data(),
-            static_cast<int>(text.size()));
-        if (count <= 0)
-            return false;
+        auto selectSegment = [&](int page, fz_point start, fz_point end, bool skipHeader, bool skipFooter)
+        {
+            RECT pageRect{};
+            if (!PageRectForPage(tab, page, pageRect)) return;
+            if (std::abs(start.x - end.x) < 0.001f && std::abs(start.y - end.y) < 0.001f)
+                return;
 
-        quads.resize(static_cast<size_t>(count));
-        g_selectionQuads = std::move(quads);
+            PdfDocumentLock pdfLock(tab);
+            std::vector<fz_quad> quads(1024);
+            std::string text(65536, '\0');
+            int count = g_pdf.selectTextWithMargins(
+                tab.ctx, tab.doc, page,
+                start.x, start.y, end.x, end.y,
+                skipHeader ? 1 : 0, skipFooter ? 1 : 0,
+                quads.data(), static_cast<int>(quads.size()),
+                text.data(), static_cast<int>(text.size()));
+            if (count <= 0) return;
+
+            quads.resize(static_cast<size_t>(count));
+            TextSelectionSegment segment;
+            segment.page = page;
+            segment.quads = std::move(quads);
+            segment.text = FromUtf8(text.c_str());
+            g_selectionQuads.insert(g_selectionQuads.end(), segment.quads.begin(), segment.quads.end());
+            if (!g_selectionText.empty() && !segment.text.empty()) g_selectionText.push_back(L'\n');
+            g_selectionText += segment.text;
+            g_selectionSegments.push_back(std::move(segment));
+        };
+
+        for (int page = firstPage; page <= lastPage; ++page)
+        {
+            RECT pageRect{};
+            if (!PageRectForPage(tab, page, pageRect)) continue;
+            bool isFirst = page == firstPage;
+            bool isLast = page == lastPage;
+            fz_point a{ 0.0f, 0.0f };
+            fz_point b{ 1.0f, 1.0f };
+            bool skipHeader = false;
+            bool skipFooter = false;
+
+            if (firstPage == lastPage)
+            {
+                a = g_selectionStartNorm;
+                b = NormalizeSelectionPoint(pageRect, g_selectionEnd);
+
+                // Start filtering before the pointer reaches the page gap.
+                // Without this transition state, the last footer line can be
+                // painted for one frame while the endpoint is still inside
+                // the bottom margin, then disappear after the next page is
+                // detected. A drag that starts in the margin remains
+                // explicitly selectable on the same page.
+                constexpr float kMarginTrigger = 0.88f;
+                bool startInHeader = g_selectionStartNorm.y <= (1.0f - kMarginTrigger);
+                bool startInFooter = g_selectionStartNorm.y >= kMarginTrigger;
+                if (forward && !startInFooter && b.y >= kMarginTrigger)
+                    skipFooter = true;
+                else if (!forward && !startInHeader && b.y <= (1.0f - kMarginTrigger))
+                    skipHeader = true;
+            }
+            else if (forward)
+            {
+                if (isFirst) a = g_selectionStartNorm;
+                if (isLast) b = NormalizeSelectionPoint(pageRect, g_selectionEnd);
+                skipHeader = !isFirst;
+                skipFooter = !isLast;
+            }
+            else
+            {
+                if (isFirst) a = NormalizeSelectionPoint(pageRect, g_selectionEnd);
+                if (isLast) b = g_selectionStartNorm;
+                // Margin filtering follows document order, regardless of
+                // drag direction: every page after the first omits its
+                // header, and every page before the last omits its footer.
+                skipHeader = !isFirst;
+                skipFooter = !isLast;
+            }
+            selectSegment(page, a, b, skipHeader, skipFooter);
+        }
+
+        if (g_selectionSegments.empty()) return false;
         g_selectionNorm = NormalizeSelectionRect(g_selectionPageRect, g_selectionStart, g_selectionEnd);
-        g_selectionText = FromUtf8(text.c_str());
-        return true;
+        return !g_selectionQuads.empty();
     }
 
     bool TrySelectImageAtPoint(PdfTab& tab, int page, RECT pageRect, POINT clientPt)
@@ -7535,11 +8786,13 @@ namespace
         hitRect.bottom = std::clamp(hitRect.bottom, hitRect.top + 1, pageRect.bottom);
 
         g_selectionPage = page;
+        g_selectionEndPage = page;
         g_selectionPageRect = pageRect;
         g_selectionNorm = imageRect;
         g_selectionStart = POINT{ hitRect.left, hitRect.top };
         g_selectionEnd = POINT{ hitRect.right, hitRect.bottom };
         g_selectionQuads.clear();
+        g_selectionSegments.clear();
         g_selectionText.clear();
         g_selectionIsImage = true;
         g_hasContentSelection = true;
@@ -7649,12 +8902,10 @@ namespace
         POINT cursor{};
         if (!GetCursorPos(&cursor)) return false;
         ScreenToClient(hwnd, &cursor);
-        g_selectionEnd = POINT{
-            static_cast<LONG>(std::clamp<LONG>(static_cast<LONG>(cursor.x), g_selectionPageRect.left, g_selectionPageRect.right)),
-            static_cast<LONG>(std::clamp<LONG>(static_cast<LONG>(cursor.y), g_selectionPageRect.top, g_selectionPageRect.bottom))
-        };
         PdfTab* tab = Active();
         if (!tab) return false;
+        g_selectionEnd = cursor;
+        UpdateSelectionEndpointPage(*tab, cursor.x, cursor.y);
         if (RefreshTextSelection(*tab))
         {
             RememberDragTextSelection();
@@ -7692,10 +8943,15 @@ namespace
         g_hasContentSelection = false;
         g_selectionIsImage = false;
         g_selectionPage = -1;
+        g_selectionEndPage = -1;
         g_selectionPageRect = {};
+        g_selectionStartNorm = {};
         g_selectionNorm = {};
         g_selectionQuads.clear();
+        g_selectionSegments.clear();
         g_selectionText.clear();
+        g_selectionAutoScroll = false;
+        KillTimer(g_hwnd, 23);
         ResetDragSelectionLatch();
         NotifyUiaSelectionChanged();
     }
@@ -7719,26 +8975,27 @@ namespace
         PdfTab* tab = Active();
         if (!tab) return snapshot;
 
-        RECT pageRect{};
-        if (!PageRectForPage(*tab, g_selectionPage, pageRect))
-            pageRect = g_selectionPageRect;
-
         snapshot.text = g_selectionText;
         snapshot.screenRects.reserve(g_selectionQuads.size());
-        for (fz_quad const& quad : g_selectionQuads)
+        for (TextSelectionSegment const& segment : g_selectionSegments)
         {
-            RECT r = QuadToRect(quad, pageRect);
-            RECT clipped{};
+            RECT pageRect{};
+            if (!PageRectForPage(*tab, segment.page, pageRect)) continue;
             RECT visiblePage{};
             if (!IntersectRect(&visiblePage, &pageRect, &g_stage)) continue;
-            if (!IntersectRect(&clipped, &r, &visiblePage)) continue;
-            if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) continue;
+            for (fz_quad const& quad : segment.quads)
+            {
+                RECT r = QuadToRect(quad, pageRect);
+                RECT clipped{};
+                if (!IntersectRect(&clipped, &r, &visiblePage)) continue;
+                if (clipped.right <= clipped.left || clipped.bottom <= clipped.top) continue;
 
-            POINT tl{ clipped.left, clipped.top };
-            POINT br{ clipped.right, clipped.bottom };
-            ClientToScreen(g_hwnd, &tl);
-            ClientToScreen(g_hwnd, &br);
-            snapshot.screenRects.push_back(RECT{ tl.x, tl.y, br.x, br.y });
+                POINT tl{ clipped.left, clipped.top };
+                POINT br{ clipped.right, clipped.bottom };
+                ClientToScreen(g_hwnd, &tl);
+                ClientToScreen(g_hwnd, &br);
+                snapshot.screenRects.push_back(RECT{ tl.x, tl.y, br.x, br.y });
+            }
         }
         return snapshot;
     }
@@ -8775,12 +10032,16 @@ namespace
         g_hasContentSelection = true;
         g_selectionIsImage = false;
         g_selectionPage = page;
+        g_selectionEndPage = page;
         g_selectionPageRect = pageRect;
         g_selectionStart = POINT{ unionRect.left, unionRect.top };
         g_selectionEnd = POINT{ unionRect.right, unionRect.bottom };
+        g_selectionStartNorm = fz_point{ norm.x0, norm.y0 };
         g_selectionNorm = norm;
         g_selectionQuads = std::move(quads);
         g_selectionText = FromUtf8(text.c_str());
+        g_selectionSegments.clear();
+        g_selectionSegments.push_back(TextSelectionSegment{ page, g_selectionQuads, g_selectionText });
         InvalidateRect(hwnd, &g_stage, FALSE);
         return true;
     }
@@ -8858,7 +10119,7 @@ namespace
     {
         int tileW = S(152);
         int coverH = S(198);
-        int nameH = S(38);
+        int nameH = S(42);
         int tileH = coverH + nameH + S(10);
         int gapX = S(28);
         int gapY = S(28);
@@ -8996,26 +10257,25 @@ namespace
     int PageFromScroll(PdfTab const& tab, int scrollY)
     {
         if (tab.pageCount <= 0) return 0;
-        int gap = PageGap();
-        int y = S(28);
+        EnsureLayoutCache(tab);
         int probe = scrollY + S(32);
-        int best = 0;
-        for (int start = 0; start < tab.pageCount; start = NextSpreadStart(tab, start))
-        {
-            int spreadH = SpreadHeight(tab, start);
-            if (probe < y + spreadH + gap / 2) return start;
-            y += spreadH + gap;
-            best = start;
-        }
-        return best;
+        auto found = std::upper_bound(tab.layoutSpreadEnds.begin(), tab.layoutSpreadEnds.end(), probe);
+        if (found == tab.layoutSpreadEnds.end()) return tab.layoutSpreadStarts.back();
+        return tab.layoutSpreadStarts[static_cast<size_t>(found - tab.layoutSpreadEnds.begin())];
     }
 
     int OutlineTargetScrollY(PdfTab const& tab, OutlineItem const& item, int knownPage = -1, int knownPageTop = 0)
     {
         int page = std::clamp(item.page, 0, tab.pageCount - 1);
         int scroll = knownPage == page ? knownPageTop : SpreadTopScroll(tab, page);
-        int yOffset = item.yPt > 0 ? static_cast<int>(item.yPt * tab.zoom * static_cast<double>(g_dpi) / 72.0 + 0.5) : 0;
-        return std::max(0, scroll + yOffset - S(24));
+        int start = FirstPageInSpread(page);
+        int pageOffsetY = std::max(0, (SpreadHeight(tab, start) - PageH(tab, page)) / 2);
+        double yPt = std::isfinite(item.yPt) ? item.yPt : 0.0;
+        if (yPt < 0.0) yPt = 0.0;
+        if (page >= 0 && page < static_cast<int>(tab.pages.size()))
+            yPt = std::min(yPt, std::max(0.0, tab.pages[static_cast<size_t>(page)].heightPt - 1.0));
+        int yOffset = static_cast<int>(yPt * tab.zoom * static_cast<double>(g_dpi) / 72.0 + 0.5);
+        return std::max(0, scroll + pageOffsetY + yOffset - S(24));
     }
 
     bool OutlineRowVisible(PdfTab const& tab, int row)
@@ -9039,13 +10299,18 @@ namespace
         if (tab.outline.empty() || tab.pageCount <= 0) return -1;
         int probe = scrollY + S(48);
         int best = -1;
+        int lastTarget = std::numeric_limits<int>::min();
         for (int i = 0; i < static_cast<int>(tab.outline.size()); ++i)
         {
             if (!OutlineRowVisible(tab, i)) continue;
-            int itemPage = std::clamp(tab.outline[static_cast<size_t>(i)].page, 0, tab.pageCount - 1);
             int target = OutlineTargetScrollY(tab, tab.outline[static_cast<size_t>(i)]);
+            // PDF outlines are normally ordered by destination, but malformed
+            // or lazily resolved destinations can briefly report an earlier
+            // target for a later row. Keep the progress sequence monotonic so
+            // scrolling cannot make adjacent rows fight over the selection.
+            target = std::max(target, lastTarget);
+            lastTarget = target;
             if (target <= probe) best = i;
-            else if (itemPage > tab.currentPage || target > probe + S(400)) break;
         }
         return best;
     }
@@ -9119,9 +10384,13 @@ namespace
         }
     }
 
+    int StableOutlineRowDuringMainScroll(PdfTab const& tab, int scrollY);
+
     void SyncOutlineSelectionFromScroll(HWND hwnd, PdfTab& tab)
     {
-        int selected = OutlineRowFromScroll(tab, g_scrollY);
+        int selected = g_draggingMainScroll
+            ? StableOutlineRowDuringMainScroll(tab, g_dragScrollTarget)
+            : OutlineRowFromScroll(tab, g_scrollY);
         if (selected == g_selectedOutlineRow) return;
         g_selectedOutlineRow = selected;
         KeepOutlineSelectionVisible(hwnd, tab);
@@ -9133,16 +10402,57 @@ namespace
         else if (g_sideMode == 1) KeepThumbnailSelectionVisible(hwnd, tab);
     }
 
-    void SyncSidebarProgressFromScrollFast(HWND hwnd, PdfTab& tab)
+    int StableOutlineRowDuringMainScroll(PdfTab const& tab, int scrollY)
+    {
+        int selected = OutlineRowFromScroll(tab, scrollY);
+        if (g_dragOutlinePreviewRow < 0 || g_dragOutlinePreviewRow >= static_cast<int>(tab.outline.size()))
+            return selected;
+
+        // A partially built large-document layout must not erase a valid
+        // selection for one drag sample. Once the target is valid again the
+        // normal monotonic calculation resumes; at the actual top of a
+        // document there is no previous preview row to preserve.
+        if (selected < 0)
+            return scrollY > S(16) ? g_dragOutlinePreviewRow : selected;
+
+        if (selected > g_dragOutlinePreviewRow)
+        {
+            int nextTarget = OutlineTargetScrollY(tab, tab.outline[static_cast<size_t>(selected)]);
+            // OutlineRowFromScroll intentionally looks a little ahead into
+            // the viewport. Add a small dead band around that boundary so a
+            // pointer sample cannot toggle between adjacent rows.
+            if (scrollY + S(48) < nextTarget + S(12))
+                return g_dragOutlinePreviewRow;
+        }
+        else if (selected < g_dragOutlinePreviewRow)
+        {
+            int previousTarget = OutlineTargetScrollY(tab, tab.outline[static_cast<size_t>(g_dragOutlinePreviewRow)]);
+            if (scrollY + S(48) > previousTarget - S(12))
+                return g_dragOutlinePreviewRow;
+        }
+
+        return selected;
+    }
+
+    void SyncSidebarProgressFromScrollFast(HWND hwnd, PdfTab& tab, int scrollY)
     {
         if (!SidebarVisible()) return;
         if (g_sideMode == 0)
         {
-            int selected = OutlineRowFromScroll(tab, g_scrollY);
+            int selected = StableOutlineRowDuringMainScroll(tab, scrollY);
             if (selected != g_selectedOutlineRow)
             {
                 g_selectedOutlineRow = selected;
-                RequestSidebarRepaint(hwnd);
+                g_dragOutlinePreviewRow = selected;
+                // Keep the newly selected outline row inside the sidebar
+                // viewport while the reader is being dragged. Without this,
+                // the selection advances below the first sidebar screen but
+                // the visible list appears frozen.
+                KeepOutlineSelectionVisible(hwnd, tab);
+            }
+            else if (g_draggingMainScroll)
+            {
+                g_dragOutlinePreviewRow = selected;
             }
         }
         else if (g_sideMode == 1)
@@ -9200,10 +10510,20 @@ namespace
         }
         auto const& item = tab.outline[static_cast<size_t>(outlineRow)];
         int page = std::clamp(item.page, 0, tab.pageCount - 1);
-        int scroll = SpreadTopScroll(tab, page);
-        int yOffset = item.yPt > 0 ? static_cast<int>(item.yPt * tab.zoom * static_cast<double>(g_dpi) / 72.0 + 0.5) : 0;
         tab.currentPage = page;
-        g_scrollY = std::max(0, scroll + yOffset - S(24));
+        // Use the same target calculation as outline-progress tracking. This
+        // keeps double-page centering and malformed destination coordinates
+        // consistent with the actual click target.
+        g_scrollY = OutlineTargetScrollY(tab, item);
+        tab.pendingSessionPosition = false;
+        g_outlineNavigationRow = outlineRow;
+        g_outlineNavigationRenderVersion = tab.renderVersion;
+    }
+
+    void ClearOutlineNavigationOverride()
+    {
+        g_outlineNavigationRow = -1;
+        g_outlineNavigationRenderVersion = 0;
     }
 
     void RunSearch()
@@ -9270,6 +10590,25 @@ namespace
         return total;
     }
 
+    void LoadInitialPageGeometry(PdfTab& tab)
+    {
+        tab.pages.assign(static_cast<size_t>(std::max(0, tab.pageCount)), PageInfo{ 612.0, 792.0 });
+        if (tab.pageCount <= 0) return;
+
+        // The first page is enough to establish the initial viewport. The
+        // complete page-size index is filled by the metadata worker after the
+        // window is visible, so a large document does not block first paint.
+        fz_page* page = g_pdf.loadPage(tab.ctx, tab.doc, 0);
+        if (!page) return;
+        fz_rect first = g_pdf.boundPage(tab.ctx, page);
+        g_pdf.dropPage(tab.ctx, page);
+        PageInfo fallback{
+            std::max(1.0, static_cast<double>(first.x1 - first.x0)),
+            std::max(1.0, static_cast<double>(first.y1 - first.y0))
+        };
+        std::fill(tab.pages.begin(), tab.pages.end(), fallback);
+    }
+
     void LoadPageGeometry(PdfTab& tab)
     {
         tab.pages.assign(static_cast<size_t>(std::max(0, tab.pageCount)), PageInfo{ 612.0, 792.0 });
@@ -9318,17 +10657,12 @@ namespace
         tab->name = std::filesystem::path(path).filename().wstring();
         UpdateTabFileStamp(*tab);
         int restorePage = RecentPageForPath(path);
-        LoadPageGeometry(*tab);
-        fz_outline* outline = g_pdf.loadOutline(tab->ctx, tab->doc);
-        if (outline)
-        {
-            CollectOutline(*tab, outline, 0);
-            g_pdf.dropOutline(tab->ctx, outline);
-        }
-        LoadAnnotationsFromPdf(*tab);
+        LoadInitialPageGeometry(*tab);
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
+        g_tabs.back()->lastActivatedSerial = ++g_tabActivationSerial;
+        g_sidebarKeyboardFocus = false;
         EnsureTabWindowVisible(g_active);
         g_tabListOpen = false;
         if (auto* active = Active())
@@ -9342,8 +10676,27 @@ namespace
         RestoreActiveTabSidebarState(hwnd);
         UpdateRecent(*Active());
         SetTitle();
-        StartActiveFileWatcher(hwnd);
+        // Starting or replacing the directory watcher can join an old
+        // watcher thread. Keep it out of the document-open transaction.
+        PostMessageW(hwnd, WM_QUIETPDF_REFRESH_FILE_WATCH, 0, 0);
+        // Only the active Tab is allowed to generate work while a new file is
+        // being opened. This mirrors SumatraPDF's visible-document-first
+        // policy and prevents several large PDFs from warming concurrently.
+        PrioritizePageRendersForTab(*Active());
+        TrimBackgroundRenderCaches();
+        // The outline is the first sidebar payload for a newly opened Tab.
+        // Queue it before the preview so the worker cannot start the preview
+        // first and leave a large document's directory waiting behind it.
+        RequestOutlineMetadata(hwnd, *Active());
+        QueueInitialViewportPreview(hwnd, *Active());
         SchedulePagePrefetch(hwnd);
+        // Geometry is deliberately queued behind the outline and the visible
+        // page. It is only a refinement for scrolling/layout accuracy.
+        QueuePageMetadata(hwnd, *Active());
+        // Ensure a one-shot cleanup also runs when the first page is already
+        // cached and therefore produces no render-completion message.
+        g_sharedStoreTrimPending = true;
+        ScheduleIdleCacheTrim(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -9376,14 +10729,27 @@ namespace
     void ApplySessionPosition(PdfTab& tab, LastSessionItem const& item)
     {
         tab.zoom = std::clamp(item.zoom, 0.0833, 64.0);
-        ScrollToPage(tab, std::clamp(item.page, 1, tab.pageCount) - 1);
+        int restoredPage = std::clamp(item.page, 1, tab.pageCount) - 1;
+        ScrollToPage(tab, restoredPage);
         tab.savedScrollY = std::max(0, item.scrollY);
+        tab.sidebarScrollY[0] = std::max(0, item.sidebarScrollY);
+        tab.selectedOutlineRow = item.selectedOutlineRow;
         if (g_continuousRead)
         {
+            tab.pendingSessionPosition = true;
+            tab.pendingSessionPage = restoredPage;
+            tab.pendingSessionPageOffset = item.hasPageOffset;
+            tab.pendingSessionPageOffsetY = item.hasPageOffset
+                ? item.pageOffsetY
+                : tab.savedScrollY - SpreadTopScroll(tab, restoredPage);
+            tab.pendingSessionOffsetY = tab.pendingSessionPageOffsetY;
             g_contentHeight = ContinuousContentHeight(tab);
             int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
-            g_scrollY = std::clamp(tab.savedScrollY, 0, maxScroll);
-            tab.currentPage = PageFromScroll(tab, g_scrollY);
+            int initial = tab.pendingSessionPageOffset
+                ? PageTopScroll(tab, restoredPage) + tab.pendingSessionPageOffsetY
+                : tab.savedScrollY;
+            g_scrollY = std::clamp(initial, 0, maxScroll);
+            tab.currentPage = restoredPage;
         }
         else
         {
@@ -9403,9 +10769,17 @@ namespace
             if (!tab || tab->path.empty()) continue;
             LastSessionItem item;
             item.path = tab->path;
-            item.page = std::max(1, tab->currentPage + 1);
-            item.scrollY = (g_active == i) ? g_scrollY : tab->savedScrollY;
+            int scrollY = (g_active == i) ? g_scrollY : tab->savedScrollY;
+            int page = (g_active == i && g_continuousRead)
+                ? PageFromScroll(*tab, scrollY)
+                : tab->currentPage;
+            item.page = std::max(1, page + 1);
+            item.scrollY = std::max(0, scrollY);
             item.zoom = tab->zoom;
+            item.pageOffsetY = PageOffsetFromScroll(*tab, page, item.scrollY);
+            item.hasPageOffset = g_continuousRead;
+            item.sidebarScrollY = (g_active == i) ? g_sidebarScrollY : tab->sidebarScrollY[0];
+            item.selectedOutlineRow = (g_active == i) ? g_selectedOutlineRow : tab->selectedOutlineRow;
             g_lastSessionTabs.push_back(item);
         }
         if (!g_lastSessionTabs.empty())
@@ -9531,7 +10905,18 @@ namespace
         {
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
             TouchRecentProgress(*tab, false);
-            SyncSidebarProgressFromScroll(hwnd, *tab);
+            if (g_outlineNavigationRow >= 0 &&
+                g_outlineNavigationRenderVersion == tab->renderVersion)
+            {
+                g_selectedOutlineRow = g_outlineNavigationRow;
+                tab->selectedOutlineRow = g_outlineNavigationRow;
+                if (!g_pageNavigationPending)
+                    ClearOutlineNavigationOverride();
+            }
+            else
+            {
+                SyncSidebarProgressFromScroll(hwnd, *tab);
+            }
         }
         DisableNativeScrollbars(hwnd);
     }
@@ -9712,6 +11097,24 @@ namespace
         KillTimer(hwnd, 6);
     }
 
+    void RequestPageNavigationRepaint(HWND hwnd, PdfTab& tab, bool waitForComplete)
+    {
+        g_contentHeight = g_continuousRead
+            ? ContinuousContentHeight(tab)
+            : SinglePageContentHeight(tab);
+        g_contentWidth = ReadingContentWidth(tab);
+        g_pageNavigationPending = waitForComplete;
+        UpdateVertScrollBar(hwnd);
+
+        if (UseTiledPageRendering(tab))
+            MaintainVisibleTileRenderQueueForScroll(tab);
+        else
+            MaintainVisiblePageRenderQueueForScroll(tab);
+
+        SchedulePagePrefetch(hwnd);
+        RequestStageRepaint(hwnd, true);
+    }
+
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
     {
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
@@ -9855,8 +11258,8 @@ namespace
                 hadVisible = true;
 
                 bool pageReady = false;
-                PageImage* fallback = FindZoomFallbackPage(tab, page);
-                if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                PageImage* committed = FindCachedPage(tab, page);
+                if (committed && (committed->dib || !committed->bgra.empty()) && committed->width > 0 && committed->height > 0)
                     pageReady = true;
 
                 int pageW = PageW(tab, page);
@@ -9873,14 +11276,50 @@ namespace
                 if (!pageReady)
                 {
                     ready = false;
-                    QueueZoomPreviewRender(hwnd, tab, page, 10 + queued);
-                    int queueBudget = 10;
-                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect, 0, queued, queueBudget);
+                    if (CanCacheWholePageAtCurrentZoom(tab, page))
+                        QueuePageRender(hwnd, tab, page, -24 + queued);
+                    else
+                    {
+                        int queueBudget = 10;
+                        QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect, 0, queued, queueBudget);
+                    }
                     ++queued;
                 }
             }
         }
         return !hadVisible || ready;
+    }
+
+    void QueueVisibleCommittedPagesForScroll(HWND hwnd, PdfTab& tab)
+    {
+        if (!UseTiledPageRendering(tab) || tab.pageCount <= 0) return;
+
+        RECT view = g_stage;
+        InflateRect(&view, S(8), S(8));
+        int firstVisible = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int queued = 0;
+        for (int start = firstVisible; start < tab.pageCount && queued < 2; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+            if (g_continuousRead && spreadRect.top > view.bottom) break;
+            if (!Intersects(spreadRect, view) && (g_continuousRead || start != firstVisible)) continue;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && queued < 2; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect) || !Intersects(pageRect, view)) continue;
+                if (CanCacheWholePageAtCurrentZoom(tab, page))
+                {
+                    QueuePageRender(hwnd, tab, page, -32 + queued);
+                    ++queued;
+                }
+            }
+            if (!g_continuousRead) break;
+        }
     }
 
     bool VisiblePagesReadyForPixelScroll(HWND hwnd, PdfTab& tab)
@@ -9953,6 +11392,10 @@ namespace
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
         PdfTab* tab = Active();
+        // A real document scroll means the user's viewport is authoritative;
+        // stop carrying a previous directory click through that scroll.
+        if (g_outlineNavigationRow >= 0)
+            ClearOutlineNavigationOverride();
         int oldPage = tab ? tab->currentPage : -1;
         if (tab)
         {
@@ -9969,7 +11412,7 @@ namespace
             if (oldPage != tab->currentPage)
             {
                 TouchRecentProgress(*tab, false);
-                SyncSidebarProgressFromScrollFast(hwnd, *tab);
+                SyncSidebarProgressFromScrollFast(hwnd, *tab, g_scrollY);
             }
             g_sidebarProgressRefreshPending = true;
         }
@@ -9999,6 +11442,13 @@ namespace
             }
             return;
         }
+
+        // A scrollbar drag can expose a new page whose tiles arrive in
+        // separate render completions. Hold the reader presentation until
+        // the visible viewport is complete, then commit one full-stage frame
+        // instead of revealing the page from left to right.
+        if (g_draggingMainScroll)
+            g_pageNavigationPending = true;
 
         if (!immediateRepaint)
             MarkStageScrolling(hwnd);
@@ -10044,6 +11494,8 @@ namespace
                 MaintainVisibleTileRenderQueueForScroll(*tab);
             else
                 MaintainVisiblePageRenderQueueForScroll(*tab);
+            if (g_pageNavigationPending && UseTiledPageRendering(*tab))
+                QueueVisibleCommittedPagesForScroll(hwnd, *tab);
         }
         if (tab && !UseTiledPageRendering(*tab) && !StageScrollPaintInProgress())
         {
@@ -10058,6 +11510,11 @@ namespace
         if (target == g_scrollY) return;
         if (PdfTab* tab = Active())
             WarmLowZoomPagesAtScroll(*tab, target);
+        // The final mouse-up can carry the last pointer delta after the
+        // dragging flag has been cleared. Set the atomic presentation gate
+        // here as well so that release-time movement cannot reveal partial
+        // tiles.
+        g_pageNavigationPending = true;
         ScrollStageTo(hwnd, target, true, false);
         if (PdfTab* tab = Active())
         {
@@ -10673,6 +12130,93 @@ namespace
             else ScrollSinglePageByPixels(hwnd, *tab, dy);
         }
     }
+
+    void UpdateSelectionAutoScroll(HWND hwnd, int x, int y)
+    {
+        if (!g_selectingContent || !g_continuousRead || !Active())
+        {
+            if (g_selectionAutoScroll)
+            {
+                g_selectionAutoScroll = false;
+                KillTimer(hwnd, 23);
+            }
+            return;
+        }
+
+        int edge = std::max<int>(S(24), std::min<int>(S(72), (g_stage.bottom - g_stage.top) / 8));
+        bool nearTop = y < g_stage.top + edge;
+        bool nearBottom = y > g_stage.bottom - edge;
+        if (!nearTop && !nearBottom)
+        {
+            if (g_selectionAutoScroll)
+            {
+                g_selectionAutoScroll = false;
+                KillTimer(hwnd, 23);
+            }
+            return;
+        }
+
+        g_selectionAutoScroll = true;
+        SetTimer(hwnd, 23, 16, nullptr);
+    }
+
+    void StepSelectionAutoScroll(HWND hwnd)
+    {
+        if (!g_selectionAutoScroll || !g_selectingContent || !g_continuousRead)
+        {
+            KillTimer(hwnd, 23);
+            g_selectionAutoScroll = false;
+            return;
+        }
+        PdfTab* tab = Active();
+        if (!tab)
+        {
+            KillTimer(hwnd, 23);
+            g_selectionAutoScroll = false;
+            return;
+        }
+
+        POINT cursor{};
+        if (!GetCursorPos(&cursor)) return;
+        ScreenToClient(hwnd, &cursor);
+        int edge = std::max<int>(S(24), std::min<int>(S(72), (g_stage.bottom - g_stage.top) / 8));
+        int delta = 0;
+        if (cursor.y < g_stage.top + edge)
+        {
+            int distance = g_stage.top + edge - cursor.y;
+            delta = -std::clamp(S(4) + distance / 3, S(4), S(34));
+        }
+        else if (cursor.y > g_stage.bottom - edge)
+        {
+            int distance = cursor.y - (g_stage.bottom - edge);
+            delta = std::clamp(S(4) + distance / 3, S(4), S(34));
+        }
+        else
+        {
+            KillTimer(hwnd, 23);
+            g_selectionAutoScroll = false;
+            return;
+        }
+
+        int oldScroll = g_scrollY;
+        ScrollStageTo(hwnd, g_scrollY + delta, true, false);
+        if (oldScroll == g_scrollY)
+        {
+            KillTimer(hwnd, 23);
+            g_selectionAutoScroll = false;
+            return;
+        }
+
+        g_selectionEnd = cursor;
+        UpdateSelectionEndpointPage(*tab, cursor.x, cursor.y);
+        if (RefreshTextSelection(*tab))
+        {
+            RememberDragTextSelection();
+            g_hasContentSelection = true;
+            g_selectionIsImage = false;
+        }
+        InvalidateRect(hwnd, &g_stage, FALSE);
+    }
     void QueueTouchPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX)
     {
         if (deltaY == 0 && deltaX == 0) return;
@@ -10757,7 +12301,6 @@ namespace
             g_sidebarScrollTargetY = 0;
             g_selectedOutlineRow = -1;
             g_collapsedOutlineRows.clear();
-            ++g_outlineCollapseVersion;
             return;
         }
 
@@ -10766,9 +12309,8 @@ namespace
         g_sidebarScrollTargetY = g_sidebarScrollY;
         g_selectedOutlineRow = tab->selectedOutlineRow;
         g_collapsedOutlineRows = tab->collapsedOutlineRows;
-        ++g_outlineCollapseVersion;
 
-        if (g_sideMode == 0 && !tab->outline.empty())
+        if (g_sideMode == 0 && tab->outlineMetadataLoaded && !tab->outline.empty())
         {
             if (g_selectedOutlineRow < 0 || g_selectedOutlineRow >= static_cast<int>(tab->outline.size()))
                 g_selectedOutlineRow = OutlineRowFromScroll(*tab, g_scrollY);
@@ -10779,6 +12321,12 @@ namespace
     void SwitchSidebarMode(HWND hwnd, int mode)
     {
         mode = std::clamp(mode, 0, 3);
+        if (mode == 0)
+        {
+            PdfTab* tab = Active();
+            if (!tab || !tab->outlineMetadataLoaded || tab->outline.empty())
+                return;
+        }
         if (mode == g_sideMode) return;
         if (PdfTab* tab = Active()) SaveActiveTabSidebarState(*tab);
         g_sideMode = mode;
@@ -10797,8 +12345,20 @@ namespace
         {
             g_contentHeight = ContinuousContentHeight(*tab);
             int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
-            g_scrollY = std::clamp(tab->savedScrollY, 0, maxScroll);
-            tab->currentPage = PageFromScroll(*tab, g_scrollY);
+            int desired = tab->savedScrollY;
+            if (tab->pendingSessionPosition && tab->metadataGeometryComplete)
+            {
+                int page = std::clamp(tab->pendingSessionPage, 0, tab->pageCount - 1);
+                desired = (tab->pendingSessionPageOffset
+                    ? PageTopScroll(*tab, page)
+                    : SpreadTopScroll(*tab, page)) + tab->pendingSessionOffsetY;
+                tab->currentPage = page;
+                tab->pendingSessionPosition = false;
+                tab->pendingSessionPageOffset = false;
+            }
+            g_scrollY = std::clamp(desired, 0, maxScroll);
+            if (!tab->pendingSessionPosition)
+                tab->currentPage = PageFromScroll(*tab, g_scrollY);
         }
         else
         {
@@ -10821,13 +12381,41 @@ namespace
         }
         SaveActiveTabProgress();
         g_active = index;
+        g_tabs[static_cast<size_t>(index)]->lastActivatedSerial = ++g_tabActivationSerial;
+        g_sidebarKeyboardFocus = false;
         EnsureTabWindowVisible(g_active);
         g_tabListOpen = false;
         RestoreActiveTabPosition(hwnd);
         RestoreActiveTabSidebarState(hwnd);
+        // A pending page-navigation commit belongs to the previous Tab. Do
+        // not make the new Tab wait for that old viewport to become complete.
+        g_pageNavigationPending = false;
+        g_stageIdleRefreshPending = false;
+        g_stageLightPaintUntil = 0;
+        g_smoothStageScroll = false;
+        KillTimer(hwnd, 4);
+        if (PdfTab* target = Active())
+        {
+            ResumeActiveTabMetadata(hwnd, *target);
+            // The renderer is shared, but only this Tab's work is allowed to
+            // compete during activation. Completed caches on other Tabs stay
+            // intact and their suspended metadata resumes when revisited.
+            PrioritizePageRendersForTab(*target);
+            // Release the previous Tab's raster and hit-test caches at the
+            // switch boundary. Display-list destruction is deferred to the
+            // existing idle trim so activation never waits on a worker-held
+            // document lock.
+            TrimBackgroundRenderCaches();
+            QueueInitialViewportPreview(hwnd, *target);
+            SchedulePagePrefetch(hwnd);
+        }
+        ScheduleIdleCacheTrim(hwnd);
         SetTitle();
-        StartActiveFileWatcher(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        // File watcher replacement can join the old directory thread. Keep
+        // that housekeeping out of the visible tab-switch transaction.
+        PostMessageW(hwnd, WM_QUIETPDF_REFRESH_FILE_WATCH, 0, 0);
+        PresentCachedTabFrame(hwnd);
+        PresentTabChrome(hwnd);
     }
 
     void StartSmoothStageScroll(HWND hwnd, int target)
@@ -11465,7 +13053,7 @@ namespace
         HGDIOBJ oldFont = SelectObject(dc, f);
         int tileW = S(152);
         int coverH = S(198);
-        int nameH = S(38);
+        int nameH = S(42);
         int tileH = coverH + nameH + S(10);
         int gapX = S(28);
         int gapY = S(28);
@@ -11577,8 +13165,17 @@ namespace
                 if (drawTile) DrawHomeIconButton(dc, hot, actions[a], actions[a] == HomeAction::Pin && item.pinned, g_homeHits.size() - 1, hovered, 4, false);
             }
 
-            RECT name{ tile.left, cover.bottom + S(8), tile.right, tile.bottom };
-            if (drawTile) Text(dc, item.name, name, DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS, T().text);
+            RECT name{ tile.left, cover.bottom + S(7), tile.right, tile.bottom };
+            if (drawTile)
+            {
+                std::wstring shownName = FitHomeTitleToLines(dc, item.name, name.right - name.left, 2);
+                int textHeight = MeasureTextHeight(dc, shownName, name.right - name.left,
+                    DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+                int nameHeight = static_cast<int>(name.bottom - name.top);
+                int verticalInset = std::max(0, (nameHeight - textHeight) / 2);
+                name.top += verticalInset;
+                Text(dc, shownName, name, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX, T().text);
+            }
             lastBottom = std::max(lastBottom, static_cast<int>(tile.bottom));
             advance();
         }
@@ -12184,7 +13781,7 @@ namespace
                             pageRow.left + S(24),
                             pageRow.top + (pageRow.bottom - pageRow.top - S(24)) / 2 + S(24)
                         };
-                        bool twistHovered = Hit(twist, g_mousePos.x, g_mousePos.y);
+                        bool twistHovered = !g_draggingSidebarScroll && Hit(twist, g_mousePos.x, g_mousePos.y);
                         bool twistPressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &twist);
                         if (twistHovered || twistPressed)
                         {
@@ -12216,7 +13813,7 @@ namespace
                     g_sidebarRowRects.push_back(row);
                     g_sidebarRowIds.push_back(static_cast<int>(i));
                     bool selected = static_cast<int>(i) == g_activeAnnotation;
-                    bool hovered = Hit(row, g_mousePos.x, g_mousePos.y);
+                    bool hovered = !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered || selected)
                     {
                         COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.22 : 0.12) : T().panel2;
@@ -12296,10 +13893,11 @@ namespace
             int clipDc = SaveDC(dc);
             RECT scrollArea{ g_sidebar.left, g_sidebar.top + S(44), g_sidebar.right, g_sidebar.bottom };
             IntersectClipRect(dc, scrollArea.left, scrollArea.top, scrollArea.right, scrollArea.bottom);
-            int rows = tab.outline.empty() ? std::min(tab.pageCount, 300) : static_cast<int>(tab.outline.size());
+            int rows = static_cast<int>(tab.outline.size());
+            bool compactOutline = rows > 512;
             HPEN treePen = CreatePen(PS_DOT, 1, SidebarTreeColor());
             HGDIOBJ oldPen = SelectObject(dc, treePen);
-            int sampleDepth = rows > 0 && !tab.outline.empty() ? tab.outline[0].depth : 0;
+            int sampleDepth = rows > 0 ? tab.outline[0].depth : 0;
             int sampleLineX = g_sidebar.left + S(10 + sampleDepth * 18);
             int sampleIconLeft = sampleLineX + S(12);
             int sampleTextWidth = std::max<int>(24, static_cast<int>((g_sidebar.right - S(30)) - (sampleIconLeft + S(10) + S(5)) - S(4)));
@@ -12324,8 +13922,10 @@ namespace
                 int pageLeft = g_sidebar.right - S(30);
                 int textLeft = iconLeft + iconW + S(5);
                 int textWidth = std::max(24, pageLeft - textLeft - S(4));
-                std::wstring label = tab.outline.empty() ? (L"\u7b2c" + std::to_wstring(i + 1) + L" \u9875") : tab.outline[static_cast<size_t>(i)].title;
-                int textH = textWidth == sampleTextWidth ? it->textHeight : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+                std::wstring label = tab.outline[static_cast<size_t>(i)].title;
+                int textH = compactOutline
+                    ? S(16)
+                    : (textWidth == sampleTextWidth ? it->textHeight : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX));
                 int rowH = it->height;
                 int y = scrollArea.top + it->top - g_sidebarScrollY;
                 RECT row{ g_sidebar.left + S(3), y, g_sidebar.right - S(3), y + rowH };
@@ -12343,8 +13943,8 @@ namespace
                     LineTo(dc, lineX, row.bottom - S(4));
                     MoveToEx(dc, lineX, firstLineCenterY, nullptr);
                     LineTo(dc, iconLeft - S(4), firstLineCenterY);
-                    bool selected = tab.outline.empty() ? page == tab.currentPage : (g_selectedOutlineRow == i);
-                    bool hovered = Hit(row, g_mousePos.x, g_mousePos.y);
+                    bool selected = g_selectedOutlineRow == i;
+                    bool hovered = !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered && !selected) RoundFill(dc, row, S(5), SidebarHoverFill(), SidebarHoverFill());
                     if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(), SidebarSelectedBorder());
 
@@ -12353,7 +13953,7 @@ namespace
                         RECT toggle{ lineX - S(5), firstLineCenterY - S(5), lineX + S(5), firstLineCenterY + S(5) };
                         g_outlineToggleRects.push_back(toggle);
                         g_outlineToggleRowIds.push_back(i);
-                        bool toggleHover = Hit(toggle, g_mousePos.x, g_mousePos.y);
+                        bool toggleHover = !g_draggingSidebarScroll && Hit(toggle, g_mousePos.x, g_mousePos.y);
                         COLORREF toggleBg = SidebarToggleFill(toggleHover);
                         COLORREF toggleLine = SidebarToggleLine(toggleHover);
                         RoundFill(dc, toggle, S(2), toggleBg, toggleBg);
@@ -12380,7 +13980,10 @@ namespace
 
                     RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
                     DrawBookmarkIcon(dc, mark, markColor, false);
-                    Text(dc, label, tx, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, rowText);
+                    Text(dc, label, tx,
+                        compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
+                                       : (DT_LEFT | DT_WORDBREAK | DT_NOPREFIX),
+                        rowText);
                     Text(dc, std::to_wstring(page + 1), pageRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, rowAux);
                 }
             }
@@ -12495,6 +14098,7 @@ namespace
     {
         return DrawCachedImagePart(dc, image, dest, 0, 0, image.width, image.height);
     }
+    bool DrawTileLevel(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect, int level, bool renderMissing, bool& missingVisiblePage);
     bool DrawOldZoomTiles(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect)
     {
         int currentZoom = TileZoomKey(tab.zoom);
@@ -12621,11 +14225,18 @@ namespace
                 RECT visible{};
                 if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
                 hadVisiblePage = true;
+                auto committed = tab.cache.find(page);
+                bool committedReady = committed != tab.cache.end() &&
+                    committed->second.width > 0 && committed->second.height > 0 &&
+                    (committed->second.dib || !committed->second.bgra.empty());
+                if (committedReady) continue;
                 if (!UseTiledPageRendering(tab))
                 {
                     auto found = tab.cache.find(page);
-                    if (found == tab.cache.end() || ((!found->second.dib && found->second.bgra.empty()) ||
-                        found->second.width <= 0 || found->second.height <= 0))
+                    bool pageReady = found != tab.cache.end() &&
+                        (found->second.dib || !found->second.bgra.empty()) &&
+                        found->second.width > 0 && found->second.height > 0;
+                    if (!pageReady && !TileLevelFullyCached(tab, page, pageRect, visible, 0))
                         return false;
                 }
                 else if (!TileLevelFullyCached(tab, page, pageRect, visible, 0))
@@ -12701,6 +14312,12 @@ namespace
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
+        bool holdPartialFrame = g_pageNavigationPending;
+        if (holdPartialFrame && CurrentZoomVisibleContentReady(tab))
+        {
+            g_pageNavigationPending = false;
+            holdPartialFrame = false;
+        }
         bool lightPaint = StageLightPaintActive();
         bool stageScrolling = StageScrollPaintInProgress();
         bool hadVisiblePage = false;
@@ -12760,6 +14377,13 @@ namespace
                             if (!ZoomRenderDeferred()) QueuePageRender(g_hwnd, tab, i, 0);
                         }
                         Fill(dc, drawRect, PdfPageBackgroundColor());
+                        bool currentTilesPainted = false;
+                        if (!image)
+                        {
+                            bool ignoredMissing = false;
+                            currentTilesPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                            if (currentTilesPainted) paintedRenderable = true;
+                        }
                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
@@ -12774,29 +14398,46 @@ namespace
                         }
                         else
                         {
-                            bool oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
+                            bool oldZoomPainted = !currentTilesPainted && DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
                             if (oldZoomPainted) paintedRenderable = true;
-                            else missingVisiblePage = true;
+                            else if (!currentTilesPainted) missingVisiblePage = true;
                         }
                     }
                     else
                     {
                         Fill(dc, drawRect, PdfPageBackgroundColor());
-                        bool fallbackPainted = false;
-                        PageImage* fallback = FindZoomFallbackPage(tab, i);
-                        if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                        PageImage* committed = FindCachedPage(tab, i);
+                        bool committedPainted = false;
+                        if (committed && committed->width > 0 && committed->height > 0 &&
+                            (committed->dib || !committed->bgra.empty()))
                         {
-                            int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
-                            int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
-                            int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
-                            int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
-                            fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
+                            int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(committed->width) / std::max(1, pageW))), 0, committed->width - 1);
+                            int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(committed->height) / std::max(1, pageH))), 0, committed->height - 1);
+                            int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(committed->width) / std::max(1, pageW))), sx + 1, committed->width);
+                            int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(committed->height) / std::max(1, pageH))), sy + 1, committed->height);
+                            committedPainted = DrawCachedImagePart(dc, *committed, drawRect, sx, sy, ex - sx, ey - sy);
                         }
-                        int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
-                        bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
-                        bool paintTiles = !ZoomRenderDeferred() || !fallbackPainted;
-                        bool coarseComplete = false;
-                        if (paintTiles)
+                        if (committedPainted)
+                        {
+                            paintedRenderable = true;
+                        }
+                        else if (!holdPartialFrame)
+                        {
+                            bool fallbackPainted = false;
+                            PageImage* fallback = FindZoomFallbackPage(tab, i);
+                            if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                            {
+                                int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
+                                int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
+                                int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
+                                int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
+                                fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
+                            }
+                            int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
+                            bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
+                            bool paintTiles = !ZoomRenderDeferred() || !fallbackPainted;
+                         bool coarseComplete = false;
+                         if (paintTiles)
                         {
                             for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
                                 coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
@@ -12819,14 +14460,24 @@ namespace
                             bool ignoredMissing = false;
                             targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
                         }
-                        if (targetMissing && !ZoomRenderDeferred())
-                        {
-                            int queueBudget = stageScrolling ? 4 : 12;
-                            QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                         if (targetMissing && !ZoomRenderDeferred())
+                         {
+                             int queueBudget = stageScrolling ? 4 : 12;
+                             QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                         }
+                         if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
+                         if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                         }
-                        if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
-                        if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
-                    }
+                        else
+                        {
+                            if (!CanCacheWholePageAtCurrentZoom(tab, i))
+                            {
+                                int queueBudget = 8;
+                                QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                            }
+                            missingVisiblePage = true;
+                        }
+                     }
                     if (IsDarkTheme())
                     {
                         AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
@@ -12901,13 +14552,21 @@ namespace
                         }
                         else drawSegment(DenormalizeAnnotationRect(annotation, pageRect));
                     }
-                    if ((g_hasContentSelection || g_selectingContent) && g_selectionPage == i)
+                    if (g_hasContentSelection || g_selectingContent)
                     {
-                        if (!g_selectionQuads.empty())
+                        auto selectedSegment = std::find_if(
+                            g_selectionSegments.begin(), g_selectionSegments.end(),
+                            [i](TextSelectionSegment const& segment) { return segment.page == i; });
+                        if (selectedSegment != g_selectionSegments.end() && !selectedSegment->quads.empty())
                         {
-                            DrawTextSelectionQuads(dc, pageRect, g_selectionQuads);
+                            DrawTextSelectionQuads(dc, pageRect, selectedSegment->quads);
                         }
-                        else if (g_selectingContent || g_selectionIsImage)
+                        // Text dragging is rendered only from native text
+                        // quads. The rectangle fallback is reserved for an
+                        // explicit image double-click; otherwise it briefly
+                        // paints headers, footers, or gaps before native
+                        // filtering finishes.
+                        else if (g_selectionIsImage && g_selectionPage == i)
                         {
                             RECT selection = CurrentSelectionRect();
                             RECT visibleSelection{};
@@ -12935,15 +14594,14 @@ namespace
         g_contentWidth = ReadingContentWidth(tab);
         if (g_pageNavigationPending)
         {
-            // Render completions invalidate small tile rectangles. During a
-            // discrete page change, wait for the whole visible spread and
-            // schedule one full-stage paint so the new page is committed as
-            // a complete frame instead of appearing from left to right.
+            // Keep the previously presented frame until the new viewport is
+            // complete. For pages that fit the committed-page budget, the
+            // background render is a single full bitmap; oversized pages use
+            // the existing complete tile coverage path.
             if (!CurrentZoomVisibleContentReady(tab))
                 return false;
             g_pageNavigationPending = false;
-            InvalidateRect(g_hwnd, &g_stage, FALSE);
-            return false;
+            return true;
         }
         return true;
     }
@@ -13558,8 +15216,115 @@ namespace
         if (paintedPages) ClampScroll(g_hwnd);
         PaintMainScrollBar(dc, client, paintClip);
         if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) || Intersects(paintClip, g_annotationNotePanelRect))
-            PaintAnnotationToolbar(dc, *tab, client);
+        PaintAnnotationToolbar(dc, *tab, client);
         return canFlush;
+    }
+
+    bool PresentCachedTabFrame(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!hwnd || !tab) return false;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HDC dc = GetDC(hwnd);
+        if (!dc) return false;
+        bool presented = false;
+        int top = g_immersive ? 0 : S(76);
+        int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+        int side = SidebarVisible() ? g_sidebarWidth : 0;
+        int splitW = side ? std::max(1, S(1)) : 0;
+        g_stage = RECT{ side + splitW, top, client.right, client.bottom - bottom };
+        RECT stage = g_stage;
+        if (!IsRectEmpty(&stage))
+        {
+            // Only completed native page images are presented here. There is
+            // deliberately no scaled snapshot or disk-backed bridge: a Tab
+            // switch must either show the same sharp pixels as before or let
+            // the normal renderer complete the missing viewport.
+            Fill(dc, stage, T().stage);
+            int firstVisibleSpread = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(*tab)) : 0;
+            int firstPage = g_continuousRead ? firstVisibleSpread : FirstPageInSpread(std::clamp(tab->currentPage, 0, tab->pageCount - 1));
+            int lastPage = g_continuousRead ? tab->pageCount : NextSpreadStart(*tab, firstPage);
+            for (int start = firstPage; start < lastPage; start = NextSpreadStart(*tab, start))
+            {
+                int y = g_continuousRead ? SpreadVisualTop(*tab, start) : g_stage.top + S(28) - g_scrollY;
+                int spreadH = SpreadHeight(*tab, start);
+                RECT spreadRect{ SpreadX(*tab, start), y, SpreadX(*tab, start) + SpreadWidth(*tab, start), y + spreadH };
+                if (g_continuousRead && spreadRect.top > stage.bottom + S(64)) break;
+                int count = SpreadPageCount(*tab, start);
+                for (int j = 0; j < count; ++j)
+                {
+                    int page = start + j;
+                    RECT pageRect{};
+                    if (!BuildSpreadPageRect(*tab, start, y, page, pageRect)) continue;
+                    RECT drawRect{};
+                    if (!IntersectRect(&drawRect, &pageRect, &stage)) continue;
+                    Fill(dc, drawRect, PdfPageBackgroundColor());
+
+                    PageImage* image = FindCachedPage(*tab, page);
+                    if (image && image->width > 0 && image->height > 0 && (image->dib || !image->bgra.empty()))
+                    {
+                        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+                        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+                        int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / pageW)), 0, image->width - 1);
+                        int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(image->height) / pageH)), 0, image->height - 1);
+                        int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / pageW)), sx + 1, image->width);
+                        int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image->height) / pageH)), sy + 1, image->height);
+                        presented |= DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy);
+                    }
+                    else
+                    {
+                        bool ignoredMissing = false;
+                        presented |= DrawTileLevel(dc, *tab, page, pageRect, drawRect, 0, false, ignoredMissing);
+                    }
+                }
+            }
+        }
+        ReleaseDC(hwnd, dc);
+        return presented;
+    }
+
+    void PresentTabChrome(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!hwnd || !tab) return;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HDC dc = GetDC(hwnd);
+        if (!dc) return;
+
+        int top = g_immersive ? 0 : S(76);
+        int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+        int side = SidebarVisible() ? g_sidebarWidth : 0;
+        g_sidebar = RECT{ 0, top, side, client.bottom - bottom };
+        g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
+
+        // This is intentionally a small direct presentation. A full-window
+        // invalidation would make PaintReader walk every visible layout page
+        // before the next input message, which is especially costly for a
+        // 1400-page document.
+        if (!g_immersive)
+        {
+            g_buttons.clear();
+            PaintToolbar(dc, client);
+            PaintTabs(dc, client);
+        }
+        if (side > 0)
+        {
+            RECT splitter{ side, top, side + std::max(1, S(1)), client.bottom - bottom };
+            GlassDivider(dc, splitter);
+        }
+        PaintSidebarPanelToggle(dc, client);
+        PaintStatus(dc, client);
+        ReleaseDC(hwnd, dc);
+
+        // Let the normal paint pass refresh the directory in its own narrow
+        // update region. It must not be drawn synchronously during a Tab
+        // click because outline layout can be expensive for large files.
+        if (side > 0)
+            InvalidateRect(hwnd, &g_sidebar, FALSE);
     }
 
     COLORREF MenuPopupFill()
@@ -15072,44 +16837,52 @@ namespace
     {
         PdfTab* tab = Active();
         if (!tab || !g_hasContentSelection || g_selectionPage < 0 || g_selectionQuads.empty()) return;
-        float minX = 1.0f;
-        float minY = 1.0f;
-        float maxX = 0.0f;
-        float maxY = 0.0f;
-        for (fz_quad const& quad : g_selectionQuads)
+        int firstAnnotation = -1;
+        for (TextSelectionSegment const& selected : g_selectionSegments)
         {
-            minX = std::min({ minX, quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
-            minY = std::min({ minY, quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
-            maxX = std::max({ maxX, quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
-            maxY = std::max({ maxY, quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            if (selected.page < 0 || selected.page >= tab->pageCount || selected.quads.empty()) continue;
+            float minX = 1.0f;
+            float minY = 1.0f;
+            float maxX = 0.0f;
+            float maxY = 0.0f;
+            for (fz_quad const& quad : selected.quads)
+            {
+                minX = std::min({ minX, quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+                minY = std::min({ minY, quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+                maxX = std::max({ maxX, quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+                maxY = std::max({ maxY, quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+            }
+            fz_rect r{ minX, minY, maxX, maxY };
+            if (std::abs(r.x1 - r.x0) < 0.004f || std::abs(r.y1 - r.y0) < 0.004f) continue;
+            PdfAnnotation annotation;
+            annotation.page = selected.page;
+            annotation.x0 = std::min(r.x0, r.x1);
+            annotation.y0 = std::min(r.y0, r.y1);
+            annotation.x1 = std::max(r.x0, r.x1);
+            annotation.y1 = std::max(r.y0, r.y1);
+            annotation.kind = kind;
+            annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : (kind == AnnotationKind::Underline ? 1 : 3);
+            annotation.createdAt = NowMs();
+            annotation.author = L"10726";
+            annotation.text = selected.text;
+            for (fz_quad const& quad : selected.quads)
+            {
+                double sx0 = std::min({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+                double sy0 = std::min({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+                double sx1 = std::max({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
+                double sy1 = std::max({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
+                AppendUniqueSegment(annotation.segments, AnnotationSegment{ sx0, sy0, sx1, sy1 });
+            }
+            MergeAnnotationSegments(annotation.segments);
+            if (annotation.segments.empty())
+                annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
+            tab->annotations.push_back(std::move(annotation));
+            if (firstAnnotation < 0) firstAnnotation = static_cast<int>(tab->annotations.size()) - 1;
         }
-        fz_rect r{ minX, minY, maxX, maxY };
-        if (std::abs(r.x1 - r.x0) < 0.004f || std::abs(r.y1 - r.y0) < 0.004f) return;
-        PdfAnnotation annotation;
-        annotation.page = std::clamp(g_selectionPage, 0, tab->pageCount - 1);
-        annotation.x0 = std::min(r.x0, r.x1);
-        annotation.y0 = std::min(r.y0, r.y1);
-        annotation.x1 = std::max(r.x0, r.x1);
-        annotation.y1 = std::max(r.y0, r.y1);
-        annotation.kind = kind;
-        annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : (kind == AnnotationKind::Underline ? 1 : 3);
-        annotation.createdAt = NowMs();
-        annotation.author = L"10726";
-        annotation.text = g_selectionText;
-        for (fz_quad const& quad : g_selectionQuads)
-        {
-            double sx0 = std::min({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
-            double sy0 = std::min({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
-            double sx1 = std::max({ quad.ul.x, quad.ur.x, quad.ll.x, quad.lr.x });
-            double sy1 = std::max({ quad.ul.y, quad.ur.y, quad.ll.y, quad.lr.y });
-            AppendUniqueSegment(annotation.segments, AnnotationSegment{ sx0, sy0, sx1, sy1 });
-        }
-        if (annotation.segments.empty())
-            annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
-        tab->annotations.push_back(annotation);
+        if (firstAnnotation < 0) return;
         tab->dirty = true;
         ClearTextSelection();
-        g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
+        g_activeAnnotation = firstAnnotation;
         g_annotationToolbarOpen = true;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
@@ -15174,6 +16947,8 @@ namespace
                 continue;
             tab.annotations.push_back(std::move(annotation));
         }
+        for (PdfAnnotation& annotation : tab.annotations)
+            MergeAnnotationSegments(annotation.segments);
     }
 
     bool ReopenPdfHandlesPreservingView(PdfTab& tab, const std::wstring& path)
@@ -15242,6 +17017,11 @@ namespace
                 CollectOutline(replacement, outline, 0);
                 g_pdf.dropOutline(replacement.ctx, outline);
             }
+            // ReloadPdfTab reads the outline synchronously, so mark its
+            // metadata state explicitly instead of briefly hiding a real
+            // directory after an external PDF edit.
+            replacement.outlineMetadataRequested = true;
+            replacement.outlineMetadataLoaded = true;
             LoadAnnotationsFromPdf(replacement);
         }
         catch (...)
@@ -15322,6 +17102,7 @@ namespace
                 uniqueSegments.reserve(item.segments.size());
                 for (auto const& segment : item.segments)
                     AppendUniqueSegment(uniqueSegments, segment);
+                MergeAnnotationSegments(uniqueSegments);
                 for (auto const& segment : uniqueSegments)
                     pushAnnotation(segment.x0, segment.y0, segment.x1, segment.y1);
             }
@@ -16140,6 +17921,8 @@ namespace
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdBookmark:
+            if (PdfTab* tab = Active(); !tab || !tab->outlineMetadataLoaded || tab->outline.empty())
+                return;
             if (g_sidebarOpen && g_sideMode == 0) StartSidebarPanelAnimation(hwnd, false);
             else
             {
@@ -16336,7 +18119,7 @@ namespace
                 {
                     g_collapsedOutlineRows.clear();
                 }
-                ++g_outlineCollapseVersion;
+                ++tab->outlineCollapseVersion;
                 g_sidebarScrollY = ClampSidebarScrollValue(g_sidebarScrollY);
                 InvalidateRect(hwnd, &g_sidebar, FALSE);
             }
@@ -16467,6 +18250,70 @@ namespace
         EndPaint(hwnd, &ps);
     }
 
+    bool HandleDocumentArrowKey(HWND hwnd, WPARAM key)
+    {
+        if (key != VK_UP && key != VK_DOWN && key != VK_LEFT && key != VK_RIGHT)
+            return false;
+
+        // Keep native/custom text editing, menus and the sidebar's own keyboard
+        // navigation from being interpreted as document navigation.
+        if ((GetKeyState(VK_CONTROL) & 0x8000) ||
+            (GetKeyState(VK_SHIFT) & 0x8000) ||
+            (GetKeyState(VK_MENU) & 0x8000) ||
+            g_customZoomOpen || g_pageInputFocused || g_searchInputFocused ||
+            g_homeSearchFocused || g_annotationNoteFocused || g_sidebarKeyboardFocus)
+            return false;
+
+        PdfTab* tab = Active();
+        if (!tab) return false;
+
+        g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+        g_contentWidth = ReadingContentWidth(*tab);
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        int lineStep = std::max<int>(1, S(40));
+
+        switch (key)
+        {
+        case VK_UP:
+            if (g_contentHeight > stageH + 1)
+            {
+                if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY - lineStep);
+                else ScrollSinglePageByPixels(hwnd, *tab, -lineStep);
+            }
+            else
+            {
+                Command(hwnd, CmdPrev);
+            }
+            return true;
+        case VK_DOWN:
+            if (g_contentHeight > stageH + 1)
+            {
+                if (g_continuousRead) ScrollStageTo(hwnd, g_scrollY + lineStep);
+                else ScrollSinglePageByPixels(hwnd, *tab, lineStep);
+            }
+            else
+            {
+                Command(hwnd, CmdNext);
+            }
+            return true;
+        case VK_LEFT:
+            if (g_contentWidth > stageW + 1)
+                ScrollStageXTo(hwnd, g_scrollX - lineStep);
+            else
+                Command(hwnd, CmdPrev);
+            return true;
+        case VK_RIGHT:
+            if (g_contentWidth > stageW + 1)
+                ScrollStageXTo(hwnd, g_scrollX + lineStep);
+            else
+                Command(hwnd, CmdNext);
+            return true;
+        default:
+            return false;
+        }
+    }
+
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         switch (msg)
@@ -16489,6 +18336,11 @@ namespace
                 SetGestureConfig(hwnd, 0, 1, &panConfig, sizeof(panConfig));
             }
             return 0;
+        case WM_MOUSEACTIVATE:
+            // DefWindowProc may return an eat-click result for an inactive
+            // top-level window. Always activate the reader and let Windows
+            // deliver the original client click to WM_LBUTTONDOWN.
+            return MA_ACTIVATE;
         case WM_ACTIVATEAPP:
             if (!wParam) StopAutoScroll(hwnd);
             if (wParam) RefreshActiveFileIfChanged(hwnd);
@@ -16498,6 +18350,9 @@ namespace
             {
                 RefreshActiveFileIfChanged(hwnd);
             }
+            return 0;
+        case WM_QUIETPDF_REFRESH_FILE_WATCH:
+            StartActiveFileWatcher(hwnd);
             return 0;
         case WM_QUIETPDF_DRAG_SCROLL:
             g_dragScrollPosted = false;
@@ -16527,14 +18382,150 @@ namespace
                 PdfTab& tab = *g_tabs[static_cast<size_t>(i)];
                 PageRenderRequest const& request = result->request;
                 if (_wcsicmp(tab.path.c_str(), request.path.c_str()) != 0 ||
-                    tab.renderVersion != request.documentVersion || tab.zoom != request.zoom ||
-                    request.dpi != g_dpi || request.theme != PdfRenderTheme())
+                    tab.renderVersion != request.documentVersion || request.dpi != g_dpi ||
+                    (!request.metadata && request.theme != PdfRenderTheme()))
                     continue;
+
+                if (request.metadata)
+                {
+                    if (request.metadataPageCount != tab.pageCount)
+                        break;
+                    if (request.metadataPhase == 0)
+                    {
+                        int start = std::clamp(request.metadataPageStart, 0, tab.pageCount);
+                        if (start + static_cast<int>(result->metadataPages.size()) > tab.pageCount)
+                            break;
+                        for (size_t offset = 0; offset < result->metadataPages.size(); ++offset)
+                            tab.pages[static_cast<size_t>(start) + offset] = std::move(result->metadataPages[offset]);
+
+                        int next = start + static_cast<int>(result->metadataPages.size());
+                        tab.metadataPagesLoaded = std::max(tab.metadataPagesLoaded, next);
+                        if (next < tab.pageCount)
+                        {
+                            QueuePageMetadata(hwnd, tab, next, 0);
+                        }
+                        else
+                        {
+                            tab.metadataGeometryComplete = true;
+                            RequestOutlineMetadata(hwnd, tab);
+                        }
+                    }
+                    else if (request.metadataPhase == 1)
+                    {
+                        if (!result->metadataOutlineRead)
+                        {
+                            // Do not mistake an exception for a PDF without
+                            // an outline. Requeue a few times so a transient
+                            // document-lock or parser failure cannot leave
+                            // the directory permanently invisible.
+                            tab.outlineMetadataRequested = false;
+                            if (tab.outlineMetadataRetryCount < 2)
+                            {
+                                ++tab.outlineMetadataRetryCount;
+                                RequestOutlineMetadata(hwnd, tab);
+                            }
+                        }
+                        else
+                        {
+                            tab.outline = std::move(result->metadataOutline);
+                            tab.outlineMetadataRetryCount = 0;
+                            tab.outlineMetadataLoaded = true;
+                            if (i == g_active)
+                            {
+                                // Re-apply the saved directory state only after
+                                // the real outline exists. Before this point the
+                                // sidebar has no stable row geometry to select.
+                                RestoreActiveTabSidebarState(hwnd);
+                                // The sidebar may have been hidden while the
+                                // outline was unknown. Repaint the full client
+                                // so a real outline can take its reserved width.
+                                InvalidateRect(hwnd, nullptr, FALSE);
+                            }
+                        }
+                        QueuePageMetadata(hwnd, tab, tab.pageCount, 2);
+                    }
+                    else
+                    {
+                        tab.annotations = std::move(result->metadataAnnotations);
+                    }
+
+                    bool metadataFinished = request.metadataPhase == 2;
+                    if (metadataFinished)
+                    {
+                        tab.layoutCacheViewMode = -1;
+                        tab.layoutSpreadStarts.clear();
+                        tab.layoutSpreadTops.clear();
+                        tab.layoutSpreadEnds.clear();
+                        tab.outlineLayoutWidth = 0;
+                        tab.outlineLayoutFont = 0;
+                        tab.outlineLayoutDpi = 0;
+                        tab.outlineLayoutCollapseVersion = 0;
+                        if (i == g_active)
+                        {
+                            // Preserve the exact viewport. During startup
+                            // restore, translate the saved page-relative offset
+                            // from the fallback geometry to the final index.
+                            if (g_continuousRead)
+                            {
+                                int page = tab.pendingSessionPosition
+                                    ? std::clamp(tab.pendingSessionPage, 0, tab.pageCount - 1)
+                                    : std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+                                int stageHeight = std::max<int>(1, g_stage.bottom - g_stage.top);
+                                int desired = tab.pendingSessionPosition
+                                    ? PageTopScroll(tab, page) + tab.pendingSessionOffsetY
+                                    : g_scrollY;
+                                g_scrollY = std::clamp(desired, 0,
+                                    std::max(0, ContinuousContentHeight(tab) - stageHeight));
+                                if (tab.pendingSessionPosition)
+                                {
+                                    tab.currentPage = page;
+                                    tab.pendingSessionPosition = false;
+                                }
+                            }
+                            else
+                            {
+                                g_scrollY = std::clamp(g_scrollY, 0, SinglePageMaxScroll(tab));
+                            }
+                            UpdateVertScrollBar(hwnd);
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                        }
+                    }
+                    break;
+                }
+
+                // Thumbnail renders belong to the document, not to the active
+                // viewport. Accept them even after a tab switch so the pending
+                // marker is cleared and the cached thumbnail can be reused.
+                if (request.thumbnail)
+                {
+                    tab.thumbRenderPending.erase(request.page);
+                    auto found = tab.thumbCache.find(request.page);
+                    if (found != tab.thumbCache.end())
+                    {
+                        found->second = std::move(result->image);
+                        if ((found->second.dib || !found->second.bgra.empty()) && i == g_active)
+                            InvalidateRect(hwnd, &g_sidebar, FALSE);
+                    }
+                    break;
+                }
+
+                if (tab.zoom != request.zoom)
+                    continue;
+
+                // A queued outline request can be canceled when another Tab
+                // is activated. Re-arm it when this Tab gets a normal render
+                // completion, without adding a timer or another worker.
+                if (i == g_active && !tab.outlineMetadataLoaded && !tab.outlineMetadataRequested)
+                    RequestOutlineMetadata(hwnd, tab);
 
                 PreparePageCache(tab);
                 bool inserted = false;
                 RECT dirtyRect{};
-                if (!RenderRequestStillUseful(tab, request, dirtyRect))
+                // Keep completed work for a background Tab as its bounded
+                // return-to-tab cache. Its screen coordinates are no longer
+                // the active viewport's coordinates, so only the active Tab
+                // needs the viewport usefulness test and repaint rectangle.
+                if (i == g_active && !RenderRequestStillUseful(tab, request, dirtyRect))
                     break;
                 bool isPreview = !request.tile && request.renderZoom > 0.0 && request.renderZoom < request.zoom - 0.001;
                 if (request.tile)
@@ -16570,6 +18561,17 @@ namespace
                 else if (tab.cache.find(request.page) == tab.cache.end())
                 {
                     tab.cache.emplace(request.page, std::move(result->image));
+                    // A committed full page supersedes the same page's tile
+                    // and low-resolution copies. Keep only one presentation
+                    // representation for the page after the swap.
+                    for (auto tileIt = tab.tileCache.begin(); tileIt != tab.tileCache.end(); )
+                    {
+                        if (tileIt->first.page == request.page)
+                            tileIt = tab.tileCache.erase(tileIt);
+                        else
+                            ++tileIt;
+                    }
+                    tab.zoomFallbackCache.erase(request.page);
                     TrimPageCache(tab, request.page);
                     inserted = true;
                     PageRenderRequestScreenRect(tab, request, dirtyRect);
@@ -16583,10 +18585,8 @@ namespace
                 {
                     if (g_pageNavigationPending)
                     {
-                        // A discrete navigation is presented only after the
-                        // complete visible viewport is available. Do not
-                        // expose individual tile completions as flashing
-                        // strips while the target page is still rendering.
+                        // A committed full page, or complete tile coverage for
+                        // an oversized page, is presented atomically.
                         if (CurrentZoomVisibleContentReady(tab))
                             InvalidateRect(hwnd, &g_stage, FALSE);
                     }
@@ -16891,6 +18891,14 @@ namespace
                     }
                     if (TrySelectWordAtPoint(hwnd, *tab, page, pageRect, POINT{ x, y }))
                         return 0;
+                    // Only fall back to image selection when the double-click
+                    // did not land on selectable text. This keeps page-sized
+                    // background images from stealing text selection.
+                    if (TrySelectImageAtPoint(*tab, page, pageRect, POINT{ x, y }))
+                    {
+                        InvalidateRect(hwnd, &g_stage, FALSE);
+                        return 0;
+                    }
                     ClearTextSelection();
                     InvalidateRect(hwnd, &g_stage, FALSE);
                     return 0;
@@ -16907,6 +18915,16 @@ namespace
             }
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            g_outlineClickHandledOnDown = false;
+            // Directory navigation has priority over page selection and all
+            // other client hit tests. The handler uses a state-validated
+            // painted snapshot and falls back to the current layout.
+            if (HandleOutlineClick(hwnd, x, y))
+            {
+                g_outlineClickHandledOnDown = true;
+                return 0;
+            }
+            g_sidebarKeyboardFocus = SidebarVisible() && Hit(g_sidebar, x, y);
             g_pdfLinkPressPending = false;
             g_pdfLinkPressPage = -1;
             g_pdfLinkPressUri.clear();
@@ -17171,6 +19189,7 @@ namespace
                 g_mainScrollDragStartY = y;
                 g_mainScrollDragStartPos = g_scrollY;
                 g_dragScrollTarget = g_scrollY;
+                g_dragOutlinePreviewRow = g_selectedOutlineRow;
                 g_lastMainScrollDragMoveMs = GetTickCount64();
                 g_dragScrollPosted = false;
                 g_mainScrollThumbLive = true;
@@ -17343,7 +19362,11 @@ namespace
                     SetTimer(hwnd, 2, 90, nullptr);
                     InvalidateRect(hwnd, &g_tabRects[i], FALSE);
                     ActivateTab(hwnd, tabId);
-                    g_draggingTab = true;
+                    // A normal Tab click must not enter mouse-capture mode.
+                    // Defer drag activation until the pointer actually moves
+                    // past the drag threshold in WM_MOUSEMOVE.
+                    g_tabPressPending = true;
+                    g_draggingTab = false;
                     g_tabDetachArmed = false;
                     g_tabDragFloating = false;
                     g_draggingTabIndex = tabId;
@@ -17352,7 +19375,7 @@ namespace
                     g_tabDragSourceRect = g_tabRects[i];
                     g_tabDragCurrentRect = g_tabRects[i];
                     g_tabDragInsertIndex = tabId;
-                    SetCapture(hwnd);
+                    // Capture is intentionally deferred until a real drag.
                     return 0;
                 }
             }
@@ -17409,6 +19432,14 @@ namespace
                 }
                 return 0;
             }
+            // Windows promotes a rapid second click to WM_LBUTTONDBLCLK.
+            // Treat it as the same directory activation before the page
+            // double-click handler gets a chance to interpret it as text.
+            if (HandleOutlineClick(hwnd, x, y))
+            {
+                g_outlineClickHandledOnDown = false;
+                return 0;
+            }
             if (PdfTab* tab = Active())
             {
                 int page = -1;
@@ -17428,9 +19459,12 @@ namespace
                     g_hasContentSelection = false;
                     g_selectionIsImage = false;
                     g_selectionPage = page;
+                    g_selectionEndPage = page;
                     g_selectionStart = POINT{ x, y };
                     g_selectionEnd = POINT{ x, y };
                     g_selectionPageRect = pageRect;
+                    g_selectionStartNorm = NormalizeSelectionPoint(pageRect, POINT{ x, y });
+                    g_selectionSegments.clear();
                     ResetDragSelectionLatch();
                     SetCapture(hwnd);
                     InvalidateRect(hwnd, &g_stage, FALSE);
@@ -17440,6 +19474,11 @@ namespace
             if (SidebarVisible() && Hit(g_sidebar, x, y))
             {
                 PdfTab* tab = Active();
+                // Outline mode is handled once at the start of this message
+                // from the active layout. Do not fall back to the legacy
+                // painted-row arrays, which may belong to a previous repaint.
+                if (g_sideMode == 0)
+                    return 0;
                 if (g_sideMode == 0)
                 {
                     for (size_t i = 0; i < g_outlineToggleRects.size() && i < g_outlineToggleRowIds.size(); ++i)
@@ -17449,7 +19488,7 @@ namespace
                             int rowId = g_outlineToggleRowIds[i];
                             if (g_collapsedOutlineRows.find(rowId) != g_collapsedOutlineRows.end()) g_collapsedOutlineRows.erase(rowId);
                             else g_collapsedOutlineRows.insert(rowId);
-                            ++g_outlineCollapseVersion;
+                            if (tab) ++tab->outlineCollapseVersion;
                             g_sidebarScrollY = ClampSidebarScrollValue(g_sidebarScrollY);
                             InvalidateRect(hwnd, &g_sidebar, FALSE);
                             return 0;
@@ -17461,6 +19500,11 @@ namespace
                     if (Hit(g_sidebarRowRects[i], x, y))
                     {
                         int page = std::clamp(g_sidebarRowPages[i], 0, tab->pageCount - 1);
+                        // The outline is mouse-navigated only. Do not leave
+                        // the sidebar keyboard guard set after a click, or
+                        // the document arrow keys will be swallowed until
+                        // focus moves elsewhere.
+                        g_sidebarKeyboardFocus = false;
                         if (g_sideMode == 3 && i < g_sidebarRowIds.size())
                         {
                             int rowId = g_sidebarRowIds[i];
@@ -17497,15 +19541,22 @@ namespace
                         if (g_sideMode == 0 && i < g_sidebarRowIds.size())
                         {
                             g_selectedOutlineRow = g_sidebarRowIds[i];
-                            if (!tab->outline.empty() && g_selectedOutlineRow >= 0)
+                            if (tab->outlineMetadataLoaded && !tab->outline.empty() && g_selectedOutlineRow >= 0)
                             {
+                                tab->selectedOutlineRow = g_selectedOutlineRow;
                                 ScrollToOutline(*tab, g_selectedOutlineRow);
-                                InvalidateRect(hwnd, nullptr, FALSE);
+                                // Navigation repaint covers the reading area;
+                                // invalidate the sidebar separately so the
+                                // selected row changes before the next mouse
+                                // move.
+                                InvalidateRect(hwnd, &g_sidebar, FALSE);
+                                RequestPageNavigationRepaint(hwnd, *tab);
                                 break;
                             }
                         }
+                        InvalidateRect(hwnd, &g_sidebar, FALSE);
                         ScrollToPage(*tab, page);
-                        InvalidateRect(hwnd, nullptr, FALSE);
+                        RequestPageNavigationRepaint(hwnd, *tab);
                         break;
                     }
                 }
@@ -17613,6 +19664,17 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (g_tabPressPending)
+            {
+                int dx = mx - g_tabDragStart.x;
+                int dy = my - g_tabDragStart.y;
+                if ((dx * dx + dy * dy) > S(8) * S(8))
+                {
+                    g_tabPressPending = false;
+                    g_draggingTab = true;
+                    SetCapture(hwnd);
+                }
+            }
             if (g_draggingTab)
             {
                 RECT client{};
@@ -17646,10 +19708,16 @@ namespace
             bool oldMainHScrollHover = g_mainHScrollHover;
             bool oldHomeScrollHover = g_homeScrollHover;
             bool oldSidebarScrollHover = g_sidebarScrollHover;
+            // The sidebar hover state is used to invalidate the scrollbar
+            // when entering or leaving it. Track the actual scrollbar track,
+            // not the whole scrollable content area; otherwise moving from a
+            // directory row to the scrollbar produces no state transition.
+            UpdateSidebarScrollRects();
             g_mainScrollHover = Hit(g_mainScrollTrackRect, mx, my);
             g_mainHScrollHover = Hit(g_mainHScrollTrackRect, mx, my);
             g_homeScrollHover = Hit(g_homeScrollTrackRect, mx, my);
-            g_sidebarScrollHover = SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) && Hit(SidebarScrollRect(), mx, my);
+            g_sidebarScrollHover = SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) &&
+                Hit(g_sidebarScrollTrackRect, mx, my);
             g_sidebarPanelToggleHover = Hit(g_sidebarPanelToggleRect, mx, my);
             if (oldSidebarPanelToggleHover != g_sidebarPanelToggleHover)
             {
@@ -17742,12 +19810,10 @@ namespace
                     g_pdfLinkPressPage = -1;
                     g_pdfLinkPressUri.clear();
                 }
-                g_selectionEnd = POINT{
-                    static_cast<LONG>(std::clamp(mx, static_cast<int>(g_selectionPageRect.left), static_cast<int>(g_selectionPageRect.right))),
-                    static_cast<LONG>(std::clamp(my, static_cast<int>(g_selectionPageRect.top), static_cast<int>(g_selectionPageRect.bottom)))
-                };
+                g_selectionEnd = POINT{ mx, my };
                 if (PdfTab* tab = Active())
                 {
+                    UpdateSelectionEndpointPage(*tab, mx, my);
                     if (RefreshTextSelection(*tab))
                     {
                         RememberDragTextSelection();
@@ -17760,6 +19826,7 @@ namespace
                         g_selectionIsImage = false;
                     }
                 }
+                UpdateSelectionAutoScroll(hwnd, mx, my);
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
@@ -17958,6 +20025,24 @@ namespace
             break;
         }
         case WM_LBUTTONUP:
+        {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+            if (g_outlineClickHandledOnDown)
+            {
+                g_outlineClickHandledOnDown = false;
+                return 0;
+            }
+            g_outlineClickHandledOnDown = false;
+        }
+            if (g_tabPressPending)
+            {
+                g_tabPressPending = false;
+                g_hasPressedButton = false;
+                KillTimer(hwnd, 2);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_pressedAnnotationPage >= 0)
             {
                 int page = g_pressedAnnotationPage;
@@ -18058,19 +20143,23 @@ namespace
                 bool largeEnough =
                     (selection.right - selection.left) >= S(8) &&
                     (selection.bottom - selection.top) >= S(6);
-                bool imageHit = false;
                 if (PdfTab* tab = Active())
                 {
+                    g_selectionEnd = releasePoint;
+                    UpdateSelectionEndpointPage(*tab, releasePoint.x, releasePoint.y);
                     if (RefreshTextSelection(*tab)) RememberDragTextSelection();
                     else if (largeEnough) RestoreLastDragTextSelection();
-                    if (!largeEnough && g_selectionQuads.empty())
-                        imageHit = TrySelectImageAtPoint(*tab, g_selectionPage, g_selectionPageRect, g_selectionEnd);
                 }
                 g_selectingContent = false;
+                KillTimer(hwnd, 23);
+                g_selectionAutoScroll = false;
                 ReleaseCapture();
                 if (largeEnough && g_selectionQuads.empty()) RestoreLastDragTextSelection();
-                g_selectionIsImage = imageHit || (largeEnough && g_selectionQuads.empty() && !g_selectionHadTextDuringDrag);
-                g_hasContentSelection = imageHit || !g_selectionQuads.empty() || (largeEnough && g_selectionIsImage);
+                // Image selection is intentionally restricted to the explicit
+                // double-click path above. A drag over a page-sized background
+                // image must never create a false yellow selection.
+                g_selectionIsImage = false;
+                g_hasContentSelection = !g_selectionQuads.empty();
                 if (!g_hasContentSelection)
                 {
                     g_selectionQuads.clear();
@@ -18105,6 +20194,7 @@ namespace
                 g_mainScrollThumbLive = false;
                 g_dragScrollPosted = false;
                 CommitMainScrollDragTarget(hwnd);
+                g_dragOutlinePreviewRow = -1;
                 ReleaseCapture();
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
                 return 0;
@@ -18260,7 +20350,6 @@ namespace
                     if (!IsRectEmpty(&g_mainHScrollTrackRect))
                         InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
                 }
-                SchedulePagePrefetch(hwnd);
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
@@ -18381,6 +20470,11 @@ namespace
                     RECT viewport = HomeContentViewportRect(client);
                     InvalidateRect(hwnd, &viewport, FALSE);
                 }
+                return 0;
+            }
+            if (wParam == 23)
+            {
+                StepSelectionAutoScroll(hwnd);
                 return 0;
             }
             if (wParam == 21)
@@ -18696,6 +20790,7 @@ namespace
                     return 0;
                 }
             }
+            if (HandleDocumentArrowKey(hwnd, wParam)) return 0;
             if (wParam == VK_ESCAPE && g_pageInputFocused) { CancelPageInput(hwnd); return 0; }
             if (wParam == VK_ESCAPE && g_homeSearchFocused)
             {

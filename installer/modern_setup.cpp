@@ -50,6 +50,7 @@ enum class Hot { None, Minimize, Close, Back, Primary, WelcomeCancel, OptionsCan
 struct InstallResult { bool success; std::wstring error; };
 struct ProgressMessage { int percent; std::wstring text; };
 struct CabinetContext { std::filesystem::path target; };
+struct LicenseLine { std::wstring text; int top{}; int height{}; };
 struct DirectoryCleanup {
     std::filesystem::path path;
     ~DirectoryCleanup() { std::error_code ec; if(!path.empty())std::filesystem::remove_all(path,ec); }
@@ -80,6 +81,10 @@ std::wstring g_stage, g_error;
 std::wstring g_spacePath, g_availableSpaceText;
 std::wstring g_licenseText;
 std::wstring g_licenseDisplayText;
+std::vector<LicenseLine> g_licenseLines;
+int g_licenseLayoutWidth = 0;
+int g_licenseLineHeight = 0;
+size_t g_licenseLayoutTextSize = 0;
 std::filesystem::path g_installedDir;
 std::filesystem::path g_uninstallDir;
 
@@ -182,6 +187,70 @@ void LoadLicenseText() {
         start=end+1;
     }
 }
+void EnsureLicenseLayout(HWND h) {
+    if(!h||!g_smallFont||IsRectEmpty(&g_licenseBox)) return;
+    const int viewportWidth=g_licenseBox.right-g_licenseBox.left-S(26);
+    const std::wstring& displayText=g_licenseDisplayText.empty()?g_licenseText:g_licenseDisplayText;
+    if(viewportWidth<=0||
+       (g_licenseLayoutWidth==viewportWidth&&g_licenseLayoutTextSize==displayText.size()&&
+        !g_licenseLines.empty())) return;
+
+    HDC dc=GetDC(h);
+    if(!dc) return;
+    HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
+    TEXTMETRICW metrics{};
+    GetTextMetricsW(dc,&metrics);
+    const int lineHeight=std::max(1,static_cast<int>(metrics.tmHeight));
+    std::vector<LicenseLine> lines;
+    size_t paragraphStart=0;
+    auto addLine=[&](std::wstring text) {
+        while(!text.empty()&&(text.back()==L' '||text.back()==L'\t')) text.pop_back();
+        lines.push_back({std::move(text),static_cast<int>(lines.size())*lineHeight,lineHeight});
+    };
+    auto measure=[&](size_t start,size_t count) {
+        SIZE size{};
+        GetTextExtentPoint32W(dc,displayText.data()+start,static_cast<int>(count),&size);
+        return size.cx;
+    };
+    while(paragraphStart<=displayText.size()) {
+        size_t paragraphEnd=displayText.find(L'\n',paragraphStart);
+        if(paragraphEnd==std::wstring::npos) paragraphEnd=displayText.size();
+        if(paragraphStart==paragraphEnd) {
+            addLine({});
+        } else {
+            size_t start=paragraphStart;
+            while(start<paragraphEnd) {
+                while(start<paragraphEnd&&(displayText[start]==L' '||displayText[start]==L'\t')) ++start;
+                if(start>=paragraphEnd) break;
+                const size_t remaining=paragraphEnd-start;
+                if(measure(start,remaining)<=viewportWidth) {
+                    addLine(displayText.substr(start,remaining));
+                    break;
+                }
+                size_t low=1, high=remaining, best=1;
+                while(low<=high) {
+                    const size_t middle=low+(high-low)/2;
+                    if(measure(start,middle)<=viewportWidth) { best=middle; low=middle+1; }
+                    else high=middle-1;
+                }
+                size_t breakAt=start+best;
+                size_t whitespace=displayText.find_last_of(L" \t",breakAt-1);
+                if(whitespace!=std::wstring::npos&&whitespace>=start) breakAt=whitespace;
+                if(breakAt==start) breakAt=start+best;
+                addLine(displayText.substr(start,breakAt-start));
+                start=breakAt;
+            }
+        }
+        if(paragraphEnd==displayText.size()) break;
+        paragraphStart=paragraphEnd+1;
+    }
+    SelectObject(dc,oldFont);
+    ReleaseDC(h,dc);
+    g_licenseLines=std::move(lines);
+    g_licenseLayoutWidth=viewportWidth;
+    g_licenseLineHeight=lineHeight;
+    g_licenseLayoutTextSize=displayText.size();
+}
 std::filesystem::path KnownFolder(REFKNOWNFOLDERID id) {
     PWSTR value=nullptr; if (FAILED(SHGetKnownFolderPath(id,0,nullptr,&value))) return {};
     std::filesystem::path result(value); CoTaskMemFree(value); return result;
@@ -258,6 +327,7 @@ void Layout(HWND h) {
     g_deleteData={S(48),S(210),S(672),S(278)};
     g_launch={S(110),S(310),S(610),S(360)};
     g_licenseBox={S(48),S(170),c.right-S(48),S(346)};
+    EnsureLicenseLayout(h);
     g_licenseAgree={S(48),S(354),S(248),S(394)};
     if(g_uiFont) {
         HDC dc=GetDC(h);
@@ -304,21 +374,27 @@ void DrawLicenseDocument(Gdiplus::Graphics& g,RECT box) {
     g_licenseScrollTrack=RECT{};
     g_licenseScrollThumb=RECT{};
     g_licenseScrollHit=RECT{};
-    HDC dc=g.GetHDC();
-    HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
-    RECT measure{0,0,viewport.right-viewport.left,0};
-    const std::wstring& displayText=g_licenseDisplayText.empty()?g_licenseText:g_licenseDisplayText;
-    DrawTextW(dc,displayText.c_str(),static_cast<int>(displayText.size()),&measure,DT_LEFT|DT_WORDBREAK|DT_CALCRECT);
-    g_licenseContentHeight=std::max<int>(0,static_cast<int>(measure.bottom));
+    EnsureLicenseLayout(g_window);
+    g_licenseContentHeight=static_cast<int>(g_licenseLines.size())*g_licenseLineHeight;
     const int viewportHeight=viewport.bottom-viewport.top;
     const int maxScroll=std::max(0,g_licenseContentHeight-viewportHeight);
     g_licenseScrollY=std::clamp(g_licenseScrollY,0,maxScroll);
+    HDC dc=g.GetHDC();
+    HGDIOBJ oldFont=SelectObject(dc,g_smallFont);
     int saved=SaveDC(dc);
     IntersectClipRect(dc,viewport.left,viewport.top,viewport.right,viewport.bottom);
     SetBkMode(dc,TRANSPARENT);
     SetTextColor(dc,RGB(113,112,107));
-    RECT textRect{viewport.left,viewport.top-g_licenseScrollY,viewport.right,viewport.top-g_licenseScrollY+g_licenseContentHeight};
-    DrawTextW(dc,displayText.c_str(),static_cast<int>(displayText.size()),&textRect,DT_LEFT|DT_WORDBREAK);
+    const int firstLine=std::max(0,g_licenseScrollY/g_licenseLineHeight-1);
+    const int lastLine=std::min<int>(static_cast<int>(g_licenseLines.size()),
+                                     (g_licenseScrollY+viewportHeight)/g_licenseLineHeight+2);
+    for(int i=firstLine;i<lastLine;++i) {
+        const auto& line=g_licenseLines[static_cast<size_t>(i)];
+        RECT textRect{viewport.left,viewport.top+line.top-g_licenseScrollY,
+                      viewport.right,viewport.top+line.top-g_licenseScrollY+line.height};
+        DrawTextW(dc,line.text.c_str(),static_cast<int>(line.text.size()),&textRect,
+                  DT_LEFT|DT_SINGLELINE|DT_NOPREFIX);
+    }
     RestoreDC(dc,saved);
     SelectObject(dc,oldFont);
     g.ReleaseHDC(dc);
@@ -550,6 +626,13 @@ void Paint(HWND h) {
     PAINTSTRUCT ps{}; HDC dc=BeginPaint(h,&ps); RECT c{}; GetClientRect(h,&c); HDC mem=CreateCompatibleDC(dc); HBITMAP bmp=CreateCompatibleBitmap(dc,c.right,c.bottom); HGDIOBJ old=SelectObject(mem,bmp);
     Gdiplus::Graphics g(mem); g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias); g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit); DrawCompactPage(g,c);
     BitBlt(dc,0,0,c.right,c.bottom,mem,0,0,SRCCOPY); SelectObject(mem,old); DeleteObject(bmp); DeleteDC(mem); EndPaint(h,&ps);
+}
+void RefreshNow(HWND h) {
+    InvalidateRect(h,nullptr,FALSE);
+}
+void LayoutAndRefresh(HWND h) {
+    Layout(h);
+    InvalidateRect(h,nullptr,FALSE);
 }
 Hot HotAt(POINT p) {
     if(Hit(g_minimize,p))return Hot::Minimize; if(Hit(g_close,p))return Hot::Close;
@@ -911,7 +994,7 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
             return 0;
         }
         Hot hot=HotAt(p);
-        if(hot!=Hot::None) { g_pressed=hot; SetCapture(h); InvalidateRect(h,nullptr,FALSE); return 0; }
+        if(hot!=Hot::None) { g_pressed=hot; SetCapture(h); RefreshNow(h); return 0; }
         if(!g_installing&&p.y<S(70)) { ReleaseCapture(); SendMessageW(h,WM_NCLBUTTONDOWN,HTCAPTION,0); }
         return 0;
     }
@@ -930,25 +1013,25 @@ LRESULT CALLBACK WindowProc(HWND h,UINT m,WPARAM w,LPARAM l) {
                 if(!PromptForAppClose(h,{g_uninstallDir},true))return 0;
                 g_page=Page::Uninstalling; g_installing=true; g_progress=g_targetProgress=0; g_stage=L"\u6b63\u5728\u51c6\u5907"; SetTimer(h,kTimer,16,nullptr);
                 std::thread([] { bool deleteData=g_deleteAppData; auto error=UninstallPackage(deleteData); PostMessageW(g_window,kMsgComplete,reinterpret_cast<WPARAM>(new InstallResult{error.empty(),error}),0); }).detach();
-                Layout(h); InvalidateRect(h,nullptr,FALSE); return 0;
+                LayoutAndRefresh(h); return 0;
             }
             if(pressed==Hot::Primary&&(g_page==Page::UninstallComplete||g_page==Page::UninstallFailed)) { PostMessageW(h,WM_CLOSE,0,0); return 0; }
             return 0;
         }
         if(pressed==Hot::Primary) {
-            if(g_page==Page::Welcome) { g_page=Page::License; Layout(h); InvalidateRect(h,nullptr,FALSE); }
-            else if(g_page==Page::License) { g_page=Page::Options; Layout(h); InvalidateRect(h,nullptr,FALSE); }
+            if(g_page==Page::Welcome) { g_page=Page::License; LayoutAndRefresh(h); }
+            else if(g_page==Page::License) { g_page=Page::Options; LayoutAndRefresh(h); }
             else if(g_page==Page::Options) {
                 auto requestedPath=std::filesystem::path(WindowText(g_pathEdit));
                 auto absolutePath=requestedPath.empty()?requestedPath:std::filesystem::absolute(requestedPath);
                 if(!PromptForAppClose(h,{RegisteredInstallDir(),absolutePath},false))return 0;
-                g_page=Page::Installing; g_installing=true; g_progress=g_targetProgress=0; g_stage=L"\u6b63\u5728\u51c6\u5907"; Layout(h); SetTimer(h,kTimer,16,nullptr);
+                g_page=Page::Installing; g_installing=true; g_progress=g_targetProgress=0; g_stage=L"\u6b63\u5728\u51c6\u5907"; LayoutAndRefresh(h); SetTimer(h,kTimer,16,nullptr);
                 auto path=std::move(requestedPath); bool desktop=g_desktopShortcut;
                 std::thread([path,desktop] { auto error=InstallPackage(path,desktop); PostMessageW(g_window,kMsgComplete,reinterpret_cast<WPARAM>(new InstallResult{error.empty(),error}),0); }).detach(); InvalidateRect(h,nullptr,FALSE);
             } else if(g_page==Page::Complete) { if(g_launchAfterInstall) LaunchInstalled(); PostMessageW(h,WM_CLOSE,0,0); }
-            else if(g_page==Page::Failed) { g_page=Page::Options; g_error.clear(); Layout(h); InvalidateRect(h,nullptr,FALSE); }
+            else if(g_page==Page::Failed) { g_page=Page::Options; g_error.clear(); LayoutAndRefresh(h); }
         } else if(pressed==Hot::Back) {
-            g_page=g_page==Page::Options?Page::License:(g_page==Page::License?Page::Welcome:Page::Options); Layout(h); InvalidateRect(h,nullptr,FALSE);
+            g_page=g_page==Page::Options?Page::License:(g_page==Page::License?Page::Welcome:Page::Options); LayoutAndRefresh(h);
         } else if(pressed==Hot::Browse) {
             std::filesystem::path selected; if(BrowseForFolder(h,selected)) SetWindowTextW(g_pathEdit,selected.c_str());
         } else if(pressed==Hot::Desktop) { g_desktopShortcut=!g_desktopShortcut; InvalidateRect(h,nullptr,FALSE); }

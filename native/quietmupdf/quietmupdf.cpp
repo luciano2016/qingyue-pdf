@@ -1913,11 +1913,12 @@ static int quiet_append_line_quads(
     if (last <= first)
         return count;
 
-    fz_rect run = line.chars[static_cast<size_t>(first)].rect;
-    fz_rect previous = run;
+    fz_rect run{};
+    fz_rect previous{};
+    bool haveRun = false;
     auto flush_run = [&]()
     {
-        if (count >= max_quads)
+        if (!haveRun || count >= max_quads)
             return;
         fz_quad quad{};
         quad.ul = fz_point{ run.x0, run.y0 };
@@ -1928,11 +1929,34 @@ static int quiet_append_line_quads(
         quads[count++] = quad;
     };
 
-    for (int i = first + 1; i < last; ++i)
+    for (int i = first; i < last; ++i)
     {
-        fz_rect r = line.chars[static_cast<size_t>(i)].rect;
+        const quiet_visual_char& visualChar = line.chars[static_cast<size_t>(i)];
+        int c = visualChar.ch ? visualChar.ch->c : 0;
+        bool isWhitespace = c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == 0xA0;
+        // Keep ordinary spaces inside the same visual run. Their glyph boxes
+        // are often empty or unusually wide, and splitting on the space
+        // itself creates the small white gaps visible between punctuation
+        // such as "(" and ")". The following real glyph still decides
+        // whether the gap is ordinary word spacing or a column boundary.
+        if (isWhitespace)
+            continue;
+
+        fz_rect r = visualChar.rect;
+        if (!haveRun)
+        {
+            run = r;
+            previous = r;
+            haveRun = true;
+            continue;
+        }
+
         float gap = r.x0 - previous.x1;
-        float split_gap = std::max(3.0f, line.size * 0.72f);
+        // A PDF may encode a pair such as "（ ）" with a visibly large
+        // character gap. Keep that ordinary same-line spacing continuous;
+        // only a gap substantially larger than the line height is treated as
+        // a real column boundary.
+        float split_gap = std::max(4.0f, line.size * 1.65f);
         if (gap > split_gap)
         {
             flush_run();
@@ -1953,7 +1977,211 @@ static int quiet_append_line_quads(
     flush_run();
     return count;
 }
-extern "C" int quiet_pdf_select_text(
+
+extern "C" int quiet_pdf_get_page_bounds_range(
+    fz_context* ctx,
+    fz_document* fzdoc,
+    int start_page,
+    fz_rect* out,
+    int max_pages)
+{
+    quiet_set_last_error("");
+    if (!ctx || !fzdoc || !out || start_page < 0 || max_pages <= 0)
+    {
+        quiet_set_last_error("invalid quiet_pdf_get_page_bounds_range arguments");
+        return 0;
+    }
+
+    int count = 0;
+    fz_try(ctx)
+    {
+        pdf_document* doc = pdf_specifics(ctx, fzdoc);
+        if (!doc)
+            fz_throw(ctx, FZ_ERROR_FORMAT, "document is not a PDF");
+
+        int page_count = pdf_count_pages(ctx, doc);
+        if (start_page >= page_count)
+            return 0;
+        count = std::min(page_count - start_page, max_pages);
+        for (int offset = 0; offset < count; ++offset)
+        {
+            fz_rect bounds = fz_make_rect(0, 0, 612, 792);
+            fz_try(ctx)
+            {
+                pdf_obj* page_obj = pdf_lookup_page_obj(ctx, doc, start_page + offset);
+                fz_rect box{};
+                fz_matrix transform{};
+                pdf_page_obj_transform(ctx, page_obj, &box, &transform);
+                fz_rect candidate = fz_transform_rect(box, transform);
+                if (std::isfinite(candidate.x0) && std::isfinite(candidate.y0) &&
+                    std::isfinite(candidate.x1) && std::isfinite(candidate.y1) &&
+                    candidate.x1 - candidate.x0 >= 1 && candidate.y1 - candidate.y0 >= 1)
+                    bounds = candidate;
+            }
+            fz_catch(ctx)
+            {
+                // Keep a standard page fallback for a malformed individual page.
+            }
+            out[offset] = bounds;
+        }
+    }
+    fz_catch(ctx)
+    {
+        quiet_set_last_error(fz_caught_message(ctx));
+        count = 0;
+    }
+    return count;
+}
+
+static bool quiet_same_visual_line_text(const quiet_visual_line& a, const quiet_visual_line& b)
+{
+    std::vector<int> left;
+    std::vector<int> right;
+    auto append_signature = [](const quiet_visual_line& line, std::vector<int>& output)
+    {
+        for (const quiet_visual_char& ch : line.chars)
+        {
+            int c = ch.ch ? ch.ch->c : 0;
+            if (c <= 32)
+                continue;
+            // Page numbers change on every page. Treat ASCII digits as one
+            // token so a footer such as "5" and "6" has the same signature.
+            if (c >= '0' && c <= '9')
+                output.push_back('#');
+            else
+                output.push_back(c < 128 ? static_cast<unsigned char>(quiet_ascii_lower(static_cast<char>(c))) : c);
+        }
+    };
+    append_signature(a, left);
+    append_signature(b, right);
+    return !left.empty() && left == right;
+}
+
+static bool quiet_line_is_page_number(const quiet_visual_line& line)
+{
+    bool hasDigit = false;
+    for (const quiet_visual_char& ch : line.chars)
+    {
+        int c = ch.ch ? ch.ch->c : 0;
+        if (c >= '0' && c <= '9')
+        {
+            hasDigit = true;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '.' || c == '-' || c == '/' || c == '(' || c == ')')
+            continue;
+        return false;
+    }
+    return hasDigit;
+}
+
+static bool quiet_lines_are_adjacent(const quiet_visual_line& a, const quiet_visual_line& b)
+{
+    float gap = std::max(0.0f, b.y0 - a.y1);
+    float size = std::max(1.0f, std::min(a.size, b.size));
+    return gap <= size * 1.8f;
+}
+
+static bool quiet_line_in_top_margin(const quiet_visual_line& line, fz_rect bounds)
+{
+    float pageHeight = std::max(1.0f, bounds.y1 - bounds.y0);
+    float margin = std::max(18.0f, pageHeight * 0.08f);
+    return line.y0 <= bounds.y0 + margin;
+}
+
+static bool quiet_line_in_bottom_margin(const quiet_visual_line& line, fz_rect bounds)
+{
+    float pageHeight = std::max(1.0f, bounds.y1 - bounds.y0);
+    float margin = std::max(18.0f, pageHeight * 0.08f);
+    return line.y1 >= bounds.y1 - margin;
+}
+
+static void quiet_find_repeated_margin_lines(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    const std::vector<quiet_visual_line>& lines,
+    int* header_line,
+    int* footer_line)
+{
+    *header_line = -1;
+    *footer_line = -1;
+    if (!ctx || !doc || lines.empty()) return;
+
+    std::vector<quiet_visual_line> previous;
+    std::vector<quiet_visual_line> next;
+    auto load_lines = [&](int page, std::vector<quiet_visual_line>& target)
+    {
+        if (page < 0 || page >= fz_count_pages(ctx, doc)) return;
+        fz_stext_options opts{};
+        opts.flags = FZ_STEXT_DEHYPHENATE;
+        fz_stext_page* pageText = fz_new_stext_page_from_page_number(ctx, doc, page, &opts);
+        target = quiet_build_visual_lines(pageText);
+        fz_drop_stext_page(ctx, pageText);
+    };
+    load_lines(page_number - 1, previous);
+    load_lines(page_number + 1, next);
+
+    auto matches_neighbor_margin = [&](int index, bool top)
+    {
+        const quiet_visual_line& candidate = lines[static_cast<size_t>(index)];
+        auto matches = [&](const std::vector<quiet_visual_line>& neighbor)
+        {
+            if (neighbor.empty()) return false;
+            int begin = top ? 0 : std::max(0, static_cast<int>(neighbor.size()) - 3);
+            int end = top ? std::min(3, static_cast<int>(neighbor.size())) : static_cast<int>(neighbor.size());
+            for (int i = begin; i < end; ++i)
+            {
+                if (quiet_same_visual_line_text(candidate, neighbor[static_cast<size_t>(i)]))
+                    return true;
+            }
+            return false;
+        };
+        return matches(previous) || matches(next);
+    };
+
+    for (int i = 0; i < std::min(3, static_cast<int>(lines.size())); ++i)
+    {
+        // A standalone page number does not need a repeated neighbor to be
+        // recognized. It is already unambiguous when it sits in the top
+        // margin candidate rows, and must be excluded before quads are made.
+        if (quiet_line_is_page_number(lines[static_cast<size_t>(i)]) ||
+            matches_neighbor_margin(i, true))
+        {
+            *header_line = i;
+            break;
+        }
+    }
+    for (int i = std::max(0, static_cast<int>(lines.size()) - 3); i < static_cast<int>(lines.size()); ++i)
+    {
+        if (quiet_line_is_page_number(lines[static_cast<size_t>(i)]) ||
+            matches_neighbor_margin(i, false))
+        {
+            *footer_line = i;
+            // A page number is often the last line of a multi-line footer.
+            // Expand the cutoff across the whole adjacent margin block so
+            // every candidate footer line is excluded, not only the number.
+            if (quiet_line_is_page_number(lines[static_cast<size_t>(i)]))
+            {
+                while (*footer_line > 0 && quiet_lines_are_adjacent(
+                    lines[static_cast<size_t>(*footer_line - 1)],
+                    lines[static_cast<size_t>(*footer_line)]))
+                {
+                    --(*footer_line);
+                }
+            }
+            break;
+        }
+    }
+}
+
+static bool quiet_point_hits_line(fz_point point, const quiet_visual_line& line)
+{
+    float pad = std::max(1.0f, line.size * 0.22f);
+    return point.y >= line.y0 - pad && point.y <= line.y1 + pad;
+}
+
+static int quiet_pdf_select_text_impl(
     fz_context* ctx,
     fz_document* doc,
     int page_number,
@@ -1961,6 +2189,8 @@ extern "C" int quiet_pdf_select_text(
     float ay,
     float bx,
     float by,
+    int skip_header,
+    int skip_footer,
     fz_quad* quads,
     int max_quads,
     char* text,
@@ -2029,7 +2259,13 @@ extern "C" int quiet_pdf_select_text(
             std::swap(boundaryA, boundaryB);
         }
 
+        int headerLine = -1;
+        int footerLine = -1;
+        if (skip_header || skip_footer)
+            quiet_find_repeated_margin_lines(ctx, doc, page_number, lines, &headerLine, &footerLine);
+
         text_buffer = fz_new_buffer(ctx, 1024);
+        bool wroteText = false;
         for (int lineIndex = lineA; lineIndex <= lineB && count < max_quads; ++lineIndex)
         {
             const quiet_visual_line& line = lines[static_cast<size_t>(lineIndex)];
@@ -2038,13 +2274,35 @@ extern "C" int quiet_pdf_select_text(
             int last = lineIndex == lineB ? boundaryB : static_cast<int>(line.chars.size());
             if (last <= first) continue;
 
+            bool keepHeader = headerLine == lineIndex && quiet_point_hits_line(b, line);
+            bool keepFooter = footerLine == lineIndex && quiet_point_hits_line(a, line);
+            // The cutoff line describes the whole candidate margin region:
+            // every line in that region is filtered before quads are emitted.
+            // The endpoint exception preserves deliberate single-margin
+            // selection when the drag starts directly on that margin.
+            // Repeated margin text is the primary signal. The geometric
+            // fallback covers PDFs whose neighboring pages have slightly
+            // different text extraction, so an intermediate page's footer
+            // cannot flash into the selection while the drag crosses the
+            // page gap.
+            bool inHeaderCandidateRegion =
+                (headerLine >= 0 && lineIndex <= headerLine) ||
+                quiet_line_in_top_margin(line, bounds);
+            bool inFooterCandidateRegion =
+                (footerLine >= 0 && lineIndex >= footerLine) ||
+                quiet_line_in_bottom_margin(line, bounds);
+            if ((skip_header && inHeaderCandidateRegion && !keepHeader) ||
+                (skip_footer && inFooterCandidateRegion && !keepFooter))
+                continue;
+
             count = quiet_append_line_quads(line, first, last, bounds, quads, count, max_quads);
 
             if (text_buffer)
             {
-                if (lineIndex > lineA)
+                if (wroteText)
                     fz_append_byte(ctx, text_buffer, '\n');
                 quiet_append_line_text(ctx, text_buffer, line, first, last);
+                wroteText = true;
             }
         }
 
@@ -2068,6 +2326,44 @@ extern "C" int quiet_pdf_select_text(
     }
 
     return count;
+}
+
+extern "C" int quiet_pdf_select_text(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    float ax,
+    float ay,
+    float bx,
+    float by,
+    fz_quad* quads,
+    int max_quads,
+    char* text,
+    int text_capacity)
+{
+    return quiet_pdf_select_text_impl(
+        ctx, doc, page_number, ax, ay, bx, by, 0, 0,
+        quads, max_quads, text, text_capacity);
+}
+
+extern "C" int quiet_pdf_select_text_with_margins(
+    fz_context* ctx,
+    fz_document* doc,
+    int page_number,
+    float ax,
+    float ay,
+    float bx,
+    float by,
+    int skip_header,
+    int skip_footer,
+    fz_quad* quads,
+    int max_quads,
+    char* text,
+    int text_capacity)
+{
+    return quiet_pdf_select_text_impl(
+        ctx, doc, page_number, ax, ay, bx, by, skip_header, skip_footer,
+        quads, max_quads, text, text_capacity);
 }
 extern "C" int quiet_pdf_find_image_at_point(
     fz_context* ctx,

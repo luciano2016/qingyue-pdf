@@ -30,6 +30,7 @@ EXPORTS
     fz_pixmap_stride
     fz_pixmap_samples
     quiet_pdf_get_page_bounds
+    quiet_pdf_get_page_bounds_range
     fz_drop_pixmap
     quiet_new_pixmap_from_page_number_clip
     quiet_new_render_cookie
@@ -47,6 +48,7 @@ EXPORTS
     quiet_pdf_load_annotations
     quiet_pdf_last_error
     quiet_pdf_select_text
+    quiet_pdf_select_text_with_margins
     quiet_pdf_search_page_number
     quiet_pdf_get_text_char_boxes
     quiet_pdf_select_word_at_point
