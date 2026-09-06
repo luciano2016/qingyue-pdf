@@ -6901,10 +6901,28 @@ namespace
 
     void RequestOutlineMetadata(HWND hwnd, PdfTab& tab)
     {
-        if (tab.outlineMetadataRequested || tab.outlineMetadataLoaded || tab.outlineMetadataRetryCount >= 2)
+        if (tab.outlineMetadataRequested || tab.outlineMetadataLoaded)
             return;
         tab.outlineMetadataRequested = true;
         QueuePageMetadata(hwnd, tab, tab.pageCount, 1);
+        if (Active() == &tab)
+            SetTimer(hwnd, 24, 500, nullptr);
+    }
+
+    bool OutlineRequestPending(PdfTab const& tab)
+    {
+        auto matches = [&](PageRenderRequest const& request)
+        {
+            return request.metadata && request.metadataPhase == 1 &&
+                request.session == tab.renderSession &&
+                request.documentVersion == tab.renderVersion &&
+                _wcsicmp(request.path.c_str(), tab.path.c_str()) == 0;
+        };
+
+        std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+        if (g_pageRenderActive && matches(g_pageRenderActiveRequest))
+            return true;
+        return std::any_of(g_pageRenderQueue.begin(), g_pageRenderQueue.end(), matches);
     }
 
     void ResumeActiveTabMetadata(HWND hwnd, PdfTab& tab)
@@ -6918,9 +6936,9 @@ namespace
         if (!tab.outlineMetadataLoaded)
         {
             tab.outlineMetadataRequested = false;
-            if (tab.outlineMetadataRetryCount >= 2)
-                tab.outlineMetadataRetryCount = 0;
             RequestOutlineMetadata(hwnd, tab);
+            if (Active() == &tab)
+                SetTimer(hwnd, 24, 500, nullptr);
         }
     }
 
@@ -18857,14 +18875,17 @@ namespace
                         if (!result->metadataOutlineRead)
                         {
                             // Do not mistake an exception for a PDF without
-                            // an outline. Requeue a few times so a transient
-                            // document-lock or parser failure cannot leave
-                            // the directory permanently invisible.
+                            // an outline. Retry with a bounded cadence so a
+                            // transient document-lock/parser failure cannot
+                            // strand the sidebar, while a permanently broken
+                            // document does not spin the UI thread.
                             tab.outlineMetadataRequested = false;
-                            if (tab.outlineMetadataRetryCount < 2)
+                            ++tab.outlineMetadataRetryCount;
+                            if (i == g_active)
                             {
-                                ++tab.outlineMetadataRetryCount;
-                                RequestOutlineMetadata(hwnd, tab);
+                                UINT delay = static_cast<UINT>(std::min(
+                                    2000, 150 * std::max(1, tab.outlineMetadataRetryCount)));
+                                SetTimer(hwnd, 24, delay, nullptr);
                             }
                         }
                         else
@@ -18873,6 +18894,8 @@ namespace
                             tab.outlineMetadataRetryCount = 0;
                             tab.outlineMetadataRequested = false;
                             tab.outlineMetadataLoaded = true;
+                            if (i == g_active)
+                                KillTimer(hwnd, 24);
                             if (i == g_active)
                             {
                                 // Re-apply the saved directory state only after
@@ -20927,6 +20950,23 @@ namespace
             if (wParam == 23)
             {
                 StepSelectionAutoScroll(hwnd);
+                return 0;
+            }
+            if (wParam == 24)
+            {
+                KillTimer(hwnd, 24);
+                if (PdfTab* tab = Active(); tab && !tab->outlineMetadataLoaded)
+                {
+                    // A request can disappear between tab close/reopen,
+                    // queue pruning, or a dropped window message. Re-arm only
+                    // when neither the worker nor its queue still owns it.
+                    if (!OutlineRequestPending(*tab))
+                        tab->outlineMetadataRequested = false;
+                    if (!tab->outlineMetadataRequested)
+                        RequestOutlineMetadata(hwnd, *tab);
+                    else
+                        SetTimer(hwnd, 24, 500, nullptr);
+                }
                 return 0;
             }
             break;
