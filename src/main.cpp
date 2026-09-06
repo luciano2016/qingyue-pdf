@@ -12166,6 +12166,11 @@ namespace
         KillTimer(hwnd, 5);
         g_smoothSidebarScroll = false;
         g_draggingSidebarScroll = false;
+        // A restored outline row is authoritative until the user starts a
+        // real document scroll. Without this short-lived override, the first
+        // paint can derive a neighboring row from fallback page geometry and
+        // visibly move the saved selection before metadata settles.
+        ClearOutlineNavigationOverride();
 
         PdfTab* tab = Active();
         if (!tab)
@@ -12188,6 +12193,11 @@ namespace
             if (g_selectedOutlineRow < 0 || g_selectedOutlineRow >= static_cast<int>(tab->outline.size()))
                 g_selectedOutlineRow = OutlineRowFromScroll(*tab, g_scrollY);
             tab->selectedOutlineRow = g_selectedOutlineRow;
+            if (g_selectedOutlineRow >= 0)
+            {
+                g_outlineNavigationRow = g_selectedOutlineRow;
+                g_outlineNavigationRenderVersion = tab->renderVersion;
+            }
         }
     }
 
