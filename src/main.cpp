@@ -1433,6 +1433,7 @@ namespace
     LONG_PTR g_preImmersiveExStyle{};
     int g_active{ -1 };
     bool g_pageNavigationPending{};
+    bool g_zoomPresentationPending{};
     int g_scrollY{};
     int g_scrollX{};
     int g_stageScrollTarget{};
@@ -6670,7 +6671,7 @@ namespace
         // The outline is the first user-visible sidebar payload. It must run
         // before normal page prefetch and before the full geometry index; the
         // latter is only needed to refine scrolling after the first paint.
-        request.priority = phase == 1 ? -16 : 24;
+        request.priority = phase == 1 ? -21 : 24;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
@@ -10502,32 +10503,6 @@ namespace
         int restoreSidebarScrollY = recent == g_recent.end() ? 0 : recent->sidebarScrollY;
         int restoreSelectedOutlineRow = recent == g_recent.end() ? -1 : recent->selectedOutlineRow;
         LoadInitialPageGeometry(*tab);
-        if (openedFromHome)
-        {
-            // A document opened from the home page must not show a permanent
-            // empty outline while waiting for the worker message. Read this
-            // small, user-visible metadata payload once on the open path;
-            // geometry, page images, and annotations remain asynchronous.
-            bool outlineRead = false;
-            try
-            {
-                PdfDocumentLock lock(*tab);
-                fz_outline* outline = g_pdf.loadOutline(tab->ctx, tab->doc);
-                if (outline)
-                {
-                    try { CollectOutline(*tab, outline, 0); }
-                    catch (...) { tab->outline.clear(); }
-                    g_pdf.dropOutline(tab->ctx, outline);
-                }
-                outlineRead = true;
-            }
-            catch (...)
-            {
-                tab->outline.clear();
-            }
-            tab->outlineMetadataLoaded = outlineRead;
-            tab->outlineMetadataRequested = outlineRead;
-        }
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
@@ -10564,10 +10539,10 @@ namespace
         // policy and prevents several large PDFs from warming concurrently.
         PrioritizePageRendersForTab(*Active());
         TrimBackgroundRenderCaches();
-        // The home-page path reads the outline before the tab is published;
-        // other tab opens continue to use the asynchronous metadata pipeline.
-        if (!Active()->outlineMetadataLoaded)
-            RequestOutlineMetadata(hwnd, *Active());
+        // Outline parsing is always asynchronous. In particular, opening a
+        // recent large document must not wait for the complete outline before
+        // its first page can be shown.
+        RequestOutlineMetadata(hwnd, *Active());
         QueueInitialViewportPreview(hwnd, *Active());
         SchedulePagePrefetch(hwnd);
         // Geometry is deliberately queued behind the outline and the visible
@@ -10796,7 +10771,7 @@ namespace
             {
                 g_selectedOutlineRow = g_outlineNavigationRow;
                 tab->selectedOutlineRow = g_outlineNavigationRow;
-                if (!g_pageNavigationPending)
+                if (!g_pageNavigationPending && tab->outlineMetadataLoaded)
                     ClearOutlineNavigationOverride();
             }
             else
@@ -10990,6 +10965,7 @@ namespace
             : SinglePageContentHeight(tab);
         g_contentWidth = ReadingContentWidth(tab);
         g_pageNavigationPending = waitForComplete;
+        g_zoomPresentationPending = false;
         UpdateVertScrollBar(hwnd);
 
         if (UseTiledPageRendering(tab))
@@ -11273,6 +11249,7 @@ namespace
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false)
     {
         PdfTab* tab = Active();
+        g_zoomPresentationPending = false;
         // A real document scroll means the user's viewport is authoritative;
         // stop carrying a previous directory click through that scroll.
         if (g_outlineNavigationRow >= 0)
@@ -11395,6 +11372,7 @@ namespace
         // dragging flag has been cleared. Set the atomic presentation gate
         // here as well so that release-time movement cannot reveal partial
         // tiles.
+        g_zoomPresentationPending = false;
         g_pageNavigationPending = true;
         ScrollStageTo(hwnd, target, true, false);
         if (PdfTab* tab = Active())
@@ -11595,6 +11573,7 @@ namespace
         // PaintPages renders the target generation into the existing back
         // buffer, but does not present it until the visible page is complete.
         // This keeps partial tiles from replacing the last stable frame.
+        g_zoomPresentationPending = true;
         g_pageNavigationPending = true;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
@@ -12192,7 +12171,15 @@ namespace
         g_selectedOutlineRow = tab->selectedOutlineRow;
         g_collapsedOutlineRows = tab->collapsedOutlineRows;
 
-        if (g_sideMode == 0 && tab->outlineMetadataLoaded && !tab->outline.empty())
+        if (g_sideMode == 0 && !tab->outlineMetadataLoaded && g_selectedOutlineRow >= 0)
+        {
+            // Keep the persisted row authoritative while the worker is still
+            // building the outline. Fallback page geometry can run first,
+            // but it must not replace the saved item with a neighbor.
+            g_outlineNavigationRow = g_selectedOutlineRow;
+            g_outlineNavigationRenderVersion = tab->renderVersion;
+        }
+        else if (g_sideMode == 0 && tab->outlineMetadataLoaded && !tab->outline.empty())
         {
             if (g_selectedOutlineRow < 0 || g_selectedOutlineRow >= static_cast<int>(tab->outline.size()))
                 g_selectedOutlineRow = OutlineRowFromScroll(*tab, g_scrollY);
@@ -12202,6 +12189,12 @@ namespace
                 g_outlineNavigationRow = g_selectedOutlineRow;
                 g_outlineNavigationRenderVersion = tab->renderVersion;
             }
+        }
+        else if (g_sideMode == 0 && tab->outlineMetadataLoaded)
+        {
+            g_selectedOutlineRow = -1;
+            tab->selectedOutlineRow = -1;
+            ClearOutlineNavigationOverride();
         }
     }
 
@@ -12272,6 +12265,7 @@ namespace
         // A pending page-navigation commit belongs to the previous Tab. Do
         // not make the new Tab wait for that old viewport to become complete.
         g_pageNavigationPending = false;
+        g_zoomPresentationPending = false;
         g_stageIdleRefreshPending = false;
         g_stageLightPaintUntil = 0;
         g_smoothStageScroll = false;
@@ -14085,6 +14079,106 @@ namespace
         }
         return true;
     }
+
+    bool TileLevelFullyCachedAtZoom(PdfTab const& tab, int page, RECT pageRect, RECT drawRect, int zoomKey, int level)
+    {
+        if (page < 0 || page >= tab.pageCount || page >= static_cast<int>(tab.pages.size())) return false;
+        int pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        int pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        double oldZoom = static_cast<double>(zoomKey) / 10000.0;
+        int oldPageW = std::max<int>(1, static_cast<int>(tab.pages[static_cast<size_t>(page)].widthPt * oldZoom * g_dpi / 72.0 + 0.5));
+        int oldPageH = std::max<int>(1, static_cast<int>(tab.pages[static_cast<size_t>(page)].heightPt * oldZoom * g_dpi / 72.0 + 0.5));
+        int scale = TileLevelScale(level);
+        int levelPageW = std::max<int>(1, (oldPageW + scale - 1) / scale);
+        int levelPageH = std::max<int>(1, (oldPageH + scale - 1) / scale);
+        int localLeft = std::clamp<int>(drawRect.left - pageRect.left, 0, pageW);
+        int localTop = std::clamp<int>(drawRect.top - pageRect.top, 0, pageH);
+        int localRight = std::clamp<int>(drawRect.right - pageRect.left, 0, pageW);
+        int localBottom = std::clamp<int>(drawRect.bottom - pageRect.top, 0, pageH);
+        int oldLeft = std::clamp<int>(static_cast<int>(std::floor(static_cast<double>(localLeft) * oldPageW / pageW)), 0, oldPageW);
+        int oldTop = std::clamp<int>(static_cast<int>(std::floor(static_cast<double>(localTop) * oldPageH / pageH)), 0, oldPageH);
+        int oldRight = std::clamp<int>(static_cast<int>(std::ceil(static_cast<double>(localRight) * oldPageW / pageW)), oldLeft + 1, oldPageW);
+        int oldBottom = std::clamp<int>(static_cast<int>(std::ceil(static_cast<double>(localBottom) * oldPageH / pageH)), oldTop + 1, oldPageH);
+        int levelLeft = TileCoordAtLevel(oldLeft, level);
+        int levelTop = TileCoordAtLevel(oldTop, level);
+        int levelRight = std::clamp<int>((oldRight + scale - 1) / scale, levelLeft + 1, levelPageW);
+        int levelBottom = std::clamp<int>((oldBottom + scale - 1) / scale, levelTop + 1, levelPageH);
+        int tileSize = TileSize();
+        int tileLeft = (levelLeft / tileSize) * tileSize;
+        int tileTop = (levelTop / tileSize) * tileSize;
+        for (int ty = tileTop; ty < levelBottom; ty += tileSize)
+        {
+            int h = std::min(tileSize, levelPageH - ty);
+            if (h <= 0) continue;
+            for (int tx = tileLeft; tx < levelRight; tx += tileSize)
+            {
+                int w = std::min(tileSize, levelPageW - tx);
+                if (w <= 0) continue;
+                TileKey key{ page, zoomKey, PdfRenderTheme(), level, tx, ty, w, h };
+                auto found = tab.tileCache.find(key);
+                if (found == tab.tileCache.end() || found->second.width <= 0 || found->second.height <= 0 ||
+                    (!found->second.dib && found->second.bgra.empty()))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    bool ZoomPreviewVisibleContentReady(PdfTab& tab)
+    {
+        if (tab.pageCount <= 0) return true;
+        int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        bool hadVisiblePage = false;
+        int currentZoom = TileZoomKey(tab.zoom);
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > g_stage.bottom) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                RECT visible{};
+                if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
+                hadVisiblePage = true;
+
+                if (!UseTiledPageRendering(tab))
+                {
+                    PageImage* fallback = FindZoomFallbackPage(tab, page);
+                    if (!fallback || fallback->width <= 0 || fallback->height <= 0 ||
+                        (!fallback->dib && fallback->bgra.empty()))
+                        return false;
+                    continue;
+                }
+
+                bool ready = false;
+                std::vector<int> oldZooms;
+                for (auto const& entry : tab.tileCache)
+                {
+                    if (entry.first.page == page && entry.first.zoom != currentZoom &&
+                        std::find(oldZooms.begin(), oldZooms.end(), entry.first.zoom) == oldZooms.end())
+                        oldZooms.push_back(entry.first.zoom);
+                }
+                std::sort(oldZooms.begin(), oldZooms.end(), [&](int left, int right)
+                {
+                    return std::abs(left - currentZoom) < std::abs(right - currentZoom);
+                });
+                for (int oldZoom : oldZooms)
+                {
+                    for (int level = 0; level <= 6 && !ready; ++level)
+                        ready = TileLevelFullyCachedAtZoom(tab, page, pageRect, visible, oldZoom, level);
+                    if (ready) break;
+                }
+                if (!ready) return false;
+            }
+        }
+        return hadVisiblePage;
+    }
+
     bool CurrentZoomVisibleContentReady(PdfTab& tab)
     {
         if (tab.pageCount <= 0) return true;
@@ -14194,10 +14288,13 @@ namespace
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
-        bool holdPartialFrame = g_pageNavigationPending;
-        if (holdPartialFrame && CurrentZoomVisibleContentReady(tab))
+        bool currentContentReady = g_pageNavigationPending && CurrentZoomVisibleContentReady(tab);
+        bool zoomPreviewReady = g_zoomPresentationPending && !currentContentReady && ZoomPreviewVisibleContentReady(tab);
+        bool holdPartialFrame = g_pageNavigationPending && !currentContentReady && !zoomPreviewReady;
+        if (currentContentReady)
         {
             g_pageNavigationPending = false;
+            g_zoomPresentationPending = false;
             holdPartialFrame = false;
         }
         bool lightPaint = StageLightPaintActive();
@@ -14484,10 +14581,18 @@ namespace
             // complete. For pages that fit the committed-page budget, the
             // background render is a single full bitmap; oversized pages use
             // the existing complete tile coverage path.
-            if (!CurrentZoomVisibleContentReady(tab))
-                return false;
-            g_pageNavigationPending = false;
-            return true;
+            if (CurrentZoomVisibleContentReady(tab))
+            {
+                g_pageNavigationPending = false;
+                g_zoomPresentationPending = false;
+                return true;
+            }
+            // During zoom, a complete previous generation is a valid
+            // presentation frame. It follows the pointer immediately while
+            // the target generation is rendered off-screen.
+            if (g_zoomPresentationPending && ZoomPreviewVisibleContentReady(tab))
+                return true;
+            return false;
         }
         return true;
     }
@@ -17931,7 +18036,7 @@ namespace
                     ScrollStageTo(hwnd, 0);
                     if (g_scrollY == oldScroll) g_pageNavigationPending = false;
                 }
-                else { tab->currentPage = 0; g_scrollY = 0; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                else { tab->currentPage = 0; g_scrollY = 0; g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdPrev:
@@ -17952,7 +18057,7 @@ namespace
                     tab->currentPage = previous;
                     g_scrollY = 0;
                 }
-                if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                if (!g_continuousRead) { g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdNext:
@@ -17970,7 +18075,7 @@ namespace
                     tab->currentPage = std::min(tab->pageCount - 1, NextSpreadStart(*tab, FirstPageInSpread(tab->currentPage)));
                     g_scrollY = 0;
                 }
-                if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                if (!g_continuousRead) { g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdLast:
@@ -17984,7 +18089,7 @@ namespace
                     if (g_scrollY == oldScroll) g_pageNavigationPending = false;
                 }
                 else tab->currentPage = tab->pageCount - 1;
-                if (!g_continuousRead) { g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
+                if (!g_continuousRead) { g_zoomPresentationPending = false; g_pageNavigationPending = true; RequestStageRepaint(hwnd, false); }
             }
             break;
         case CmdOutlineToggleAll:
