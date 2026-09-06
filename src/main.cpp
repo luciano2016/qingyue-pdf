@@ -14256,14 +14256,19 @@ namespace
                 if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
                 hadVisiblePage = true;
 
-                if (!UseTiledPageRendering(tab))
+                // A complete page bitmap from the previous zoom is also a
+                // valid transition frame after the page switches to tiled
+                // rendering. Without this check, crossing the whole-page
+                // budget leaves PaintPages holding the old frame until all
+                // high-resolution tiles arrive, which feels like zoom input
+                // has stopped responding.
+                PageImage* fallback = FindZoomFallbackPage(tab, page);
+                if (fallback && fallback->width > 0 && fallback->height > 0 &&
+                    (fallback->dib || !fallback->bgra.empty()))
                 {
-                    PageImage* fallback = FindZoomFallbackPage(tab, page);
-                    if (!fallback || fallback->width <= 0 || fallback->height <= 0 ||
-                        (!fallback->dib && fallback->bgra.empty()))
-                        return false;
                     continue;
                 }
+                if (!UseTiledPageRendering(tab)) return false;
 
                 bool ready = false;
                 std::vector<int> oldZooms;
