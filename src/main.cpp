@@ -396,6 +396,7 @@ namespace
         unsigned zoomFallbackDpi{};
         int zoomFallbackTheme{ -1 };
         double zoomFallbackZoom{};
+        ULONGLONG zoomFallbackUntil{};
         int cachedThumbSize{};
         int cachedThumbTheme{ -1 };
         std::filesystem::file_time_type fileStamp{};
@@ -1580,6 +1581,7 @@ namespace
     ULONGLONG g_lastTouchFollowPaintMs{};
     ULONGLONG g_lastMainScrollDragMoveMs{};
     ULONGLONG g_stageLightPaintUntil{};
+    ULONGLONG g_zoomRenderDeferUntil{};
     ULONGLONG g_sidebarAnimationStartMs{};
     HBITMAP g_glassBackdrop{};
     HDC g_paintBufferDc{};
@@ -4985,6 +4987,7 @@ namespace
             tab.zoomFallbackDpi = 0;
             tab.zoomFallbackTheme = -1;
             tab.zoomFallbackZoom = 0.0;
+            tab.zoomFallbackUntil = 0;
 
             int anchorPage = tab.pageCount > 0
                 ? std::clamp(tab.currentPage, 0, tab.pageCount - 1)
@@ -5090,6 +5093,7 @@ namespace
             tab.zoomFallbackDpi = 0;
             tab.zoomFallbackTheme = -1;
             tab.zoomFallbackZoom = 0.0;
+            tab.zoomFallbackUntil = 0;
             tab.tileCache.clear();
             tab.thumbCache.clear();
             tab.thumbRenderPending.clear();
@@ -6067,13 +6071,17 @@ namespace
     void PruneZoomFallbackCache(PdfTab& tab)
     {
         if (tab.zoomFallbackCache.empty()) return;
-        // Keep the last committed generation until the new generation is ready.
-        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
+        ULONGLONG now = GetTickCount64();
+        // Keep the last committed generation briefly, then release it even if
+        // a render was canceled or the user stopped zooming midway.
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme() ||
+            (tab.zoomFallbackUntil != 0 && now >= tab.zoomFallbackUntil))
         {
             tab.zoomFallbackCache.clear();
             tab.zoomFallbackDpi = 0;
             tab.zoomFallbackTheme = -1;
             tab.zoomFallbackZoom = 0.0;
+            tab.zoomFallbackUntil = 0;
         }
     }
 
@@ -6113,6 +6121,7 @@ namespace
         tab.zoomFallbackDpi = tab.cachedDpi;
         tab.zoomFallbackTheme = newTheme;
         tab.zoomFallbackZoom = tab.cachedZoom;
+        tab.zoomFallbackUntil = GetTickCount64() + 1400;
     }
 
     void PreservePageCacheForZoomTransition(PdfTab& tab, double oldZoom)
@@ -6134,6 +6143,7 @@ namespace
                 tab.zoomFallbackDpi = tab.cachedDpi;
                 tab.zoomFallbackTheme = PdfRenderTheme();
                 tab.zoomFallbackZoom = oldZoom;
+                tab.zoomFallbackUntil = GetTickCount64() + 1400;
             }
             return;
         }
@@ -6144,6 +6154,27 @@ namespace
         tab.zoomFallbackDpi = tab.cachedDpi;
         tab.zoomFallbackTheme = PdfRenderTheme();
         tab.zoomFallbackZoom = oldZoom;
+        tab.zoomFallbackUntil = GetTickCount64() + 1400;
+    }
+
+    void ReleaseZoomFallback(PdfTab& tab)
+    {
+        if (tab.zoomFallbackZoom > 0.0)
+        {
+            int oldZoomKey = static_cast<int>(tab.zoomFallbackZoom * 10000.0 + 0.5);
+            for (auto it = tab.tileCache.begin(); it != tab.tileCache.end(); )
+            {
+                if (it->first.zoom == oldZoomKey && it->first.theme == PdfRenderTheme())
+                    it = tab.tileCache.erase(it);
+                else
+                    ++it;
+            }
+        }
+        tab.zoomFallbackCache.clear();
+        tab.zoomFallbackDpi = 0;
+        tab.zoomFallbackTheme = -1;
+        tab.zoomFallbackZoom = 0.0;
+        tab.zoomFallbackUntil = 0;
     }
 
     void TrimZoomFallbackCache(PdfTab& tab, int protectedPage)
@@ -6165,6 +6196,73 @@ namespace
             }
             if (victim == tab.zoomFallbackCache.end() || victim->first == protectedPage) break;
             tab.zoomFallbackCache.erase(victim);
+        }
+    }
+
+    double PreviewZoomForPage(PdfTab const& tab, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(tab.pages.size())) return std::min(tab.zoom, 0.5);
+        PageInfo const& page = tab.pages[static_cast<size_t>(index)];
+        double baseW = page.widthPt * static_cast<double>(g_dpi) / 72.0;
+        double baseH = page.heightPt * static_cast<double>(g_dpi) / 72.0;
+        double maxEdge = std::max(baseW, baseH);
+        if (maxEdge <= 1.0) return std::min(tab.zoom, 0.5);
+        constexpr double previewMaxEdge = 1280.0;
+        return std::clamp(std::min(tab.zoom, previewMaxEdge / maxEdge), 0.06, tab.zoom);
+    }
+
+    PageImage* EnsureZoomPreviewPage(PdfTab& tab, int index)
+    {
+        if (index < 0 || index >= tab.pageCount) return nullptr;
+        PruneZoomFallbackCache(tab);
+        double previewZoom = PreviewZoomForPage(tab, index);
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
+        {
+            tab.zoomFallbackCache.clear();
+            tab.zoomFallbackDpi = g_dpi;
+            tab.zoomFallbackTheme = PdfRenderTheme();
+        }
+        if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
+            tab.zoomFallbackZoom = previewZoom;
+        tab.zoomFallbackUntil = GetTickCount64() + 8000;
+        auto found = tab.zoomFallbackCache.find(index);
+        if (found == tab.zoomFallbackCache.end())
+        {
+            found = tab.zoomFallbackCache.emplace(index, RenderPageAtZoom(tab, index, previewZoom)).first;
+            TrimZoomFallbackCache(tab, index);
+        }
+        return &found->second;
+    }
+
+    void WarmZoomPreviewPagesForCurrentView(PdfTab& tab, int anchorPage)
+    {
+        if (!UseTiledPageRendering(tab) || tab.pageCount <= 0) return;
+        RECT view = g_stage;
+        InflateRect(&view, S(8), S(8));
+        int firstVisible = g_continuousRead ?
+            std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(anchorPage, 0, tab.pageCount - 1));
+        int warmed = 0;
+        int warmLimit = std::clamp(VisiblePageCountForCache(tab), 1, 2);
+        for (int start = firstVisible; start < tab.pageCount && warmed < warmLimit; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            RECT spreadRect{ SpreadX(tab, start), y, SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+            if (g_continuousRead && spreadRect.top > view.bottom) break;
+            if (!Intersects(spreadRect, view) && (g_continuousRead || start != firstVisible)) continue;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && warmed < warmLimit; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                if (!Intersects(pageRect, view)) continue;
+                if (!FindZoomFallbackPage(tab, page))
+                    EnsureZoomPreviewPage(tab, page);
+                ++warmed;
+            }
+            if (!g_continuousRead) break;
         }
     }
 
@@ -6939,16 +7037,7 @@ namespace
         }
         if (tab->zoomFallbackZoom > 0.0 && CurrentZoomVisibleContentReady(*tab))
         {
-            int oldZoomKey = TileZoomKey(tab->zoomFallbackZoom);
-            for (auto it = tab->tileCache.begin(); it != tab->tileCache.end(); )
-            {
-                if (it->first.zoom == oldZoomKey && it->first.theme == PdfRenderTheme()) it = tab->tileCache.erase(it);
-                else ++it;
-            }
-            tab->zoomFallbackCache.clear();
-            tab->zoomFallbackDpi = 0;
-            tab->zoomFallbackTheme = -1;
-            tab->zoomFallbackZoom = 0.0;
+            ReleaseZoomFallback(*tab);
         }
         // Keep the current page parsed so the first input after an idle trim
         // does not have to rebuild its display list on the UI-visible path.
@@ -7075,6 +7164,79 @@ namespace
                     g_pageRenderQueue.rbegin(),
                     g_pageRenderQueue.rend(),
                     [](PageRenderRequest const& queued) { return queued.tile; });
+                if (victim == g_pageRenderQueue.rend()) break;
+                g_pageRenderQueue.erase(std::next(victim).base());
+            }
+        }
+        g_pageRenderCv.notify_one();
+    }
+
+    void QueueZoomPreviewRender(HWND hwnd, PdfTab& tab, int page, int priority = 0)
+    {
+        if (page < 0 || page >= tab.pageCount) return;
+        double previewZoom = PreviewZoomForPage(tab, page);
+        if (previewZoom <= 0.0 || previewZoom >= tab.zoom - 0.001) return;
+        PruneZoomFallbackCache(tab);
+        if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
+        {
+            tab.zoomFallbackCache.clear();
+            tab.zoomFallbackDpi = g_dpi;
+            tab.zoomFallbackTheme = PdfRenderTheme();
+        }
+        if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
+            tab.zoomFallbackZoom = previewZoom;
+        tab.zoomFallbackUntil = GetTickCount64() + 8000;
+        if (tab.zoomFallbackCache.find(page) != tab.zoomFallbackCache.end()) return;
+
+        EnsurePageRenderWorker();
+        PageRenderRequest request;
+        request.documentVersion = tab.renderVersion;
+        request.session = tab.renderSession;
+        request.target = hwnd;
+        request.path = tab.path;
+        request.page = page;
+        request.zoom = tab.zoom;
+        request.renderZoom = previewZoom;
+        request.dpi = g_dpi;
+        request.theme = PdfRenderTheme();
+        request.viewportGeneration = g_viewportGeneration;
+        request.priority = priority;
+        {
+            std::lock_guard<std::mutex> lock(g_pageRenderMutex);
+            g_pageRenderQueue.erase(
+                std::remove_if(
+                    g_pageRenderQueue.begin(),
+                    g_pageRenderQueue.end(),
+                    [&](PageRenderRequest const& queued)
+                    {
+                        return !queued.tile && queued.renderZoom > 0.0 && queued.viewportGeneration + 1 < g_viewportGeneration &&
+                            queued.documentVersion == tab.renderVersion && _wcsicmp(queued.path.c_str(), tab.path.c_str()) == 0;
+                    }),
+                g_pageRenderQueue.end());
+            if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
+            for (auto& queued : g_pageRenderQueue)
+            {
+                if (SamePageRenderRequest(queued, request))
+                {
+                    queued.viewportGeneration = std::max(queued.viewportGeneration, request.viewportGeneration);
+                    return;
+                }
+            }
+            request.serial = ++g_pageRenderSerial;
+            auto insertAt = std::find_if(
+                g_pageRenderQueue.begin(),
+                g_pageRenderQueue.end(),
+                [&](PageRenderRequest const& queued)
+                { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
+            g_pageRenderQueue.insert(insertAt, request);
+            constexpr size_t maxQueuedPreviewRenders = 2;
+            auto isQueuedPreview = [](PageRenderRequest const& queued)
+            {
+                return !queued.tile && queued.renderZoom > 0.0 && queued.renderZoom < queued.zoom - 0.001;
+            };
+            while (std::count_if(g_pageRenderQueue.begin(), g_pageRenderQueue.end(), isQueuedPreview) > maxQueuedPreviewRenders)
+            {
+                auto victim = std::find_if(g_pageRenderQueue.rbegin(), g_pageRenderQueue.rend(), isQueuedPreview);
                 if (victim == g_pageRenderQueue.rend()) break;
                 g_pageRenderQueue.erase(std::next(victim).base());
             }
@@ -11146,6 +11308,11 @@ namespace
         }
     }
 
+    bool ZoomRenderDeferred()
+    {
+        return g_zoomRenderDeferUntil != 0 && GetTickCount64() < g_zoomRenderDeferUntil;
+    }
+
     bool StageLightPaintActive()
     {
         if (g_hasContentSelection || g_selectingContent || g_annotationToolbarOpen || g_annotationNoteOpen)
@@ -11235,8 +11402,8 @@ namespace
                 hadVisible = true;
 
                 bool pageReady = false;
-                PageImage* committed = FindCachedPage(tab, page);
-                if (committed && (committed->dib || !committed->bgra.empty()) && committed->width > 0 && committed->height > 0)
+                PageImage* fallback = FindZoomFallbackPage(tab, page);
+                if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                     pageReady = true;
 
                 int pageW = PageW(tab, page);
@@ -11253,13 +11420,9 @@ namespace
                 if (!pageReady)
                 {
                     ready = false;
-                    if (CanCacheWholePageAtCurrentZoom(tab, page))
-                        QueuePageRender(hwnd, tab, page, -24 + queued);
-                    else
-                    {
-                        int queueBudget = 10;
-                        QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect, 0, queued, queueBudget);
-                    }
+                    QueueZoomPreviewRender(hwnd, tab, page, 10 + queued);
+                    int queueBudget = 10;
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect, 0, queued, queueBudget);
                     ++queued;
                 }
             }
@@ -11678,10 +11841,10 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         CancelObsoletePageRendersForZoom(tab);
+        g_zoomRenderDeferUntil = GetTickCount64() + 140;
+        KillTimer(hwnd, 21);
+        SetTimer(hwnd, 21, 140, nullptr);
         tab.zoom = clampedZoom;
-        // Zoom input must update the geometry immediately. The paint pass may
-        // show the target page background while the current-scale raster is
-        // produced, but it must never hold the viewport at the old scale.
         g_pageNavigationPending = false;
         ++g_viewportGeneration;
         if (!g_continuousRead) tab.currentPage = anchorPage;
@@ -11727,6 +11890,8 @@ namespace
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
 
+        if (!UseTiledPageRendering(tab))
+            WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
         UpdateVertScrollBar(hwnd);
 
         if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
@@ -11736,9 +11901,8 @@ namespace
         GetClientRect(hwnd, &client);
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         InvalidateRect(hwnd, &status, FALSE);
-        // The invalidated paint pass queues only the current-scale page or
-        // tiles. Do not synchronously preflight other render generations from
-        // the input handler; that makes rapid mouse-wheel zoom feel frozen.
+        SchedulePagePrefetch(hwnd);
+        ScheduleIdleCacheTrim(hwnd);
     }
 
     void FinishGestureZoom(HWND hwnd)
@@ -14483,13 +14647,6 @@ namespace
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
-        bool currentContentReady = g_pageNavigationPending && CurrentZoomVisibleContentReady(tab);
-        bool holdPartialFrame = g_pageNavigationPending && !currentContentReady;
-        if (currentContentReady)
-        {
-            g_pageNavigationPending = false;
-            holdPartialFrame = false;
-        }
         bool lightPaint = StageLightPaintActive();
         bool stageScrolling = StageScrollPaintInProgress();
         bool hadVisiblePage = false;
@@ -14571,74 +14728,50 @@ namespace
                     else
                     {
                          Fill(dc, drawRect, PdfPageBackgroundColor());
-                         PageImage* committed = FindCachedPage(tab, i);
-                         PageImage* fallback = committed ? nullptr : FindZoomFallbackPage(tab, i);
-                         bool committedPainted = false;
-                         if (committed && committed->width > 0 && committed->height > 0 &&
-                             (committed->dib || !committed->bgra.empty()))
-                        {
-                            int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(committed->width) / std::max(1, pageW))), 0, committed->width - 1);
-                            int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(committed->height) / std::max(1, pageH))), 0, committed->height - 1);
-                            int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(committed->width) / std::max(1, pageW))), sx + 1, committed->width);
-                            int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(committed->height) / std::max(1, pageH))), sy + 1, committed->height);
-                            committedPainted = DrawCachedImagePart(dc, *committed, drawRect, sx, sy, ex - sx, ey - sy);
-                        }
-                         if (committedPainted)
+                         bool fallbackPainted = false;
+                         PageImage* fallback = FindZoomFallbackPage(tab, i);
+                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                          {
-                             paintedRenderable = true;
+                            int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
+                            int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
+                            int fex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), fsx + 1, fallback->width);
+                            int fey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), fsy + 1, fallback->height);
+                            fallbackPainted = DrawCachedImagePart(dc, *fallback, drawRect, fsx, fsy, fex - fsx, fey - fsy);
                          }
-                         else if (!holdPartialFrame)
+                         int targetLevel = TileLevelForPage(tab, i, pageW, pageH);
+                         bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
+                         bool paintTiles = !ZoomRenderDeferred() || !fallbackPainted;
+                         bool coarseComplete = false;
+                         if (paintTiles)
                          {
-                             bool targetMissing = !TileLevelFullyCached(tab, i, pageRect, drawRect, 0);
-                             bool targetPainted = false;
-                             if (!targetMissing)
-                            {
+                             for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
+                                 coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
+                         }
+                         bool oldZoomPainted = false;
+                         if (paintTiles && !fallbackPainted && targetMissing && !coarseComplete)
+                             oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
+                         bool coarsePainted = false;
+                         if (paintTiles && targetMissing)
+                         {
+                             for (int level = targetLevel; level >= 1; --level)
+                             {
                                  bool ignoredMissing = false;
-                                 targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
-                             }
-                             if (targetMissing)
-                             {
-                                 int queueBudget = stageScrolling ? 4 : 12;
-                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                             }
-                             if (targetPainted)
-                             {
-                                 paintedRenderable = true;
-                             }
-                             else if (fallback && DrawCommittedPageImage(dc, *fallback, pageRect, drawRect))
-                             {
-                                 // A complete frame from the previous zoom is
-                                 // preferable to a mixture of new and old
-                                 // tiles. Swap to the new generation only when
-                                 // the visible target tiles are complete.
-                                 paintedRenderable = true;
-                             }
-                             else if (DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect))
-                             {
-                                 paintedRenderable = true;
-                             }
-                             else if (targetMissing)
-                             {
-                                 missingVisiblePage = true;
+                                 coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
                              }
                          }
-                         else
+                         bool targetPainted = false;
+                         if (paintTiles)
                          {
-                             if (fallback && DrawCommittedPageImage(dc, *fallback, pageRect, drawRect))
-                             {
-                                 paintedRenderable = true;
-                             }
-                             else if (DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect))
-                             {
-                                 paintedRenderable = true;
-                             }
-                             else if (!CanCacheWholePageAtCurrentZoom(tab, i))
-                             {
-                                 int queueBudget = 8;
-                                 QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                            }
-                            missingVisiblePage = true;
-                        }
+                             bool ignoredMissing = false;
+                             targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                         }
+                         if (targetMissing && !ZoomRenderDeferred())
+                         {
+                             int queueBudget = stageScrolling ? 4 : 12;
+                             QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                         }
+                         if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
+                         if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                      }
                     if (IsDarkTheme())
                     {
@@ -14756,15 +14889,14 @@ namespace
         g_contentWidth = ReadingContentWidth(tab);
         if (g_pageNavigationPending)
         {
-            // Keep the previously presented frame until the new viewport is
-            // complete. For pages that fit the committed-page budget, the
-            // background render is a single full bitmap; oversized pages use
-            // the existing complete tile coverage path.
-            if (CurrentZoomVisibleContentReady(tab))
-            {
-                g_pageNavigationPending = false;
-                return true;
-            }
+            // Render completions invalidate small tile rectangles. During a
+            // discrete page change, wait for the whole visible spread and
+            // schedule one full-stage paint so the new page is committed as
+            // a complete frame instead of appearing from left to right.
+            if (!CurrentZoomVisibleContentReady(tab))
+                return false;
+            g_pageNavigationPending = false;
+            InvalidateRect(g_hwnd, &g_stage, FALSE);
             return false;
         }
         return true;
@@ -18695,6 +18827,7 @@ namespace
                 // needs the viewport usefulness test and repaint rectangle.
                 if (i == g_active && !RenderRequestStillUseful(tab, request, dirtyRect))
                     break;
+                bool isPreview = !request.tile && request.renderZoom > 0.0 && request.renderZoom < request.zoom - 0.001;
                  if (request.tile)
                  {
                      TileKey key{ request.page, TileZoomKey(request.zoom), request.theme, request.level, request.x, request.y, request.w, request.h };
@@ -18704,25 +18837,27 @@ namespace
                          TrimTileCache(tab, key);
                          inserted = true;
                          TileRequestScreenRect(tab, request, dirtyRect);
-                         if (i == g_active && tab.zoomFallbackZoom > 0.0 && CurrentZoomVisibleContentReady(tab))
-                         {
-                             // Once the visible target tile set is complete,
-                             // release the old transition frame in one step.
-                             int oldZoomKey = TileZoomKey(tab.zoomFallbackZoom);
-                             for (auto tileIt = tab.tileCache.begin(); tileIt != tab.tileCache.end(); )
-                             {
-                                 if (tileIt->first.zoom == oldZoomKey && tileIt->first.theme == PdfRenderTheme())
-                                     tileIt = tab.tileCache.erase(tileIt);
-                                 else
-                                     ++tileIt;
-                             }
-                             tab.zoomFallbackCache.clear();
-                             tab.zoomFallbackDpi = 0;
-                             tab.zoomFallbackTheme = -1;
-                             tab.zoomFallbackZoom = 0.0;
-                         }
                      }
                  }
+                else if (isPreview)
+                {
+                    if (tab.zoomFallbackDpi != g_dpi || tab.zoomFallbackTheme != PdfRenderTheme())
+                    {
+                        tab.zoomFallbackCache.clear();
+                        tab.zoomFallbackDpi = g_dpi;
+                        tab.zoomFallbackTheme = PdfRenderTheme();
+                    }
+                    if (tab.zoomFallbackZoom <= 0.0 || tab.zoomFallbackCache.empty())
+                        tab.zoomFallbackZoom = request.renderZoom;
+                    if (tab.zoomFallbackCache.find(request.page) == tab.zoomFallbackCache.end())
+                    {
+                        tab.zoomFallbackCache.emplace(request.page, std::move(result->image));
+                        tab.zoomFallbackUntil = GetTickCount64() + 8000;
+                        TrimZoomFallbackCache(tab, request.page);
+                        inserted = true;
+                        PageRenderRequestScreenRect(tab, request, dirtyRect);
+                    }
+                }
                 else if (tab.cache.find(request.page) == tab.cache.end())
                 {
                     tab.cache.emplace(request.page, std::move(result->image));
@@ -18736,7 +18871,6 @@ namespace
                         else
                             ++tileIt;
                     }
-                    tab.zoomFallbackCache.erase(request.page);
                     TrimPageCache(tab, request.page);
                     inserted = true;
                     PageRenderRequestScreenRect(tab, request, dirtyRect);
@@ -20620,8 +20754,23 @@ namespace
                 }
                 if (renderBusy)
                     SetTimer(hwnd, 20, 250, nullptr);
-                else if (!StageScrollPaintInProgress())
+                else if (!StageScrollPaintInProgress() && !ZoomRenderDeferred())
                     TrimIdleRenderCaches(hwnd);
+                return 0;
+            }
+            if (wParam == 21)
+            {
+                ULONGLONG now = GetTickCount64();
+                if (now < g_zoomRenderDeferUntil)
+                {
+                    SetTimer(hwnd, 21, static_cast<UINT>(std::max<ULONGLONG>(10, g_zoomRenderDeferUntil - now)), nullptr);
+                    return 0;
+                }
+                KillTimer(hwnd, 21);
+                g_zoomRenderDeferUntil = 0;
+                InvalidateRect(hwnd, &g_stage, FALSE);
+                SchedulePagePrefetch(hwnd);
+                ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
             if (wParam == 22)
