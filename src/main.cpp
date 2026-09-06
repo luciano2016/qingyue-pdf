@@ -441,6 +441,13 @@ namespace
         bool favorite{};
         int sidebarScrollY{};
         int selectedOutlineRow{ -1 };
+        // Keep recent-document reopening as precise as last-session restore.
+        // Older state files simply leave these fields at their defaults.
+        int scrollY{};
+        double zoom{ 1.0 };
+        int pageOffsetY{};
+        bool hasPageOffset{};
+        bool hasExactPosition{};
     };
 
     struct LastSessionItem
@@ -4696,6 +4703,14 @@ namespace
                     if (parts.size() >= 6) item.pinnedAt = std::atoll(parts[5].c_str());
                     if (parts.size() >= 7) item.sidebarScrollY = std::max(0, std::atoi(parts[6].c_str()));
                     if (parts.size() >= 8) item.selectedOutlineRow = std::atoi(parts[7].c_str());
+                    if (parts.size() >= 9)
+                    {
+                        item.scrollY = std::max(0, std::atoi(parts[8].c_str()));
+                        item.hasExactPosition = true;
+                    }
+                    if (parts.size() >= 10) item.zoom = std::clamp(std::atof(parts[9].c_str()), 0.0833, 64.0);
+                    if (parts.size() >= 11) item.pageOffsetY = std::atoi(parts[10].c_str());
+                    if (parts.size() >= 12) item.hasPageOffset = std::atoi(parts[11].c_str()) != 0;
                     g_recent.push_back(item);
                 }
             }
@@ -4735,7 +4750,9 @@ namespace
         {
             out << "recent=" << item.openedAt << '\t' << item.page << '\t' << ToUtf8(item.path) << '\t'
                 << (item.favorite ? 1 : 0) << '\t' << (item.pinned ? 1 : 0) << '\t' << item.pinnedAt << '\t'
-                << item.sidebarScrollY << '\t' << item.selectedOutlineRow << "\n";
+                << item.sidebarScrollY << '\t' << item.selectedOutlineRow << '\t'
+                << item.scrollY << '\t' << item.zoom << '\t' << item.pageOffsetY << '\t'
+                << (item.hasPageOffset ? 1 : 0) << "\n";
         }
     }
 
@@ -5317,10 +5334,13 @@ namespace
         DwmSetWindowAttribute(g_hwnd, 34, &border, sizeof(border));
     }
 
+    void CaptureRecentPosition(RecentItem& item, PdfTab const& tab);
+
     void UpdateRecent(const PdfTab& tab)
     {
         if (tab.path.empty()) return;
         RecentItem item{ tab.path, tab.name, tab.currentPage + 1, NowMs() };
+        CaptureRecentPosition(item, tab);
         auto it = std::find_if(g_recent.begin(), g_recent.end(), [&](auto const& i) { return i.path == tab.path; });
         if (it != g_recent.end())
         {
@@ -5346,11 +5366,11 @@ namespace
     void TouchRecentProgress(const PdfTab& tab, bool saveNow)
     {
         if (tab.path.empty()) return;
-        int page = std::max(1, tab.currentPage + 1);
         auto it = std::find_if(g_recent.begin(), g_recent.end(), [&](auto const& item) { return item.path == tab.path; });
         if (it == g_recent.end())
         {
-            RecentItem item{ tab.path, tab.name, page, NowMs() };
+            RecentItem item{ tab.path, tab.name, tab.currentPage + 1, NowMs() };
+            CaptureRecentPosition(item, tab);
             item.sidebarScrollY = std::max(0, tab.sidebarScrollY[0]);
             item.selectedOutlineRow = tab.selectedOutlineRow;
             g_recent.insert(g_recent.begin(), std::move(item));
@@ -5359,7 +5379,7 @@ namespace
         }
         else
         {
-            it->page = page;
+            CaptureRecentPosition(*it, tab);
             it->sidebarScrollY = std::max(0, tab.sidebarScrollY[0]);
             it->selectedOutlineRow = tab.selectedOutlineRow;
         }
@@ -6404,6 +6424,20 @@ namespace
     {
         if (!g_continuousRead) return std::max(0, scrollY);
         return scrollY - PageTopScroll(tab, page);
+    }
+
+    void CaptureRecentPosition(RecentItem& item, PdfTab const& tab)
+    {
+        bool active = Active() == &tab;
+        int scrollY = active ? g_scrollY : tab.savedScrollY;
+        int page = (active && g_continuousRead) ? PageFromScroll(tab, scrollY) : tab.currentPage;
+        page = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
+        item.page = std::max(1, page + 1);
+        item.scrollY = std::max(0, scrollY);
+        item.zoom = std::clamp(tab.zoom, 0.0833, 64.0);
+        item.hasPageOffset = g_continuousRead;
+        item.pageOffsetY = item.hasPageOffset ? PageOffsetFromScroll(tab, page, item.scrollY) : 0;
+        item.hasExactPosition = true;
     }
 
     void ResetSuspendedMetadataRequest(PageRenderRequest const& request)
@@ -10497,6 +10531,42 @@ namespace
             tab.pages[static_cast<size_t>(i)] = fallback;
         }
     }
+    void ApplyDocumentPosition(PdfTab& tab, int page, int scrollY, double zoom, int pageOffsetY, bool hasPageOffset)
+    {
+        tab.zoom = std::clamp(zoom, 0.0833, 64.0);
+        int restoredPage = std::clamp(page, 0, std::max(0, tab.pageCount - 1));
+        if (tab.pageCount > 0) ScrollToPage(tab, restoredPage);
+        tab.savedScrollY = std::max(0, scrollY);
+        tab.pendingSessionPosition = false;
+        tab.pendingSessionPage = restoredPage;
+        tab.pendingSessionOffsetY = 0;
+        tab.pendingSessionPageOffset = false;
+        tab.pendingSessionPageOffsetY = 0;
+
+        if (g_continuousRead && tab.pageCount > 0)
+        {
+            tab.pendingSessionPosition = true;
+            tab.pendingSessionPage = restoredPage;
+            tab.pendingSessionPageOffset = hasPageOffset;
+            tab.pendingSessionPageOffsetY = hasPageOffset
+                ? pageOffsetY
+                : tab.savedScrollY - SpreadTopScroll(tab, restoredPage);
+            tab.pendingSessionOffsetY = tab.pendingSessionPageOffsetY;
+            g_contentHeight = ContinuousContentHeight(tab);
+            int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+            int initial = tab.pendingSessionPageOffset
+                ? PageTopScroll(tab, restoredPage) + tab.pendingSessionOffsetY
+                : tab.savedScrollY;
+            g_scrollY = std::clamp(initial, 0, maxScroll);
+            tab.currentPage = restoredPage;
+        }
+        else
+        {
+            g_contentHeight = SinglePageContentHeight(tab);
+            g_scrollY = std::clamp(tab.savedScrollY, 0, SinglePageMaxScroll(tab));
+        }
+    }
+
     void OpenPdf(HWND hwnd, const std::wstring& path)
     {
         bool openedFromHome = g_active < 0;
@@ -10512,6 +10582,9 @@ namespace
         UpdateTabFileStamp(*tab);
         int restorePage = RecentPageForPath(path);
         auto recent = std::find_if(g_recent.begin(), g_recent.end(), [&](auto const& item) { return item.path == path; });
+        bool hasRecentPosition = recent != g_recent.end();
+        RecentItem recentPosition;
+        if (hasRecentPosition) recentPosition = *recent;
         int restoreSidebarScrollY = recent == g_recent.end() ? 0 : recent->sidebarScrollY;
         int restoreSelectedOutlineRow = recent == g_recent.end() ? -1 : recent->selectedOutlineRow;
         LoadInitialPageGeometry(*tab);
@@ -10526,7 +10599,19 @@ namespace
         g_tabListOpen = false;
         if (auto* active = Active())
         {
-            ScrollToPage(*active, std::clamp(restorePage, 1, active->pageCount) - 1);
+            if (hasRecentPosition && recentPosition.hasExactPosition)
+            {
+                ApplyDocumentPosition(*active,
+                    recentPosition.page - 1,
+                    recentPosition.scrollY,
+                    recentPosition.zoom,
+                    recentPosition.pageOffsetY,
+                    recentPosition.hasPageOffset);
+            }
+            else
+            {
+                ScrollToPage(*active, std::clamp(restorePage, 1, active->pageCount) - 1);
+            }
         }
         else
         {
@@ -10601,34 +10686,14 @@ namespace
 
     void ApplySessionPosition(PdfTab& tab, LastSessionItem const& item)
     {
-        tab.zoom = std::clamp(item.zoom, 0.0833, 64.0);
-        int restoredPage = std::clamp(item.page, 1, tab.pageCount) - 1;
-        ScrollToPage(tab, restoredPage);
-        tab.savedScrollY = std::max(0, item.scrollY);
+        ApplyDocumentPosition(tab,
+            item.page - 1,
+            item.scrollY,
+            item.zoom,
+            item.pageOffsetY,
+            item.hasPageOffset);
         tab.sidebarScrollY[0] = std::max(0, item.sidebarScrollY);
         tab.selectedOutlineRow = item.selectedOutlineRow;
-        if (g_continuousRead)
-        {
-            tab.pendingSessionPosition = true;
-            tab.pendingSessionPage = restoredPage;
-            tab.pendingSessionPageOffset = item.hasPageOffset;
-            tab.pendingSessionPageOffsetY = item.hasPageOffset
-                ? item.pageOffsetY
-                : tab.savedScrollY - SpreadTopScroll(tab, restoredPage);
-            tab.pendingSessionOffsetY = tab.pendingSessionPageOffsetY;
-            g_contentHeight = ContinuousContentHeight(tab);
-            int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
-            int initial = tab.pendingSessionPageOffset
-                ? PageTopScroll(tab, restoredPage) + tab.pendingSessionPageOffsetY
-                : tab.savedScrollY;
-            g_scrollY = std::clamp(initial, 0, maxScroll);
-            tab.currentPage = restoredPage;
-        }
-        else
-        {
-            g_contentHeight = SinglePageContentHeight(tab);
-            g_scrollY = std::clamp(tab.savedScrollY, 0, SinglePageMaxScroll(tab));
-        }
         TouchRecentProgress(tab, false);
     }
 
