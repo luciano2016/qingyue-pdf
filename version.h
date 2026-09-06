@@ -3,9 +3,9 @@
 // Use semantic versions: after patch 9, carry into the minor component (for example 0.7.9 -> 0.8.0).
 #define QINGYUE_VERSION_MAJOR 1
 #define QINGYUE_VERSION_MINOR 5
-#define QINGYUE_VERSION_PATCH 8
+#define QINGYUE_VERSION_PATCH 9
 #define QINGYUE_VERSION_BUILD 0
-#define QINGYUE_VERSION_TUPLE 1,5,8,0
-#define QINGYUE_VERSION_STRING "1.5.8"
-#define QINGYUE_VERSION_STRING_W L"1.5.8"
-#define QINGYUE_VERSION_FILE_STRING "1.5.8.0"
+#define QINGYUE_VERSION_TUPLE 1,5,9,0
+#define QINGYUE_VERSION_STRING "1.5.9"
+#define QINGYUE_VERSION_STRING_W L"1.5.9"
+#define QINGYUE_VERSION_FILE_STRING "1.5.9.0"

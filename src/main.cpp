@@ -10646,6 +10646,7 @@ namespace
     }
     void OpenPdf(HWND hwnd, const std::wstring& path)
     {
+        bool openedFromHome = g_active < 0;
         g_pdf.Load();
         auto tab = std::make_unique<PdfTab>();
         tab->renderVersion = ++g_nextRenderVersion;
@@ -10672,6 +10673,14 @@ namespace
         else
         {
             g_scrollY = 0;
+        }
+        if (openedFromHome)
+        {
+            // Opening a document from the home page should start in the
+            // document outline when one exists, independent of the sidebar
+            // mode remembered from the previous document.
+            g_sidebarOpen = true;
+            g_sideMode = 0;
         }
         RestoreActiveTabSidebarState(hwnd);
         UpdateRecent(*Active());
@@ -10717,9 +10726,15 @@ namespace
 
     void OpenOrActivatePdf(HWND hwnd, std::wstring const& path)
     {
+        bool activatedFromHome = g_active < 0;
         int existing = FindOpenTabByPath(path);
         if (existing >= 0)
         {
+            if (activatedFromHome)
+            {
+                g_sidebarOpen = true;
+                g_sideMode = 0;
+            }
             ActivateTab(hwnd, existing);
             return;
         }
