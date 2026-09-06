@@ -6648,8 +6648,12 @@ namespace
                 auto victim = std::find_if(
                     g_pageRenderQueue.rbegin(),
                     g_pageRenderQueue.rend(),
-                    [](PageRenderRequest const& queued) { return queued.priority > 0 && !queued.metadata; });
-                if (victim == g_pageRenderQueue.rend()) g_pageRenderQueue.pop_back();
+                    [](PageRenderRequest const& queued) { return !queued.metadata; });
+                // Metadata drives the outline and geometry state machine. It
+                // must survive page-prefetch pressure; evicting it leaves
+                // outlineMetadataRequested set and makes the sidebar stay
+                // empty indefinitely.
+                if (victim == g_pageRenderQueue.rend()) break;
                 else g_pageRenderQueue.erase(std::next(victim).base());
             }
         }
