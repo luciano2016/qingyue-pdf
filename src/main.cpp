@@ -1401,6 +1401,7 @@ namespace
     RECT g_favoriteListScrollTrackRect{};
     RECT g_favoriteListScrollThumbRect{};
     std::vector<RECT> g_favoriteItemRects;
+    std::vector<int> g_favoriteItemIds;
     int g_hoverFavoriteItem{ -1 };
     int g_favoriteListScrollY{};
     int g_favoriteListContentHeight{};
@@ -1530,6 +1531,7 @@ namespace
     int g_viewMode{};
     int g_contextTab{ -1 };
     int g_contextRecent{ -1 };
+    int g_contextFavorite{ -1 };
     int g_lastSessionActive{ -1 };
     int g_searchCurrent{};
     int g_selectedOutlineRow{ -1 };
@@ -3153,7 +3155,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(38), top + S(5), side - S(8), top + S(35) }
+            ? RECT{ side - S(36), top + S(3), side - S(6), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
     }
@@ -3508,7 +3510,10 @@ namespace
         {
             if (Hit(g_favoriteItemRects[i], x, y))
             {
-                ActivateFavorite(hwnd, static_cast<int>(g_favorites.size() - 1 - i));
+                int favoriteIndex = i < g_favoriteItemIds.size()
+                    ? g_favoriteItemIds[i]
+                    : static_cast<int>(g_favorites.size() - 1 - i);
+                ActivateFavorite(hwnd, favoriteIndex);
                 return true;
             }
         }
@@ -3525,6 +3530,7 @@ namespace
     void PaintFavoriteList(HDC dc)
     {
         g_favoriteItemRects.clear();
+        g_favoriteItemIds.clear();
         g_favoriteListRect = {};
         g_favoriteListScrollTrackRect = {};
         g_favoriteListScrollThumbRect = {};
@@ -3535,7 +3541,9 @@ namespace
         int width = std::min<int>(S(600), maxWidth);
         int rowH = S(43);
         int headerH = S(30);
-        int panelTop = g_sidebar.top + S(68);
+        int panelTop = !IsRectEmpty(&g_favoriteButtonRect)
+            ? g_favoriteButtonRect.bottom + S(6)
+            : g_sidebar.top + S(68);
         int maxBodyHeight = std::max<int>(rowH,
             g_sidebar.bottom - panelTop - headerH - S(8));
         int bodyHeight = g_favorites.empty()
@@ -3587,6 +3595,7 @@ namespace
                 RECT row{ content.left, y, content.right, y + rowH };
                 int visibleIndex = static_cast<int>(g_favoriteItemRects.size());
             g_favoriteItemRects.push_back(row);
+            g_favoriteItemIds.push_back(favoriteIndex);
                 bool hovered = g_hoverFavoriteItem == visibleIndex;
             if (hovered) RoundFill(dc, row, S(5), MenuPopupHoverFill(), MenuPopupHoverFill());
             RECT iconRect{ row.left + S(8), row.top + S(11), row.left + S(25), row.top + S(28) };
@@ -10930,8 +10939,11 @@ namespace
 
     int ClampTabListScrollValue(RECT client, int value)
     {
-        int maxHeight = std::max<int>(S(120), static_cast<int>(client.bottom - g_tabCountRect.bottom - S(18)));
-        int visible = std::min(maxHeight, std::max<int>(0, g_tabListContentHeight));
+        int availableHeight = std::max<int>(S(56),
+            static_cast<int>(client.bottom - g_tabCountRect.bottom - S(18)));
+        int visible = std::min(
+            std::max<int>(0, g_tabListContentHeight),
+            std::max<int>(0, availableHeight - S(12)));
         int maxScroll = std::max<int>(0, g_tabListContentHeight - visible);
         return std::clamp(value, 0, maxScroll);
     }
@@ -13160,7 +13172,7 @@ namespace
         if (x < tabLeft || x >= tabLeft + tabWidth) return -1;
         int relativeY = y - g_sidebar.top - S(10);
         int stride = tabWidth + tabGap;
-        if (relativeY < 0 || relativeY >= stride * 4) return -1;
+        if (relativeY < 0 || relativeY >= stride * 5) return -1;
         int item = relativeY / stride;
         if (relativeY % stride >= tabWidth) return -1;
         return item;
@@ -13168,7 +13180,7 @@ namespace
 
     bool HandleSidebarRailClick(HWND hwnd, int item)
     {
-        if (item < 0 || item >= 4 || !Active() || !SidebarRailVisible()) return false;
+        if (item < 0 || item >= 5 || !Active() || !SidebarRailVisible()) return false;
 
         int tabWidth = S(34);
         int tabGap = S(5);
@@ -13182,6 +13194,16 @@ namespace
         g_pressedButtonRect = pressedRect;
         g_hasPressedButton = true;
         SetTimer(hwnd, 2, 90, nullptr);
+
+        if (item == 4)
+        {
+            g_favoriteListOpen = !g_favoriteListOpen;
+            g_hoverFavoriteItem = -1;
+            g_sidebarRailOpen = true;
+            if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+        }
 
         bool sameMode = item == g_sideMode;
         if (sameMode)
@@ -13689,9 +13711,11 @@ namespace
 
         int rowH = S(31);
         int panelW = std::clamp<int>(client.right / 3, S(240), S(332));
-        int maxHeight = std::max<int>(S(140), static_cast<int>(client.bottom - g_tabCountRect.bottom - S(18)));
-        g_tabListContentHeight = static_cast<int>(g_tabs.size()) * rowH + S(12);
-        int panelH = std::min(maxHeight, std::max<int>(S(56), g_tabListContentHeight));
+        int availableHeight = std::max<int>(S(56),
+            static_cast<int>(client.bottom - g_tabCountRect.bottom - S(18)));
+        g_tabListContentHeight = static_cast<int>(g_tabs.size()) * rowH;
+        int panelH = std::min(availableHeight,
+            std::max<int>(S(56), g_tabListContentHeight + S(12)));
         int left = std::max<int>(S(8), static_cast<int>(g_tabCountRect.right - panelW));
         g_tabListRect = RECT{ left, g_tabCountRect.bottom + S(6), left + panelW, g_tabCountRect.bottom + S(6) + panelH };
         g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
@@ -14433,6 +14457,46 @@ namespace
             DrawSideTabIcon(dc, tabRect, sideIcons[i], iconColor);
         }
 
+        RECT favoriteRailRect{
+            tabStart,
+            tabBar.top + 4 * (tabWidth + tabGap),
+            tabStart + tabWidth,
+            tabBar.top + 4 * (tabWidth + tabGap) + tabWidth
+        };
+        g_favoriteButtonRect = favoriteRailRect;
+        g_sideTabRects.push_back(favoriteRailRect);
+        if (registerSidebarButtons)
+            AddButton(CmdFavoriteListToggle, favoriteRailRect, L"", L"收藏列表");
+        bool favoriteHovered = Hit(favoriteRailRect, g_mousePos.x, g_mousePos.y);
+        bool favoriteActive = g_favoriteListOpen;
+        if (favoriteHovered || favoriteActive)
+        {
+            COLORREF fill{};
+            COLORREF line{};
+            if (IsAuroraTheme())
+            {
+                fill = favoriteActive ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill();
+                line = favoriteActive ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill();
+            }
+            else if (IsBeigeTheme() || IsDarkTheme())
+            {
+                fill = favoriteActive ? SidebarSelectedFill() : SidebarHoverFill();
+                line = favoriteActive ? SidebarSelectedBorder() : SidebarHoverFill();
+            }
+            else
+            {
+                fill = favoriteActive ? RGB(232, 238, 244) : T().panel2;
+                line = favoriteActive ? RGB(232, 238, 244) : T().line;
+            }
+            RoundFill(dc, favoriteRailRect, S(7), fill, line);
+        }
+        RECT favoriteGlyph{
+            favoriteRailRect.left + S(2), favoriteRailRect.top + S(2),
+            favoriteRailRect.right - S(2), favoriteRailRect.bottom - S(2)
+        };
+        DrawFavoriteIcon(dc, favoriteGlyph,
+            favoriteActive ? T().accent : SidebarIconColor(), favoriteActive);
+
         // Close only the content panel; the rail remains available as the
         // entry point for reopening a sidebar mode.
         if (!SidebarVisible())
@@ -14442,8 +14506,8 @@ namespace
             return;
         }
         g_sidebarContentCloseRect = RECT{
-            g_sidebar.right - S(38), g_sidebar.top + S(5),
-            g_sidebar.right - S(8), g_sidebar.top + S(35) };
+            g_sidebar.right - S(36), g_sidebar.top + S(3),
+            g_sidebar.right - S(6), g_sidebar.top + S(33) };
         if (registerSidebarButtons)
             AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
         bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
@@ -14853,13 +14917,6 @@ namespace
             Text(dc, L"A+", largeBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
             SelectObject(dc, oldSizeFont);
             DeleteObject(sizeFont);
-            RECT favoriteBtn{ toggleAll.right + S(5), sizeBar.top, toggleAll.right + S(35), sizeBar.bottom };
-            g_favoriteButtonRect = favoriteBtn;
-            if (registerSidebarButtons) AddButton(CmdFavoriteListToggle, favoriteBtn, L"", L"收藏列表");
-            DrawStatusHotArea(dc, favoriteBtn, 5);
-            RECT favoriteGlyph{ favoriteBtn.left + S(2), favoriteBtn.top + S(2),
-                favoriteBtn.right - S(2), favoriteBtn.bottom - S(2) };
-            DrawFavoriteIcon(dc, favoriteGlyph, g_favoriteListOpen ? T().accent : T().muted, g_favoriteListOpen);
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
@@ -16687,7 +16744,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(38), top + S(5), side - S(8), top + S(35) }
+            ? RECT{ side - S(36), top + S(3), side - S(6), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
 
@@ -18166,6 +18223,15 @@ namespace
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
+    void ShowFavoriteItemMenu(HWND hwnd, int x, int y)
+    {
+        CloseThemedPopupMenu();
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        AppendThemedMenuItem(menu, 2521, L"\u53d6\u6d88\u6536\u85cf");
+        ShowThemedPopupMenu(hwnd, menu, x, y);
+    }
+
     void ShowSelectionMenu(HWND hwnd, int x, int y, bool imageOnly)
     {
         ShowSelectionNativeMenu(hwnd, x, y, imageOnly, false);
@@ -19203,6 +19269,19 @@ namespace
             AddFavoriteFromContext(hwnd);
             return;
         }
+        if (id == 2521)
+        {
+            if (g_contextFavorite >= 0 &&
+                g_contextFavorite < static_cast<int>(g_favorites.size()))
+            {
+                g_favorites.erase(g_favorites.begin() + g_contextFavorite);
+                g_contextFavorite = -1;
+                SaveState();
+                g_hoverFavoriteItem = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return;
+        }
         if (id == 2510)
         {
             SearchSelection(hwnd, 0);
@@ -19305,7 +19384,7 @@ namespace
             {
                 RECT client{};
                 GetClientRect(hwnd, &client);
-                g_tabListContentHeight = static_cast<int>(g_tabs.size()) * S(31) + S(12);
+                g_tabListContentHeight = static_cast<int>(g_tabs.size()) * S(31);
                 if (g_active >= 0)
                 {
                     int desired = g_active * S(31) - S(20);
@@ -21078,6 +21157,20 @@ namespace
                     ClientToScreen(hwnd, &pt);
                     g_contextRecent = recentIndex;
                     ShowRecentMenu(hwnd, pt.x, pt.y);
+                    return 0;
+                }
+            }
+            if (Active() && g_favoriteListOpen)
+            {
+                for (size_t i = 0; i < g_favoriteItemRects.size(); ++i)
+                {
+                    if (!Hit(g_favoriteItemRects[i], x, y)) continue;
+                    g_contextFavorite = i < g_favoriteItemIds.size()
+                        ? g_favoriteItemIds[i]
+                        : static_cast<int>(g_favorites.size() - 1 - i);
+                    POINT pt{ x, y };
+                    ClientToScreen(hwnd, &pt);
+                    ShowFavoriteItemMenu(hwnd, pt.x, pt.y);
                     return 0;
                 }
             }
