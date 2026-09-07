@@ -1398,8 +1398,13 @@ namespace
     std::vector<int> g_searchResultIds;
     RECT g_favoriteButtonRect{};
     RECT g_favoriteListRect{};
+    RECT g_favoriteListScrollTrackRect{};
+    RECT g_favoriteListScrollThumbRect{};
     std::vector<RECT> g_favoriteItemRects;
     int g_hoverFavoriteItem{ -1 };
+    int g_favoriteListScrollY{};
+    int g_favoriteListContentHeight{};
+    int g_favoriteListDragOffset{};
     int g_favoriteContextPage{ -1 };
     int g_favoriteContextOutlineRow{ -1 };
     FavoriteKind g_favoriteContextKind{ FavoriteKind::Page };
@@ -1573,8 +1578,9 @@ namespace
     RECT g_tabDragCurrentRect{};
     bool g_tabDragFloating{};
     int g_tabDragInsertIndex{ -1 };
-        bool g_tabListOpen{};
+    bool g_tabListOpen{};
     bool g_favoriteListOpen{};
+    bool g_draggingFavoriteListScroll{};
     bool g_draggingTabListScroll{};
     int g_tabListScrollY{};
     int g_tabListContentHeight{};
@@ -3126,6 +3132,8 @@ namespace
     void AddFavoriteFromContext(HWND hwnd);
     void ActivateFavorite(HWND hwnd, int index);
     bool HandleFavoriteClick(HWND hwnd, int x, int y);
+    int ClampFavoriteListScrollValue(int value);
+    void ScrollFavoriteListTo(HWND hwnd, int value);
     std::wstring FavoriteKindName(FavoriteKind kind);
     std::wstring FavoriteTitleForPage(std::wstring const& path, int page, FavoriteKind kind);
     bool SameFavoritePosition(FavoriteItem const& a, FavoriteItem const& b);
@@ -3308,25 +3316,32 @@ namespace
     {
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.35f, S(1.05f)));
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        // This is the rounded, hollow five-point star from 收藏.svg. Keep the
+        // proportions stable at toolbar and popup sizes instead of using the
+        // unrelated bookmark glyph that was previously used here.
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.25f, S(1.05f)));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
         Gdiplus::SolidBrush brush(GdiColor(color));
         auto rr = Rf(r);
         float cx = rr.X + rr.Width * 0.5f;
-        float top = rr.Y + rr.Height * 0.10f;
-        float outer = std::min(rr.Width, rr.Height) * 0.82f;
-        float left = cx - outer * 0.5f;
-        float right = cx + outer * 0.5f;
-        float bottom = rr.Y + rr.Height * 0.88f;
-        float shoulder = rr.Height * 0.27f;
+        float cy = rr.Y + rr.Height * 0.51f;
+        float outer = std::min(rr.Width, rr.Height) * 0.43f;
+        float inner = outer * 0.47f;
         Gdiplus::GraphicsPath path;
-        path.StartFigure();
-        path.AddLine(cx, bottom, left + outer * 0.08f, top + shoulder);
-        path.AddBezier(left + outer * 0.08f, top + shoulder, left, top, left + outer * 0.28f, top, left + outer * 0.50f, top + rr.Height * 0.18f);
-        path.AddBezier(left + outer * 0.50f, top + rr.Height * 0.18f, right - outer * 0.28f, top, right, top, right - outer * 0.08f, top + shoulder);
-        path.AddLine(right - outer * 0.08f, top + shoulder, cx, bottom);
+        Gdiplus::PointF points[10]{};
+        for (int i = 0; i < 10; ++i)
+        {
+            double angle = -3.14159265358979323846 / 2.0 +
+                i * 3.14159265358979323846 / 5.0;
+            float radius = (i % 2 == 0) ? outer : inner;
+            points[i] = Gdiplus::PointF(
+                cx + static_cast<float>(std::cos(angle) * radius),
+                cy + static_cast<float>(std::sin(angle) * radius));
+        }
+        path.AddLines(points, 10);
         path.CloseFigure();
         if (filled) g.FillPath(&brush, &path);
         g.DrawPath(&pen, &path);
@@ -3440,6 +3455,29 @@ namespace
             return true;
         }
         if (!g_favoriteListOpen) return false;
+        if (Hit(g_favoriteListScrollThumbRect, x, y))
+        {
+            g_draggingFavoriteListScroll = true;
+            g_favoriteListDragOffset = y - g_favoriteListScrollThumbRect.top;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, &g_favoriteListRect, FALSE);
+            return true;
+        }
+        if (Hit(g_favoriteListScrollTrackRect, x, y))
+        {
+            int trackH = std::max<int>(1,
+                g_favoriteListScrollTrackRect.bottom - g_favoriteListScrollTrackRect.top);
+            int thumbH = std::max<int>(1,
+                g_favoriteListScrollThumbRect.bottom - g_favoriteListScrollThumbRect.top);
+            int travel = std::max<int>(1, trackH - thumbH);
+            int thumbTop = std::clamp<int>(y - thumbH / 2,
+                g_favoriteListScrollTrackRect.top,
+                g_favoriteListScrollTrackRect.bottom - thumbH);
+            ScrollFavoriteListTo(hwnd, MulDiv(
+                thumbTop - g_favoriteListScrollTrackRect.top,
+                std::max<int>(0, g_favoriteListContentHeight - trackH), travel));
+            return true;
+        }
         for (size_t i = 0; i < g_favoriteItemRects.size(); ++i)
         {
             if (Hit(g_favoriteItemRects[i], x, y))
@@ -3462,49 +3500,110 @@ namespace
     {
         g_favoriteItemRects.clear();
         g_favoriteListRect = {};
+        g_favoriteListScrollTrackRect = {};
+        g_favoriteListScrollThumbRect = {};
+        g_favoriteListContentHeight = 0;
         if (!g_favoriteListOpen || !SidebarVisible()) return;
 
         int sidebarWidth = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left));
-        int width = std::clamp(sidebarWidth - S(20), S(180), std::max(S(180), sidebarWidth - S(10)));
-        int visible = std::min<int>(8, g_favorites.size());
+        int width = std::clamp(sidebarWidth - S(8), S(220),
+            std::max(S(220), sidebarWidth - S(4)));
         int rowH = S(43);
-        int bodyHeight = visible > 0 ? visible * rowH : S(32);
+        int headerH = S(30);
+        int panelTop = g_sidebar.top + S(44);
+        int maxBodyHeight = std::max<int>(rowH,
+            g_sidebar.bottom - panelTop - headerH - S(8));
+        int bodyHeight = g_favorites.empty()
+            ? S(32)
+            : std::min<int>(maxBodyHeight,
+                std::max<int>(rowH, static_cast<int>(g_favorites.size()) * rowH));
         RECT panel{
-            g_sidebar.left + S(10),
-            g_sidebar.top + S(44),
-            g_sidebar.right - S(10),
-            g_sidebar.top + S(44) + S(30) + bodyHeight + S(8) };
+            g_sidebar.left + S(4), panelTop,
+            g_sidebar.right - S(4), panelTop + headerH + bodyHeight + S(8) };
         panel.right = std::min(g_sidebar.right - S(5), panel.left + width);
         if (panel.right <= panel.left) return;
         g_favoriteListRect = panel;
         DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 28 : 18);
         RoundFill(dc, panel, S(8), MenuPopupFill(), MenuPopupBorder());
 
-        RECT heading{ panel.left + S(12), panel.top + S(7), panel.right - S(12), panel.top + S(30) };
+        RECT heading{ panel.left + S(12), panel.top + S(7), panel.right - S(12), panel.top + headerH };
         Text(dc, L"收藏", heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        if (visible == 0)
+        if (g_favorites.empty())
         {
             RECT empty{ panel.left + S(12), panel.top + S(36), panel.right - S(12), panel.bottom - S(8) };
             Text(dc, L"暂无收藏", empty, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
             return;
         }
-        int y = panel.top + S(30);
-        for (int i = 0; i < visible; ++i)
+
+        RECT content{ panel.left + S(5), panel.top + headerH,
+            panel.right - S(5), panel.bottom - S(8) };
+        g_favoriteListContentHeight = static_cast<int>(g_favorites.size()) * rowH;
+        bool needsScroll = g_favoriteListContentHeight > content.bottom - content.top;
+        if (needsScroll)
+            content.right -= S(10);
+        if (needsScroll)
         {
-            int favoriteIndex = static_cast<int>(g_favorites.size()) - 1 - i;
+            g_favoriteListScrollTrackRect = RECT{
+                panel.right - S(10), content.top,
+                panel.right - S(6), content.bottom };
+        }
+        g_favoriteListScrollY = ClampFavoriteListScrollValue(g_favoriteListScrollY);
+
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, content.left, content.top, content.right, content.bottom);
+        int y = content.top - g_favoriteListScrollY;
+        for (int i = 0; i < static_cast<int>(g_favorites.size()); ++i)
+        {
+            if (y + rowH >= content.top && y <= content.bottom)
+            {
+                int favoriteIndex = static_cast<int>(g_favorites.size()) - 1 - i;
             FavoriteItem const& item = g_favorites[static_cast<size_t>(favoriteIndex)];
-            RECT row{ panel.left + S(5), y, panel.right - S(5), y + rowH };
+                RECT row{ content.left, y, content.right, y + rowH };
+                int visibleIndex = static_cast<int>(g_favoriteItemRects.size());
             g_favoriteItemRects.push_back(row);
-            bool hovered = g_hoverFavoriteItem == i;
+                bool hovered = g_hoverFavoriteItem == visibleIndex;
             if (hovered) RoundFill(dc, row, S(5), MenuPopupHoverFill(), MenuPopupHoverFill());
             RECT iconRect{ row.left + S(8), row.top + S(11), row.left + S(25), row.top + S(28) };
             DrawFavoriteIcon(dc, iconRect, hovered ? T().accent : T().muted, false);
             RECT title{ row.left + S(32), row.top + S(4), row.right - S(8), row.top + S(23) };
             RECT detail{ row.left + S(32), row.top + S(22), row.right - S(8), row.bottom - S(3) };
             Text(dc, item.title, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
-            Text(dc, std::filesystem::path(item.path).filename().wstring() + L"  ·  " + FavoriteKindName(item.kind),
+                Text(dc, std::filesystem::path(item.path).filename().wstring() +
+                    L"  ·  第" + std::to_wstring(item.page + 1) + L" 页  ·  " + FavoriteKindName(item.kind),
                 detail, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+            }
             y += rowH;
+        }
+        RestoreDC(dc, saved);
+
+        if (needsScroll)
+        {
+            g_favoriteListScrollTrackRect = RECT{
+                panel.right - S(10), content.top,
+                panel.right - S(6), content.bottom };
+            int trackH = std::max<int>(1,
+                g_favoriteListScrollTrackRect.bottom - g_favoriteListScrollTrackRect.top);
+            int visibleH = std::max<int>(1, content.bottom - content.top);
+            int thumbH = std::clamp(MulDiv(visibleH, trackH,
+                std::max(1, g_favoriteListContentHeight)), S(28), trackH);
+            int maxScroll = std::max<int>(1, g_favoriteListContentHeight - visibleH);
+            int travel = std::max<int>(0, trackH - thumbH);
+            int thumbTop = g_favoriteListScrollTrackRect.top + MulDiv(
+                g_favoriteListScrollY, travel, maxScroll);
+            g_favoriteListScrollThumbRect = RECT{
+                g_favoriteListScrollTrackRect.left, thumbTop,
+                g_favoriteListScrollTrackRect.right, thumbTop + thumbH };
+            bool active = g_draggingFavoriteListScroll ||
+                Hit(g_favoriteListRect, g_mousePos.x, g_mousePos.y);
+            int centerX = (g_favoriteListScrollTrackRect.left +
+                g_favoriteListScrollTrackRect.right) / 2;
+            int visualW = active ? S(4) : std::max(2, S(2));
+            RECT thumb{
+                centerX - visualW / 2, g_favoriteListScrollThumbRect.top,
+                centerX + (visualW + 1) / 2,
+                g_favoriteListScrollThumbRect.bottom };
+            RoundFill(dc, thumb, S(5), ScrollThumbColor(active),
+                ScrollThumbColor(active));
         }
     }
 
@@ -10822,6 +10921,23 @@ namespace
         InvalidateRect(hwnd, &g_tabListRect, FALSE);
     }
 
+    int ClampFavoriteListScrollValue(int value)
+    {
+        int visible = std::max<int>(1,
+            g_favoriteListScrollTrackRect.bottom - g_favoriteListScrollTrackRect.top);
+        int maxScroll = std::max<int>(0, g_favoriteListContentHeight - visible);
+        return std::clamp(value, 0, maxScroll);
+    }
+
+    void ScrollFavoriteListTo(HWND hwnd, int value)
+    {
+        if (!g_favoriteListOpen) return;
+        int clamped = ClampFavoriteListScrollValue(value);
+        if (clamped == g_favoriteListScrollY) return;
+        g_favoriteListScrollY = clamped;
+        InvalidateRect(hwnd, &g_favoriteListRect, FALSE);
+    }
+
     int PageFromScroll(PdfTab const& tab, int scrollY)
     {
         if (tab.pageCount <= 0) return 0;
@@ -12546,6 +12662,12 @@ namespace
     bool ScrollByWheelDelta(HWND hwnd, POINT clientPt, int delta, bool ctrlDown)
     {
         PdfTab* tab = Active();
+        if (g_favoriteListOpen && Hit(g_favoriteListRect, clientPt.x, clientPt.y))
+        {
+            int pixels = WheelPixels(delta, S(52), g_stageWheelRemainder);
+            if (pixels != 0) ScrollFavoriteListTo(hwnd, g_favoriteListScrollY - pixels);
+            return true;
+        }
         if (g_tabListOpen && Hit(g_tabListRect, clientPt.x, clientPt.y))
         {
             int pixels = WheelPixels(delta, S(52), g_stageWheelRemainder);
@@ -12640,6 +12762,11 @@ namespace
     bool ScrollByPanPixels(HWND hwnd, POINT clientPt, int deltaY, int deltaX)
     {
         if (deltaY == 0 && deltaX == 0) return true;
+        if (g_favoriteListOpen && Hit(g_favoriteListRect, clientPt.x, clientPt.y))
+        {
+            if (deltaY != 0) ScrollFavoriteListTo(hwnd, g_favoriteListScrollY - deltaY);
+            return true;
+        }
         if (g_tabListOpen && Hit(g_tabListRect, clientPt.x, clientPt.y))
         {
             if (deltaY != 0) ScrollTabListTo(hwnd, g_tabListScrollY - deltaY);
@@ -14186,7 +14313,9 @@ namespace
         else if (IsGraphiteTheme()) Fill(dc, rail, RGB(34, 37, 41));
         else Fill(dc, rail, T().panel);
         RECT railLine{ rail.right - std::max(1, S(1)), rail.top, rail.right, rail.bottom };
-        GlassDivider(dc, railLine);
+        // When the content panel is closed the outer splitter already forms
+        // the rail's boundary. Avoid painting two adjacent divider pixels.
+        if (SidebarVisible()) GlassDivider(dc, railLine);
         RECT tabBar{ rail.left, g_sidebar.top + S(10), rail.right, g_sidebar.bottom };
         int tabWidth = S(34);
         int tabGap = S(5);
@@ -14589,8 +14718,13 @@ namespace
             Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
 
             Fill(dc, sizeBar, T().panel);
-            RECT toggleAll{ sizeBar.left, sizeBar.top, sizeBar.left + S(92), sizeBar.bottom };
             std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"\u6536\u8d77\u6240\u6709" : L"\u5c55\u5f00\u6240\u6709";
+            SIZE toggleTextSize{};
+            GetTextExtentPoint32W(dc, toggleText.c_str(),
+                static_cast<int>(toggleText.size()), &toggleTextSize);
+            int toggleWidth = std::max<int>(S(52), toggleTextSize.cx + S(16));
+            RECT toggleAll{ g_sidebar.left + S(14), sizeBar.top,
+                g_sidebar.left + S(14) + toggleWidth, sizeBar.bottom };
             if (registerSidebarButtons) AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
             bool toggleHovered = Hit(toggleAll, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &toggleAll);
@@ -14613,7 +14747,7 @@ namespace
                 RoundFill(dc, toggleAll, S(5), fill, line);
             }
             COLORREF toggleColor = togglePressed ? T().text : (toggleHovered ? MixColor(T().text, T().muted, 0.08) : T().muted);
-            Text(dc, toggleText, toggleAll, DT_CENTER | DT_VCENTER | DT_SINGLELINE, toggleColor);
+            Text(dc, toggleText, toggleAll, DT_LEFT | DT_VCENTER | DT_SINGLELINE, toggleColor);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
             if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
@@ -20507,7 +20641,29 @@ namespace
             {
                 if (Hit(g_sideTabRects[i], x, y))
                 {
-                    SwitchSidebarMode(hwnd, static_cast<int>(i));
+                    bool sameMode = static_cast<int>(i) == g_sideMode;
+                    if (sameMode)
+                    {
+                        // The rail remains visible after the panel is closed.
+                        // Clicking the active rail icon therefore toggles the
+                        // content panel back open or closed.
+                        g_sidebarOpen = !g_sidebarOpen;
+                    }
+                    else
+                    {
+                        g_sidebarRailOpen = true;
+                        SwitchSidebarMode(hwnd, static_cast<int>(i));
+                        // Selecting another rail item is also an explicit
+                        // request to show that item's content panel.
+                        g_sidebarOpen = true;
+                    }
+                    g_sidebarRailOpen = true;
+                    if (g_immersive)
+                    {
+                        g_immersiveSidebarOpen = true;
+                        g_lastImmersiveSidebarOpen = true;
+                    }
+                    if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
                     g_searchInputFocused = g_sideMode == 2;
                     if (g_searchInputFocused)
                     {
@@ -21074,6 +21230,21 @@ namespace
                 ScrollTabListTo(hwnd, MulDiv(thumbTop - g_tabListScrollTrackRect.top, maxScroll, travel));
                 return 0;
             }
+            if (g_draggingFavoriteListScroll)
+            {
+                int trackH = std::max<int>(1,
+                    g_favoriteListScrollTrackRect.bottom - g_favoriteListScrollTrackRect.top);
+                int thumbH = std::max<int>(1,
+                    g_favoriteListScrollThumbRect.bottom - g_favoriteListScrollThumbRect.top);
+                int travel = std::max<int>(1, trackH - thumbH);
+                int thumbTop = std::clamp<int>(my - g_favoriteListDragOffset,
+                    g_favoriteListScrollTrackRect.top,
+                    g_favoriteListScrollTrackRect.bottom - thumbH);
+                ScrollFavoriteListTo(hwnd, MulDiv(
+                    thumbTop - g_favoriteListScrollTrackRect.top,
+                    std::max<int>(0, g_favoriteListContentHeight - trackH), travel));
+                return 0;
+            }
             if (g_resizingSidebar)
             {
                 ResizeSidebarNow(hwnd, mx, false);
@@ -21521,6 +21692,13 @@ namespace
                 g_draggingTabListScroll = false;
                 ReleaseCapture();
                 InvalidateRect(hwnd, &g_tabListRect, FALSE);
+                return 0;
+            }
+            if (g_draggingFavoriteListScroll)
+            {
+                g_draggingFavoriteListScroll = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g_favoriteListRect, FALSE);
                 return 0;
             }
             if (g_draggingThumbSlider)
