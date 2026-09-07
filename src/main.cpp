@@ -374,6 +374,10 @@ namespace
         int sidebarScrollY[4]{};
         int selectedOutlineRow{ -1 };
         std::set<int> collapsedOutlineRows;
+        // Sidebar presentation is document-local: switching Tabs must not
+        // reopen or hide another document's rail or content panel.
+        bool sidebarRailOpen{ true };
+        bool sidebarContentOpen{ true };
         double zoom{ 1.0 };
         // Every zoom transition keeps the previous complete page generation
         // visible until the new viewport coverage is ready. The raster
@@ -563,7 +567,8 @@ namespace
         CmdSidebarPanelToggle,
         CmdColorMode,
         CmdSave,
-        CmdFavoriteListToggle
+        CmdFavoriteListToggle,
+        CmdSidebarContentClose
     };
 
     std::string ToUtf8(const std::wstring& text)
@@ -1548,8 +1553,10 @@ namespace
     RECT g_tabListScrollTrackRect{};
     RECT g_tabListScrollThumbRect{};
     RECT g_sidebarPanelToggleRect{};
+    RECT g_sidebarContentCloseRect{};
     POINT g_mousePos{};
     bool g_sidebarOpen{ true };
+    bool g_sidebarRailOpen{ true };
     bool g_immersive{};
     bool g_immersiveSidebarOpen{};
     bool g_lastImmersiveSidebarOpen{};
@@ -1858,10 +1865,24 @@ namespace
         return g_theme == 1;
     }
 
+    int S(int value);
+
+    bool SidebarRailVisible()
+    {
+        if (!g_sidebarRailOpen || (g_immersive && !g_immersiveSidebarOpen)) return false;
+        return g_active >= 0 && g_active < static_cast<int>(g_tabs.size());
+    }
+
     bool SidebarVisible()
     {
-        if (!g_sidebarOpen || (g_immersive && !g_immersiveSidebarOpen)) return false;
-        return g_active >= 0 && g_active < static_cast<int>(g_tabs.size());
+        if (!SidebarRailVisible() || !g_sidebarOpen || g_sidebarWidth <= S(44)) return false;
+        return true;
+    }
+
+    int SidebarTotalWidth()
+    {
+        if (!SidebarRailVisible()) return 0;
+        return std::max<int>(S(44), g_sidebarOpen ? g_sidebarWidth : S(44));
     }
 
     bool UsesBackdropTheme()
@@ -3120,9 +3141,12 @@ namespace
         GetClientRect(hwnd, &client);
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int side = SidebarVisible() ? g_sidebarWidth : 0;
+        int side = SidebarTotalWidth();
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
+        g_sidebarContentCloseRect = SidebarVisible()
+            ? RECT{ side - S(40), top + S(5), side - S(10), top + S(35) }
+            : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
     }
 
@@ -11280,6 +11304,7 @@ namespace
             // Opening a document from the home page should start in the
             // document outline when one exists, independent of the sidebar
             // mode remembered from the previous document.
+            g_sidebarRailOpen = true;
             g_sidebarOpen = true;
             g_sideMode = 0;
         }
@@ -11335,6 +11360,7 @@ namespace
         {
             if (activatedFromHome)
             {
+                g_sidebarRailOpen = true;
                 g_sidebarOpen = true;
                 g_sideMode = 0;
             }
@@ -11586,7 +11612,7 @@ namespace
 
     RECT SidebarScrollRect()
     {
-        int top = g_sidebar.top + S(g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 146 : 44));
+        int top = g_sidebar.top + S(g_sideMode == 0 ? 70 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
         return RECT{ g_sidebar.left, top, g_sidebar.right, g_sidebar.bottom };
     }
 
@@ -12888,6 +12914,8 @@ namespace
         tab.sidebarScrollY[ActiveSidebarModeIndex()] = std::max(0, g_sidebarScrollY);
         tab.selectedOutlineRow = g_selectedOutlineRow;
         tab.collapsedOutlineRows = g_collapsedOutlineRows;
+        tab.sidebarRailOpen = g_sidebarRailOpen;
+        tab.sidebarContentOpen = g_sidebarOpen;
     }
 
     void SaveActiveTabProgress()
@@ -12915,6 +12943,8 @@ namespace
         PdfTab* tab = Active();
         if (!tab)
         {
+            g_sidebarRailOpen = true;
+            g_sidebarOpen = true;
             g_sidebarScrollY = 0;
             g_sidebarScrollTargetY = 0;
             g_selectedOutlineRow = -1;
@@ -12923,6 +12953,8 @@ namespace
         }
 
         int mode = ActiveSidebarModeIndex();
+        g_sidebarRailOpen = tab->sidebarRailOpen;
+        g_sidebarOpen = tab->sidebarContentOpen;
         g_sidebarScrollY = std::max(0, tab->sidebarScrollY[mode]);
         g_sidebarScrollTargetY = g_sidebarScrollY;
         g_selectedOutlineRow = tab->selectedOutlineRow;
@@ -13073,6 +13105,7 @@ namespace
     void StartSidebarPanelAnimation(HWND hwnd, bool open)
     {
         bool wasOpen = g_sidebarOpen;
+        g_sidebarRailOpen = true;
         if (open)
         {
             g_sidebarOpen = true;
@@ -14126,7 +14159,8 @@ namespace
 
     void PaintSidebar(HDC dc, PdfTab& tab, RECT paintClip)
     {
-        if (!SidebarVisible() || g_sidebarWidth <= 0) return;
+        g_sidebarContentCloseRect = {};
+        if (!SidebarRailVisible() || SidebarTotalWidth() <= 0) return;
         g_favoriteButtonRect = {};
         RECT sidebarFull{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
         if (IsGraphiteTheme()) Fill(dc, sidebarFull, RGB(34, 37, 41));
@@ -14180,6 +14214,40 @@ namespace
             DrawSideTabIcon(dc, tabRect, sideIcons[i], iconColor);
         }
 
+        // Close only the content panel; the rail remains available as the
+        // entry point for reopening a sidebar mode.
+        if (!SidebarVisible())
+        {
+            SelectObject(dc, oldFont);
+            DeleteObject(f);
+            return;
+        }
+        g_sidebarContentCloseRect = RECT{
+            g_sidebar.right - S(40), g_sidebar.top + S(5),
+            g_sidebar.right - S(10), g_sidebar.top + S(35) };
+        if (registerSidebarButtons)
+            AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
+        bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
+        bool closePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_sidebarContentCloseRect);
+        if (closeHovered || closePressed)
+        {
+            COLORREF fill = closePressed
+                ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
+                : SidebarHoverFill();
+            RoundFill(dc, g_sidebarContentCloseRect, S(7), fill, fill);
+        }
+        RECT closeGlyph{
+            g_sidebarContentCloseRect.left + S(7), g_sidebarContentCloseRect.top + S(7),
+            g_sidebarContentCloseRect.right - S(7), g_sidebarContentCloseRect.bottom - S(7) };
+        DrawCloseGlyph(dc, closeGlyph, closePressed || closeHovered ? T().text : T().muted);
+
+        const wchar_t* panelTitle = g_sideMode == 0 ? L"目录"
+            : (g_sideMode == 1 ? L"缩略图" : (g_sideMode == 2 ? L"查找" : L"注释"));
+        RECT panelTitleRect{
+            g_sidebar.left + S(14), g_sidebar.top + S(6),
+            g_sidebarContentCloseRect.left - S(8), g_sidebar.top + S(30) };
+        Text(dc, panelTitle, panelTitleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+
         auto visible = [&](RECT r)
         {
             return r.bottom >= g_sidebar.top + S(48) && r.top <= g_sidebar.bottom - S(10);
@@ -14187,8 +14255,6 @@ namespace
 
         if (g_sideMode == 1)
         {
-            RECT title{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(34) };
-            Text(dc, L"\u7f29\u7565\u56fe", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
             g_thumbSliderRect = RECT{ g_sidebar.left + S(58), g_sidebar.top + S(42), g_sidebar.right - S(58), g_sidebar.top + S(62) };
             HPEN track = CreatePen(PS_SOLID, S(3), T().line);
             HGDIOBJ oldPen = SelectObject(dc, track);
@@ -14255,7 +14321,7 @@ namespace
         }
         else if (g_sideMode == 2)
         {
-            g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(8), g_sidebar.right - S(14), g_sidebar.top + S(48) };
+            g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(34), g_sidebar.right - S(14), g_sidebar.top + S(74) };
             constexpr int searchInputRadius = 11;
             if (g_searchInputFocused)
                 DrawSoftGlowRect(dc, g_searchInputRect, searchInputRadius, T().accent, IsDarkTheme() ? 84 : 70);
@@ -14291,7 +14357,7 @@ namespace
             int rowRight = g_sidebar.right - S(18);
             int gap = S(7);
             int btnW = std::max(1, (rowRight - rowLeft - gap * 2) / 3);
-            RECT prev{ rowLeft, g_sidebar.top + S(62), rowLeft + btnW, g_sidebar.top + S(92) };
+            RECT prev{ rowLeft, g_sidebar.top + S(88), rowLeft + btnW, g_sidebar.top + S(118) };
             RECT next{ prev.right + gap, prev.top, prev.right + gap + btnW, prev.bottom };
             RECT run{ next.right + gap, prev.top, rowRight, prev.bottom };
             AddButton(CmdSearchPrev, prev, L"\u4e0a\u4e00\u9875");
@@ -14301,14 +14367,14 @@ namespace
             DrawSearchActionButton(dc, CmdSearchNext, next, L"\u4e0b\u4e00\u9875");
             DrawSearchActionButton(dc, CmdSearchRun, run, L"\u67e5\u627e");
 
-            RECT summary{ g_searchInputRect.left, g_sidebar.top + S(108), g_searchInputRect.right, g_sidebar.top + S(138) };
+            RECT summary{ g_searchInputRect.left, g_sidebar.top + S(134), g_sidebar.right - S(14), g_sidebar.top + S(164) };
             std::wstring summaryText = g_searchHasRun ? (L"\u7cbe\u786e\u67e5\u627e (" + std::to_wstring(SearchHitTotal()) + L")") : L"\u8f93\u5165\u5173\u952e\u8bcd\u540e\u70b9\u51fb\u67e5\u627e";
             Text(dc, summaryText, summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
 
             int clipDc = SaveDC(dc);
-            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(142), g_sidebar.right, g_sidebar.bottom);
-            int y = g_sidebar.top + S(146) - g_sidebarScrollY;
-            int content = S(146);
+            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(168), g_sidebar.right, g_sidebar.bottom);
+            int y = g_sidebar.top + S(172) - g_sidebarScrollY;
+            int content = S(172);
             for (size_t i = 0; i < g_searchResults.size(); ++i)
             {
                 RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(42) };
@@ -14340,8 +14406,6 @@ namespace
         }
         else if (g_sideMode == 3)
         {
-            RECT title{ g_sidebar.left + S(14), g_sidebar.top + S(6), g_sidebar.right - S(14), g_sidebar.top + S(30) };
-            Text(dc, L"\u6ce8\u91ca", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
             int buttonTop = g_sidebar.top + S(33);
             int buttonSize = S(30);
             int buttonGap = S(3);
@@ -14521,7 +14585,7 @@ namespace
                 return;
             }
             KillTimer(g_hwnd, 7);
-            RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(8), g_sidebar.right - S(12), g_sidebar.top + S(36) };
+            RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(62) };
             Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
 
             Fill(dc, sizeBar, T().panel);
@@ -14570,7 +14634,7 @@ namespace
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
-            RECT scrollArea{ g_sidebar.left, g_sidebar.top + S(44), g_sidebar.right, g_sidebar.bottom };
+            RECT scrollArea{ g_sidebar.left, g_sidebar.top + S(70), g_sidebar.right, g_sidebar.bottom };
             IntersectClipRect(dc, scrollArea.left, scrollArea.top, scrollArea.right, scrollArea.bottom);
             int rows = static_cast<int>(tab.outline.size());
             bool compactOutline = rows > 512;
@@ -16070,7 +16134,7 @@ namespace
         RECT r{ left, bottom - size, left + size, bottom };
         g_sidebarPanelToggleRect = r;
 
-        bool open = SidebarVisible();
+        bool open = SidebarRailVisible();
         bool hovered = Hit(r, g_mousePos.x, g_mousePos.y);
         bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
         COLORREF base = IsAuroraTheme() ? T().panel : T().panel2;
@@ -16267,7 +16331,7 @@ namespace
         }
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int side = (SidebarVisible()) ? g_sidebarWidth : 0;
+        int side = SidebarTotalWidth();
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         int splitW = side ? std::max(1, S(1)) : 0;
@@ -16317,7 +16381,7 @@ namespace
         bool presented = false;
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int side = SidebarVisible() ? g_sidebarWidth : 0;
+        int side = SidebarTotalWidth();
         int splitW = side ? std::max(1, S(1)) : 0;
         g_stage = RECT{ side + splitW, top, client.right, client.bottom - bottom };
         RECT stage = g_stage;
@@ -16382,8 +16446,12 @@ namespace
 
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int side = SidebarVisible() ? g_sidebarWidth : 0;
-        g_sidebar = RECT{ 0, top, side, client.bottom - bottom };
+        int side = SidebarTotalWidth();
+        int rail = side ? std::min<int>(S(44), side) : 0;
+        g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
+        g_sidebarContentCloseRect = SidebarVisible()
+            ? RECT{ side - S(40), top + S(5), side - S(10), top + S(35) }
+            : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
 
         // This is intentionally a small direct presentation. A full-window
@@ -18361,9 +18429,9 @@ namespace
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_preImmersiveExStyle & ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
             g_immersive = true;
             g_immersiveSidebarOpen = g_lastImmersiveSidebarOpen;
+            g_sidebarRailOpen = g_immersiveSidebarOpen;
             if (g_immersiveSidebarOpen)
             {
-                g_sidebarOpen = true;
                 if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
             }
             SetWindowPos(hwnd, HWND_TOP,
@@ -18376,6 +18444,7 @@ namespace
         else
         {
             g_lastImmersiveSidebarOpen = g_immersiveSidebarOpen;
+            g_sidebarRailOpen = g_immersiveSidebarOpen;
             SetWindowLongPtrW(hwnd, GWL_STYLE, (g_preImmersiveStyle ? g_preImmersiveStyle : WS_OVERLAPPEDWINDOW) & ~(WS_VSCROLL | WS_HSCROLL));
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, g_preImmersiveExStyle);
             g_immersive = false;
@@ -18979,17 +19048,19 @@ namespace
         case CmdSidebarPanelToggle:
             if (g_immersive)
             {
-                g_immersiveSidebarOpen = !g_immersiveSidebarOpen;
+                g_sidebarRailOpen = !g_sidebarRailOpen;
+                g_immersiveSidebarOpen = g_sidebarRailOpen;
                 g_lastImmersiveSidebarOpen = g_immersiveSidebarOpen;
-                if (g_immersiveSidebarOpen)
-                {
-                    g_sidebarOpen = true;
-                    if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
-                }
+                if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
                 SaveState();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
-            else StartSidebarPanelAnimation(hwnd, !g_sidebarOpen);
+            else
+            {
+                g_sidebarRailOpen = !g_sidebarRailOpen;
+                if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             break;
         case CmdTabListToggle:
             g_tabListOpen = !g_tabListOpen;
@@ -19013,8 +19084,18 @@ namespace
             g_hoverFavoriteItem = -1;
             InvalidateRect(hwnd, &g_sidebar, FALSE);
             break;
+        case CmdSidebarContentClose:
+            if (Active())
+            {
+                g_sidebarOpen = false;
+                g_favoriteListOpen = false;
+                SaveActiveTabSidebarState(*Active());
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            break;
         case CmdSidebar: Command(hwnd, CmdSidebarPanelToggle); break;
         case CmdSearch:
+            g_sidebarRailOpen = true;
             g_sidebarOpen = true;
             if (g_immersive)
             {
@@ -19034,6 +19115,7 @@ namespace
             if (g_sidebarOpen && g_sideMode == 0) StartSidebarPanelAnimation(hwnd, false);
             else
             {
+                g_sidebarRailOpen = true;
                 SwitchSidebarMode(hwnd, 0);
                 if (g_immersive)
                 {
@@ -19308,7 +19390,7 @@ namespace
         RECT tabsRect{ 0, S(38), client.right, S(76) };
         RECT statusRect{ 0, client.bottom - S(34), client.right, client.bottom };
         bool uiDirty = Intersects(dirty, toolbarRect) || Intersects(dirty, tabsRect) || Intersects(dirty, statusRect);
-        if (g_sidebarOpen)
+        if (SidebarRailVisible())
         {
             RECT sidebarControls{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.top + S(86) };
             if (Intersects(dirty, sidebarControls)) uiDirty = true;
@@ -20065,6 +20147,18 @@ namespace
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             g_outlineClickHandledOnDown = false;
+            if (Active()) RefreshReaderHitGeometry(hwnd);
+            if (SidebarVisible() && Hit(g_sidebarContentCloseRect, x, y))
+            {
+                g_pressedButtonRect = g_sidebarContentCloseRect;
+                g_hasPressedButton = true;
+                SetTimer(hwnd, 2, 90, nullptr);
+                g_sidebarOpen = false;
+                g_favoriteListOpen = false;
+                if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (HandleFavoriteClick(hwnd, x, y))
                 return 0;
             // Directory navigation has priority over page selection and all
@@ -21598,11 +21692,12 @@ namespace
                     g_sidebarWidth = g_sidebarTargetWidth;
                     g_sidebarAnimating = false;
                     KillTimer(hwnd, 11);
-                    if (g_sidebarWidth <= 0)
-                    {
-                        g_sidebarOpen = false;
-                        g_sidebarWidth = g_sidebarExpandedWidth;
-                    }
+                if (g_sidebarWidth <= 0)
+                {
+                    g_sidebarOpen = false;
+                    g_sidebarWidth = g_sidebarExpandedWidth;
+                }
+                    if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
                     SaveState();
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -21984,6 +22079,7 @@ namespace
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
+                g_sidebarRailOpen = true;
                 g_sidebarOpen = true;
                 SwitchSidebarMode(hwnd, 2);
                 g_searchInputFocused = true;
