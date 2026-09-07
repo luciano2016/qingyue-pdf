@@ -3538,8 +3538,10 @@ namespace
         g_favoriteListContentHeight = 0;
         if (!g_favoriteListOpen || !SidebarVisible()) return;
 
-        int width = std::max<int>(S(220),
-            static_cast<int>(g_sidebar.right - g_sidebar.left - S(8)));
+        int availableWidth = std::max<int>(S(1),
+            static_cast<int>(g_stage.right - g_sidebar.left - S(8)));
+        int width = std::min<int>(S(560), availableWidth);
+        width = std::max<int>(S(220), width);
         int rowH = S(34);
         int headerH = S(30);
         int panelTop = !IsRectEmpty(&g_favoriteButtonRect)
@@ -3551,9 +3553,18 @@ namespace
             ? S(32)
             : std::min<int>(maxBodyHeight,
                 std::max<int>(rowH, static_cast<int>(g_favorites.size()) * rowH));
+        int anchorX = !IsRectEmpty(&g_favoriteButtonRect)
+            ? (g_favoriteButtonRect.left + g_favoriteButtonRect.right) / 2
+            : g_sidebar.left + S(30);
+        int panelLeft = anchorX - width / 2;
+        int leftLimit = g_sidebar.left + S(4);
+        int rightLimit = g_stage.right - S(4);
+        panelLeft = std::max(panelLeft, leftLimit);
+        if (panelLeft + width > rightLimit)
+            panelLeft = std::max(leftLimit, rightLimit - width);
         RECT panel{
-            g_sidebar.left + S(4), panelTop,
-            g_sidebar.left + S(4) + width, panelTop + headerH + bodyHeight + S(8) };
+            panelLeft, panelTop,
+            panelLeft + width, panelTop + headerH + bodyHeight + S(8) };
         if (panel.right <= panel.left) return;
         g_favoriteListRect = panel;
         HFONT favoriteFont = Font(10);
@@ -3603,10 +3614,12 @@ namespace
                 if (hovered) RoundFill(dc, row, S(5), MenuPopupHoverFill(), MenuPopupHoverFill());
                 RECT iconRect{ row.left + S(8), row.top + S(8), row.left + S(26), row.bottom - S(8) };
                 DrawFavoriteIcon(dc, iconRect, hovered ? T().accent : T().muted, false);
-                RECT title{ row.left + S(34), row.top, row.right - S(8), row.bottom };
-                std::wstring label = ElideText(item.title, 64) +
-                    L"  ·  第" + std::to_wstring(item.page + 1) + L" 页";
-                Text(dc, label, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+                RECT page{ row.right - S(52), row.top, row.right - S(8), row.bottom };
+                RECT title{ row.left + S(34), row.top, page.left - S(8), row.bottom };
+                Text(dc, item.title, title,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+                Text(dc, std::to_wstring(item.page + 1), page,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE, T().text);
             }
             y += rowH;
         }
@@ -14492,37 +14505,6 @@ namespace
             g_sidebar.left + S(14), g_sidebar.top + S(6),
             g_sidebarContentCloseRect.left - S(8), g_sidebar.top + S(30) };
         Text(dc, panelTitle, panelTitleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        if (g_sideMode == 0)
-        {
-            SIZE titleSize{};
-            GetTextExtentPoint32W(dc, panelTitle, lstrlenW(panelTitle), &titleSize);
-            int buttonSize = panelTitleRect.bottom - panelTitleRect.top;
-            int buttonLeft = panelTitleRect.left + titleSize.cx + S(6);
-            int buttonRight = std::min<int>(buttonLeft + buttonSize, panelTitleRect.right);
-            if (buttonRight - buttonLeft >= S(18))
-            {
-                g_favoriteButtonRect = RECT{
-                    buttonLeft, panelTitleRect.top, buttonRight, panelTitleRect.bottom };
-                if (registerSidebarButtons)
-                    AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
-                bool hovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
-                bool pressed = g_hasPressedButton &&
-                    EqualRect(&g_pressedButtonRect, &g_favoriteButtonRect);
-                if (hovered || pressed || g_favoriteListOpen)
-                {
-                    COLORREF fill = pressed
-                        ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
-                        : (g_favoriteListOpen ? SidebarSelectedFill() : SidebarHoverFill());
-                    RoundFill(dc, g_favoriteButtonRect, S(6), fill, fill);
-                }
-                RECT glyph{
-                    g_favoriteButtonRect.left + S(2), g_favoriteButtonRect.top + S(2),
-                    g_favoriteButtonRect.right - S(2), g_favoriteButtonRect.bottom - S(2) };
-                DrawFavoriteIcon(dc, glyph,
-                    pressed || hovered || g_favoriteListOpen ? T().accent : SidebarIconColor(),
-                    g_favoriteListOpen);
-            }
-        }
 
         auto visible = [&](RECT r)
         {
@@ -14900,6 +14882,30 @@ namespace
             Text(dc, toggleText, toggleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE, toggleColor);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
+            int favoriteSize = panelTitleRect.bottom - panelTitleRect.top;
+            int favoriteRight = smallBtnNew.left - S(4);
+            g_favoriteButtonRect = RECT{
+                favoriteRight - favoriteSize,
+                sizeBar.top + (sizeBar.bottom - sizeBar.top - favoriteSize) / 2,
+                favoriteRight,
+                sizeBar.top + (sizeBar.bottom - sizeBar.top - favoriteSize) / 2 + favoriteSize };
+            if (registerSidebarButtons)
+                AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
+            bool favoriteHovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
+            bool favoritePressed = g_hasPressedButton &&
+                EqualRect(&g_pressedButtonRect, &g_favoriteButtonRect);
+            if (favoriteHovered || favoritePressed)
+            {
+                COLORREF fill = favoritePressed
+                    ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
+                    : SidebarHoverFill();
+                RoundFill(dc, g_favoriteButtonRect, S(6), fill, fill);
+            }
+            RECT favoriteGlyph{
+                g_favoriteButtonRect.left + S(2), g_favoriteButtonRect.top + S(2),
+                g_favoriteButtonRect.right - S(2), g_favoriteButtonRect.bottom - S(2) };
+            DrawFavoriteIcon(dc, favoriteGlyph,
+                favoritePressed || favoriteHovered ? T().accent : SidebarIconColor(), false);
             if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
             if (registerSidebarButtons) AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
             DrawStatusHotArea(dc, smallBtnNew, 5);
