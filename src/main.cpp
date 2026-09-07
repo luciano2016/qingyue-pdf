@@ -3153,7 +3153,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(40), top + S(5), side - S(10), top + S(35) }
+            ? RECT{ side - S(38), top + S(5), side - S(8), top + S(35) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
     }
@@ -3317,10 +3317,9 @@ namespace
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        // This is the rounded, hollow five-point star from 收藏.svg. Keep the
-        // proportions stable at toolbar and popup sizes instead of using the
-        // unrelated bookmark glyph that was previously used here.
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.25f, S(1.05f)));
+        // Match 收藏.svg's soft star points. A rounded polygon keeps the icon
+        // vector-sharp at every DPI while preserving the hollow toolbar form.
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.20f, S(1.0f)));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -3328,8 +3327,8 @@ namespace
         auto rr = Rf(r);
         float cx = rr.X + rr.Width * 0.5f;
         float cy = rr.Y + rr.Height * 0.51f;
-        float outer = std::min(rr.Width, rr.Height) * 0.43f;
-        float inner = outer * 0.47f;
+        float outer = std::min(rr.Width, rr.Height) * 0.37f;
+        float inner = outer * 0.46f;
         Gdiplus::GraphicsPath path;
         Gdiplus::PointF points[10]{};
         for (int i = 0; i < 10; ++i)
@@ -3341,7 +3340,34 @@ namespace
                 cx + static_cast<float>(std::cos(angle) * radius),
                 cy + static_cast<float>(std::sin(angle) * radius));
         }
-        path.AddLines(points, 10);
+        Gdiplus::PointF entry[10]{};
+        Gdiplus::PointF exit[10]{};
+        constexpr float corner = 0.16f;
+        for (int i = 0; i < 10; ++i)
+        {
+            Gdiplus::PointF const& prev = points[(i + 9) % 10];
+            Gdiplus::PointF const& current = points[i];
+            Gdiplus::PointF const& next = points[(i + 1) % 10];
+            entry[i] = Gdiplus::PointF(
+                current.X + (prev.X - current.X) * corner,
+                current.Y + (prev.Y - current.Y) * corner);
+            exit[i] = Gdiplus::PointF(
+                current.X + (next.X - current.X) * corner,
+                current.Y + (next.Y - current.Y) * corner);
+        }
+        path.AddLine(exit[9], entry[0]);
+        for (int i = 0; i < 10; ++i)
+        {
+            Gdiplus::PointF const& current = points[i];
+            Gdiplus::PointF c1{
+                entry[i].X + (current.X - entry[i].X) * (2.0f / 3.0f),
+                entry[i].Y + (current.Y - entry[i].Y) * (2.0f / 3.0f) };
+            Gdiplus::PointF c2{
+                exit[i].X + (current.X - exit[i].X) * (2.0f / 3.0f),
+                exit[i].Y + (current.Y - exit[i].Y) * (2.0f / 3.0f) };
+            path.AddBezier(entry[i], c1, c2, exit[i]);
+            path.AddLine(exit[i], entry[(i + 1) % 10]);
+        }
         path.CloseFigure();
         if (filled) g.FillPath(&brush, &path);
         g.DrawPath(&pen, &path);
@@ -3402,7 +3428,7 @@ namespace
         }
         g_favoriteListOpen = true;
         g_hoverFavoriteItem = -1;
-        InvalidateRect(hwnd, &g_sidebar, FALSE);
+        InvalidateRect(hwnd, nullptr, FALSE);
     }
 
     void ActivateFavorite(HWND hwnd, int index)
@@ -3451,7 +3477,7 @@ namespace
         {
             g_favoriteListOpen = false;
             g_hoverFavoriteItem = -1;
-            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            InvalidateRect(hwnd, nullptr, FALSE);
             return true;
         }
         if (!g_favoriteListOpen) return false;
@@ -3490,7 +3516,7 @@ namespace
         {
             g_favoriteListOpen = false;
             g_hoverFavoriteItem = -1;
-            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            InvalidateRect(hwnd, nullptr, FALSE);
             return false;
         }
         return true;
@@ -3505,12 +3531,11 @@ namespace
         g_favoriteListContentHeight = 0;
         if (!g_favoriteListOpen || !SidebarVisible()) return;
 
-        int sidebarWidth = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left));
-        int width = std::clamp(sidebarWidth - S(8), S(220),
-            std::max(S(220), sidebarWidth - S(4)));
+        int maxWidth = std::max<int>(S(220), static_cast<int>(g_stage.right - g_sidebar.left - S(12)));
+        int width = std::min<int>(S(600), maxWidth);
         int rowH = S(43);
         int headerH = S(30);
-        int panelTop = g_sidebar.top + S(44);
+        int panelTop = g_sidebar.top + S(68);
         int maxBodyHeight = std::max<int>(rowH,
             g_sidebar.bottom - panelTop - headerH - S(8));
         int bodyHeight = g_favorites.empty()
@@ -3519,8 +3544,9 @@ namespace
                 std::max<int>(rowH, static_cast<int>(g_favorites.size()) * rowH));
         RECT panel{
             g_sidebar.left + S(4), panelTop,
-            g_sidebar.right - S(4), panelTop + headerH + bodyHeight + S(8) };
-        panel.right = std::min(g_sidebar.right - S(5), panel.left + width);
+            g_sidebar.left + S(4) + width, panelTop + headerH + bodyHeight + S(8) };
+        int rightLimit = std::max<int>(panel.left + S(220), static_cast<int>(g_stage.right) - S(4));
+        panel.right = std::min<int>(static_cast<int>(panel.left) + width, rightLimit);
         if (panel.right <= panel.left) return;
         g_favoriteListRect = panel;
         DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 28 : 18);
@@ -14416,8 +14442,8 @@ namespace
             return;
         }
         g_sidebarContentCloseRect = RECT{
-            g_sidebar.right - S(40), g_sidebar.top + S(5),
-            g_sidebar.right - S(10), g_sidebar.top + S(35) };
+            g_sidebar.right - S(38), g_sidebar.top + S(5),
+            g_sidebar.right - S(8), g_sidebar.top + S(35) };
         if (registerSidebarButtons)
             AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
         bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
@@ -14786,9 +14812,10 @@ namespace
             SIZE toggleTextSize{};
             GetTextExtentPoint32W(dc, toggleText.c_str(),
                 static_cast<int>(toggleText.size()), &toggleTextSize);
-            int toggleWidth = std::max<int>(S(52), toggleTextSize.cx + S(16));
-            RECT toggleAll{ g_sidebar.left + S(14), sizeBar.top,
-                g_sidebar.left + S(14) + toggleWidth, sizeBar.bottom };
+            int togglePadding = S(3);
+            int toggleWidth = toggleTextSize.cx + togglePadding * 2;
+            RECT toggleAll{ g_sidebar.left + S(11), sizeBar.top,
+                g_sidebar.left + S(11) + toggleWidth, sizeBar.bottom };
             if (registerSidebarButtons) AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
             bool toggleHovered = Hit(toggleAll, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &toggleAll);
@@ -14811,7 +14838,9 @@ namespace
                 RoundFill(dc, toggleAll, S(5), fill, line);
             }
             COLORREF toggleColor = togglePressed ? T().text : (toggleHovered ? MixColor(T().text, T().muted, 0.08) : T().muted);
-            Text(dc, toggleText, toggleAll, DT_LEFT | DT_VCENTER | DT_SINGLELINE, toggleColor);
+            RECT toggleLabel{ toggleAll.left + togglePadding, toggleAll.top,
+                toggleAll.right - togglePadding, toggleAll.bottom };
+            Text(dc, toggleText, toggleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE, toggleColor);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
             if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
@@ -14828,7 +14857,9 @@ namespace
             g_favoriteButtonRect = favoriteBtn;
             if (registerSidebarButtons) AddButton(CmdFavoriteListToggle, favoriteBtn, L"", L"收藏列表");
             DrawStatusHotArea(dc, favoriteBtn, 5);
-            DrawFavoriteIcon(dc, favoriteBtn, g_favoriteListOpen ? T().accent : T().muted, g_favoriteListOpen);
+            RECT favoriteGlyph{ favoriteBtn.left + S(2), favoriteBtn.top + S(2),
+                favoriteBtn.right - S(2), favoriteBtn.bottom - S(2) };
+            DrawFavoriteIcon(dc, favoriteGlyph, g_favoriteListOpen ? T().accent : T().muted, g_favoriteListOpen);
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
@@ -16545,7 +16576,10 @@ namespace
         bool paintedPages = false;
         bool canFlush = true;
         RECT sidebarPaint{ 0, top, side, client.bottom - bottom };
-        if (side && Intersects(paintClip, sidebarPaint))
+        bool sidebarNeedsPaint = Intersects(paintClip, sidebarPaint) ||
+            (g_favoriteListOpen && !IsRectEmpty(&g_favoriteListRect) &&
+                Intersects(paintClip, g_favoriteListRect));
+        if (side && sidebarNeedsPaint)
         {
             PaintSidebar(dc, *tab, paintClip);
         }
@@ -16560,6 +16594,11 @@ namespace
             canFlush = PaintPages(dc, *tab, paintClip);
             paintedPages = true;
         }
+        // The widened favorite panel can overlap the reader. Paint it after
+        // the page pass so the overlay remains above the document.
+        if (g_favoriteListOpen && !IsRectEmpty(&g_favoriteListRect) &&
+            Intersects(paintClip, g_favoriteListRect))
+            PaintFavoriteList(dc);
         if (paintedPages) ClampScroll(g_hwnd);
         PaintMainScrollBar(dc, client, paintClip);
         if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) || Intersects(paintClip, g_annotationNotePanelRect))
@@ -16648,7 +16687,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(40), top + S(5), side - S(10), top + S(35) }
+            ? RECT{ side - S(38), top + S(5), side - S(8), top + S(35) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
 
@@ -19280,7 +19319,7 @@ namespace
             if (!Active()) return;
             g_favoriteListOpen = !g_favoriteListOpen;
             g_hoverFavoriteItem = -1;
-            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdSidebarContentClose:
             if (Active())
@@ -21486,9 +21525,8 @@ namespace
             }
             if (oldHoverFavoriteItem != g_hoverFavoriteItem)
             {
-                // The favorite panel is painted on top of the outline, so only
-                // repaint the sidebar when its row hover changes.
-                InvalidateRect(hwnd, &g_sidebar, FALSE);
+                // The favorite panel may extend into the reader area.
+                InvalidateRect(hwnd, &g_favoriteListRect, FALSE);
             }
             if (oldHoverOutlineRow != g_hoverOutlineRow || oldHoverOutlineToggle != g_hoverOutlineToggle)
             {
