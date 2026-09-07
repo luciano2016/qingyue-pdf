@@ -234,6 +234,12 @@ namespace
         double heightPt{ 792.0 };
     };
 
+    struct ZoomPresentationPage
+    {
+        int page{ -1 };
+        RECT rect{};
+    };
+
     struct OutlineItem
     {
         std::wstring title;
@@ -373,14 +379,12 @@ namespace
         // until the new viewport coverage is ready. The raster strategy may be
         // a whole page or tiles, but presentation must not branch on that.
         bool zoomPresentationPending{};
-        // Stable screen-space frame used while a high-zoom generation is
-        // being rendered. Keeping the already submitted pixels together is
-        // stronger than trying to reconstruct a complete frame from Tile
-        // cache entries that may be evicted independently.
+        // The transition snapshot is indexed by page. It is never transformed
+        // as one screen-sized rectangle: the old page crop is mapped to the
+        // new page rect so a paper edge cannot become a second moving frame.
         PageImage zoomPresentationFrame;
         RECT zoomPresentationSourceStage{};
-        POINT zoomPresentationAnchor{};
-        double zoomPresentationSourceZoom{};
+        std::vector<ZoomPresentationPage> zoomPresentationPages;
         bool zoomPresentationFrameValid{};
         double cachedZoom{};
         unsigned cachedDpi{};
@@ -1418,6 +1422,7 @@ namespace
     bool DrawCachedImagePart(HDC dc, PageImage& image, RECT dest, int sx, int sy, int sw, int sh);
     bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
     void ClearZoomPresentationFrame(PdfTab& tab);
+    void CaptureZoomPresentationFrame(PdfTab& tab);
     void LoadPageGeometry(PdfTab& tab);
     void CollectOutline(PdfTab& tab, fz_outline* item, int depth);
     void LoadAnnotationsFromPdf(PdfTab& tab);
@@ -11943,105 +11948,6 @@ namespace
         };
     }
 
-    void ClearZoomPresentationFrame(PdfTab& tab)
-    {
-        tab.zoomPresentationFrame.ResetDib();
-        tab.zoomPresentationFrame.width = 0;
-        tab.zoomPresentationFrame.height = 0;
-        tab.zoomPresentationFrame.bgra.clear();
-        tab.zoomPresentationSourceStage = {};
-        tab.zoomPresentationAnchor = {};
-        tab.zoomPresentationSourceZoom = 0.0;
-        tab.zoomPresentationFrameValid = false;
-    }
-
-    void CaptureZoomPresentationFrame(PdfTab& tab, POINT anchor, double sourceZoom)
-    {
-        ClearZoomPresentationFrame(tab);
-        if (!g_paintBufferDc || sourceZoom <= 0.0 || IsRectEmpty(&g_stage)) return;
-
-        int width = std::max<int>(1, g_stage.right - g_stage.left);
-        int height = std::max<int>(1, g_stage.bottom - g_stage.top);
-        if (g_paintBufferW < g_stage.right || g_paintBufferH < g_stage.bottom) return;
-
-        tab.zoomPresentationFrame.width = width;
-        tab.zoomPresentationFrame.height = height;
-        if (!tab.zoomPresentationFrame.AllocateDibPixels())
-        {
-            ClearZoomPresentationFrame(tab);
-            return;
-        }
-
-        HDC frameDc = CreateCompatibleDC(g_paintBufferDc);
-        if (!frameDc)
-        {
-            ClearZoomPresentationFrame(tab);
-            return;
-        }
-        HGDIOBJ oldBitmap = SelectObject(frameDc, tab.zoomPresentationFrame.dib);
-        bool copied = BitBlt(
-            frameDc,
-            0,
-            0,
-            width,
-            height,
-            g_paintBufferDc,
-            g_stage.left,
-            g_stage.top,
-            SRCCOPY) != FALSE;
-        SelectObject(frameDc, oldBitmap);
-        DeleteDC(frameDc);
-        if (!copied)
-        {
-            ClearZoomPresentationFrame(tab);
-            return;
-        }
-
-        tab.zoomPresentationSourceStage = g_stage;
-        tab.zoomPresentationAnchor = anchor;
-        tab.zoomPresentationSourceZoom = sourceZoom;
-        tab.zoomPresentationFrameValid = true;
-    }
-
-    bool DrawZoomPresentationFrame(HDC dc, PdfTab& tab, RECT paintClip)
-    {
-        PageImage& frame = tab.zoomPresentationFrame;
-        if (!tab.zoomPresentationFrameValid || !frame.dib || frame.width <= 0 || frame.height <= 0 ||
-            tab.zoomPresentationSourceZoom <= 0.0 || tab.zoom <= 0.0)
-            return false;
-
-        double ratio = tab.zoom / tab.zoomPresentationSourceZoom;
-        RECT sourceStage = tab.zoomPresentationSourceStage;
-        RECT destination{
-            static_cast<int>(std::lround(tab.zoomPresentationAnchor.x +
-                (sourceStage.left - tab.zoomPresentationAnchor.x) * ratio)),
-            static_cast<int>(std::lround(tab.zoomPresentationAnchor.y +
-                (sourceStage.top - tab.zoomPresentationAnchor.y) * ratio)),
-            static_cast<int>(std::lround(tab.zoomPresentationAnchor.x +
-                (sourceStage.right - tab.zoomPresentationAnchor.x) * ratio)),
-            static_cast<int>(std::lround(tab.zoomPresentationAnchor.y +
-                (sourceStage.bottom - tab.zoomPresentationAnchor.y) * ratio))
-        };
-        RECT clipped{};
-        if (!IntersectRect(&clipped, &destination, &paintClip)) return false;
-
-        int destinationWidth = std::max<int>(1, destination.right - destination.left);
-        int destinationHeight = std::max<int>(1, destination.bottom - destination.top);
-        int sx = std::clamp<int>(static_cast<int>(std::floor(
-            static_cast<double>(clipped.left - destination.left) * frame.width / destinationWidth)),
-            0, frame.width - 1);
-        int sy = std::clamp<int>(static_cast<int>(std::floor(
-            static_cast<double>(clipped.top - destination.top) * frame.height / destinationHeight)),
-            0, frame.height - 1);
-        int ex = std::clamp<int>(static_cast<int>(std::ceil(
-            static_cast<double>(clipped.right - destination.left) * frame.width / destinationWidth)),
-            sx + 1, frame.width);
-        int ey = std::clamp<int>(static_cast<int>(std::ceil(
-            static_cast<double>(clipped.bottom - destination.top) * frame.height / destinationHeight)),
-            sy + 1, frame.height);
-        return DrawCachedImagePart(dc, frame, clipped, sx, sy, ex - sx, ey - sy);
-    }
-
     void ApplyZoomAtPoint(HWND hwnd, PdfTab& tab, POINT clientPt, double newZoom)
     {
         double clampedZoom = std::clamp(newZoom, 0.0833, 64.0);
@@ -12049,7 +11955,7 @@ namespace
         CancelStageMotion(hwnd);
         double oldZoom = tab.zoom;
         if (!tab.zoomPresentationPending)
-            CaptureZoomPresentationFrame(tab, clientPt, oldZoom);
+            CaptureZoomPresentationFrame(tab);
         PreservePageCacheForZoomTransition(tab, oldZoom);
 
         int anchorPage = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
@@ -14742,6 +14648,191 @@ namespace
         return painted;
     }
 
+    void ClearZoomPresentationFrame(PdfTab& tab)
+    {
+        tab.zoomPresentationFrame.ResetDib();
+        tab.zoomPresentationFrame.width = 0;
+        tab.zoomPresentationFrame.height = 0;
+        tab.zoomPresentationFrame.bgra.clear();
+        tab.zoomPresentationSourceStage = {};
+        tab.zoomPresentationPages.clear();
+        tab.zoomPresentationFrameValid = false;
+    }
+
+    void CaptureZoomPresentationFrame(PdfTab& tab)
+    {
+        ClearZoomPresentationFrame(tab);
+        if (!g_paintBufferDc || IsRectEmpty(&g_stage)) return;
+
+        int width = std::max<int>(1, g_stage.right - g_stage.left);
+        int height = std::max<int>(1, g_stage.bottom - g_stage.top);
+        if (g_paintBufferW < g_stage.right || g_paintBufferH < g_stage.bottom) return;
+
+        tab.zoomPresentationFrame.width = width;
+        tab.zoomPresentationFrame.height = height;
+        if (!tab.zoomPresentationFrame.AllocateDibPixels())
+        {
+            ClearZoomPresentationFrame(tab);
+            return;
+        }
+
+        HDC frameDc = CreateCompatibleDC(g_paintBufferDc);
+        if (!frameDc)
+        {
+            ClearZoomPresentationFrame(tab);
+            return;
+        }
+        HGDIOBJ oldBitmap = SelectObject(frameDc, tab.zoomPresentationFrame.dib);
+        bool copied = BitBlt(
+            frameDc,
+            0,
+            0,
+            width,
+            height,
+            g_paintBufferDc,
+            g_stage.left,
+            g_stage.top,
+            SRCCOPY) != FALSE;
+        SelectObject(frameDc, oldBitmap);
+        DeleteDC(frameDc);
+        if (!copied)
+        {
+            ClearZoomPresentationFrame(tab);
+            return;
+        }
+
+        tab.zoomPresentationSourceStage = g_stage;
+        int firstPage = g_continuousRead ? std::max(0, FirstVisibleSpreadStart(tab)) :
+            FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > g_stage.bottom) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                RECT visible{};
+                if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
+                tab.zoomPresentationPages.push_back({ page, pageRect });
+            }
+        }
+        tab.zoomPresentationFrameValid = !tab.zoomPresentationPages.empty();
+        if (!tab.zoomPresentationFrameValid)
+            ClearZoomPresentationFrame(tab);
+    }
+
+    bool DrawZoomPresentationPageFrame(HDC dc, PdfTab& tab, int page, RECT pageRect, RECT drawRect)
+    {
+        if (!tab.zoomPresentationFrameValid || !tab.zoomPresentationFrame.dib) return false;
+        auto source = std::find_if(tab.zoomPresentationPages.begin(), tab.zoomPresentationPages.end(),
+            [page](ZoomPresentationPage const& item) { return item.page == page; });
+        if (source == tab.zoomPresentationPages.end()) return false;
+
+        RECT sourceVisible{};
+        if (!IntersectRect(&sourceVisible, &source->rect, &tab.zoomPresentationSourceStage)) return false;
+        int sourceW = std::max<int>(1, source->rect.right - source->rect.left);
+        int sourceH = std::max<int>(1, source->rect.bottom - source->rect.top);
+        int destinationW = std::max<int>(1, pageRect.right - pageRect.left);
+        int destinationH = std::max<int>(1, pageRect.bottom - pageRect.top);
+        RECT destination{
+            pageRect.left + static_cast<int>(std::floor(
+                (sourceVisible.left - source->rect.left) * static_cast<double>(destinationW) / sourceW)),
+            pageRect.top + static_cast<int>(std::floor(
+                (sourceVisible.top - source->rect.top) * static_cast<double>(destinationH) / sourceH)),
+            pageRect.left + static_cast<int>(std::ceil(
+                (sourceVisible.right - source->rect.left) * static_cast<double>(destinationW) / sourceW)),
+            pageRect.top + static_cast<int>(std::ceil(
+                (sourceVisible.bottom - source->rect.top) * static_cast<double>(destinationH) / sourceH))
+        };
+        RECT clipped{};
+        if (!IntersectRect(&clipped, &destination, &drawRect)) return false;
+        // A clipped source page cannot cover the complete visible target
+        // page. Leave that case to the page/tile fallback instead of exposing
+        // a partial screenshot as a second rectangular frame.
+        if (clipped.left != drawRect.left || clipped.top != drawRect.top ||
+            clipped.right != drawRect.right || clipped.bottom != drawRect.bottom)
+            return false;
+
+        int frameX = sourceVisible.left - tab.zoomPresentationSourceStage.left;
+        int frameY = sourceVisible.top - tab.zoomPresentationSourceStage.top;
+        int sourceWidth = std::max<int>(1, sourceVisible.right - sourceVisible.left);
+        int sourceHeight = std::max<int>(1, sourceVisible.bottom - sourceVisible.top);
+        int destinationClipW = std::max<int>(1, static_cast<int>(destination.right - destination.left));
+        int destinationClipH = std::max<int>(1, static_cast<int>(destination.bottom - destination.top));
+        int sx = std::clamp(frameX + MulDiv(static_cast<int>(clipped.left - destination.left), sourceWidth, destinationClipW),
+            0, tab.zoomPresentationFrame.width - 1);
+        int sy = std::clamp(frameY + MulDiv(static_cast<int>(clipped.top - destination.top), sourceHeight, destinationClipH),
+            0, tab.zoomPresentationFrame.height - 1);
+        int ex = std::clamp(frameX + MulDiv(static_cast<int>(clipped.right - destination.left), sourceWidth, destinationClipW),
+            sx + 1, tab.zoomPresentationFrame.width);
+        int ey = std::clamp(frameY + MulDiv(static_cast<int>(clipped.bottom - destination.top), sourceHeight, destinationClipH),
+            sy + 1, tab.zoomPresentationFrame.height);
+        return DrawCachedImagePart(dc, tab.zoomPresentationFrame, clipped, sx, sy, ex - sx, ey - sy);
+    }
+
+    bool DrawZoomPresentationFrameUnchanged(HDC dc, PdfTab& tab, RECT targetStage, RECT drawRect)
+    {
+        if (!tab.zoomPresentationFrameValid || !tab.zoomPresentationFrame.dib) return false;
+        int sourceW = tab.zoomPresentationSourceStage.right - tab.zoomPresentationSourceStage.left;
+        int sourceH = tab.zoomPresentationSourceStage.bottom - tab.zoomPresentationSourceStage.top;
+        int targetW = targetStage.right - targetStage.left;
+        int targetH = targetStage.bottom - targetStage.top;
+        if (sourceW <= 0 || sourceH <= 0 || targetW != sourceW || targetH != sourceH) return false;
+
+        RECT clipped{};
+        if (!IntersectRect(&clipped, &targetStage, &drawRect)) return false;
+        RECT sourceRect{
+            clipped.left - targetStage.left,
+            clipped.top - targetStage.top,
+            clipped.right - targetStage.left,
+            clipped.bottom - targetStage.top
+        };
+        return DrawCachedImagePart(
+            dc,
+            tab.zoomPresentationFrame,
+            clipped,
+            sourceRect.left,
+            sourceRect.top,
+            sourceRect.right - sourceRect.left,
+            sourceRect.bottom - sourceRect.top);
+    }
+
+    void QueueVisibleZoomContent(PdfTab& tab)
+    {
+        if (tab.pageCount <= 0) return;
+        int firstPage = g_continuousRead
+            ? std::max(0, FirstVisibleSpreadStart(tab))
+            : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        int tileBudget = 24;
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > g_stage.bottom) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect)) continue;
+                RECT visible{};
+                if (!IntersectRect(&visible, &pageRect, &g_stage)) continue;
+                if (!UseTiledPageRendering(tab))
+                {
+                    if (!FindCachedPage(tab, page)) QueuePageRender(g_hwnd, tab, page, -12);
+                }
+                else if (tileBudget > 0 && !TileLevelFullyCached(tab, page, pageRect, visible, 0))
+                {
+                    QueueVisibleTilesForPageLevel(g_hwnd, tab, page, pageRect, visible, 0, -12, tileBudget);
+                }
+            }
+        }
+    }
+
     bool DrawCommittedPageImage(HDC dc, PageImage& image, RECT pageRect, RECT drawRect)
     {
         if (image.width <= 0 || image.height <= 0 || (!image.dib && image.bgra.empty())) return false;
@@ -14937,15 +15028,20 @@ namespace
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
-        Fill(dc, stageDirty, T().stage);
-        if (zoomPresentationPending && tab.zoomPresentationFrameValid)
+
+        // Keep the last submitted reading surface intact for the whole zoom
+        // transition. Repainting a new page background before its target image
+        // is complete is the source of the full-surface flash seen during
+        // rapid zoom-out. Rendering continues in the background and is
+        // presented atomically when CurrentZoomVisibleContentReady succeeds.
+        if (zoomPresentationPending &&
+            DrawZoomPresentationFrameUnchanged(dc, tab, g_stage, stageDirty))
         {
-            // Paint only the single committed screen frame during a zoom
-            // transition. Rendering individual old/new tiles here reopens the
-            // exact high-zoom hole this frame is meant to prevent.
-            DrawZoomPresentationFrame(dc, tab, stageDirty);
+            QueueVisibleZoomContent(tab);
             return true;
         }
+
+        Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -14996,8 +15092,14 @@ namespace
                              QueuePageRender(g_hwnd, tab, i, 0);
                          }
                          Fill(dc, drawRect, PdfPageBackgroundColor());
-                         PageImage* fallback = image ? nullptr : FindZoomFallbackPage(tab, i);
-                         if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
+                         bool presentationPainted = zoomPresentationPending &&
+                             DrawZoomPresentationPageFrame(dc, tab, i, pageRect, drawRect);
+                          PageImage* fallback = image ? nullptr : FindZoomFallbackPage(tab, i);
+                         if (presentationPainted)
+                         {
+                             paintedRenderable = true;
+                         }
+                         else if (image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
                         {
                             int sx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), 0, image->width - 1);
                             int sy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), 0, image->height - 1);
@@ -15031,9 +15133,10 @@ namespace
                     else
                     {
                          Fill(dc, drawRect, PdfPageBackgroundColor());
-                         bool fallbackPainted = false;
+                         bool fallbackPainted = zoomPresentationPending &&
+                             DrawZoomPresentationPageFrame(dc, tab, i, pageRect, drawRect);
                          PageImage* fallback = FindZoomFallbackPage(tab, i);
-                         if (fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
+                         if (!fallbackPainted && fallback && (fallback->dib || !fallback->bgra.empty()) && fallback->width > 0 && fallback->height > 0)
                          {
                             int fsx = std::clamp<int>(static_cast<int>(std::floor((drawRect.left - pageRect.left) * static_cast<double>(fallback->width) / std::max(1, pageW))), 0, fallback->width - 1);
                             int fsy = std::clamp<int>(static_cast<int>(std::floor((drawRect.top - pageRect.top) * static_cast<double>(fallback->height) / std::max(1, pageH))), 0, fallback->height - 1);
