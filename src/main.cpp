@@ -2542,6 +2542,10 @@ namespace
         UpdateMainScrollRects(client);
         if (!IsRectEmpty(&g_mainScrollTrackRect) && (Intersects(paintClip, g_mainScrollTrackRect) || Intersects(paintClip, g_mainScrollThumbRect)))
         {
+            // The track is part of the reading surface gutter. Paint it
+            // explicitly so a zoom repaint cannot expose the window's light
+            // background behind a dark or tinted document.
+            Fill(dc, g_mainScrollTrackRect, ScrollTrackColor());
             bool active = g_draggingMainScroll || Hit(g_mainScrollTrackRect, g_mousePos.x, g_mousePos.y);
             int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
             int trackW = active ? S(7) : std::max(2, S(3));
@@ -2550,6 +2554,7 @@ namespace
         }
         if (!IsRectEmpty(&g_mainHScrollTrackRect) && (Intersects(paintClip, g_mainHScrollTrackRect) || Intersects(paintClip, g_mainHScrollThumbRect)))
         {
+            Fill(dc, g_mainHScrollTrackRect, ScrollTrackColor());
             bool hActive = g_draggingMainHScroll || Hit(g_mainHScrollTrackRect, g_mousePos.x, g_mousePos.y);
             int centerY = (g_mainHScrollTrackRect.top + g_mainHScrollTrackRect.bottom) / 2;
             int h = hActive ? S(7) : std::max(2, S(3));
