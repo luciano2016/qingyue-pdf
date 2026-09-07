@@ -463,6 +463,30 @@ namespace
         bool hasExactPosition{};
     };
 
+    enum class FavoriteKind
+    {
+        Page = 0,
+        Outline = 1,
+        Text = 2,
+        Image = 3
+    };
+
+    struct FavoriteItem
+    {
+        std::wstring path;
+        std::wstring title;
+        int page{};
+        int outlineRow{ -1 };
+        int scrollY{};
+        double zoom{ 1.0 };
+        int pageOffsetY{};
+        bool hasPageOffset{};
+        FavoriteKind kind{ FavoriteKind::Page };
+        fz_rect norm{};
+        bool hasNorm{};
+        long long createdAt{};
+    };
+
     struct LastSessionItem
     {
         std::wstring path;
@@ -538,7 +562,8 @@ namespace
         CmdTabListToggle,
         CmdSidebarPanelToggle,
         CmdColorMode,
-        CmdSave
+        CmdSave,
+        CmdFavoriteListToggle
     };
 
     std::string ToUtf8(const std::wstring& text)
@@ -1339,6 +1364,7 @@ namespace
     std::vector<std::unique_ptr<PdfTab>> g_tabs;
     std::vector<RecentItem> g_recent;
     std::vector<LastSessionItem> g_lastSessionTabs;
+        std::vector<FavoriteItem> g_favorites;
     std::map<std::wstring, PageImage> g_homeThumbCache;
     std::map<std::wstring, ULONGLONG> g_homeThumbLastUsed;
     std::map<std::wstring, ULONGLONG> g_homeThumbFailedUntil;
@@ -1365,6 +1391,16 @@ namespace
     std::vector<RECT> g_sideTabRects;
     std::vector<RECT> g_searchResultRects;
     std::vector<int> g_searchResultIds;
+    RECT g_favoriteButtonRect{};
+    RECT g_favoriteListRect{};
+    std::vector<RECT> g_favoriteItemRects;
+    int g_hoverFavoriteItem{ -1 };
+    int g_favoriteContextPage{ -1 };
+    int g_favoriteContextOutlineRow{ -1 };
+    FavoriteKind g_favoriteContextKind{ FavoriteKind::Page };
+    fz_rect g_favoriteContextNorm{};
+    bool g_favoriteContextHasNorm{};
+    bool g_favoriteContextValid{};
     std::vector<RECT> g_tabListItemRects;
     std::vector<int> g_tabListItemIds;
     constexpr UINT WM_QUIETPDF_FILE_CHANGED = WM_APP + 41;
@@ -1530,7 +1566,8 @@ namespace
     RECT g_tabDragCurrentRect{};
     bool g_tabDragFloating{};
     int g_tabDragInsertIndex{ -1 };
-    bool g_tabListOpen{};
+        bool g_tabListOpen{};
+    bool g_favoriteListOpen{};
     bool g_draggingTabListScroll{};
     int g_tabListScrollY{};
     int g_tabListContentHeight{};
@@ -2542,10 +2579,8 @@ namespace
         UpdateMainScrollRects(client);
         if (!IsRectEmpty(&g_mainScrollTrackRect) && (Intersects(paintClip, g_mainScrollTrackRect) || Intersects(paintClip, g_mainScrollThumbRect)))
         {
-            // The track is part of the reading surface gutter. Paint it
-            // explicitly so a zoom repaint cannot expose the window's light
-            // background behind a dark or tinted document.
-            Fill(dc, g_mainScrollTrackRect, ScrollTrackColor());
+            // The track is an overlay: leave its background transparent so
+            // the page or reading surface remains visible underneath it.
             bool active = g_draggingMainScroll || Hit(g_mainScrollTrackRect, g_mousePos.x, g_mousePos.y);
             int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
             int trackW = active ? S(7) : std::max(2, S(3));
@@ -2554,7 +2589,6 @@ namespace
         }
         if (!IsRectEmpty(&g_mainHScrollTrackRect) && (Intersects(paintClip, g_mainHScrollTrackRect) || Intersects(paintClip, g_mainHScrollThumbRect)))
         {
-            Fill(dc, g_mainHScrollTrackRect, ScrollTrackColor());
             bool hActive = g_draggingMainHScroll || Hit(g_mainHScrollTrackRect, g_mousePos.x, g_mousePos.y);
             int centerY = (g_mainHScrollTrackRect.top + g_mainHScrollTrackRect.bottom) / 2;
             int h = hActive ? S(7) : std::max(2, S(3));
@@ -3057,6 +3091,23 @@ namespace
     void UpdateVertScrollBar(HWND hwnd);
     void RequestPageNavigationRepaint(HWND hwnd, PdfTab& tab, bool waitForComplete = true);
     void RestoreActiveTabSidebarState(HWND hwnd);
+    int PageOffsetFromScroll(PdfTab const& tab, int page, int scrollY);
+    int PageH(PdfTab const& tab, int page);
+    int PageTopScroll(PdfTab const& tab, int page);
+    int ContinuousContentHeight(PdfTab const& tab);
+    bool SamePath(std::wstring const& a, std::wstring const& b);
+    void SaveState();
+    void OpenOrActivatePdf(HWND hwnd, std::wstring const& path);
+    COLORREF MenuPopupFill();
+    COLORREF MenuPopupBorder();
+    COLORREF MenuPopupHoverFill();
+    void SetFavoriteContextForPage(int page, FavoriteKind kind = FavoriteKind::Page, int outlineRow = -1);
+    void AddFavoriteFromContext(HWND hwnd);
+    void ActivateFavorite(HWND hwnd, int index);
+    bool HandleFavoriteClick(HWND hwnd, int x, int y);
+    std::wstring FavoriteKindName(FavoriteKind kind);
+    std::wstring FavoriteTitleForPage(std::wstring const& path, int page, FavoriteKind kind);
+    bool SameFavoritePosition(FavoriteItem const& a, FavoriteItem const& b);
 
     void RefreshReaderHitGeometry(HWND hwnd)
     {
@@ -3227,6 +3278,210 @@ namespace
         path.CloseFigure();
         if (filled) g.FillPath(&brush, &path);
         g.DrawPath(&pen, &path);
+    }
+
+    void DrawFavoriteIcon(HDC dc, RECT r, COLORREF color, bool filled)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.35f, S(1.05f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        Gdiplus::SolidBrush brush(GdiColor(color));
+        auto rr = Rf(r);
+        float cx = rr.X + rr.Width * 0.5f;
+        float top = rr.Y + rr.Height * 0.10f;
+        float outer = std::min(rr.Width, rr.Height) * 0.82f;
+        float left = cx - outer * 0.5f;
+        float right = cx + outer * 0.5f;
+        float bottom = rr.Y + rr.Height * 0.88f;
+        float shoulder = rr.Height * 0.27f;
+        Gdiplus::GraphicsPath path;
+        path.StartFigure();
+        path.AddLine(cx, bottom, left + outer * 0.08f, top + shoulder);
+        path.AddBezier(left + outer * 0.08f, top + shoulder, left, top, left + outer * 0.28f, top, left + outer * 0.50f, top + rr.Height * 0.18f);
+        path.AddBezier(left + outer * 0.50f, top + rr.Height * 0.18f, right - outer * 0.28f, top, right, top, right - outer * 0.08f, top + shoulder);
+        path.AddLine(right - outer * 0.08f, top + shoulder, cx, bottom);
+        path.CloseFigure();
+        if (filled) g.FillPath(&brush, &path);
+        g.DrawPath(&pen, &path);
+    }
+
+    void SetFavoriteContextForPage(int page, FavoriteKind kind, int outlineRow)
+    {
+        g_favoriteContextPage = page;
+        g_favoriteContextOutlineRow = outlineRow;
+        g_favoriteContextKind = kind;
+        g_favoriteContextNorm = {};
+        g_favoriteContextHasNorm = false;
+        g_favoriteContextValid = Active() && page >= 0;
+    }
+
+    void SetFavoriteContextFromSelection()
+    {
+        if (!Active() || !g_hasContentSelection || g_selectionPage < 0) return;
+        SetFavoriteContextForPage(
+            g_selectionPage,
+            g_selectionIsImage ? FavoriteKind::Image : FavoriteKind::Text);
+        g_favoriteContextNorm = g_selectionNorm;
+        g_favoriteContextHasNorm = !g_selectionIsImage ? !g_selectionQuads.empty() : true;
+    }
+
+    void AddFavoriteFromContext(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab || !g_favoriteContextValid || g_favoriteContextPage < 0 ||
+            g_favoriteContextPage >= tab->pageCount)
+            return;
+
+        FavoriteItem item;
+        item.path = tab->path;
+        item.page = g_favoriteContextPage;
+        item.outlineRow = g_favoriteContextOutlineRow;
+        item.scrollY = g_scrollY;
+        item.zoom = tab->zoom;
+        item.hasPageOffset = g_continuousRead;
+        item.pageOffsetY = item.hasPageOffset ? PageOffsetFromScroll(*tab, item.page, g_scrollY) : 0;
+        item.kind = g_favoriteContextKind;
+        item.norm = g_favoriteContextNorm;
+        item.hasNorm = g_favoriteContextHasNorm;
+        item.createdAt = NowMs();
+        if (item.kind == FavoriteKind::Outline && item.outlineRow >= 0 && item.outlineRow < static_cast<int>(tab->outline.size()))
+            item.title = tab->outline[static_cast<size_t>(item.outlineRow)].title;
+        if (item.title.empty()) item.title = FavoriteTitleForPage(item.path, item.page, item.kind);
+
+        auto duplicate = std::find_if(g_favorites.begin(), g_favorites.end(), [&](FavoriteItem const& existing)
+        {
+            return SameFavoritePosition(existing, item);
+        });
+        if (duplicate == g_favorites.end())
+        {
+            g_favorites.push_back(std::move(item));
+            if (g_favorites.size() > 200) g_favorites.erase(g_favorites.begin());
+            SaveState();
+        }
+        g_favoriteListOpen = true;
+        g_hoverFavoriteItem = -1;
+        InvalidateRect(hwnd, &g_sidebar, FALSE);
+    }
+
+    void ActivateFavorite(HWND hwnd, int index)
+    {
+        if (index < 0 || index >= static_cast<int>(g_favorites.size())) return;
+        FavoriteItem const item = g_favorites[static_cast<size_t>(index)];
+        OpenOrActivatePdf(hwnd, item.path);
+        PdfTab* tab = Active();
+        if (!tab || !SamePath(tab->path, item.path)) return;
+
+        tab->zoom = std::clamp(item.zoom, 0.0833, 64.0);
+        tab->currentPage = std::clamp(item.page, 0, std::max(0, tab->pageCount - 1));
+        if (g_continuousRead)
+        {
+            g_contentHeight = ContinuousContentHeight(*tab);
+            int stageHeight = std::max<int>(1, static_cast<int>(g_stage.bottom - g_stage.top));
+            int maxScroll = std::max<int>(0, g_contentHeight - stageHeight);
+            int target = item.hasPageOffset
+                ? PageTopScroll(*tab, tab->currentPage) + item.pageOffsetY
+                : item.scrollY;
+            if (item.hasNorm)
+                target = PageTopScroll(*tab, tab->currentPage) +
+                    static_cast<int>(std::clamp(item.norm.y0, 0.0f, 1.0f) * PageH(*tab, tab->currentPage)) -
+                    std::max<int>(0, static_cast<int>(g_stage.bottom - g_stage.top) / 3);
+            g_scrollY = std::clamp(target, 0, maxScroll);
+        }
+        else
+        {
+            g_scrollY = 0;
+        }
+        if (item.kind == FavoriteKind::Outline && item.outlineRow >= 0 && item.outlineRow < static_cast<int>(tab->outline.size()))
+        {
+            g_selectedOutlineRow = item.outlineRow;
+            tab->selectedOutlineRow = item.outlineRow;
+        }
+        TouchRecentProgress(*tab, false);
+        UpdateVertScrollBar(hwnd);
+        g_favoriteListOpen = false;
+        g_hoverFavoriteItem = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    bool HandleFavoriteClick(HWND hwnd, int x, int y)
+    {
+        if (g_favoriteListOpen && Hit(g_favoriteButtonRect, x, y))
+        {
+            g_favoriteListOpen = false;
+            g_hoverFavoriteItem = -1;
+            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            return true;
+        }
+        if (!g_favoriteListOpen) return false;
+        for (size_t i = 0; i < g_favoriteItemRects.size(); ++i)
+        {
+            if (Hit(g_favoriteItemRects[i], x, y))
+            {
+                ActivateFavorite(hwnd, static_cast<int>(g_favorites.size() - 1 - i));
+                return true;
+            }
+        }
+        if (!Hit(g_favoriteListRect, x, y) && !Hit(g_favoriteButtonRect, x, y))
+        {
+            g_favoriteListOpen = false;
+            g_hoverFavoriteItem = -1;
+            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            return false;
+        }
+        return true;
+    }
+
+    void PaintFavoriteList(HDC dc)
+    {
+        g_favoriteItemRects.clear();
+        g_favoriteListRect = {};
+        if (!g_favoriteListOpen || !SidebarVisible()) return;
+
+        int sidebarWidth = std::max<int>(1, static_cast<int>(g_sidebar.right - g_sidebar.left));
+        int width = std::clamp(sidebarWidth - S(20), S(180), std::max(S(180), sidebarWidth - S(10)));
+        int visible = std::min<int>(8, g_favorites.size());
+        int rowH = S(43);
+        int bodyHeight = visible > 0 ? visible * rowH : S(32);
+        RECT panel{
+            g_sidebar.left + S(10),
+            g_sidebar.top + S(44),
+            g_sidebar.right - S(10),
+            g_sidebar.top + S(44) + S(30) + bodyHeight + S(8) };
+        panel.right = std::min(g_sidebar.right - S(5), panel.left + width);
+        if (panel.right <= panel.left) return;
+        g_favoriteListRect = panel;
+        DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 28 : 18);
+        RoundFill(dc, panel, S(8), MenuPopupFill(), MenuPopupBorder());
+
+        RECT heading{ panel.left + S(12), panel.top + S(7), panel.right - S(12), panel.top + S(30) };
+        Text(dc, L"收藏", heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        if (visible == 0)
+        {
+            RECT empty{ panel.left + S(12), panel.top + S(36), panel.right - S(12), panel.bottom - S(8) };
+            Text(dc, L"暂无收藏", empty, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+            return;
+        }
+        int y = panel.top + S(30);
+        for (int i = 0; i < visible; ++i)
+        {
+            int favoriteIndex = static_cast<int>(g_favorites.size()) - 1 - i;
+            FavoriteItem const& item = g_favorites[static_cast<size_t>(favoriteIndex)];
+            RECT row{ panel.left + S(5), y, panel.right - S(5), y + rowH };
+            g_favoriteItemRects.push_back(row);
+            bool hovered = g_hoverFavoriteItem == i;
+            if (hovered) RoundFill(dc, row, S(5), MenuPopupHoverFill(), MenuPopupHoverFill());
+            RECT iconRect{ row.left + S(8), row.top + S(11), row.left + S(25), row.top + S(28) };
+            DrawFavoriteIcon(dc, iconRect, hovered ? T().accent : T().muted, false);
+            RECT title{ row.left + S(32), row.top + S(4), row.right - S(8), row.top + S(23) };
+            RECT detail{ row.left + S(32), row.top + S(22), row.right - S(8), row.bottom - S(3) };
+            Text(dc, item.title, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+            Text(dc, std::filesystem::path(item.path).filename().wstring() + L"  ·  " + FavoriteKindName(item.kind),
+                detail, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+            y += rowH;
+        }
     }
 
     std::wstring FormatDate(long long ms)
@@ -4591,6 +4846,43 @@ namespace
         return parts;
     }
 
+    std::wstring FavoriteKindName(FavoriteKind kind)
+    {
+        switch (kind)
+        {
+        case FavoriteKind::Outline: return L"目录";
+        case FavoriteKind::Text: return L"文本";
+        case FavoriteKind::Image: return L"图片";
+        default: return L"页面";
+        }
+    }
+
+    std::wstring FavoriteTitleForPage(std::wstring const& path, int page, FavoriteKind kind)
+    {
+        return std::filesystem::path(path).filename().wstring() + L" · " + FavoriteKindName(kind) +
+            L" · 第 " + std::to_wstring(std::max(1, page + 1)) + L" 页";
+    }
+
+    bool SameFavoritePosition(FavoriteItem const& a, FavoriteItem const& b)
+    {
+        if (_wcsicmp(a.path.c_str(), b.path.c_str()) != 0 || a.page != b.page || a.kind != b.kind) return false;
+        if (a.kind == FavoriteKind::Page || a.kind == FavoriteKind::Outline)
+            return true;
+        if (a.hasNorm != b.hasNorm) return false;
+        if (!a.hasNorm) return true;
+        constexpr double epsilon = 0.0005;
+        return std::abs(a.norm.x0 - b.norm.x0) < epsilon && std::abs(a.norm.y0 - b.norm.y0) < epsilon &&
+            std::abs(a.norm.x1 - b.norm.x1) < epsilon && std::abs(a.norm.y1 - b.norm.y1) < epsilon;
+    }
+
+    std::wstring FavoritePathForState(std::wstring const& value)
+    {
+        std::wstring result = value;
+        for (wchar_t& ch : result)
+            if (ch == L'\t' || ch == L'\r' || ch == L'\n') ch = L' ';
+        return result;
+    }
+
     void SortRecent()
     {
         std::stable_sort(g_recent.begin(), g_recent.end(), [](RecentItem const& a, RecentItem const& b)
@@ -4736,6 +5028,34 @@ namespace
                     g_recent.push_back(item);
                 }
             }
+            else if (line.rfind("favorite=", 0) == 0)
+            {
+                auto parts = SplitTabLine(line.substr(9));
+                if (parts.size() >= 14)
+                {
+                    FavoriteItem item;
+                    item.createdAt = std::atoll(parts[0].c_str());
+                    item.page = std::max(0, std::atoi(parts[1].c_str()));
+                    item.outlineRow = std::atoi(parts[2].c_str());
+                    item.scrollY = std::max(0, std::atoi(parts[3].c_str()));
+                    item.zoom = std::clamp(std::atof(parts[4].c_str()), 0.0833, 64.0);
+                    item.pageOffsetY = std::atoi(parts[5].c_str());
+                    item.hasPageOffset = std::atoi(parts[6].c_str()) != 0;
+                    item.kind = static_cast<FavoriteKind>(std::clamp(std::atoi(parts[7].c_str()), 0, 3));
+                    item.hasNorm = std::atoi(parts[8].c_str()) != 0;
+                    item.norm.x0 = static_cast<float>(std::atof(parts[9].c_str()));
+                    item.norm.y0 = static_cast<float>(std::atof(parts[10].c_str()));
+                    item.norm.x1 = static_cast<float>(std::atof(parts[11].c_str()));
+                    item.norm.y1 = static_cast<float>(std::atof(parts[12].c_str()));
+                    item.path = FromUtf8(parts[13]);
+                    if (parts.size() >= 15) item.title = FromUtf8(parts[14]);
+                    if (!item.path.empty())
+                    {
+                        if (item.title.empty()) item.title = FavoriteTitleForPage(item.path, item.page, item.kind);
+                        g_favorites.push_back(std::move(item));
+                    }
+                }
+            }
         }
         SortRecent();
         if (!sawLastLightTheme && IsLightThemeIndex(g_theme)) g_lastLightTheme = g_theme;
@@ -4745,6 +5065,7 @@ namespace
         if (g_recent.size() > 80) g_recent.resize(80);
         if (g_lastSessionActive < 0 || g_lastSessionActive >= static_cast<int>(g_lastSessionTabs.size()))
             g_lastSessionActive = g_lastSessionTabs.empty() ? -1 : 0;
+        if (g_favorites.size() > 200) g_favorites.resize(200);
     }
 
     void SaveState()
@@ -4775,6 +5096,16 @@ namespace
                 << item.sidebarScrollY << '\t' << item.selectedOutlineRow << '\t'
                 << item.scrollY << '\t' << item.zoom << '\t' << item.pageOffsetY << '\t'
                 << (item.hasPageOffset ? 1 : 0) << "\n";
+        }
+        for (auto const& item : g_favorites)
+        {
+            out << "favorite=" << item.createdAt << '\t' << item.page << '\t' << item.outlineRow << '\t'
+                << item.scrollY << '\t' << item.zoom << '\t' << item.pageOffsetY << '\t'
+                << (item.hasPageOffset ? 1 : 0) << '\t' << static_cast<int>(item.kind) << '\t'
+                << (item.hasNorm ? 1 : 0) << '\t' << item.norm.x0 << '\t' << item.norm.y0 << '\t'
+                << item.norm.x1 << '\t' << item.norm.y1 << '\t'
+                << ToUtf8(FavoritePathForState(item.path)) << '\t'
+                << ToUtf8(FavoritePathForState(item.title)) << "\n";
         }
     }
 
@@ -13796,6 +14127,7 @@ namespace
     void PaintSidebar(HDC dc, PdfTab& tab, RECT paintClip)
     {
         if (!SidebarVisible() || g_sidebarWidth <= 0) return;
+        g_favoriteButtonRect = {};
         RECT sidebarFull{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
         if (IsGraphiteTheme()) Fill(dc, sidebarFull, RGB(34, 37, 41));
         else GlassSurface(dc, sidebarFull, 128);
@@ -14230,6 +14562,11 @@ namespace
             Text(dc, L"A+", largeBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
             SelectObject(dc, oldSizeFont);
             DeleteObject(sizeFont);
+            RECT favoriteBtn{ toggleAll.right + S(5), sizeBar.top, toggleAll.right + S(35), sizeBar.bottom };
+            g_favoriteButtonRect = favoriteBtn;
+            if (registerSidebarButtons) AddButton(CmdFavoriteListToggle, favoriteBtn, L"", L"收藏列表");
+            DrawStatusHotArea(dc, favoriteBtn, 5);
+            DrawFavoriteIcon(dc, favoriteBtn, g_favoriteListOpen ? T().accent : T().muted, g_favoriteListOpen);
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
@@ -14337,6 +14674,7 @@ namespace
         }
         ClampSidebarScroll();
         PaintSidebarScrollBar(dc);
+        PaintFavoriteList(dc);
         SelectObject(dc, oldFont);
         DeleteObject(f);
     }
@@ -17509,6 +17847,17 @@ namespace
             AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
             AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22");
         }
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2520, withShortcuts ? L"\u6536\u85cf\tCtrl + B" : L"\u6536\u85cf");
+        ShowThemedPopupMenu(hwnd, menu, x, y);
+    }
+
+    void ShowFavoriteOnlyMenu(HWND hwnd, int x, int y)
+    {
+        CloseThemedPopupMenu();
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        AppendThemedMenuItem(menu, 2520, L"\u6536\u85cf\tCtrl + B");
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
@@ -18541,6 +18890,13 @@ namespace
             CopyCurrentSelectionToClipboard(hwnd);
             return;
         }
+        if (id == 2520)
+        {
+            if (!g_favoriteContextValid && Active())
+                SetFavoriteContextForPage(Active()->currentPage);
+            AddFavoriteFromContext(hwnd);
+            return;
+        }
         if (id == 2510)
         {
             SearchSelection(hwnd, 0);
@@ -18650,6 +19006,12 @@ namespace
                 g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
             }
             InvalidateRect(hwnd, nullptr, FALSE);
+            break;
+        case CmdFavoriteListToggle:
+            if (!Active()) return;
+            g_favoriteListOpen = !g_favoriteListOpen;
+            g_hoverFavoriteItem = -1;
+            InvalidateRect(hwnd, &g_sidebar, FALSE);
             break;
         case CmdSidebar: Command(hwnd, CmdSidebarPanelToggle); break;
         case CmdSearch:
@@ -18986,8 +19348,10 @@ namespace
             flushRect(statusRect);
             RECT sidebarPanel{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
             flushRect(sidebarPanel);
-            flushRect(g_mainScrollTrackRect);
-            flushRect(g_mainHScrollTrackRect);
+            // Scrollbars are transparent overlays. When the reader defers a
+            // stage commit, flushing these rectangles would copy the freshly
+            // cleared back-buffer background over the page and expose bars.
+            // Keep the previous page frame until the next complete commit.
             flushRect(g_sidebarPanelToggleRect);
             flushRect(g_tabListRect);
 
@@ -19701,6 +20065,8 @@ namespace
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
             g_outlineClickHandledOnDown = false;
+            if (HandleFavoriteClick(hwnd, x, y))
+                return 0;
             // Directory navigation has priority over page selection and all
             // other client hit tests. The handler uses a state-validated
             // painted snapshot and falls back to the current layout.
@@ -20392,12 +20758,44 @@ namespace
                     return 0;
                 }
             }
+            if (Active() && SidebarVisible() && g_sideMode == 0)
+            {
+                int outlineRow = -1;
+                bool outlineToggle = false;
+                if (FindOutlineHitAtPoint(hwnd, x, y, outlineRow, outlineToggle) && outlineRow >= 0)
+                {
+                    PdfTab* tab = Active();
+                    if (tab && outlineRow < static_cast<int>(tab->outline.size()))
+                    {
+                        SetFavoriteContextForPage(tab->outline[static_cast<size_t>(outlineRow)].page,
+                            FavoriteKind::Outline, outlineRow);
+                        POINT pt{ x, y };
+                        ClientToScreen(hwnd, &pt);
+                        ShowFavoriteOnlyMenu(hwnd, pt.x, pt.y);
+                        return 0;
+                    }
+                }
+            }
             if (g_hasContentSelection && Hit(g_stage, x, y))
             {
                 POINT pt{ x, y };
                 ClientToScreen(hwnd, &pt);
+                SetFavoriteContextFromSelection();
                 ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y, HasImageSelection());
                 return 0;
+            }
+            if (Active() && Hit(g_stage, x, y))
+            {
+                int page = -1;
+                RECT pageRect{};
+                if (PageRectAtPoint(*Active(), x, y, page, pageRect))
+                {
+                    SetFavoriteContextForPage(page);
+                    POINT pt{ x, y };
+                    ClientToScreen(hwnd, &pt);
+                    ShowFavoriteOnlyMenu(hwnd, pt.x, pt.y);
+                    return 0;
+                }
             }
             return 0;
         }
@@ -20623,6 +21021,7 @@ namespace
             int oldHoverHomeHit = g_hoverHomeHit;
             int oldHoverRecentRect = g_hoverRecentRect;
             int oldHoverTabListItem = g_hoverTabListItem;
+            int oldHoverFavoriteItem = g_hoverFavoriteItem;
             bool oldHasHoverButton = g_hasHoverButton;
             RECT oldHoverButtonRect = g_hoverButtonRect;
             g_hoverTab = -1;
@@ -20633,6 +21032,7 @@ namespace
             g_hoverHomeHit = -1;
             g_hoverRecentRect = -1;
             g_hoverTabListItem = -1;
+            g_hoverFavoriteItem = -1;
             g_hasHoverButton = false;
             g_hoverButtonRect = RECT{};
             for (size_t i = 0; i < g_tabRects.size(); ++i)
@@ -20653,6 +21053,17 @@ namespace
                     if (Hit(g_tabListItemRects[i], mx, my))
                     {
                         g_hoverTabListItem = g_tabListItemIds[i];
+                        break;
+                    }
+                }
+            }
+            if (g_favoriteListOpen)
+            {
+                for (size_t i = 0; i < g_favoriteItemRects.size(); ++i)
+                {
+                    if (Hit(g_favoriteItemRects[i], mx, my))
+                    {
+                        g_hoverFavoriteItem = static_cast<int>(i);
                         break;
                     }
                 }
@@ -20773,6 +21184,12 @@ namespace
             {
                 // Keep the tab list responsive without forcing a PDF-page repaint.
                 InvalidateRect(hwnd, &g_tabListRect, FALSE);
+            }
+            if (oldHoverFavoriteItem != g_hoverFavoriteItem)
+            {
+                // The favorite panel is painted on top of the outline, so only
+                // repaint the sidebar when its row hover changes.
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
             }
             if (oldHoverOutlineRow != g_hoverOutlineRow || oldHoverOutlineToggle != g_hoverOutlineToggle)
             {
@@ -21545,6 +21962,16 @@ namespace
                         return 0;
                     }
                 }
+            }
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'B')
+            {
+                if (!Active()) return 0;
+                if (g_hasContentSelection && g_selectionPage >= 0)
+                    SetFavoriteContextFromSelection();
+                else
+                    SetFavoriteContextForPage(Active()->currentPage);
+                AddFavoriteFromContext(hwnd);
+                return 0;
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'F')
             {
