@@ -373,6 +373,15 @@ namespace
         // until the new viewport coverage is ready. The raster strategy may be
         // a whole page or tiles, but presentation must not branch on that.
         bool zoomPresentationPending{};
+        // Stable screen-space frame used while a high-zoom generation is
+        // being rendered. Keeping the already submitted pixels together is
+        // stronger than trying to reconstruct a complete frame from Tile
+        // cache entries that may be evicted independently.
+        PageImage zoomPresentationFrame;
+        RECT zoomPresentationSourceStage{};
+        POINT zoomPresentationAnchor{};
+        double zoomPresentationSourceZoom{};
+        bool zoomPresentationFrameValid{};
         double cachedZoom{};
         unsigned cachedDpi{};
         std::wstring path;
@@ -1408,6 +1417,7 @@ namespace
     bool EnsureImageDib(PageImage& image);
     bool DrawCachedImagePart(HDC dc, PageImage& image, RECT dest, int sx, int sy, int sw, int sh);
     bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
+    void ClearZoomPresentationFrame(PdfTab& tab);
     void LoadPageGeometry(PdfTab& tab);
     void CollectOutline(PdfTab& tab, fz_outline* item, int depth);
     void LoadAnnotationsFromPdf(PdfTab& tab);
@@ -6193,6 +6203,7 @@ namespace
         tab.zoomFallbackTheme = -1;
         tab.zoomFallbackZoom = 0.0;
         tab.zoomFallbackUntil = 0;
+        ClearZoomPresentationFrame(tab);
     }
 
     void TrimZoomFallbackCache(PdfTab& tab, int protectedPage)
@@ -7095,7 +7106,7 @@ namespace
             // resource-store policy. They are cheap to rebuild on return.
             TrimDisplayLists(*g_tabs[static_cast<size_t>(i)], -1);
         }
-        if (tab->zoomFallbackZoom > 0.0 && CurrentZoomVisibleContentReady(*tab))
+        if (tab->zoomFallbackZoom > 0.0 && !tab->zoomPresentationPending && CurrentZoomVisibleContentReady(*tab))
         {
             ReleaseZoomFallback(*tab);
         }
@@ -11334,6 +11345,8 @@ namespace
         return g_zoomRenderDeferUntil != 0 && GetTickCount64() < g_zoomRenderDeferUntil;
     }
 
+    constexpr ULONGLONG kZoomPresentationDebounceMs = 72;
+
     void RequestStageRepaint(HWND hwnd, bool includeStatus)
     {
         RECT client{};
@@ -11930,12 +11943,113 @@ namespace
         };
     }
 
+    void ClearZoomPresentationFrame(PdfTab& tab)
+    {
+        tab.zoomPresentationFrame.ResetDib();
+        tab.zoomPresentationFrame.width = 0;
+        tab.zoomPresentationFrame.height = 0;
+        tab.zoomPresentationFrame.bgra.clear();
+        tab.zoomPresentationSourceStage = {};
+        tab.zoomPresentationAnchor = {};
+        tab.zoomPresentationSourceZoom = 0.0;
+        tab.zoomPresentationFrameValid = false;
+    }
+
+    void CaptureZoomPresentationFrame(PdfTab& tab, POINT anchor, double sourceZoom)
+    {
+        ClearZoomPresentationFrame(tab);
+        if (!g_paintBufferDc || sourceZoom <= 0.0 || IsRectEmpty(&g_stage)) return;
+
+        int width = std::max<int>(1, g_stage.right - g_stage.left);
+        int height = std::max<int>(1, g_stage.bottom - g_stage.top);
+        if (g_paintBufferW < g_stage.right || g_paintBufferH < g_stage.bottom) return;
+
+        tab.zoomPresentationFrame.width = width;
+        tab.zoomPresentationFrame.height = height;
+        if (!tab.zoomPresentationFrame.AllocateDibPixels())
+        {
+            ClearZoomPresentationFrame(tab);
+            return;
+        }
+
+        HDC frameDc = CreateCompatibleDC(g_paintBufferDc);
+        if (!frameDc)
+        {
+            ClearZoomPresentationFrame(tab);
+            return;
+        }
+        HGDIOBJ oldBitmap = SelectObject(frameDc, tab.zoomPresentationFrame.dib);
+        bool copied = BitBlt(
+            frameDc,
+            0,
+            0,
+            width,
+            height,
+            g_paintBufferDc,
+            g_stage.left,
+            g_stage.top,
+            SRCCOPY) != FALSE;
+        SelectObject(frameDc, oldBitmap);
+        DeleteDC(frameDc);
+        if (!copied)
+        {
+            ClearZoomPresentationFrame(tab);
+            return;
+        }
+
+        tab.zoomPresentationSourceStage = g_stage;
+        tab.zoomPresentationAnchor = anchor;
+        tab.zoomPresentationSourceZoom = sourceZoom;
+        tab.zoomPresentationFrameValid = true;
+    }
+
+    bool DrawZoomPresentationFrame(HDC dc, PdfTab& tab, RECT paintClip)
+    {
+        PageImage& frame = tab.zoomPresentationFrame;
+        if (!tab.zoomPresentationFrameValid || !frame.dib || frame.width <= 0 || frame.height <= 0 ||
+            tab.zoomPresentationSourceZoom <= 0.0 || tab.zoom <= 0.0)
+            return false;
+
+        double ratio = tab.zoom / tab.zoomPresentationSourceZoom;
+        RECT sourceStage = tab.zoomPresentationSourceStage;
+        RECT destination{
+            static_cast<int>(std::lround(tab.zoomPresentationAnchor.x +
+                (sourceStage.left - tab.zoomPresentationAnchor.x) * ratio)),
+            static_cast<int>(std::lround(tab.zoomPresentationAnchor.y +
+                (sourceStage.top - tab.zoomPresentationAnchor.y) * ratio)),
+            static_cast<int>(std::lround(tab.zoomPresentationAnchor.x +
+                (sourceStage.right - tab.zoomPresentationAnchor.x) * ratio)),
+            static_cast<int>(std::lround(tab.zoomPresentationAnchor.y +
+                (sourceStage.bottom - tab.zoomPresentationAnchor.y) * ratio))
+        };
+        RECT clipped{};
+        if (!IntersectRect(&clipped, &destination, &paintClip)) return false;
+
+        int destinationWidth = std::max<int>(1, destination.right - destination.left);
+        int destinationHeight = std::max<int>(1, destination.bottom - destination.top);
+        int sx = std::clamp<int>(static_cast<int>(std::floor(
+            static_cast<double>(clipped.left - destination.left) * frame.width / destinationWidth)),
+            0, frame.width - 1);
+        int sy = std::clamp<int>(static_cast<int>(std::floor(
+            static_cast<double>(clipped.top - destination.top) * frame.height / destinationHeight)),
+            0, frame.height - 1);
+        int ex = std::clamp<int>(static_cast<int>(std::ceil(
+            static_cast<double>(clipped.right - destination.left) * frame.width / destinationWidth)),
+            sx + 1, frame.width);
+        int ey = std::clamp<int>(static_cast<int>(std::ceil(
+            static_cast<double>(clipped.bottom - destination.top) * frame.height / destinationHeight)),
+            sy + 1, frame.height);
+        return DrawCachedImagePart(dc, frame, clipped, sx, sy, ex - sx, ey - sy);
+    }
+
     void ApplyZoomAtPoint(HWND hwnd, PdfTab& tab, POINT clientPt, double newZoom)
     {
         double clampedZoom = std::clamp(newZoom, 0.0833, 64.0);
         if (std::abs(clampedZoom - tab.zoom) < 0.0001) return;
         CancelStageMotion(hwnd);
         double oldZoom = tab.zoom;
+        if (!tab.zoomPresentationPending)
+            CaptureZoomPresentationFrame(tab, clientPt, oldZoom);
         PreservePageCacheForZoomTransition(tab, oldZoom);
 
         int anchorPage = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
@@ -11952,8 +12066,15 @@ namespace
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
         CancelObsoletePageRendersForZoom(tab);
+        // Keep the last complete presentation frame for one short quiet
+        // period. Lower zoom levels often finish rendering faster than the
+        // next wheel event arrives; committing each of those intermediate
+        // pages exposes their moving edges and causes the down-zoom flicker.
+        // The frame is still transformed immediately, so input remains
+        // responsive and no extra image cache is retained.
+        g_zoomRenderDeferUntil = GetTickCount64() + kZoomPresentationDebounceMs;
         KillTimer(hwnd, 21);
-        g_zoomRenderDeferUntil = 0;
+        SetTimer(hwnd, 21, static_cast<UINT>(kZoomPresentationDebounceMs), nullptr);
         tab.zoom = clampedZoom;
         // Keep one presentation rule for both whole-page and tiled rendering.
         // The old complete result is the interactive frame; the new result is
@@ -14805,7 +14926,7 @@ namespace
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
-        if (tab.zoomPresentationPending && CurrentZoomVisibleContentReady(tab))
+        if (tab.zoomPresentationPending && !ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
         {
             tab.zoomPresentationPending = false;
             ReleaseZoomFallback(tab);
@@ -14817,6 +14938,14 @@ namespace
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
         Fill(dc, stageDirty, T().stage);
+        if (zoomPresentationPending && tab.zoomPresentationFrameValid)
+        {
+            // Paint only the single committed screen frame during a zoom
+            // transition. Rendering individual old/new tiles here reopens the
+            // exact high-zoom hole this frame is meant to prevent.
+            DrawZoomPresentationFrame(dc, tab, stageDirty);
+            return true;
+        }
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -14924,8 +15053,6 @@ namespace
                               // queued here but never mixed into that frame.
                               if (!fallbackPainted)
                                   oldZoomPainted = DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect);
-                              if (!fallbackPainted && !oldZoomPainted)
-                                  oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
                               if (!fallbackPainted && !oldZoomPainted)
                               {
                                   // If the old generation was trimmed, use a
