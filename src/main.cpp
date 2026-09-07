@@ -13124,6 +13124,70 @@ namespace
         RestoreActiveTabSidebarState(hwnd);
     }
 
+    int SidebarRailItemAtPoint(int x, int y)
+    {
+        if (!Active() || !SidebarRailVisible()) return -1;
+        int tabWidth = S(34);
+        int tabGap = S(5);
+        int railWidth = S(44);
+        int tabLeft = std::max<int>(0, (railWidth - tabWidth) / 2);
+        if (x < tabLeft || x >= tabLeft + tabWidth) return -1;
+        int relativeY = y - g_sidebar.top - S(10);
+        int stride = tabWidth + tabGap;
+        if (relativeY < 0 || relativeY >= stride * 4) return -1;
+        int item = relativeY / stride;
+        if (relativeY % stride >= tabWidth) return -1;
+        return item;
+    }
+
+    bool HandleSidebarRailClick(HWND hwnd, int item)
+    {
+        if (item < 0 || item >= 4 || !Active() || !SidebarRailVisible()) return false;
+
+        int tabWidth = S(34);
+        int tabGap = S(5);
+        int railWidth = S(44);
+        int tabLeft = std::max<int>(0, (railWidth - tabWidth) / 2);
+        RECT pressedRect{
+            tabLeft,
+            g_sidebar.top + S(10) + item * (tabWidth + tabGap),
+            tabLeft + tabWidth,
+            g_sidebar.top + S(10) + item * (tabWidth + tabGap) + tabWidth };
+        g_pressedButtonRect = pressedRect;
+        g_hasPressedButton = true;
+        SetTimer(hwnd, 2, 90, nullptr);
+
+        bool sameMode = item == g_sideMode;
+        if (sameMode)
+        {
+            // The active rail button is the direct toggle for its content
+            // panel after the panel's close button has hidden that panel.
+            g_sidebarOpen = !g_sidebarOpen;
+        }
+        else
+        {
+            g_sidebarRailOpen = true;
+            SwitchSidebarMode(hwnd, item);
+            g_sidebarOpen = true;
+        }
+        g_sidebarRailOpen = true;
+        if (g_immersive)
+        {
+            g_immersiveSidebarOpen = true;
+            g_lastImmersiveSidebarOpen = true;
+        }
+        if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
+        g_searchInputFocused = g_sideMode == 2;
+        if (g_searchInputFocused)
+        {
+            g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
+            g_searchCaretVisible = true;
+            SetTimer(hwnd, 12, 500, nullptr);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return true;
+    }
+
     void RestoreActiveTabPosition(HWND hwnd)
     {
         PdfTab* tab = Active();
@@ -20282,6 +20346,14 @@ namespace
             int y = GET_Y_LPARAM(lParam);
             g_outlineClickHandledOnDown = false;
             if (Active()) RefreshReaderHitGeometry(hwnd);
+            // Resolve rail clicks from the current geometry before any
+            // scroll/content hit tests. The painted rectangle list can still
+            // describe the previous panel width during an immediate toggle.
+            if (int railItem = SidebarRailItemAtPoint(x, y); railItem >= 0)
+            {
+                HandleSidebarRailClick(hwnd, railItem);
+                return 0;
+            }
             if (SidebarVisible() && Hit(g_sidebarContentCloseRect, x, y))
             {
                 g_pressedButtonRect = g_sidebarContentCloseRect;
@@ -20634,44 +20706,6 @@ namespace
                     int travel = std::max<int>(1, trackH - thumbH);
                     int thumbTop = std::clamp<int>(y - thumbH / 2, g_sidebarScrollTrackRect.top, g_sidebarScrollTrackRect.bottom - thumbH);
                     ScrollSidebarTo(hwnd, MulDiv(thumbTop - g_sidebarScrollTrackRect.top, maxScroll, travel));
-                    return 0;
-                }
-            }
-            for (size_t i = 0; i < g_sideTabRects.size(); ++i)
-            {
-                if (Hit(g_sideTabRects[i], x, y))
-                {
-                    bool sameMode = static_cast<int>(i) == g_sideMode;
-                    if (sameMode)
-                    {
-                        // The rail remains visible after the panel is closed.
-                        // Clicking the active rail icon therefore toggles the
-                        // content panel back open or closed.
-                        g_sidebarOpen = !g_sidebarOpen;
-                    }
-                    else
-                    {
-                        g_sidebarRailOpen = true;
-                        SwitchSidebarMode(hwnd, static_cast<int>(i));
-                        // Selecting another rail item is also an explicit
-                        // request to show that item's content panel.
-                        g_sidebarOpen = true;
-                    }
-                    g_sidebarRailOpen = true;
-                    if (g_immersive)
-                    {
-                        g_immersiveSidebarOpen = true;
-                        g_lastImmersiveSidebarOpen = true;
-                    }
-                    if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
-                    g_searchInputFocused = g_sideMode == 2;
-                    if (g_searchInputFocused)
-                    {
-                        g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
-                        g_searchCaretVisible = true;
-                        SetTimer(hwnd, 12, 500, nullptr);
-                    }
-                    InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
             }
