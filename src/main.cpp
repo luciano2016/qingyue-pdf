@@ -3139,6 +3139,7 @@ namespace
     std::wstring FavoriteKindName(FavoriteKind kind);
     std::wstring FavoriteTitleForPage(std::wstring const& path, int page, FavoriteKind kind);
     bool SameFavoritePosition(FavoriteItem const& a, FavoriteItem const& b);
+    std::wstring ElideText(std::wstring text, size_t maxChars);
 
     void RefreshReaderHitGeometry(HWND hwnd)
     {
@@ -3537,9 +3538,9 @@ namespace
         g_favoriteListContentHeight = 0;
         if (!g_favoriteListOpen || !SidebarVisible()) return;
 
-        int maxWidth = std::max<int>(S(220), static_cast<int>(g_stage.right - g_sidebar.left - S(12)));
-        int width = std::min<int>(S(600), maxWidth);
-        int rowH = S(43);
+        int width = std::max<int>(S(220),
+            static_cast<int>(g_sidebar.right - g_sidebar.left - S(8)));
+        int rowH = S(34);
         int headerH = S(30);
         int panelTop = !IsRectEmpty(&g_favoriteButtonRect)
             ? g_favoriteButtonRect.bottom + S(6)
@@ -3553,10 +3554,10 @@ namespace
         RECT panel{
             g_sidebar.left + S(4), panelTop,
             g_sidebar.left + S(4) + width, panelTop + headerH + bodyHeight + S(8) };
-        int rightLimit = std::max<int>(panel.left + S(220), static_cast<int>(g_stage.right) - S(4));
-        panel.right = std::min<int>(static_cast<int>(panel.left) + width, rightLimit);
         if (panel.right <= panel.left) return;
         g_favoriteListRect = panel;
+        HFONT favoriteFont = Font(10);
+        HGDIOBJ oldFavoriteFont = SelectObject(dc, favoriteFont);
         DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 28 : 18);
         RoundFill(dc, panel, S(8), MenuPopupFill(), MenuPopupBorder());
 
@@ -3566,6 +3567,8 @@ namespace
         {
             RECT empty{ panel.left + S(12), panel.top + S(36), panel.right - S(12), panel.bottom - S(8) };
             Text(dc, L"暂无收藏", empty, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+            SelectObject(dc, oldFavoriteFont);
+            DeleteObject(favoriteFont);
             return;
         }
 
@@ -3591,25 +3594,25 @@ namespace
             if (y + rowH >= content.top && y <= content.bottom)
             {
                 int favoriteIndex = static_cast<int>(g_favorites.size()) - 1 - i;
-            FavoriteItem const& item = g_favorites[static_cast<size_t>(favoriteIndex)];
+                FavoriteItem const& item = g_favorites[static_cast<size_t>(favoriteIndex)];
                 RECT row{ content.left, y, content.right, y + rowH };
                 int visibleIndex = static_cast<int>(g_favoriteItemRects.size());
-            g_favoriteItemRects.push_back(row);
-            g_favoriteItemIds.push_back(favoriteIndex);
+                g_favoriteItemRects.push_back(row);
+                g_favoriteItemIds.push_back(favoriteIndex);
                 bool hovered = g_hoverFavoriteItem == visibleIndex;
-            if (hovered) RoundFill(dc, row, S(5), MenuPopupHoverFill(), MenuPopupHoverFill());
-            RECT iconRect{ row.left + S(8), row.top + S(11), row.left + S(25), row.top + S(28) };
-            DrawFavoriteIcon(dc, iconRect, hovered ? T().accent : T().muted, false);
-            RECT title{ row.left + S(32), row.top + S(4), row.right - S(8), row.top + S(23) };
-            RECT detail{ row.left + S(32), row.top + S(22), row.right - S(8), row.bottom - S(3) };
-            Text(dc, item.title, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
-                Text(dc, std::filesystem::path(item.path).filename().wstring() +
-                    L"  ·  第" + std::to_wstring(item.page + 1) + L" 页  ·  " + FavoriteKindName(item.kind),
-                detail, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().muted);
+                if (hovered) RoundFill(dc, row, S(5), MenuPopupHoverFill(), MenuPopupHoverFill());
+                RECT iconRect{ row.left + S(8), row.top + S(8), row.left + S(26), row.bottom - S(8) };
+                DrawFavoriteIcon(dc, iconRect, hovered ? T().accent : T().muted, false);
+                RECT title{ row.left + S(34), row.top, row.right - S(8), row.bottom };
+                std::wstring label = ElideText(item.title, 64) +
+                    L"  ·  第" + std::to_wstring(item.page + 1) + L" 页";
+                Text(dc, label, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
             }
             y += rowH;
         }
         RestoreDC(dc, saved);
+        SelectObject(dc, oldFavoriteFont);
+        DeleteObject(favoriteFont);
 
         if (needsScroll)
         {
@@ -5223,6 +5226,13 @@ namespace
         if (g_recent.size() > 80) g_recent.resize(80);
         if (g_lastSessionActive < 0 || g_lastSessionActive >= static_cast<int>(g_lastSessionTabs.size()))
             g_lastSessionActive = g_lastSessionTabs.empty() ? -1 : 0;
+        g_favorites.erase(
+            std::remove_if(g_favorites.begin(), g_favorites.end(),
+                [](FavoriteItem const& item)
+                {
+                    return item.kind != FavoriteKind::Outline;
+                }),
+            g_favorites.end());
         if (g_favorites.size() > 200) g_favorites.resize(200);
     }
 
@@ -13158,6 +13168,8 @@ namespace
         if (!Active()) return;
         if (mode == g_sideMode) return;
         if (PdfTab* tab = Active()) SaveActiveTabSidebarState(*tab);
+        g_favoriteListOpen = false;
+        g_hoverFavoriteItem = -1;
         g_sideMode = mode;
         RestoreActiveTabSidebarState(hwnd);
     }
@@ -13172,7 +13184,7 @@ namespace
         if (x < tabLeft || x >= tabLeft + tabWidth) return -1;
         int relativeY = y - g_sidebar.top - S(10);
         int stride = tabWidth + tabGap;
-        if (relativeY < 0 || relativeY >= stride * 5) return -1;
+        if (relativeY < 0 || relativeY >= stride * 4) return -1;
         int item = relativeY / stride;
         if (relativeY % stride >= tabWidth) return -1;
         return item;
@@ -13180,7 +13192,7 @@ namespace
 
     bool HandleSidebarRailClick(HWND hwnd, int item)
     {
-        if (item < 0 || item >= 5 || !Active() || !SidebarRailVisible()) return false;
+        if (item < 0 || item >= 4 || !Active() || !SidebarRailVisible()) return false;
 
         int tabWidth = S(34);
         int tabGap = S(5);
@@ -13194,16 +13206,6 @@ namespace
         g_pressedButtonRect = pressedRect;
         g_hasPressedButton = true;
         SetTimer(hwnd, 2, 90, nullptr);
-
-        if (item == 4)
-        {
-            g_favoriteListOpen = !g_favoriteListOpen;
-            g_hoverFavoriteItem = -1;
-            g_sidebarRailOpen = true;
-            if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return true;
-        }
 
         bool sameMode = item == g_sideMode;
         if (sameMode)
@@ -14457,46 +14459,6 @@ namespace
             DrawSideTabIcon(dc, tabRect, sideIcons[i], iconColor);
         }
 
-        RECT favoriteRailRect{
-            tabStart,
-            tabBar.top + 4 * (tabWidth + tabGap),
-            tabStart + tabWidth,
-            tabBar.top + 4 * (tabWidth + tabGap) + tabWidth
-        };
-        g_favoriteButtonRect = favoriteRailRect;
-        g_sideTabRects.push_back(favoriteRailRect);
-        if (registerSidebarButtons)
-            AddButton(CmdFavoriteListToggle, favoriteRailRect, L"", L"收藏列表");
-        bool favoriteHovered = Hit(favoriteRailRect, g_mousePos.x, g_mousePos.y);
-        bool favoriteActive = g_favoriteListOpen;
-        if (favoriteHovered || favoriteActive)
-        {
-            COLORREF fill{};
-            COLORREF line{};
-            if (IsAuroraTheme())
-            {
-                fill = favoriteActive ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill();
-                line = favoriteActive ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill();
-            }
-            else if (IsBeigeTheme() || IsDarkTheme())
-            {
-                fill = favoriteActive ? SidebarSelectedFill() : SidebarHoverFill();
-                line = favoriteActive ? SidebarSelectedBorder() : SidebarHoverFill();
-            }
-            else
-            {
-                fill = favoriteActive ? RGB(232, 238, 244) : T().panel2;
-                line = favoriteActive ? RGB(232, 238, 244) : T().line;
-            }
-            RoundFill(dc, favoriteRailRect, S(7), fill, line);
-        }
-        RECT favoriteGlyph{
-            favoriteRailRect.left + S(2), favoriteRailRect.top + S(2),
-            favoriteRailRect.right - S(2), favoriteRailRect.bottom - S(2)
-        };
-        DrawFavoriteIcon(dc, favoriteGlyph,
-            favoriteActive ? T().accent : SidebarIconColor(), favoriteActive);
-
         // Close only the content panel; the rail remains available as the
         // entry point for reopening a sidebar mode.
         if (!SidebarVisible())
@@ -14530,6 +14492,37 @@ namespace
             g_sidebar.left + S(14), g_sidebar.top + S(6),
             g_sidebarContentCloseRect.left - S(8), g_sidebar.top + S(30) };
         Text(dc, panelTitle, panelTitleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        if (g_sideMode == 0)
+        {
+            SIZE titleSize{};
+            GetTextExtentPoint32W(dc, panelTitle, lstrlenW(panelTitle), &titleSize);
+            int buttonSize = panelTitleRect.bottom - panelTitleRect.top;
+            int buttonLeft = panelTitleRect.left + titleSize.cx + S(6);
+            int buttonRight = std::min<int>(buttonLeft + buttonSize, panelTitleRect.right);
+            if (buttonRight - buttonLeft >= S(18))
+            {
+                g_favoriteButtonRect = RECT{
+                    buttonLeft, panelTitleRect.top, buttonRight, panelTitleRect.bottom };
+                if (registerSidebarButtons)
+                    AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
+                bool hovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
+                bool pressed = g_hasPressedButton &&
+                    EqualRect(&g_pressedButtonRect, &g_favoriteButtonRect);
+                if (hovered || pressed || g_favoriteListOpen)
+                {
+                    COLORREF fill = pressed
+                        ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
+                        : (g_favoriteListOpen ? SidebarSelectedFill() : SidebarHoverFill());
+                    RoundFill(dc, g_favoriteButtonRect, S(6), fill, fill);
+                }
+                RECT glyph{
+                    g_favoriteButtonRect.left + S(2), g_favoriteButtonRect.top + S(2),
+                    g_favoriteButtonRect.right - S(2), g_favoriteButtonRect.bottom - S(2) };
+                DrawFavoriteIcon(dc, glyph,
+                    pressed || hovered || g_favoriteListOpen ? T().accent : SidebarIconColor(),
+                    g_favoriteListOpen);
+            }
+        }
 
         auto visible = [&](RECT r)
         {
@@ -17662,9 +17655,8 @@ namespace
         HGDIOBJ old = SelectObject(dc, font);
         bool compactCheckboxMenu = g_themedMenuItems.size() == 1 && IsCheckboxMenuItem(g_themedMenuItems.front()->id);
         int width = compactCheckboxMenu ? S(96) : S(112);
-        int outerPad = compactCheckboxMenu ? S(4) : S(6);
         int rowInset = compactCheckboxMenu ? S(2) : S(3);
-        int height = outerPad;
+        int height = rowInset;
         std::vector<int> heights;
         heights.reserve(g_themedMenuItems.size());
         for (auto const& item : g_themedMenuItems)
@@ -17694,7 +17686,7 @@ namespace
             }
             height += rowH;
         }
-        height += outerPad;
+        height += rowInset;
         SelectObject(dc, old);
         DeleteObject(font);
         ReleaseDC(hwnd, dc);
@@ -18209,8 +18201,6 @@ namespace
             AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
             AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22");
         }
-        AppendThemedMenuSeparator(menu);
-        AppendThemedMenuItem(menu, 2520, withShortcuts ? L"\u6536\u85cf\tCtrl + B" : L"\u6536\u85cf");
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
@@ -18219,7 +18209,7 @@ namespace
         CloseThemedPopupMenu();
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
-        AppendThemedMenuItem(menu, 2520, L"\u6536\u85cf\tCtrl + B");
+        AppendThemedMenuItem(menu, 2520, L"\u6536\u85cf");
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
@@ -19264,8 +19254,10 @@ namespace
         }
         if (id == 2520)
         {
-            if (!g_favoriteContextValid && Active())
-                SetFavoriteContextForPage(Active()->currentPage);
+            if (!g_favoriteContextValid ||
+                g_favoriteContextKind != FavoriteKind::Outline ||
+                g_favoriteContextOutlineRow < 0)
+                return;
             AddFavoriteFromContext(hwnd);
             return;
         }
@@ -19395,7 +19387,7 @@ namespace
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdFavoriteListToggle:
-            if (!Active()) return;
+            if (!Active() || g_sideMode != 0) return;
             g_favoriteListOpen = !g_favoriteListOpen;
             g_hoverFavoriteItem = -1;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -21196,22 +21188,8 @@ namespace
             {
                 POINT pt{ x, y };
                 ClientToScreen(hwnd, &pt);
-                SetFavoriteContextFromSelection();
                 ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y, HasImageSelection());
                 return 0;
-            }
-            if (Active() && Hit(g_stage, x, y))
-            {
-                int page = -1;
-                RECT pageRect{};
-                if (PageRectAtPoint(*Active(), x, y, page, pageRect))
-                {
-                    SetFavoriteContextForPage(page);
-                    POINT pt{ x, y };
-                    ClientToScreen(hwnd, &pt);
-                    ShowFavoriteOnlyMenu(hwnd, pt.x, pt.y);
-                    return 0;
-                }
             }
             return 0;
         }
@@ -22400,16 +22378,6 @@ namespace
                         return 0;
                     }
                 }
-            }
-            if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'B')
-            {
-                if (!Active()) return 0;
-                if (g_hasContentSelection && g_selectionPage >= 0)
-                    SetFavoriteContextFromSelection();
-                else
-                    SetFavoriteContextForPage(Active()->currentPage);
-                AddFavoriteFromContext(hwnd);
-                return 0;
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'F')
             {
