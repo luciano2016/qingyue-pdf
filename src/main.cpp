@@ -15067,7 +15067,11 @@ namespace
         if (zoomPresentationPending && !ZoomFallbackVisibleContentReady(tab))
         {
             QueueVisibleZoomContent(tab);
-            return true;
+            // Paint() has already cleared the memory DC's dirty region with
+            // the theme background. Do not flush that cleared region while
+            // the old page representation is unavailable; otherwise the
+            // document disappears until the target generation completes.
+            return false;
         }
         Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
