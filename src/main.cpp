@@ -3314,7 +3314,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(39), top + S(3), side - S(9), top + S(33) }
+            ? RECT{ side - S(31), top + S(3), side - S(1), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
     }
@@ -4014,6 +4014,15 @@ namespace
         }
         RoundFill(dc, b.rect, S(8), fill, line);
         Text(dc, b.text, b.rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, pressed || hovered ? T().text : T().muted);
+    }
+
+    void DrawBookmarkToolbarFeedback(HDC dc, RECT r, bool hovered, bool pressed)
+    {
+        if (!hovered && !pressed) return;
+        COLORREF fill = pressed
+            ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
+            : SidebarHoverFill();
+        RoundFill(dc, r, S(6), fill, fill);
     }
 
     void DrawFlatMenuItem(HDC dc, const Button& b)
@@ -14745,23 +14754,17 @@ namespace
         // Keep the two top-row controls aligned with the two size controls
         // below: the chevron sits above A-, and close sits above A+.
         g_sidebarContentCloseRect = RECT{
-            g_sidebar.right - S(39), g_sidebar.top + S(3),
-            g_sidebar.right - S(9), g_sidebar.top + S(33) };
+            g_sidebar.right - S(31), g_sidebar.top + S(3),
+            g_sidebar.right - S(1), g_sidebar.top + S(33) };
         if (registerSidebarButtons)
             AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
         bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
         bool closePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_sidebarContentCloseRect);
-        if (closeHovered || closePressed)
-        {
-            COLORREF fill = closePressed
-                ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
-                : SidebarHoverFill();
-            RoundFill(dc, g_sidebarContentCloseRect, S(7), fill, fill);
-        }
+        DrawBookmarkToolbarFeedback(dc, g_sidebarContentCloseRect, closeHovered, closePressed);
         RECT closeGlyph{
             g_sidebarContentCloseRect.left + S(7), g_sidebarContentCloseRect.top + S(7),
             g_sidebarContentCloseRect.right - S(7), g_sidebarContentCloseRect.bottom - S(7) };
-        DrawCloseGlyph(dc, closeGlyph, closePressed || closeHovered ? T().text : T().muted);
+        DrawCloseGlyph(dc, closeGlyph, closePressed || closeHovered ? T().accent : SidebarIconColor());
 
         if (g_sideMode == 0)
         {
@@ -14776,15 +14779,9 @@ namespace
                 AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, L"", collapseAll ? L"收起所有书签" : L"展开所有书签");
             bool toggleHovered = Hit(g_outlineToggleAllRect, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_outlineToggleAllRect);
-            if (toggleHovered || togglePressed)
-            {
-                COLORREF fill = togglePressed
-                    ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.48)
-                    : SidebarHoverFill();
-                RoundFill(dc, g_outlineToggleAllRect, S(7), fill, fill);
-            }
+            DrawBookmarkToolbarFeedback(dc, g_outlineToggleAllRect, toggleHovered, togglePressed);
             DrawOutlineToggleGlyph(dc, g_outlineToggleAllRect, collapseAll,
-                togglePressed || toggleHovered ? T().text : T().muted);
+                togglePressed || toggleHovered ? T().accent : SidebarIconColor());
         }
 
         const wchar_t* panelTitle = g_sideMode == 0 ? L"书签"
@@ -15146,7 +15143,7 @@ namespace
             int favoriteSize = S(26);
             int searchMinWidth = placeholderSize.cx + S(22);
             int gap = S(2);
-            int controlsRight = sizeBar.right + S(3);
+            int controlsRight = g_sidebar.right - S(1);
             RECT largeBtnNew{ controlsRight - largeWidth, sizeBar.top + S(2), controlsRight, sizeBar.bottom - S(2) };
             RECT smallBtnNew{ largeBtnNew.left - gap - smallWidth, sizeBar.top + S(2), largeBtnNew.left - gap, sizeBar.bottom - S(2) };
             int favoriteRight = smallBtnNew.left - gap;
@@ -15206,13 +15203,7 @@ namespace
             bool favoriteHovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
             bool favoritePressed = g_hasPressedButton &&
                 EqualRect(&g_pressedButtonRect, &g_favoriteButtonRect);
-            if (favoriteHovered || favoritePressed)
-            {
-                COLORREF fill = favoritePressed
-                    ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.28)
-                    : SidebarHoverFill();
-                RoundFill(dc, g_favoriteButtonRect, S(6), fill, fill);
-            }
+            DrawBookmarkToolbarFeedback(dc, g_favoriteButtonRect, favoriteHovered, favoritePressed);
             RECT favoriteGlyph{
                 g_favoriteButtonRect.left + S(5), g_favoriteButtonRect.top + S(5),
                 g_favoriteButtonRect.right - S(5), g_favoriteButtonRect.bottom - S(5) };
@@ -15220,12 +15211,18 @@ namespace
                 favoritePressed || favoriteHovered ? T().accent : SidebarIconColor(), false);
             if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"减小书签字号");
             if (registerSidebarButtons) AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"增大书签字号");
-            DrawStatusHotArea(dc, smallBtnNew, 5);
-            DrawStatusHotArea(dc, largeBtnNew, 5);
+            bool smallHovered = Hit(smallBtnNew, g_mousePos.x, g_mousePos.y);
+            bool largeHovered = Hit(largeBtnNew, g_mousePos.x, g_mousePos.y);
+            bool smallPressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &smallBtnNew);
+            bool largePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &largeBtnNew);
+            DrawBookmarkToolbarFeedback(dc, smallBtnNew, smallHovered, smallPressed);
+            DrawBookmarkToolbarFeedback(dc, largeBtnNew, largeHovered, largePressed);
             HFONT sizeFont = Font(10);
             HGDIOBJ oldSizeFont = SelectObject(dc, sizeFont);
-            Text(dc, L"A-", smallBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
-            Text(dc, L"A+", largeBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
+            Text(dc, L"A-", smallBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                smallHovered || smallPressed ? T().accent : SidebarIconColor());
+            Text(dc, L"A+", largeBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                largeHovered || largePressed ? T().accent : SidebarIconColor());
             SelectObject(dc, oldSizeFont);
             DeleteObject(sizeFont);
             }
@@ -17063,7 +17060,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(42), top + S(3), side - S(12), top + S(33) }
+            ? RECT{ side - S(31), top + S(3), side - S(1), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
 
