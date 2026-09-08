@@ -408,6 +408,7 @@ namespace
         int outlineLayoutRows{};
         int outlineLayoutContentHeight{};
         int outlineLayoutCollapseVersion{};
+        std::wstring outlineLayoutQuery;
         int cachedTheme{ -1 };
         unsigned zoomFallbackDpi{};
         int zoomFallbackTheme{ -1 };
@@ -1414,6 +1415,8 @@ namespace
     std::vector<RECT> g_searchResultRects;
     std::vector<int> g_searchResultIds;
     RECT g_favoriteButtonRect{};
+    RECT g_outlineToggleAllRect{};
+    RECT g_outlineSearchRect{};
     RECT g_favoriteListRect{};
     RECT g_favoriteListScrollTrackRect{};
     RECT g_favoriteListScrollThumbRect{};
@@ -1608,6 +1611,9 @@ namespace
     bool g_searchInputFocused{};
     bool g_searchHasRun{};
     bool g_searchCaretVisible{ true };
+    bool g_outlineSearchFocused{};
+    bool g_outlineSearchExpanded{};
+    bool g_outlineSearchCaretVisible{ true };
     bool g_searchMatchCase{};
     bool g_sidebarKeyboardFocus{};
     RECT g_searchOptionsButtonRect{};
@@ -1708,8 +1714,10 @@ namespace
     std::wstring g_hoverTip;
     std::wstring g_searchQuery;
     std::wstring g_searchLastQuery;
+    std::wstring g_outlineSearchQuery;
     std::wstring g_pageInputText;
     int g_searchCaretIndex{};
+    int g_outlineSearchCaretIndex{};
     int g_pageCaretIndex{};
     int g_homeSearchCaretIndex{};
     std::wstring g_homeSearchQuery;
@@ -3068,10 +3076,50 @@ namespace
         return std::max<int>(1, r.bottom - r.top);
     }
 
+    std::vector<int> FilteredOutlineRows(PdfTab const& tab)
+    {
+        std::vector<int> rows;
+        int count = static_cast<int>(tab.outline.size());
+        if (g_outlineSearchQuery.empty())
+        {
+            rows.reserve(static_cast<size_t>(count));
+            for (int i = 0; i < count; ++i) rows.push_back(i);
+            return rows;
+        }
+
+        std::wstring query = LowerCopy(g_outlineSearchQuery);
+        std::vector<bool> keep(static_cast<size_t>(count), false);
+        std::vector<int> parentAtDepth;
+        parentAtDepth.reserve(8);
+        for (int i = 0; i < count; ++i)
+        {
+            int depth = std::max(0, tab.outline[static_cast<size_t>(i)].depth);
+            if (static_cast<int>(parentAtDepth.size()) > depth)
+                parentAtDepth.resize(static_cast<size_t>(depth));
+            bool matches = LowerCopy(tab.outline[static_cast<size_t>(i)].title).find(query) != std::wstring::npos;
+            if (matches)
+            {
+                keep[static_cast<size_t>(i)] = true;
+                for (int parentDepth = 0; parentDepth < depth; ++parentDepth)
+                {
+                    if (parentDepth < static_cast<int>(parentAtDepth.size()) && parentAtDepth[static_cast<size_t>(parentDepth)] >= 0)
+                        keep[static_cast<size_t>(parentAtDepth[static_cast<size_t>(parentDepth)])] = true;
+                }
+            }
+            if (static_cast<int>(parentAtDepth.size()) <= depth)
+                parentAtDepth.resize(static_cast<size_t>(depth + 1), -1);
+            parentAtDepth[static_cast<size_t>(depth)] = i;
+        }
+        for (int i = 0; i < count; ++i)
+            if (keep[static_cast<size_t>(i)]) rows.push_back(i);
+        return rows;
+    }
+
     void EnsureOutlineLayout(HDC dc, PdfTab& tab, int layoutWidth)
     {
-        int rows = static_cast<int>(tab.outline.size());
-        bool compactOutline = rows > 512;
+        std::vector<int> displayRows = FilteredOutlineRows(tab);
+        int rows = static_cast<int>(displayRows.size());
+        bool compactOutline = tab.outline.size() > 512;
         if ((g_resizingSidebar || g_sidebarAnimating) && !tab.outlineLayout.empty())
         {
             g_sidebarContentHeight = tab.outlineLayoutContentHeight;
@@ -3081,7 +3129,8 @@ namespace
             tab.outlineLayoutFont == EffectiveOutlineFont() &&
             tab.outlineLayoutDpi == g_dpi &&
             tab.outlineLayoutRows == rows &&
-            tab.outlineLayoutCollapseVersion == tab.outlineCollapseVersion)
+            tab.outlineLayoutCollapseVersion == tab.outlineCollapseVersion &&
+            tab.outlineLayoutQuery == g_outlineSearchQuery)
         {
             g_sidebarContentHeight = tab.outlineLayoutContentHeight;
             return;
@@ -3091,10 +3140,11 @@ namespace
         tab.outlineLayout.reserve(static_cast<size_t>(rows));
         int y = S(6);
         int collapsedDepth = -1;
-        for (int i = 0; i < rows; ++i)
+        for (int displayIndex = 0; displayIndex < rows; ++displayIndex)
         {
+            int i = displayRows[static_cast<size_t>(displayIndex)];
             int depth = tab.outline[static_cast<size_t>(i)].depth;
-            if (collapsedDepth >= 0)
+            if (g_outlineSearchQuery.empty() && collapsedDepth >= 0)
             {
                 if (depth > collapsedDepth) continue;
                 collapsedDepth = -1;
@@ -3110,10 +3160,11 @@ namespace
                 : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
             int rowH = std::max(baseRowH, textH + S(8));
             int page = tab.outline[static_cast<size_t>(i)].page;
-            bool hasChildren = i + 1 < rows && tab.outline[static_cast<size_t>(i + 1)].depth > depth;
+            int nextIndex = displayIndex + 1 < rows ? displayRows[static_cast<size_t>(displayIndex + 1)] : -1;
+            bool hasChildren = nextIndex >= 0 && tab.outline[static_cast<size_t>(nextIndex)].depth > depth;
             tab.outlineLayout.push_back(OutlineLayoutRow{ y, rowH, page, i, depth, textH, hasChildren });
             y += rowH + S(4);
-            if (hasChildren && g_collapsedOutlineRows.find(i) != g_collapsedOutlineRows.end())
+            if (g_outlineSearchQuery.empty() && hasChildren && g_collapsedOutlineRows.find(i) != g_collapsedOutlineRows.end())
             {
                 collapsedDepth = depth;
             }
@@ -3124,8 +3175,91 @@ namespace
         tab.outlineLayoutDpi = g_dpi;
         tab.outlineLayoutRows = rows;
         tab.outlineLayoutCollapseVersion = tab.outlineCollapseVersion;
+        tab.outlineLayoutQuery = g_outlineSearchQuery;
         tab.outlineLayoutContentHeight = std::max(0, y);
         g_sidebarContentHeight = tab.outlineLayoutContentHeight;
+    }
+
+    void DrawHighlightedOutlineText(HDC dc, std::wstring const& title, RECT textRect, COLORREF textColor)
+    {
+        std::wstring query = LowerCopy(g_outlineSearchQuery);
+        if (query.empty())
+        {
+            Text(dc, title, textRect, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, textColor);
+            return;
+        }
+
+        std::vector<std::pair<int, int>> matches;
+        std::wstring lowerTitle = LowerCopy(title);
+        for (size_t at = lowerTitle.find(query); at != std::wstring::npos; at = lowerTitle.find(query, at + query.size()))
+            matches.push_back({ static_cast<int>(at), static_cast<int>(at + query.size()) });
+
+        TEXTMETRICW tm{};
+        GetTextMetricsW(dc, &tm);
+        int lineHeight = std::max<int>(1, tm.tmHeight);
+        int availableWidth = std::max<int>(1, textRect.right - textRect.left);
+        std::vector<std::pair<int, int>> lines;
+        int lineStart = 0;
+        int lineWidth = 0;
+        for (int i = 0; i < static_cast<int>(title.size()); ++i)
+        {
+            if (title[static_cast<size_t>(i)] == L'\n')
+            {
+                lines.push_back({ lineStart, i });
+                lineStart = i + 1;
+                lineWidth = 0;
+                continue;
+            }
+            SIZE charSize{};
+            GetTextExtentPoint32W(dc, title.c_str() + i, 1, &charSize);
+            if (i > lineStart && lineWidth + charSize.cx > availableWidth)
+            {
+                lines.push_back({ lineStart, i });
+                lineStart = i;
+                lineWidth = 0;
+            }
+            lineWidth += charSize.cx;
+        }
+        lines.push_back({ lineStart, static_cast<int>(title.size()) });
+
+        COLORREF markFill = IsDarkTheme() ? MixColor(T().panel2, RGB(245, 164, 72), 0.24) : RGB(255, 250, 235);
+        COLORREF markLine = IsDarkTheme() ? MixColor(T().accent, RGB(245, 164, 72), 0.55) : RGB(239, 174, 70);
+        for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
+        {
+            int start = lines[lineIndex].first;
+            int end = lines[lineIndex].second;
+            if (end <= start) continue;
+            int top = textRect.top + static_cast<int>(lineIndex) * lineHeight;
+            if (top >= textRect.bottom) break;
+            RECT lineRect{ textRect.left, top, textRect.right,
+                std::min<int>(static_cast<int>(textRect.bottom), top + lineHeight) };
+            std::wstring line = title.substr(static_cast<size_t>(start), static_cast<size_t>(end - start));
+            Text(dc, line, lineRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, textColor);
+            for (auto const& match : matches)
+            {
+                int hitStart = std::max(start, match.first);
+                int hitEnd = std::min(end, match.second);
+                if (hitEnd <= hitStart) continue;
+                std::wstring before = title.substr(static_cast<size_t>(start), static_cast<size_t>(hitStart - start));
+                std::wstring hit = title.substr(static_cast<size_t>(hitStart), static_cast<size_t>(hitEnd - hitStart));
+                SIZE beforeSize{};
+                SIZE hitSize{};
+                GetTextExtentPoint32W(dc, before.c_str(), static_cast<int>(before.size()), &beforeSize);
+                GetTextExtentPoint32W(dc, hit.c_str(), static_cast<int>(hit.size()), &hitSize);
+                RECT mark{
+                    textRect.left + beforeSize.cx - S(2),
+                    lineRect.top + S(2),
+                    textRect.left + beforeSize.cx + hitSize.cx + S(2),
+                    lineRect.bottom - S(2) };
+                RoundFill(dc, mark, S(3), markFill, markLine);
+                RECT hitRect{
+                    textRect.left + beforeSize.cx,
+                    lineRect.top,
+                    textRect.left + beforeSize.cx + hitSize.cx + S(1),
+                    lineRect.bottom };
+                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, textColor);
+            }
+        }
     }
 
     int ClampSidebarScrollValue(int value);
@@ -5068,7 +5202,7 @@ namespace
     {
         switch (kind)
         {
-        case FavoriteKind::Outline: return L"目录";
+        case FavoriteKind::Outline: return L"书签";
         case FavoriteKind::Text: return L"文本";
         case FavoriteKind::Image: return L"图片";
         default: return L"页面";
@@ -8376,7 +8510,7 @@ namespace
             }
             if (page >= 0 && page < tab.pageCount)
             {
-                std::wstring title = current->title ? FromUtf8(current->title) : L"\u672a\u547d\u540d\u76ee\u5f55";
+                std::wstring title = current->title ? FromUtf8(current->title) : L"\u672a\u547d\u540d\u4e66\u7b7e";
                 tab.outline.push_back(OutlineItem{ title, page, current->y, depth });
             }
             if (current->down)
@@ -13261,6 +13395,13 @@ namespace
         if (PdfTab* tab = Active()) SaveActiveTabSidebarState(*tab);
         g_favoriteListOpen = false;
         g_hoverFavoriteItem = -1;
+        if (mode != 0)
+        {
+            g_outlineSearchFocused = false;
+            g_outlineSearchExpanded = false;
+            g_outlineSearchCaretVisible = true;
+            KillTimer(hwnd, 13);
+        }
         g_sideMode = mode;
         RestoreActiveTabSidebarState(hwnd);
     }
@@ -14220,7 +14361,7 @@ namespace
         int dirX = dateX + S(180);
         Text(dc, L"\u6587\u6863\u540d\u79f0", RECT{ left, headerTop, dateX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         Text(dc, L"\u9605\u8bfb\u65f6\u95f4", RECT{ dateX, headerTop, dirX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        Text(dc, L"\u6240\u5728\u76ee\u5f55", RECT{ dirX, headerTop, sizeX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        Text(dc, L"\u6240\u5728\u4e66\u7b7e", RECT{ dirX, headerTop, sizeX - S(20), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         Text(dc, L"\u5927\u5c0f", RECT{ sizeX, headerTop, actionX - S(16), headerTop + S(28) }, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         RECT rowsViewport{ viewport.left, headerTop + S(34), viewport.right, viewport.bottom };
         RECT rowPaintWindow{ rowsViewport.left, rowsViewport.top - S(60), rowsViewport.right, rowsViewport.bottom + S(60) };
@@ -14453,7 +14594,7 @@ namespace
         auto oldFont = SelectObject(dc, f);
         RECT tabBar{ g_sidebar.left + S(10), g_sidebar.top + S(10), g_sidebar.right - S(10), g_sidebar.top + S(42) };
         int tabWidth = (tabBar.right - tabBar.left - S(12)) / 3;
-        const wchar_t* sideTabs[] = { L"\u76ee\u5f55", L"\u7f29\u7565\u56fe", L"\u4e66\u7b7e" };
+        const wchar_t* sideTabs[] = { L"\u4e66\u7b7e", L"\u7f29\u7565\u56fe", L"\u4e66\u7b7e" };
         for (int i = 0; i < 3; ++i)
         {
             RECT tabRect{ tabBar.left + i * (tabWidth + S(6)), tabBar.top, tabBar.left + i * (tabWidth + S(6)) + tabWidth, tabBar.bottom };
@@ -14496,6 +14637,11 @@ namespace
         g_sidebarContentCloseRect = {};
         if (!SidebarRailVisible() || SidebarTotalWidth() <= 0) return;
         g_favoriteButtonRect = {};
+        g_outlineToggleAllRect = {};
+        g_outlineSearchRect = {};
+        bool favoriteOverlayHit = g_favoriteListOpen &&
+            !IsRectEmpty(&g_favoriteListRect) &&
+            Hit(g_favoriteListRect, g_mousePos.x, g_mousePos.y);
         RECT sidebarFull{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
         if (IsGraphiteTheme()) Fill(dc, sidebarFull, RGB(34, 37, 41));
         else GlassSurface(dc, sidebarFull, 128);
@@ -14528,12 +14674,12 @@ namespace
         int tabGap = S(5);
         int tabStart = tabBar.left + std::max<int>(0, (tabBar.right - tabBar.left - tabWidth) / 2);
         SideTabIcon sideIcons[] = { SideTabIcon::Outline, SideTabIcon::Thumbnails, SideTabIcon::Search, SideTabIcon::Notes };
-        const wchar_t* sideTips[] = { L"\u76ee\u5f55", L"\u7f29\u7565\u56fe", L"\u67e5\u627e" };
+        const wchar_t* sideTips[] = { L"\u4e66\u7b7e", L"\u7f29\u7565\u56fe", L"\u67e5\u627e" };
         for (int i = 0; i < 4; ++i)
         {
             RECT tabRect{ tabStart, tabBar.top + i * (tabWidth + tabGap), tabStart + tabWidth, tabBar.top + i * (tabWidth + tabGap) + tabWidth };
             g_sideTabRects.push_back(tabRect);
-            if (registerSidebarButtons) AddButton(0, tabRect, L"", i == 0 ? L"\u76ee\u5f55" : (i == 1 ? L"\u7f29\u7565\u56fe" : (i == 2 ? L"\u67e5\u627e" : L"\u6ce8\u91ca")));
+            if (registerSidebarButtons) AddButton(0, tabRect, L"", i == 0 ? L"\u4e66\u7b7e" : (i == 1 ? L"\u7f29\u7565\u56fe" : (i == 2 ? L"\u67e5\u627e" : L"\u6ce8\u91ca")));
             bool hovered = g_mousePos.x >= tabRect.left && g_mousePos.x < tabRect.right && g_mousePos.y >= tabRect.top && g_mousePos.y < tabRect.bottom;
             bool active = i == g_sideMode;
             if (hovered || active)
@@ -14577,11 +14723,41 @@ namespace
             g_sidebarContentCloseRect.right - S(7), g_sidebarContentCloseRect.bottom - S(7) };
         DrawCloseGlyph(dc, closeGlyph, closePressed || closeHovered ? T().text : T().muted);
 
-        const wchar_t* panelTitle = g_sideMode == 0 ? L"目录"
+        if (g_sideMode == 0)
+        {
+            std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"收起所有" : L"展开所有";
+            SIZE toggleTextSize{};
+            GetTextExtentPoint32W(dc, toggleText.c_str(), static_cast<int>(toggleText.size()), &toggleTextSize);
+            int toggleWidth = toggleTextSize.cx + S(12);
+            g_outlineToggleAllRect = RECT{
+                g_sidebarContentCloseRect.left - S(8) - toggleWidth,
+                g_sidebarContentCloseRect.top,
+                g_sidebarContentCloseRect.left - S(8),
+                g_sidebarContentCloseRect.bottom };
+            if (registerSidebarButtons)
+                AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, toggleText, L"收起或展开全部书签");
+            bool toggleHovered = Hit(g_outlineToggleAllRect, g_mousePos.x, g_mousePos.y);
+            bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_outlineToggleAllRect);
+            if (toggleHovered || togglePressed)
+            {
+                COLORREF fill = togglePressed
+                    ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.48)
+                    : SidebarHoverFill();
+                RoundFill(dc, g_outlineToggleAllRect, S(5), fill, fill);
+            }
+            RECT toggleLabel{
+                g_outlineToggleAllRect.left + S(6), g_outlineToggleAllRect.top,
+                g_outlineToggleAllRect.right - S(6), g_outlineToggleAllRect.bottom };
+            Text(dc, toggleText, toggleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                togglePressed ? T().text : T().muted);
+        }
+
+        const wchar_t* panelTitle = g_sideMode == 0 ? L"书签"
             : (g_sideMode == 1 ? L"缩略图" : (g_sideMode == 2 ? L"查找" : L"注释"));
         RECT panelTitleRect{
             g_sidebar.left + S(14), g_sidebar.top + S(6),
-            g_sidebarContentCloseRect.left - S(8), g_sidebar.top + S(30) };
+            (IsRectEmpty(&g_outlineToggleAllRect) ? g_sidebarContentCloseRect.left : g_outlineToggleAllRect.left) - S(8),
+            g_sidebar.top + S(30) };
         Text(dc, panelTitle, panelTitleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
 
         auto visible = [&](RECT r)
@@ -14846,7 +15022,8 @@ namespace
                     g_sidebarRowRects.push_back(row);
                     g_sidebarRowIds.push_back(static_cast<int>(i));
                     bool selected = static_cast<int>(i) == g_activeAnnotation;
-                    bool hovered = !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
+                    bool hovered = !favoriteOverlayHit &&
+                        !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered || selected)
                     {
                         COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.22 : 0.12) : T().panel2;
@@ -14912,7 +15089,7 @@ namespace
                     g_sidebar.top + S(102),
                     g_sidebar.right - S(12),
                     g_sidebar.top + S(132) };
-                Text(dc, L"正在加载目录…", loadingText,
+                Text(dc, L"正在加载书签…", loadingText,
                     DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
                 g_sidebarContentHeight = 0;
                 KillTimer(g_hwnd, 5);
@@ -14922,44 +15099,42 @@ namespace
             }
             KillTimer(g_hwnd, 7);
             RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(62) };
-            Text(dc, L"\u6587\u5b57\u5927\u5c0f", sizeBar, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
-
             Fill(dc, sizeBar, T().panel);
-            std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"\u6536\u8d77\u6240\u6709" : L"\u5c55\u5f00\u6240\u6709";
-            SIZE toggleTextSize{};
-            GetTextExtentPoint32W(dc, toggleText.c_str(),
-                static_cast<int>(toggleText.size()), &toggleTextSize);
-            int togglePadding = S(3);
-            int toggleWidth = toggleTextSize.cx + togglePadding * 2;
-            RECT toggleAll{ g_sidebar.left + S(11), sizeBar.top,
-                g_sidebar.left + S(11) + toggleWidth, sizeBar.bottom };
-            if (registerSidebarButtons) AddButton(CmdOutlineToggleAll, toggleAll, toggleText);
-            bool toggleHovered = Hit(toggleAll, g_mousePos.x, g_mousePos.y);
-            bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &toggleAll);
-            if (toggleHovered || togglePressed)
+            HFONT searchFont = Font(10);
+            HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
+            SIZE placeholderSize{};
+            GetTextExtentPoint32W(dc, L"\u641c\u7d22\u4e66\u7b7e", 4, &placeholderSize);
+            int compactSearchWidth = std::max<int>(S(150), placeholderSize.cx + S(28));
+            int searchRight = g_outlineSearchExpanded
+                ? sizeBar.right
+                : std::min<int>(sizeBar.right, sizeBar.left + compactSearchWidth);
+            g_outlineSearchRect = RECT{ sizeBar.left, sizeBar.top, searchRight, sizeBar.bottom };
+            Fill(dc, g_outlineSearchRect, T().paper);
+            RECT searchText{
+                g_outlineSearchRect.left + S(10), g_outlineSearchRect.top,
+                g_outlineSearchRect.right - S(10), g_outlineSearchRect.bottom };
+            std::wstring searchShown = g_outlineSearchQuery.empty() ? L"\u641c\u7d22\u4e66\u7b7e" : g_outlineSearchQuery;
+            Text(dc, searchShown, searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                g_outlineSearchQuery.empty() ? T().muted : T().text);
+            if (g_outlineSearchFocused && g_outlineSearchCaretVisible)
             {
-                COLORREF fill{};
-                COLORREF line{};
-                if (IsGlassTheme())
-                {
-                    fill = togglePressed ? RGB(232, 236, 241) : RGB(255, 255, 255);
-                    line = togglePressed ? RGB(202, 210, 220) : RGB(228, 234, 241);
-                }
-                else
-                {
-                    fill = togglePressed
-                        ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.48)
-                        : MixColor(T().panel2, T().paper, IsDarkTheme() ? 0.18 : 0.50);
-                    line = togglePressed ? T().line : MixColor(T().line, T().text, 0.08);
-                }
-                RoundFill(dc, toggleAll, S(5), fill, line);
+                g_outlineSearchCaretIndex = std::clamp<int>(g_outlineSearchCaretIndex, 0, static_cast<int>(g_outlineSearchQuery.size()));
+                int caretX = CaretXCurrentFont(dc, g_outlineSearchQuery, searchText, g_outlineSearchCaretIndex, false) + S(1);
+                caretX = std::clamp<int>(caretX, searchText.left + S(1), searchText.right - S(1));
+                HPEN caret = CreatePen(PS_SOLID, std::max(1, S(1)), T().accent);
+                HGDIOBJ oldCaret = SelectObject(dc, caret);
+                MoveToEx(dc, caretX, searchText.top + S(6), nullptr);
+                LineTo(dc, caretX, searchText.bottom - S(6));
+                SetImeCompositionPoint(g_hwnd, POINT{ caretX, searchText.bottom - S(6) });
+                SelectObject(dc, oldCaret);
+                DeleteObject(caret);
             }
-            COLORREF toggleColor = togglePressed ? T().text : (toggleHovered ? MixColor(T().text, T().muted, 0.08) : T().muted);
-            RECT toggleLabel{ toggleAll.left + togglePadding, toggleAll.top,
-                toggleAll.right - togglePadding, toggleAll.bottom };
-            Text(dc, toggleText, toggleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE, toggleColor);
+            SelectObject(dc, oldSearchFont);
+            DeleteObject(searchFont);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
+            if (!g_outlineSearchExpanded)
+            {
             int favoriteSize = sizeBar.bottom - sizeBar.top;
             int favoriteRight = smallBtnNew.left - S(4);
             g_favoriteButtonRect = RECT{
@@ -14984,8 +15159,8 @@ namespace
                 g_favoriteButtonRect.right - S(5), g_favoriteButtonRect.bottom - S(5) };
             DrawFavoriteIcon(dc, favoriteGlyph,
                 favoritePressed || favoriteHovered ? T().accent : SidebarIconColor(), false);
-            if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
-            if (registerSidebarButtons) AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"\u589e\u5927\u76ee\u5f55\u5b57\u53f7");
+            if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"减小书签字号");
+            if (registerSidebarButtons) AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"增大书签字号");
             DrawStatusHotArea(dc, smallBtnNew, 5);
             DrawStatusHotArea(dc, largeBtnNew, 5);
             HFONT sizeFont = Font(10);
@@ -14994,6 +15169,7 @@ namespace
             Text(dc, L"A+", largeBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
             SelectObject(dc, oldSizeFont);
             DeleteObject(sizeFont);
+            }
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
@@ -15050,7 +15226,8 @@ namespace
                     MoveToEx(dc, lineX, firstLineCenterY, nullptr);
                     LineTo(dc, iconLeft - S(4), firstLineCenterY);
                     bool selected = g_selectedOutlineRow == i;
-                    bool hovered = !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
+                    bool hovered = !favoriteOverlayHit &&
+                        !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered && !selected) RoundFill(dc, row, S(5), SidebarHoverFill(), SidebarHoverFill());
                     if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(), SidebarSelectedBorder());
 
@@ -15059,7 +15236,8 @@ namespace
                         RECT toggle{ lineX - S(5), firstLineCenterY - S(5), lineX + S(5), firstLineCenterY + S(5) };
                         g_outlineToggleRects.push_back(toggle);
                         g_outlineToggleRowIds.push_back(i);
-                        bool toggleHover = !g_draggingSidebarScroll && Hit(toggle, g_mousePos.x, g_mousePos.y);
+                        bool toggleHover = !favoriteOverlayHit &&
+                            !g_draggingSidebarScroll && Hit(toggle, g_mousePos.x, g_mousePos.y);
                         COLORREF toggleBg = SidebarToggleFill(toggleHover);
                         COLORREF toggleLine = SidebarToggleLine(toggleHover);
                         RoundFill(dc, toggle, S(2), toggleBg, toggleBg);
@@ -15086,10 +15264,13 @@ namespace
 
                     RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
                     DrawBookmarkIcon(dc, mark, markColor, false);
-                    Text(dc, label, tx,
-                        compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
-                                       : (DT_LEFT | DT_WORDBREAK | DT_NOPREFIX),
-                        rowText);
+                    if (!g_outlineSearchQuery.empty() && !compactOutline)
+                        DrawHighlightedOutlineText(dc, label, tx, rowText);
+                    else
+                        Text(dc, label, tx,
+                            compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
+                                           : (DT_LEFT | DT_WORDBREAK | DT_NOPREFIX),
+                            rowText);
                     Text(dc, std::to_wstring(page + 1), pageRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, rowAux);
                 }
             }
@@ -20422,6 +20603,19 @@ namespace
                     SetCursor(LoadCursorW(nullptr, clickable ? IDC_HAND : IDC_ARROW));
                     return TRUE;
                 }
+                if (g_favoriteListOpen && Hit(g_favoriteListRect, pt.x, pt.y))
+                {
+                    bool item = std::any_of(g_favoriteItemRects.begin(), g_favoriteItemRects.end(),
+                        [&](RECT const& row) { return Hit(row, pt.x, pt.y); });
+                    SetCursor(LoadCursorW(nullptr, item ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
+                if (g_sideMode == 0 && SidebarVisible() &&
+                    !IsRectEmpty(&g_outlineSearchRect) && Hit(g_outlineSearchRect, pt.x, pt.y))
+                {
+                    SetCursor(LoadCursorW(nullptr, g_outlineSearchFocused ? IDC_IBEAM : IDC_ARROW));
+                    return TRUE;
+                }
                 if (g_autoScrollActive)
                 {
                     SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
@@ -20550,6 +20744,23 @@ namespace
             int y = GET_Y_LPARAM(lParam);
             g_outlineClickHandledOnDown = false;
             if (Active()) RefreshReaderHitGeometry(hwnd);
+            // The favorite popup is a foreground overlay. Resolve it before
+            // the rail, outline, and page hit tests so an overlapping point
+            // can never activate content underneath the popup.
+            if (g_favoriteListOpen && Hit(g_favoriteListRect, x, y))
+            {
+                HandleFavoriteClick(hwnd, x, y);
+                return 0;
+            }
+            if (g_outlineSearchExpanded &&
+                !(g_sideMode == 0 && Hit(g_outlineSearchRect, x, y)))
+            {
+                g_outlineSearchExpanded = false;
+                g_outlineSearchFocused = false;
+                g_outlineSearchCaretVisible = true;
+                KillTimer(hwnd, 13);
+                InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+            }
             // Resolve rail clicks from the current geometry before any
             // scroll/content hit tests. The painted rectangle list can still
             // describe the previous panel width during an immediate toggle.
@@ -20567,6 +20778,17 @@ namespace
                 g_favoriteListOpen = false;
                 if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
                 InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (g_sideMode == 0 && SidebarVisible() &&
+                !IsRectEmpty(&g_outlineToggleAllRect) &&
+                Hit(g_outlineToggleAllRect, x, y))
+            {
+                g_pressedButtonRect = g_outlineToggleAllRect;
+                g_hasPressedButton = true;
+                SetTimer(hwnd, 2, 90, nullptr);
+                InvalidateRect(hwnd, &g_outlineToggleAllRect, FALSE);
+                Command(hwnd, CmdOutlineToggleAll);
                 return 0;
             }
             if (HandleFavoriteClick(hwnd, x, y))
@@ -20912,6 +21134,25 @@ namespace
                     ScrollSidebarTo(hwnd, MulDiv(thumbTop - g_sidebarScrollTrackRect.top, maxScroll, travel));
                     return 0;
                 }
+            }
+            if (Active() && g_sideMode == 0 && Hit(g_outlineSearchRect, x, y))
+            {
+                RECT inputText{
+                    g_outlineSearchRect.left + S(10),
+                    g_outlineSearchRect.top,
+                    g_outlineSearchRect.right - S(10),
+                    g_outlineSearchRect.bottom };
+                g_outlineSearchExpanded = true;
+                g_outlineSearchFocused = true;
+                g_outlineSearchCaretIndex = CaretIndexFromPoint(
+                    hwnd, g_outlineSearchQuery, inputText, 10, x, false);
+                g_outlineSearchCaretVisible = true;
+                g_favoriteListOpen = false;
+                g_hoverFavoriteItem = -1;
+                g_sidebarKeyboardFocus = false;
+                SetTimer(hwnd, 13, 500, nullptr);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
             }
             if (g_sideMode == 3)
             {
@@ -21384,12 +21625,15 @@ namespace
             // not the whole scrollable content area; otherwise moving from a
             // directory row to the scrollbar produces no state transition.
             UpdateSidebarScrollRects();
-            g_mainScrollHover = Hit(g_mainScrollTrackRect, mx, my);
-            g_mainHScrollHover = Hit(g_mainHScrollTrackRect, mx, my);
+            bool favoriteOverlayHit = g_favoriteListOpen &&
+                !IsRectEmpty(&g_favoriteListRect) &&
+                Hit(g_favoriteListRect, mx, my);
+            g_mainScrollHover = !favoriteOverlayHit && Hit(g_mainScrollTrackRect, mx, my);
+            g_mainHScrollHover = !favoriteOverlayHit && Hit(g_mainHScrollTrackRect, mx, my);
             g_homeScrollHover = Hit(g_homeScrollTrackRect, mx, my);
-            g_sidebarScrollHover = SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) &&
+            g_sidebarScrollHover = !favoriteOverlayHit && SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) &&
                 Hit(g_sidebarScrollTrackRect, mx, my);
-            g_sidebarPanelToggleHover = Hit(g_sidebarPanelToggleRect, mx, my);
+            g_sidebarPanelToggleHover = !favoriteOverlayHit && Hit(g_sidebarPanelToggleRect, mx, my);
             if (oldSidebarPanelToggleHover != g_sidebarPanelToggleHover)
             {
                 InvalidateRect(hwnd, &g_sidebarPanelToggleRect, FALSE);
@@ -21541,15 +21785,15 @@ namespace
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
                 int tabId = i < g_tabRectIds.size() ? g_tabRectIds[i] : static_cast<int>(i);
-                if (Hit(g_tabRects[i], mx, my)) g_hoverTab = tabId;
+                if (!favoriteOverlayHit && Hit(g_tabRects[i], mx, my)) g_hoverTab = tabId;
                 RECT close{ g_tabRects[i].right - S(24), g_tabRects[i].top + S(2), g_tabRects[i].right - S(4), g_tabRects[i].bottom - S(2) };
-                if (Hit(close, mx, my))
+                if (!favoriteOverlayHit && Hit(close, mx, my))
                 {
                     g_hoverTabClose = tabId;
                     break;
                 }
             }
-            if (g_tabListOpen)
+            if (!favoriteOverlayHit && g_tabListOpen)
             {
                 for (size_t i = 0; i < g_tabListItemRects.size() && i < g_tabListItemIds.size(); ++i)
                 {
@@ -21571,7 +21815,7 @@ namespace
                     }
                 }
             }
-            if (SidebarVisible() && g_sideMode == 0)
+            if (!favoriteOverlayHit && SidebarVisible() && g_sideMode == 0)
             {
                 for (size_t i = 0; i < g_outlineToggleRects.size() && i < g_outlineToggleRowIds.size(); ++i)
                 {
@@ -21590,7 +21834,7 @@ namespace
                     }
                 }
             }
-            if (SidebarVisible() && g_sideMode == 2)
+            if (!favoriteOverlayHit && SidebarVisible() && g_sideMode == 2)
             {
                 for (size_t i = 0; i < g_searchResultRects.size() && i < g_searchResultIds.size(); ++i)
                 {
@@ -21608,7 +21852,7 @@ namespace
             g_hasHoverTip = false;
             g_hoverTipIsPdfLink = false;
             g_hoverTip.clear();
-            if (g_hoverTab >= 0)
+            if (!favoriteOverlayHit && g_hoverTab >= 0)
             {
                 for (size_t i = 0; i < g_tabRects.size() && i < g_tabRectIds.size() && i < g_tabTitleTruncated.size(); ++i)
                 {
@@ -21621,22 +21865,25 @@ namespace
                     }
                 }
             }
-            if (PdfTab* tab = Active(); tab && !g_selectingContent && Hit(g_stage, mx, my))
+            if (!favoriteOverlayHit)
             {
-                int page = -1;
-                RECT pageRect{};
-                std::wstring uri;
-                RECT linkRect{};
-                if (PageRectAtPoint(*tab, mx, my, page, pageRect) &&
-                    HitTestPdfLink(*tab, page, pageRect, POINT{ mx, my }, uri, &linkRect))
+                if (PdfTab* tab = Active(); tab && !g_selectingContent && Hit(g_stage, mx, my))
                 {
-                    g_hasHoverTip = true;
-                    g_hoverTipIsPdfLink = true;
-                    g_hoverTip = uri;
-                    g_hoverTipRect = linkRect;
+                    int page = -1;
+                    RECT pageRect{};
+                    std::wstring uri;
+                    RECT linkRect{};
+                    if (PageRectAtPoint(*tab, mx, my, page, pageRect) &&
+                        HitTestPdfLink(*tab, page, pageRect, POINT{ mx, my }, uri, &linkRect))
+                    {
+                        g_hasHoverTip = true;
+                        g_hoverTipIsPdfLink = true;
+                        g_hoverTip = uri;
+                        g_hoverTipRect = linkRect;
+                    }
                 }
             }
-            if (!Active())
+            if (!favoriteOverlayHit && !Active())
             {
                 for (size_t i = 0; i < g_recentRects.size(); ++i)
                 {
@@ -21661,7 +21908,7 @@ namespace
                     }
                 }
             }
-            for (auto const& b : g_buttons)
+            if (!favoriteOverlayHit) for (auto const& b : g_buttons)
             {
                 if (Hit(b.rect, mx, my))
                 {
@@ -22130,6 +22377,18 @@ namespace
                 InvalidateRect(hwnd, &g_searchInputRect, FALSE);
                 return 0;
             }
+            if (wParam == 13)
+            {
+                if (!g_outlineSearchFocused || g_sideMode != 0)
+                {
+                    g_outlineSearchCaretVisible = true;
+                    KillTimer(hwnd, 13);
+                    return 0;
+                }
+                g_outlineSearchCaretVisible = !g_outlineSearchCaretVisible;
+                InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+                return 0;
+            }
             if (wParam == 15)
             {
                 if (!g_homeSearchFocused || Active())
@@ -22539,6 +22798,46 @@ namespace
                     return 0;
                 }
             }
+            if (g_outlineSearchFocused && g_sideMode == 0)
+            {
+                if (wParam == VK_LEFT)
+                {
+                    g_outlineSearchCaretIndex = std::max(0, g_outlineSearchCaretIndex - 1);
+                    g_outlineSearchCaretVisible = true;
+                    InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_RIGHT)
+                {
+                    g_outlineSearchCaretIndex = std::min(
+                        static_cast<int>(g_outlineSearchQuery.size()), g_outlineSearchCaretIndex + 1);
+                    g_outlineSearchCaretVisible = true;
+                    InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_HOME)
+                {
+                    g_outlineSearchCaretIndex = 0;
+                    g_outlineSearchCaretVisible = true;
+                    InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_END)
+                {
+                    g_outlineSearchCaretIndex = static_cast<int>(g_outlineSearchQuery.size());
+                    g_outlineSearchCaretVisible = true;
+                    InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_DELETE && g_outlineSearchCaretIndex < static_cast<int>(g_outlineSearchQuery.size()))
+                {
+                    g_outlineSearchQuery.erase(static_cast<size_t>(g_outlineSearchCaretIndex), 1);
+                    g_outlineSearchCaretVisible = true;
+                    SetTimer(hwnd, 13, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
             if (g_homeSearchFocused && !Active())
             {
                 if (wParam == VK_LEFT) { g_homeSearchCaretIndex = std::max(0, g_homeSearchCaretIndex - 1); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
@@ -22559,6 +22858,15 @@ namespace
             if (wParam == VK_ESCAPE && g_homeSearchFocused)
             {
                 g_homeSearchFocused = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (wParam == VK_ESCAPE && g_outlineSearchFocused)
+            {
+                g_outlineSearchFocused = false;
+                g_outlineSearchExpanded = false;
+                g_outlineSearchCaretVisible = true;
+                KillTimer(hwnd, 13);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
@@ -22675,6 +22983,36 @@ namespace
                 {
                     g_homeSearchCaretVisible = true;
                     SetTimer(hwnd, 15, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            if (g_outlineSearchFocused && g_sideMode == 0)
+            {
+                g_outlineSearchCaretIndex = std::clamp<int>(
+                    g_outlineSearchCaretIndex, 0, static_cast<int>(g_outlineSearchQuery.size()));
+                bool changed = false;
+                if (wParam == VK_BACK)
+                {
+                    if (g_outlineSearchCaretIndex > 0)
+                    {
+                        g_outlineSearchQuery.erase(static_cast<size_t>(g_outlineSearchCaretIndex - 1), 1);
+                        --g_outlineSearchCaretIndex;
+                        changed = true;
+                    }
+                }
+                else if (wParam >= 32 && g_outlineSearchQuery.size() < 120)
+                {
+                    g_outlineSearchQuery.insert(
+                        g_outlineSearchQuery.begin() + g_outlineSearchCaretIndex,
+                        static_cast<wchar_t>(wParam));
+                    ++g_outlineSearchCaretIndex;
+                    changed = true;
+                }
+                if (changed)
+                {
+                    g_outlineSearchCaretVisible = true;
+                    SetTimer(hwnd, 13, 500, nullptr);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
