@@ -3308,7 +3308,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(36), top + S(3), side - S(6), top + S(33) }
+            ? RECT{ side - S(42), top + S(3), side - S(12), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
     }
@@ -12030,7 +12030,7 @@ namespace
 
     RECT SidebarScrollRect()
     {
-        int top = g_sidebar.top + S(g_sideMode == 0 ? 70 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
+        int top = g_sidebar.top + S(g_sideMode == 0 ? 76 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
         return RECT{ g_sidebar.left, top, g_sidebar.right, g_sidebar.bottom };
     }
 
@@ -14734,9 +14734,11 @@ namespace
             DeleteObject(f);
             return;
         }
+        // Keep the two top-row controls aligned with the two size controls
+        // below: the chevron sits above A-, and close sits above A+.
         g_sidebarContentCloseRect = RECT{
-            g_sidebar.right - S(36), g_sidebar.top + S(3),
-            g_sidebar.right - S(6), g_sidebar.top + S(33) };
+            g_sidebar.right - S(42), g_sidebar.top + S(3),
+            g_sidebar.right - S(12), g_sidebar.top + S(33) };
         if (registerSidebarButtons)
             AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
         bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
@@ -14758,9 +14760,9 @@ namespace
             bool collapseAll = g_collapsedOutlineRows.empty();
             int toggleWidth = S(30);
             g_outlineToggleAllRect = RECT{
-                g_sidebarContentCloseRect.left - S(8) - toggleWidth,
+                g_sidebarContentCloseRect.left - S(4) - toggleWidth,
                 g_sidebarContentCloseRect.top,
-                g_sidebarContentCloseRect.left - S(8),
+                g_sidebarContentCloseRect.left - S(4),
                 g_sidebarContentCloseRect.bottom };
             if (registerSidebarButtons)
                 AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, L"", collapseAll ? L"收起所有书签" : L"展开所有书签");
@@ -15123,20 +15125,40 @@ namespace
                 return;
             }
             KillTimer(g_hwnd, 7);
-            RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(62) };
+            RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(68) };
             Fill(dc, sizeBar, T().panel);
+
+            // The second row follows the compact Sumatra-style order:
+            // search, divider, favorite, smaller text, larger text.
+            RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top + S(2), sizeBar.right, sizeBar.bottom - S(2) };
+            RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top + S(2), sizeBar.right - S(34), sizeBar.bottom - S(2) };
+            int favoriteSize = sizeBar.bottom - sizeBar.top - S(4);
+            int favoriteRight = smallBtnNew.left - S(16);
+            g_favoriteButtonRect = RECT{
+                favoriteRight - favoriteSize,
+                sizeBar.top + S(2),
+                favoriteRight,
+                sizeBar.top + S(2) + favoriteSize };
+
             HFONT searchFont = Font(g_outlineSearchQuery.empty() ? 9 : 10);
             HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
             SIZE placeholderSize{};
             GetTextExtentPoint32W(dc, L"\u641c\u7d22\u4e66\u7b7e", 4, &placeholderSize);
-            int compactSearchWidth = std::max<int>(S(150), placeholderSize.cx + S(28));
+            int compactSearchWidth = std::max<int>(S(150), placeholderSize.cx + S(46));
             int searchRight = g_outlineSearchExpanded
                 ? sizeBar.right
-                : std::min<int>(sizeBar.right, sizeBar.left + compactSearchWidth);
+                : std::min<int>(sizeBar.right,
+                    std::max<int>(sizeBar.left + compactSearchWidth,
+                        g_favoriteButtonRect.left - S(18)));
             g_outlineSearchRect = RECT{ sizeBar.left, sizeBar.top, searchRight, sizeBar.bottom };
-            Fill(dc, g_outlineSearchRect, T().paper);
+            COLORREF searchFill = MixColor(T().paper, T().accent, IsDarkTheme() ? 0.10 : 0.06);
+            RoundFill(dc, g_outlineSearchRect, S(18), searchFill, searchFill);
+            RECT searchIcon{
+                g_outlineSearchRect.left + S(13), g_outlineSearchRect.top + S(5),
+                g_outlineSearchRect.left + S(37), g_outlineSearchRect.bottom - S(5) };
+            DrawSearchGlyph(dc, searchIcon, T().muted);
             RECT searchText{
-                g_outlineSearchRect.left + S(2), g_outlineSearchRect.top,
+                g_outlineSearchRect.left + S(43), g_outlineSearchRect.top,
                 g_outlineSearchRect.right - S(10), g_outlineSearchRect.bottom };
             std::wstring searchShown = g_outlineSearchQuery.empty() ? L"\u641c\u7d22\u4e66\u7b7e" : g_outlineSearchQuery;
             Text(dc, searchShown, searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
@@ -15156,17 +15178,11 @@ namespace
             }
             SelectObject(dc, oldSearchFont);
             DeleteObject(searchFont);
-            RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
-            RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
-            int favoriteSize = sizeBar.bottom - sizeBar.top;
-            int favoriteRight = smallBtnNew.left - S(4);
-            g_favoriteButtonRect = RECT{
-                favoriteRight - favoriteSize,
-                sizeBar.top,
-                favoriteRight,
-                sizeBar.top + favoriteSize };
             if (!g_outlineSearchExpanded)
             {
+            RECT divider{ g_favoriteButtonRect.left - S(9), sizeBar.top + S(7),
+                g_favoriteButtonRect.left - S(8), sizeBar.bottom - S(7) };
+            Fill(dc, divider, MixColor(T().line, T().paper, IsDarkTheme() ? 0.20 : 0.35));
             if (registerSidebarButtons)
                 AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
             bool favoriteHovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
@@ -15198,7 +15214,7 @@ namespace
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
-            RECT scrollArea{ g_sidebar.left, g_sidebar.top + S(70), g_sidebar.right, g_sidebar.bottom };
+            RECT scrollArea{ g_sidebar.left, g_sidebar.top + S(76), g_sidebar.right, g_sidebar.bottom };
             IntersectClipRect(dc, scrollArea.left, scrollArea.top, scrollArea.right, scrollArea.bottom);
             int rows = static_cast<int>(tab.outline.size());
             bool compactOutline = rows > 512;
@@ -17029,7 +17045,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(36), top + S(3), side - S(6), top + S(33) }
+            ? RECT{ side - S(42), top + S(3), side - S(12), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
 
@@ -21163,14 +21179,14 @@ namespace
             if (Active() && g_sideMode == 0 && Hit(g_outlineSearchRect, x, y))
             {
                 RECT inputText{
-                    g_outlineSearchRect.left + S(2),
+                    g_outlineSearchRect.left + S(43),
                     g_outlineSearchRect.top,
                     g_outlineSearchRect.right - S(10),
                     g_outlineSearchRect.bottom };
                 g_outlineSearchExpanded = true;
                 g_outlineSearchFocused = true;
                 g_outlineSearchCaretIndex = CaretIndexFromPoint(
-                    hwnd, g_outlineSearchQuery, inputText, 2, x, false);
+                    hwnd, g_outlineSearchQuery, inputText, 43, x, false);
                 g_outlineSearchCaretVisible = true;
                 g_favoriteListOpen = false;
                 g_hoverFavoriteItem = -1;
