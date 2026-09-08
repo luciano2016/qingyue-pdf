@@ -1900,6 +1900,13 @@ namespace
 
     int S(int value);
 
+    int SidebarMinimumWidth()
+    {
+        // 12px side padding + the four-character search label + three fixed
+        // controls. The three inter-control gaps can shrink to 2px.
+        return S(180);
+    }
+
     bool SidebarRailVisible()
     {
         if (!g_sidebarRailOpen || (g_immersive && !g_immersiveSidebarOpen)) return false;
@@ -3223,7 +3230,6 @@ namespace
         lines.push_back({ lineStart, static_cast<int>(title.size()) });
 
         COLORREF markFill = IsDarkTheme() ? MixColor(T().panel2, RGB(245, 164, 72), 0.24) : RGB(255, 250, 235);
-        COLORREF markLine = IsDarkTheme() ? MixColor(T().accent, RGB(245, 164, 72), 0.55) : RGB(239, 174, 70);
         for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
         {
             int start = lines[lineIndex].first;
@@ -3251,7 +3257,7 @@ namespace
                     lineRect.top + S(2),
                     textRect.left + beforeSize.cx + hitSize.cx + S(2),
                     lineRect.bottom - S(2) };
-                RoundFill(dc, mark, S(3), markFill, markLine);
+                RoundFill(dc, mark, S(3), markFill, markFill);
                 RECT hitRect{
                     textRect.left + beforeSize.cx,
                     lineRect.top,
@@ -3308,7 +3314,7 @@ namespace
         int rail = side ? std::min<int>(S(44), side) : 0;
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         g_sidebarContentCloseRect = SidebarVisible()
-            ? RECT{ side - S(42), top + S(3), side - S(12), top + S(33) }
+            ? RECT{ side - S(39), top + S(3), side - S(9), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
     }
@@ -4133,8 +4139,10 @@ namespace
 
         float cx = static_cast<float>(r.left + r.right) * 0.5f;
         float cy = static_cast<float>(r.top + r.bottom) * 0.5f;
-        float dx = S(5.0f);
-        float dy = S(3.8f);
+        float dx = S(3.0f);
+        // Widen the chevron by roughly ten degrees while keeping the same
+        // stroke and overall footprint as the close control.
+        float dy = S(2.35f);
         Gdiplus::PointF points[3]{};
         if (collapse)
         {
@@ -5348,7 +5356,7 @@ namespace
             }
             else if (line.rfind("sidebar=", 0) == 0)
             {
-                int savedSidebar = std::clamp(std::atoi(line.c_str() + 8), 180, 520);
+                int savedSidebar = std::clamp(std::atoi(line.c_str() + 8), SidebarMinimumWidth(), S(520));
                 if (savedSidebar == 280) savedSidebar = 520;
                 g_sidebarWidth = g_sidebarTargetWidth = g_sidebarExpandedWidth = savedSidebar;
             }
@@ -11996,7 +12004,7 @@ namespace
 
     void ResizeSidebarNow(HWND hwnd, int width, bool finalPaint)
     {
-        width = std::clamp(width, S(180), S(520));
+        width = std::clamp(width, SidebarMinimumWidth(), S(520));
         g_sidebarTargetWidth = width;
         if (!finalPaint)
         {
@@ -13613,7 +13621,7 @@ namespace
         {
             g_sidebarOpen = true;
             if (!wasOpen || g_sidebarWidth <= S(44)) g_sidebarWidth = 0;
-            g_sidebarTargetWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
+            g_sidebarTargetWidth = std::clamp(g_sidebarExpandedWidth, SidebarMinimumWidth(), S(520));
         }
         else
         {
@@ -14737,8 +14745,8 @@ namespace
         // Keep the two top-row controls aligned with the two size controls
         // below: the chevron sits above A-, and close sits above A+.
         g_sidebarContentCloseRect = RECT{
-            g_sidebar.right - S(42), g_sidebar.top + S(3),
-            g_sidebar.right - S(12), g_sidebar.top + S(33) };
+            g_sidebar.right - S(39), g_sidebar.top + S(3),
+            g_sidebar.right - S(9), g_sidebar.top + S(33) };
         if (registerSidebarButtons)
             AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
         bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
@@ -14758,7 +14766,7 @@ namespace
         if (g_sideMode == 0)
         {
             bool collapseAll = g_collapsedOutlineRows.empty();
-            int toggleWidth = S(30);
+            int toggleWidth = g_sidebarContentCloseRect.right - g_sidebarContentCloseRect.left;
             g_outlineToggleAllRect = RECT{
                 g_sidebarContentCloseRect.left - S(4) - toggleWidth,
                 g_sidebarContentCloseRect.top,
@@ -14773,7 +14781,7 @@ namespace
                 COLORREF fill = togglePressed
                     ? MixColor(T().panel2, T().line, IsDarkTheme() ? 0.34 : 0.48)
                     : SidebarHoverFill();
-                RoundFill(dc, g_outlineToggleAllRect, S(5), fill, fill);
+                RoundFill(dc, g_outlineToggleAllRect, S(7), fill, fill);
             }
             DrawOutlineToggleGlyph(dc, g_outlineToggleAllRect, collapseAll,
                 togglePressed || toggleHovered ? T().text : T().muted);
@@ -15126,40 +15134,50 @@ namespace
             }
             KillTimer(g_hwnd, 7);
             RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(68) };
-            Fill(dc, sizeBar, T().panel);
 
             // The second row follows the compact Sumatra-style order:
             // search, divider, favorite, smaller text, larger text.
-            RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top + S(2), sizeBar.right, sizeBar.bottom - S(2) };
-            RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top + S(2), sizeBar.right - S(34), sizeBar.bottom - S(2) };
-            int favoriteSize = sizeBar.bottom - sizeBar.top - S(4);
-            int favoriteRight = smallBtnNew.left - S(16);
-            g_favoriteButtonRect = RECT{
-                favoriteRight - favoriteSize,
-                sizeBar.top + S(2),
-                favoriteRight,
-                sizeBar.top + S(2) + favoriteSize };
-
             HFONT searchFont = Font(g_outlineSearchQuery.empty() ? 9 : 10);
             HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
             SIZE placeholderSize{};
             GetTextExtentPoint32W(dc, L"\u641c\u7d22\u4e66\u7b7e", 4, &placeholderSize);
-            int compactSearchWidth = std::max<int>(S(150), placeholderSize.cx + S(46));
-            int searchRight = g_outlineSearchExpanded
+            int largeWidth = S(30);
+            int smallWidth = S(30);
+            int favoriteSize = S(26);
+            int searchMinWidth = placeholderSize.cx + S(22);
+            int gap = S(2);
+            int controlsRight = sizeBar.right + S(3);
+            RECT largeBtnNew{ controlsRight - largeWidth, sizeBar.top + S(2), controlsRight, sizeBar.bottom - S(2) };
+            RECT smallBtnNew{ largeBtnNew.left - gap - smallWidth, sizeBar.top + S(2), largeBtnNew.left - gap, sizeBar.bottom - S(2) };
+            int favoriteRight = smallBtnNew.left - gap;
+            g_favoriteButtonRect = RECT{
+                favoriteRight - favoriteSize,
+                sizeBar.top + (sizeBar.bottom - sizeBar.top - favoriteSize) / 2,
+                favoriteRight,
+                sizeBar.top + (sizeBar.bottom - sizeBar.top - favoriteSize) / 2 + favoriteSize };
+            int searchRightLimit = g_outlineSearchExpanded
                 ? sizeBar.right
-                : std::min<int>(sizeBar.right,
-                    std::max<int>(sizeBar.left + compactSearchWidth,
-                        g_favoriteButtonRect.left - S(18)));
-            g_outlineSearchRect = RECT{ sizeBar.left, sizeBar.top, searchRight, sizeBar.bottom };
+                : g_favoriteButtonRect.left - gap;
+            int searchMaxWidth = std::max<int>(S(1), searchRightLimit - sizeBar.left);
+            int searchWidth = g_outlineSearchExpanded
+                ? searchMaxWidth
+                : std::min<int>(searchMaxWidth, searchMinWidth);
+            searchWidth = std::clamp(searchWidth, S(1), searchMaxWidth);
+            int searchHeight = S(26);
+            int searchTop = sizeBar.top + (sizeBar.bottom - sizeBar.top - searchHeight) / 2;
+            g_outlineSearchRect = RECT{ sizeBar.left, searchTop, sizeBar.left + searchWidth, searchTop + searchHeight };
             COLORREF searchFill = MixColor(T().paper, T().accent, IsDarkTheme() ? 0.10 : 0.06);
-            RoundFill(dc, g_outlineSearchRect, S(18), searchFill, searchFill);
-            RECT searchIcon{
-                g_outlineSearchRect.left + S(13), g_outlineSearchRect.top + S(5),
-                g_outlineSearchRect.left + S(37), g_outlineSearchRect.bottom - S(5) };
-            DrawSearchGlyph(dc, searchIcon, T().muted);
+            bool searchHovered = Hit(g_outlineSearchRect, g_mousePos.x, g_mousePos.y);
+            if (searchHovered || g_outlineSearchFocused)
+            {
+                COLORREF searchLine = g_outlineSearchFocused
+                    ? MixColor(T().line, T().accent, 0.56)
+                    : searchFill;
+                RoundFill(dc, g_outlineSearchRect, searchHeight, searchFill, searchLine);
+            }
             RECT searchText{
-                g_outlineSearchRect.left + S(43), g_outlineSearchRect.top,
-                g_outlineSearchRect.right - S(10), g_outlineSearchRect.bottom };
+                g_sidebar.left + S(14), g_outlineSearchRect.top,
+                g_outlineSearchRect.right - S(8), g_outlineSearchRect.bottom };
             std::wstring searchShown = g_outlineSearchQuery.empty() ? L"\u641c\u7d22\u4e66\u7b7e" : g_outlineSearchQuery;
             Text(dc, searchShown, searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 g_outlineSearchQuery.empty() ? T().muted : T().text);
@@ -19036,7 +19054,7 @@ namespace
             g_sidebarRailOpen = g_immersiveSidebarOpen;
             if (g_immersiveSidebarOpen)
             {
-                if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, S(220), S(520));
+                if (g_sidebarWidth <= S(120)) g_sidebarWidth = std::clamp(g_sidebarExpandedWidth, SidebarMinimumWidth(), S(520));
             }
             SetWindowPos(hwnd, HWND_TOP,
                 monitorInfo.rcMonitor.left,
@@ -19132,8 +19150,11 @@ namespace
         g_sharedStoreTrimPending = true;
         DropTab(tab);
         g_tabs.erase(g_tabs.begin() + index);
-        if (g_tabs.empty()) g_active = -1;
-        else g_active = std::clamp(g_active >= index ? g_active - 1 : g_active, 0, static_cast<int>(g_tabs.size()) - 1);
+        if (g_tabs.empty())
+            g_active = -1;
+        else if (g_active >= 0)
+            g_active = std::clamp(g_active >= index ? g_active - 1 : g_active,
+                0, static_cast<int>(g_tabs.size()) - 1);
         EnsureTabWindowVisible(g_active);
         if (g_tabs.empty()) g_tabListOpen = false;
         if (closingActive || g_tabs.empty())
@@ -21179,14 +21200,15 @@ namespace
             if (Active() && g_sideMode == 0 && Hit(g_outlineSearchRect, x, y))
             {
                 RECT inputText{
-                    g_outlineSearchRect.left + S(43),
+                    g_sidebar.left + S(14),
                     g_outlineSearchRect.top,
-                    g_outlineSearchRect.right - S(10),
+                    g_outlineSearchRect.right - S(8),
                     g_outlineSearchRect.bottom };
                 g_outlineSearchExpanded = true;
                 g_outlineSearchFocused = true;
                 g_outlineSearchCaretIndex = CaretIndexFromPoint(
-                    hwnd, g_outlineSearchQuery, inputText, 43, x, false);
+                    hwnd, g_outlineSearchQuery, inputText,
+                    g_outlineSearchQuery.empty() ? 9 : 10, x, false);
                 g_outlineSearchCaretVisible = true;
                 g_favoriteListOpen = false;
                 g_hoverFavoriteItem = -1;
