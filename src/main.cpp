@@ -20777,29 +20777,6 @@ namespace
                 HandleFavoriteClick(hwnd, x, y);
                 return 0;
             }
-            // The expanded bookmark search bar visually covers the favorite
-            // button's slot. Keep the button's hit target active so a click
-            // there still opens the favorite list instead of only collapsing
-            // the search bar.
-            if (Active() && g_sideMode == 0 && SidebarVisible() &&
-                !IsRectEmpty(&g_favoriteButtonRect) && Hit(g_favoriteButtonRect, x, y))
-            {
-                bool searchWasExpanded = g_outlineSearchExpanded;
-                if (g_outlineSearchExpanded)
-                {
-                    g_outlineSearchExpanded = false;
-                    g_outlineSearchFocused = false;
-                    g_outlineSearchCaretVisible = true;
-                    KillTimer(hwnd, 13);
-                }
-                g_pressedButtonRect = g_favoriteButtonRect;
-                g_hasPressedButton = true;
-                SetTimer(hwnd, 2, 90, nullptr);
-                g_favoriteListOpen = searchWasExpanded ? true : !g_favoriteListOpen;
-                g_hoverFavoriteItem = -1;
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
             if (g_outlineSearchExpanded &&
                 !(g_sideMode == 0 && Hit(g_outlineSearchRect, x, y)))
             {
