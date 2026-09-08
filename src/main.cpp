@@ -12229,26 +12229,16 @@ namespace
 
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
     {
-        RECT scrollClip = g_stage;
-        // The scrollbars are transparent overlays. Do not move their pixels
-        // together with the reader surface; doing so leaves a stale thumb or
-        // exposes the cleared back-buffer as a white strip at the lower/right
-        // edge during a fast drag.
-        if (!IsRectEmpty(&g_mainScrollTrackRect))
-            scrollClip.right = std::min(scrollClip.right, g_mainScrollTrackRect.left);
-        if (!IsRectEmpty(&g_mainHScrollTrackRect))
-            scrollClip.bottom = std::min(scrollClip.bottom, g_mainHScrollTrackRect.top);
-
-        int stageW = std::max<int>(1, scrollClip.right - scrollClip.left);
-        int stageH = std::max<int>(1, scrollClip.bottom - scrollClip.top);
-        if ((dx == 0 && dy == 0) || std::abs(dx) >= stageW || std::abs(dy) >= stageH || IsRectEmpty(&scrollClip))
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
+        if ((dx == 0 && dy == 0) || std::abs(dx) >= stageW || std::abs(dy) >= stageH)
         {
             RequestStageRepaint(hwnd, includeStatus);
             return;
         }
 
         RECT invalid{};
-        int result = ScrollWindowEx(hwnd, dx, dy, &scrollClip, &scrollClip, nullptr, &invalid, SW_INVALIDATE);
+        int result = ScrollWindowEx(hwnd, dx, dy, &g_stage, &g_stage, nullptr, &invalid, SW_INVALIDATE);
         if (result == ERROR)
         {
             RequestStageRepaint(hwnd, includeStatus);
@@ -12556,6 +12546,13 @@ namespace
             return;
         }
 
+        // A scrollbar drag can expose a new page whose tiles arrive in
+        // separate render completions. Hold the reader presentation until
+        // the visible viewport is complete, then commit one full-stage frame
+        // instead of revealing the page from left to right.
+        if (g_draggingMainScroll)
+            g_pageNavigationPending = true;
+
         if (!immediateRepaint)
             MarkStageScrolling(hwnd);
 
@@ -12590,21 +12587,7 @@ namespace
         }
         else
         {
-            int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-            bool canPreserveFrame = !g_pageNavigationPending &&
-                !g_annotationToolbarOpen && !g_annotationNoteOpen &&
-                std::abs(dy) > 0 && std::abs(dy) < stageH * 3 / 4;
-            if (canPreserveFrame)
-            {
-                // Sumatra-style pixel scroll: move the already committed
-                // reader frame first, then paint only the newly exposed strip
-                // from the worker's completed page cache.
-                ScrollStagePixels(hwnd, 0, dy, pageChanged);
-            }
-            else
-            {
-                RequestStageRepaint(hwnd, pageChanged);
-            }
+            RequestStageRepaint(hwnd, pageChanged);
         }
         UpdateVertScrollBar(hwnd);
         RedrawMainScrollBarNow(hwnd);
@@ -12628,10 +12611,13 @@ namespace
         if (g_active < 0) return;
         int target = g_dragScrollTarget;
         if (target == g_scrollY) return;
-        // While the pointer is down, the committed reader frame is allowed to
-        // move immediately and the worker may fill the exposed strip. Only
-        // the final mouse-up uses an atomic full-viewport commit.
-        g_pageNavigationPending = !g_draggingMainScroll;
+        if (PdfTab* tab = Active())
+            WarmLowZoomPagesAtScroll(*tab, target);
+        // The final mouse-up can carry the last pointer delta after the
+        // dragging flag has been cleared. Set the atomic presentation gate
+        // here as well so that release-time movement cannot reveal partial
+        // tiles.
+        g_pageNavigationPending = true;
         ScrollStageTo(hwnd, target, true, false);
         if (PdfTab* tab = Active())
         {
@@ -21282,9 +21268,6 @@ namespace
             if (Active() && Hit(g_mainScrollThumbRect, x, y))
             {
                 CancelStageMotion(hwnd);
-                // A scrollbar drag is the authoritative input. Let it move
-                // the committed frame while the worker catches up.
-                g_pageNavigationPending = false;
                 g_draggingMainScroll = true;
                 g_mainScrollDragOffset = y - g_mainScrollThumbRect.top;
                 g_mainScrollDragStartY = y;
