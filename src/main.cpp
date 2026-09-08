@@ -4139,10 +4139,10 @@ namespace
 
         float cx = static_cast<float>(r.left + r.right) * 0.5f;
         float cy = static_cast<float>(r.top + r.bottom) * 0.5f;
+        // Open the chevron by another roughly twenty degrees while keeping
+        // its button footprint and stroke aligned with the close control.
         float dx = S(3.0f);
-        // Widen the chevron by roughly ten degrees while keeping the same
-        // stroke and overall footprint as the close control.
-        float dy = S(2.35f);
+        float dy = S(1.7f);
         Gdiplus::PointF points[3]{};
         if (collapse)
         {
