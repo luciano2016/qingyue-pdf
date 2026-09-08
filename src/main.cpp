@@ -14884,14 +14884,16 @@ namespace
         }
         else if (g_sideMode == 2)
         {
-            g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(34), g_sidebar.right - S(14), g_sidebar.top + S(74) };
-            constexpr int searchInputRadius = 11;
+            g_searchInputRect = RECT{ g_sidebar.left + S(14), g_sidebar.top + S(36), g_sidebar.right - S(14), g_sidebar.top + S(68) };
+            constexpr int searchInputRadius = 9;
             if (g_searchInputFocused)
                 DrawSoftGlowRect(dc, g_searchInputRect, searchInputRadius, T().accent, IsDarkTheme() ? 84 : 70);
             RoundFill(dc, g_searchInputRect, S(searchInputRadius), T().paper, g_searchInputFocused ? MixColor(T().line, T().accent, 0.52) : T().line);
-            RECT searchIcon{ g_searchInputRect.left + S(13), g_searchInputRect.top + S(7), g_searchInputRect.left + S(37), g_searchInputRect.bottom - S(7) };
+            RECT searchIcon{ g_searchInputRect.left + S(14), g_searchInputRect.top + S(5), g_searchInputRect.left + S(36), g_searchInputRect.bottom - S(5) };
             DrawSearchGlyph(dc, searchIcon, T().muted);
-            RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
+            int searchGearLeft = g_searchInputRect.right - S(32);
+            int searchClearRight = searchGearLeft - S(4);
+            RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, searchClearRight - S(30), g_searchInputRect.bottom };
             HFONT searchFont = Font(9);
             HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
             Text(dc, g_searchQuery.empty() ? L"\u8f93\u5165\u5173\u952e\u8bcd" : g_searchQuery, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, g_searchQuery.empty() ? T().muted : T().text);
@@ -14909,9 +14911,10 @@ namespace
             }
             SelectObject(dc, oldSearchFont);
             DeleteObject(searchFont);
-            RECT clearRect{ g_searchInputRect.right - S(74), g_searchInputRect.top + S(6), g_searchInputRect.right - S(46), g_searchInputRect.bottom - S(6) };
-            DrawSearchIconButton(dc, CmdSearchClear, clearRect, clearRect, DrawCloseGlyph, L"清除");
-            RECT gearRect{ g_searchInputRect.right - S(35), g_searchInputRect.top + S(8), g_searchInputRect.right - S(11), g_searchInputRect.bottom - S(8) };
+            RECT clearRect{ searchClearRight - S(22), g_searchInputRect.top + S(4), searchClearRight, g_searchInputRect.bottom - S(4) };
+            RECT clearIcon{ clearRect.left + S(1), clearRect.top + S(1), clearRect.right - S(1), clearRect.bottom - S(1) };
+            DrawSearchIconButton(dc, CmdSearchClear, clearRect, clearIcon, DrawCloseGlyph, L"清除");
+            RECT gearRect{ searchGearLeft + S(1), g_searchInputRect.top + S(5), g_searchInputRect.right - S(10), g_searchInputRect.bottom - S(5) };
             RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
             g_searchOptionsButtonRect = gearHotRect;
             DrawSearchIconButton(dc, CmdSearchOptions, gearHotRect, gearRect, DrawGearGlyph, L"搜索设置");
@@ -14930,14 +14933,18 @@ namespace
             DrawSearchActionButton(dc, CmdSearchNext, next, L"\u4e0b\u4e00\u9875");
             DrawSearchActionButton(dc, CmdSearchRun, run, L"\u67e5\u627e");
 
-            RECT summary{ g_searchInputRect.left, g_sidebar.top + S(134), g_sidebar.right - S(14), g_sidebar.top + S(164) };
-            std::wstring summaryText = g_searchHasRun ? (L"\u7cbe\u786e\u67e5\u627e (" + std::to_wstring(SearchHitTotal()) + L")") : L"\u8f93\u5165\u5173\u952e\u8bcd\u540e\u70b9\u51fb\u67e5\u627e";
-            Text(dc, summaryText, summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+            if (g_searchHasRun)
+            {
+                RECT summary{ g_searchInputRect.left, g_sidebar.top + S(126), g_sidebar.right - S(14), g_sidebar.top + S(154) };
+                std::wstring summaryText = L"\u7cbe\u786e\u67e5\u627e (" + std::to_wstring(SearchHitTotal()) + L")";
+                Text(dc, summaryText, summary, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+            }
 
             int clipDc = SaveDC(dc);
-            IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(168), g_sidebar.right, g_sidebar.bottom);
-            int y = g_sidebar.top + S(172) - g_sidebarScrollY;
-            int content = S(172);
+            int resultsTop = g_sidebar.top + (g_searchHasRun ? S(162) : S(126));
+            IntersectClipRect(dc, g_sidebar.left, resultsTop, g_sidebar.right, g_sidebar.bottom);
+            int y = resultsTop + S(4) - g_sidebarScrollY;
+            int content = resultsTop - g_sidebar.top + S(4);
             for (size_t i = 0; i < g_searchResults.size(); ++i)
             {
                 RECT row{ g_sidebar.left + S(14), y, g_sidebar.right - S(14), y + S(42) };
@@ -15237,9 +15244,13 @@ namespace
             DrawBookmarkToolbarFeedback(dc, largeBtnNew, largeHovered, largePressed);
             HFONT sizeFont = Font(10);
             HGDIOBJ oldSizeFont = SelectObject(dc, sizeFont);
-            Text(dc, L"A-", smallBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            RECT smallText = smallBtnNew;
+            RECT largeText = largeBtnNew;
+            OffsetRect(&smallText, 0, -S(1));
+            OffsetRect(&largeText, 0, -S(1));
+            Text(dc, L"A-", smallText, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 smallHovered || smallPressed ? T().accent : SidebarIconColor());
-            Text(dc, L"A+", largeBtnNew, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            Text(dc, L"A+", largeText, DT_CENTER | DT_VCENTER | DT_SINGLELINE,
                 largeHovered || largePressed ? T().accent : SidebarIconColor());
             SelectObject(dc, oldSizeFont);
             DeleteObject(sizeFont);
@@ -16740,16 +16751,21 @@ namespace
         }
     }
 
-    void PaintSidebarPanelToggle(HDC dc, RECT client)
+    RECT SidebarPanelToggleRectForClient(RECT client)
     {
-        g_sidebarPanelToggleRect = {};
-        if (!Active()) return;
         int bottomInset = (!g_immersive && g_statusPinned) ? S(34) : 0;
         int size = S(24);
         int bottom = g_immersive ? client.bottom - S(21) : client.bottom - bottomInset - S(8);
         int railRight = S(44);
         int left = std::max<int>(S(7), (railRight - size) / 2);
-        RECT r{ left, bottom - size, left + size, bottom };
+        return RECT{ left, bottom - size, left + size, bottom };
+    }
+
+    void PaintSidebarPanelToggle(HDC dc, RECT client)
+    {
+        g_sidebarPanelToggleRect = {};
+        if (!Active()) return;
+        RECT r = SidebarPanelToggleRectForClient(client);
         g_sidebarPanelToggleRect = r;
 
         bool open = SidebarRailVisible();
@@ -19470,6 +19486,11 @@ namespace
         }
         SaveState();
         ApplyWindowChrome();
+        g_buttons.clear();
+        g_hasHoverButton = false;
+        g_hoverButtonRect = RECT{};
+        g_hasPressedButton = false;
+        g_pressedButtonRect = RECT{};
         RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_ALLCHILDREN);
         DwmFlush();
     }
@@ -20836,7 +20857,12 @@ namespace
                 g_outlineSearchFocused = false;
                 g_outlineSearchCaretVisible = true;
                 KillTimer(hwnd, 13);
-                InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
+                g_buttons.clear();
+                g_hasHoverButton = false;
+                g_hoverButtonRect = RECT{};
+                g_hasPressedButton = false;
+                g_pressedButtonRect = RECT{};
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
             }
             // Resolve rail clicks from the current geometry before any
             // scroll/content hit tests. The painted rectangle list can still
@@ -20855,6 +20881,22 @@ namespace
                 g_favoriteListOpen = false;
                 if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
                 InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            RECT currentPanelToggle{};
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                currentPanelToggle = SidebarPanelToggleRectForClient(client);
+                g_sidebarPanelToggleRect = currentPanelToggle;
+            }
+            if (Hit(currentPanelToggle, x, y))
+            {
+                g_pressedButtonRect = currentPanelToggle;
+                g_hasPressedButton = true;
+                SetTimer(hwnd, 2, 90, nullptr);
+                InvalidateRect(hwnd, &currentPanelToggle, FALSE);
+                Command(hwnd, CmdSidebarPanelToggle);
                 return 0;
             }
             if (g_sideMode == 0 && SidebarVisible() &&
@@ -20992,15 +21034,6 @@ namespace
                     g_tabListOpen = false;
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
-            }
-            if (Hit(g_sidebarPanelToggleRect, x, y))
-            {
-                g_pressedButtonRect = g_sidebarPanelToggleRect;
-                g_hasPressedButton = true;
-                SetTimer(hwnd, 2, 90, nullptr);
-                InvalidateRect(hwnd, &g_sidebarPanelToggleRect, FALSE);
-                Command(hwnd, CmdSidebarPanelToggle);
-                return 0;
             }
             if (!Active())
             {
@@ -21257,8 +21290,10 @@ namespace
             }
             if (g_sideMode == 2 && Hit(g_searchInputRect, x, y))
             {
-                RECT clearRect{ g_searchInputRect.right - S(74), g_searchInputRect.top + S(6), g_searchInputRect.right - S(46), g_searchInputRect.bottom - S(6) };
-                RECT gearRect{ g_searchInputRect.right - S(35), g_searchInputRect.top + S(8), g_searchInputRect.right - S(11), g_searchInputRect.bottom - S(8) };
+                int searchGearLeft = g_searchInputRect.right - S(32);
+                int searchClearRight = searchGearLeft - S(4);
+                RECT clearRect{ searchClearRight - S(22), g_searchInputRect.top + S(4), searchClearRight, g_searchInputRect.bottom - S(4) };
+                RECT gearRect{ searchGearLeft + S(1), g_searchInputRect.top + S(5), g_searchInputRect.right - S(10), g_searchInputRect.bottom - S(5) };
                 RECT gearHotRect{ gearRect.left - S(3), gearRect.top - S(3), gearRect.right + S(3), gearRect.bottom + S(3) };
                 if (Hit(gearHotRect, x, y))
                 {
@@ -21281,7 +21316,7 @@ namespace
                 }
                 else
                 {
-                    RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, g_searchInputRect.right - S(82), g_searchInputRect.bottom };
+                    RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, searchClearRight - S(30), g_searchInputRect.bottom };
                     g_searchCaretIndex = CaretIndexFromPoint(hwnd, g_searchQuery, inputText, 9, x, false);
                 }
                 g_searchInputFocused = true;
