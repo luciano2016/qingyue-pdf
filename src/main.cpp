@@ -1742,6 +1742,10 @@ namespace
     int g_mainHScrollDragOffset{};
     int g_mainScrollDragStartY{};
     int g_mainScrollDragStartPos{};
+    RECT g_mainScrollDragTrackRect{};
+    int g_mainScrollDragThumbHeight{};
+    int g_mainScrollDragMaxScroll{};
+    bool g_mainScrollDragGeometryValid{};
     int g_mainHScrollDragStartX{};
     int g_mainHScrollDragStartPos{};
     int g_mainScrollThumbLiveTop{};
@@ -2556,14 +2560,31 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int trackW = S(12);
         int gutter = S(3);
-        if (g_contentHeight > stageH + 1)
+        bool keepVerticalTrack = g_draggingMainScroll && g_mainScrollDragGeometryValid &&
+            !IsRectEmpty(&g_mainScrollDragTrackRect);
+        if (g_contentHeight > stageH + 1 || keepVerticalTrack)
         {
-            g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top + S(8), client.right - gutter, g_stage.bottom - S(8) };
+            if (g_draggingMainScroll && g_mainScrollDragGeometryValid)
+            {
+                // Keep the thumb-to-pointer mapping stable for the lifetime
+                // of a drag. Page geometry can be completed asynchronously;
+                // it must not move an already captured scrollbar under the
+                // pointer.
+                g_mainScrollTrackRect = g_mainScrollDragTrackRect;
+            }
+            else
+            {
+                g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top + S(8), client.right - gutter, g_stage.bottom - S(8) };
+            }
             int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
             int thumbH = std::clamp(MulDiv(stageH, trackH, std::max(1, g_contentHeight)), S(28), trackH);
-            if (g_draggingMainScroll && g_mainScrollThumbLive && g_mainScrollThumbLiveHeight > 0)
+            if (g_draggingMainScroll && g_mainScrollDragGeometryValid)
+                thumbH = std::clamp(g_mainScrollDragThumbHeight, S(28), trackH);
+            else if (g_draggingMainScroll && g_mainScrollThumbLive && g_mainScrollThumbLiveHeight > 0)
                 thumbH = std::clamp(g_mainScrollThumbLiveHeight, S(28), trackH);
-            int maxScroll = std::max<int>(1, g_contentHeight - stageH);
+            int maxScroll = g_draggingMainScroll && g_mainScrollDragGeometryValid
+                ? std::max<int>(1, g_mainScrollDragMaxScroll)
+                : std::max<int>(1, g_contentHeight - stageH);
             int thumbTravel = std::max<int>(0, trackH - thumbH);
             int thumbTop = g_mainScrollTrackRect.top + MulDiv(g_scrollY, thumbTravel, maxScroll);
             if (g_draggingMainScroll && g_mainScrollThumbLive)
@@ -2608,17 +2629,25 @@ namespace
     {
         if (!g_draggingMainScroll || g_active < 0) return;
 
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        UpdateMainScrollRects(client);
-        if (IsRectEmpty(&g_mainScrollTrackRect)) return;
+        if (!g_mainScrollDragGeometryValid)
+        {
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            UpdateMainScrollRects(client);
+        }
+        RECT track = g_mainScrollDragGeometryValid ? g_mainScrollDragTrackRect : g_mainScrollTrackRect;
+        if (IsRectEmpty(&track)) return;
 
-        int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
-        int thumbH = g_mainScrollThumbLiveHeight > 0 ? g_mainScrollThumbLiveHeight : std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
+        int trackH = std::max<int>(1, track.bottom - track.top);
+        int thumbH = g_mainScrollDragGeometryValid
+            ? g_mainScrollDragThumbHeight
+            : (g_mainScrollThumbLiveHeight > 0 ? g_mainScrollThumbLiveHeight : std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top));
         thumbH = std::clamp<int>(thumbH, S(28), trackH);
 
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-        int maxScroll = std::max<int>(0, g_contentHeight - stageH);
+        int maxScroll = g_mainScrollDragGeometryValid
+            ? std::max<int>(0, g_mainScrollDragMaxScroll)
+            : std::max<int>(0, g_contentHeight - stageH);
         int travel = std::max<int>(1, trackH - thumbH);
         int dragDelta = pointerY - g_mainScrollDragStartY;
         int newScroll = g_mainScrollDragStartPos;
@@ -2626,11 +2655,13 @@ namespace
             newScroll = g_mainScrollDragStartPos + MulDiv(dragDelta, maxScroll, travel);
 
         int oldTarget = g_dragScrollTarget;
-        int liveTop = std::clamp<int>(pointerY - g_mainScrollDragOffset, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
+        int liveTop = std::clamp<int>(pointerY - g_mainScrollDragOffset, track.top, track.bottom - thumbH);
         bool liveChanged = !g_mainScrollThumbLive || g_mainScrollThumbLiveTop != liveTop;
         g_mainScrollThumbLive = true;
         g_mainScrollThumbLiveTop = liveTop;
         g_mainScrollThumbLiveHeight = thumbH;
+        g_mainScrollTrackRect = track;
+        g_mainScrollThumbRect = RECT{ track.left, liveTop, track.right, liveTop + thumbH };
         g_dragScrollTarget = std::clamp<int>(newScroll, 0, maxScroll);
 
         if (g_dragScrollTarget != oldTarget)
@@ -11747,6 +11778,10 @@ namespace
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
+        // Opening a new document changes the owner of the reader surface;
+        // the previous document's committed frame must not suppress its
+        // first normal paint.
+        g_stageFrameValid = false;
         g_tabs.back()->lastActivatedSerial = ++g_tabActivationSerial;
         g_tabs.back()->sidebarScrollY[0] = std::max(0, restoreSidebarScrollY);
         g_tabs.back()->selectedOutlineRow = restoreSelectedOutlineRow;
@@ -13682,8 +13717,12 @@ namespace
         // File watcher replacement can join the old directory thread. Keep
         // that housekeeping out of the visible tab-switch transaction.
         PostMessageW(hwnd, WM_QUIETPDF_REFRESH_FILE_WATCH, 0, 0);
+        // The committed stage frame belongs to the previous Tab. It cannot
+        // gate the first paint of the newly selected document.
+        g_stageFrameValid = false;
         PresentCachedTabFrame(hwnd);
         PresentTabChrome(hwnd);
+        InvalidateRect(hwnd, &g_stage, FALSE);
     }
 
     void StartSmoothStageScroll(HWND hwnd, int target)
@@ -16167,7 +16206,7 @@ namespace
         // transition surface is repainted. If one old page representation is
         // missing, leave the already submitted back-buffer frame untouched
         // and continue rendering the target in the background.
-        if (zoomPresentationPending && !ZoomFallbackVisibleContentReady(tab))
+        if (zoomPresentationPending && !ZoomFallbackVisibleContentReady(tab) && g_stageFrameValid)
         {
             QueueVisibleZoomContent(tab);
             // Paint() has already cleared the memory DC's dirty region with
@@ -16440,7 +16479,7 @@ namespace
         // page. The caller keeps the previous committed frame until the
         // worker supplies the missing image/tile, preventing white blocks
         // during a fast scroll.
-        if (missingVisiblePage)
+        if (missingVisiblePage && g_stageFrameValid)
             return false;
         if (g_pageNavigationPending)
         {
@@ -19280,6 +19319,8 @@ namespace
         else if (g_active >= 0)
             g_active = std::clamp(g_active >= index ? g_active - 1 : g_active,
                 0, static_cast<int>(g_tabs.size()) - 1);
+        if (closingActive)
+            g_stageFrameValid = false;
         EnsureTabWindowVisible(g_active);
         if (g_tabs.empty()) g_tabListOpen = false;
         if (closingActive || g_tabs.empty())
@@ -19789,6 +19830,7 @@ namespace
         case CmdHome:
             SaveActiveTabProgress();
             g_active = -1;
+            g_stageFrameValid = false;
             g_tabListOpen = false;
             CancelQueuedPageRenders();
             SetTitle();
@@ -21345,6 +21387,12 @@ namespace
                 SetCapture(hwnd);
                 return 0;
             }
+            if (Active())
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                UpdateMainScrollRects(client);
+            }
             if (Active() && Hit(g_mainScrollThumbRect, x, y))
             {
                 CancelStageMotion(hwnd);
@@ -21359,6 +21407,11 @@ namespace
                 g_mainScrollThumbLive = true;
                 g_mainScrollThumbLiveTop = g_mainScrollThumbRect.top;
                 g_mainScrollThumbLiveHeight = std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
+                g_mainScrollDragTrackRect = g_mainScrollTrackRect;
+                g_mainScrollDragThumbHeight = g_mainScrollThumbLiveHeight;
+                g_mainScrollDragMaxScroll = std::max<int>(0,
+                    g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+                g_mainScrollDragGeometryValid = !IsRectEmpty(&g_mainScrollDragTrackRect);
                 SetCapture(hwnd);
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
                 return 0;
@@ -21915,6 +21968,12 @@ namespace
             // not the whole scrollable content area; otherwise moving from a
             // directory row to the scrollbar produces no state transition.
             UpdateSidebarScrollRects();
+            if (Active())
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                UpdateMainScrollRects(client);
+            }
             bool favoriteOverlayHit = g_favoriteListOpen &&
                 !IsRectEmpty(&g_favoriteListRect) &&
                 Hit(g_favoriteListRect, mx, my);
@@ -22434,6 +22493,8 @@ namespace
                 g_lastMainScrollDragMoveMs = 0;
                 g_mainScrollThumbLive = false;
                 g_dragScrollPosted = false;
+                g_mainScrollDragGeometryValid = false;
+                g_mainScrollDragTrackRect = {};
                 CommitMainScrollDragTarget(hwnd);
                 g_dragOutlinePreviewRow = -1;
                 ReleaseCapture();
