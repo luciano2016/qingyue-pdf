@@ -12308,6 +12308,17 @@ namespace
             return;
         }
 
+        // The scrollbars are transparent overlays painted inside g_stage.
+        // Do not move their already-present pixels together with the page;
+        // doing so makes the thumb visibly jump before its own repaint runs.
+        RECT scrollClip = g_stage;
+        if (!IsRectEmpty(&g_mainScrollTrackRect))
+            scrollClip.right = std::min(scrollClip.right, g_mainScrollTrackRect.left);
+        if (!IsRectEmpty(&g_mainHScrollTrackRect))
+            scrollClip.bottom = std::min(scrollClip.bottom, g_mainHScrollTrackRect.top);
+        if (IsRectEmpty(&scrollClip))
+            scrollClip = g_stage;
+
         // Move the committed back-buffer together with the pixels already on
         // screen. Without this, the next WM_PAINT starts from a different
         // frame and exposes white/background strips around the page.
@@ -12315,11 +12326,11 @@ namespace
         if (g_paintBufferDc)
         {
             RECT exposed{};
-            ScrollDC(g_paintBufferDc, dx, dy, &g_stage, &g_stage, nullptr, &exposed);
+            ScrollDC(g_paintBufferDc, dx, dy, &scrollClip, &scrollClip, nullptr, &exposed);
         }
 
         RECT invalid{};
-        int result = ScrollWindowEx(hwnd, dx, dy, &g_stage, &g_stage, nullptr, &invalid, SW_INVALIDATE);
+        int result = ScrollWindowEx(hwnd, dx, dy, &scrollClip, &scrollClip, nullptr, &invalid, SW_INVALIDATE);
         if (result == ERROR)
         {
             RequestStageRepaint(hwnd, includeStatus);
