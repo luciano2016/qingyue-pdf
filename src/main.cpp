@@ -1698,6 +1698,14 @@ namespace
     int g_stageFrameW{};
     int g_stageFrameH{};
     bool g_stageFrameValid{};
+    // The document extent may be refined asynchronously while a viewport is
+    // moving. Keep the scrollbar mapping on one committed extent until the
+    // motion settles, otherwise the thumb can move backward even when the
+    // user's scroll position only moves forward.
+    bool g_mainScrollPresentationValid{};
+    int g_mainScrollPresentationScrollY{};
+    int g_mainScrollPresentationMaxScroll{};
+    int g_mainScrollPresentationStageHeight{};
     int g_statusOffset{};
     int g_statusTargetOffset{};
     int g_pageWheelDeltaAccum{};
@@ -2560,9 +2568,23 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int trackW = S(12);
         int gutter = S(3);
+        bool presentationActive = g_mainScrollPresentationValid &&
+            g_mainScrollPresentationStageHeight == stageH &&
+            (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil ||
+                g_smoothStageScroll || g_touchPanQueued || g_touchMomentum || g_autoScrollActive ||
+                g_draggingMainScroll);
+        int mappedStageH = presentationActive ? g_mainScrollPresentationStageHeight : stageH;
+        int mappedMaxScroll = presentationActive
+            ? std::max<int>(0, g_mainScrollPresentationMaxScroll)
+            : std::max<int>(0, g_contentHeight - stageH);
+        // Freeze only the extent used for the mapping. The current position
+        // must remain live so the thumb follows every scroll input.
+        int mappedScrollY = presentationActive
+            ? std::clamp(g_scrollY, 0, mappedMaxScroll)
+            : g_scrollY;
         bool keepVerticalTrack = g_draggingMainScroll && g_mainScrollDragGeometryValid &&
             !IsRectEmpty(&g_mainScrollDragTrackRect);
-        if (g_contentHeight > stageH + 1 || keepVerticalTrack)
+        if (mappedMaxScroll > 0 || keepVerticalTrack)
         {
             if (g_draggingMainScroll && g_mainScrollDragGeometryValid)
             {
@@ -2577,16 +2599,17 @@ namespace
                 g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top + S(8), client.right - gutter, g_stage.bottom - S(8) };
             }
             int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
-            int thumbH = std::clamp(MulDiv(stageH, trackH, std::max(1, g_contentHeight)), S(28), trackH);
+            int mappedContentHeight = std::max<int>(1, mappedMaxScroll + mappedStageH);
+            int thumbH = std::clamp(MulDiv(mappedStageH, trackH, mappedContentHeight), S(28), trackH);
             if (g_draggingMainScroll && g_mainScrollDragGeometryValid)
                 thumbH = std::clamp(g_mainScrollDragThumbHeight, S(28), trackH);
             else if (g_draggingMainScroll && g_mainScrollThumbLive && g_mainScrollThumbLiveHeight > 0)
                 thumbH = std::clamp(g_mainScrollThumbLiveHeight, S(28), trackH);
             int maxScroll = g_draggingMainScroll && g_mainScrollDragGeometryValid
                 ? std::max<int>(1, g_mainScrollDragMaxScroll)
-                : std::max<int>(1, g_contentHeight - stageH);
+                : std::max<int>(1, mappedMaxScroll);
             int thumbTravel = std::max<int>(0, trackH - thumbH);
-            int thumbTop = g_mainScrollTrackRect.top + MulDiv(g_scrollY, thumbTravel, maxScroll);
+            int thumbTop = g_mainScrollTrackRect.top + MulDiv(mappedScrollY, thumbTravel, maxScroll);
             if (g_draggingMainScroll && g_mainScrollThumbLive)
                 thumbTop = std::clamp<int>(g_mainScrollThumbLiveTop, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
             else if (g_scrollY >= maxScroll)
@@ -11782,6 +11805,7 @@ namespace
         // the previous document's committed frame must not suppress its
         // first normal paint.
         g_stageFrameValid = false;
+        g_mainScrollPresentationValid = false;
         g_tabs.back()->lastActivatedSerial = ++g_tabActivationSerial;
         g_tabs.back()->sidebarScrollY[0] = std::max(0, restoreSidebarScrollY);
         g_tabs.back()->selectedOutlineRow = restoreSelectedOutlineRow;
@@ -12536,6 +12560,17 @@ namespace
         {
             g_stageScrollDirection = dy < 0 ? 1 : -1;
             ++g_viewportGeneration;
+            if (!g_draggingMainScroll)
+            {
+                // Publish one scrollbar mapping for the whole movement
+                // window. Background layout completion may change the final
+                // document extent, but it must not move the thumb while the
+                // user is still scrolling.
+                g_mainScrollPresentationValid = true;
+                g_mainScrollPresentationScrollY = g_scrollY;
+                g_mainScrollPresentationMaxScroll = maxScroll;
+                g_mainScrollPresentationStageHeight = std::max<int>(1, g_stage.bottom - g_stage.top);
+            }
         }
 
         if (dy == 0)
@@ -13720,6 +13755,7 @@ namespace
         // The committed stage frame belongs to the previous Tab. It cannot
         // gate the first paint of the newly selected document.
         g_stageFrameValid = false;
+        g_mainScrollPresentationValid = false;
         PresentCachedTabFrame(hwnd);
         PresentTabChrome(hwnd);
         InvalidateRect(hwnd, &g_stage, FALSE);
@@ -19320,7 +19356,10 @@ namespace
             g_active = std::clamp(g_active >= index ? g_active - 1 : g_active,
                 0, static_cast<int>(g_tabs.size()) - 1);
         if (closingActive)
+        {
             g_stageFrameValid = false;
+            g_mainScrollPresentationValid = false;
+        }
         EnsureTabWindowVisible(g_active);
         if (g_tabs.empty()) g_tabListOpen = false;
         if (closingActive || g_tabs.empty())
@@ -19831,6 +19870,7 @@ namespace
             SaveActiveTabProgress();
             g_active = -1;
             g_stageFrameValid = false;
+            g_mainScrollPresentationValid = false;
             g_tabListOpen = false;
             CancelQueuedPageRenders();
             SetTitle();
@@ -22641,6 +22681,7 @@ namespace
                 }
                 KillTimer(hwnd, 8);
                 g_stageLightPaintUntil = 0;
+                g_mainScrollPresentationValid = false;
                 if (PdfTab* tab = Active())
                 {
                     TouchRecentProgress(*tab, false);
