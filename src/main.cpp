@@ -4121,6 +4121,36 @@ namespace
         g.DrawLines(&pen, points, static_cast<INT>(std::size(points)));
     }
 
+    void DrawOutlineToggleGlyph(HDC dc, RECT r, bool collapse, COLORREF color)
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.35f, S(1.05f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+
+        float cx = static_cast<float>(r.left + r.right) * 0.5f;
+        float cy = static_cast<float>(r.top + r.bottom) * 0.5f;
+        float dx = S(5.0f);
+        float dy = S(3.8f);
+        Gdiplus::PointF points[3]{};
+        if (collapse)
+        {
+            points[0] = { cx - dx, cy - dy };
+            points[1] = { cx, cy + dy };
+            points[2] = { cx + dx, cy - dy };
+        }
+        else
+        {
+            points[0] = { cx - dx, cy + dy };
+            points[1] = { cx, cy - dy };
+            points[2] = { cx + dx, cy + dy };
+        }
+        g.DrawLines(&pen, points, static_cast<INT>(std::size(points)));
+    }
+
     void DrawTabArrowGlyph(HDC dc, RECT r, bool right, COLORREF color)
     {
         Gdiplus::Graphics g(dc);
@@ -14725,17 +14755,15 @@ namespace
 
         if (g_sideMode == 0)
         {
-            std::wstring toggleText = g_collapsedOutlineRows.empty() ? L"收起所有" : L"展开所有";
-            SIZE toggleTextSize{};
-            GetTextExtentPoint32W(dc, toggleText.c_str(), static_cast<int>(toggleText.size()), &toggleTextSize);
-            int toggleWidth = toggleTextSize.cx + S(12);
+            bool collapseAll = g_collapsedOutlineRows.empty();
+            int toggleWidth = S(30);
             g_outlineToggleAllRect = RECT{
                 g_sidebarContentCloseRect.left - S(8) - toggleWidth,
                 g_sidebarContentCloseRect.top,
                 g_sidebarContentCloseRect.left - S(8),
                 g_sidebarContentCloseRect.bottom };
             if (registerSidebarButtons)
-                AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, toggleText, L"收起或展开全部书签");
+                AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, L"", collapseAll ? L"收起所有书签" : L"展开所有书签");
             bool toggleHovered = Hit(g_outlineToggleAllRect, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_outlineToggleAllRect);
             if (toggleHovered || togglePressed)
@@ -14745,11 +14773,8 @@ namespace
                     : SidebarHoverFill();
                 RoundFill(dc, g_outlineToggleAllRect, S(5), fill, fill);
             }
-            RECT toggleLabel{
-                g_outlineToggleAllRect.left + S(6), g_outlineToggleAllRect.top,
-                g_outlineToggleAllRect.right - S(6), g_outlineToggleAllRect.bottom };
-            Text(dc, toggleText, toggleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                togglePressed ? T().text : T().muted);
+            DrawOutlineToggleGlyph(dc, g_outlineToggleAllRect, collapseAll,
+                togglePressed || toggleHovered ? T().text : T().muted);
         }
 
         const wchar_t* panelTitle = g_sideMode == 0 ? L"书签"
@@ -15100,7 +15125,7 @@ namespace
             KillTimer(g_hwnd, 7);
             RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(62) };
             Fill(dc, sizeBar, T().panel);
-            HFONT searchFont = Font(10);
+            HFONT searchFont = Font(g_outlineSearchQuery.empty() ? 9 : 10);
             HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
             SIZE placeholderSize{};
             GetTextExtentPoint32W(dc, L"\u641c\u7d22\u4e66\u7b7e", 4, &placeholderSize);
@@ -15111,7 +15136,7 @@ namespace
             g_outlineSearchRect = RECT{ sizeBar.left, sizeBar.top, searchRight, sizeBar.bottom };
             Fill(dc, g_outlineSearchRect, T().paper);
             RECT searchText{
-                g_outlineSearchRect.left + S(10), g_outlineSearchRect.top,
+                g_outlineSearchRect.left + S(2), g_outlineSearchRect.top,
                 g_outlineSearchRect.right - S(10), g_outlineSearchRect.bottom };
             std::wstring searchShown = g_outlineSearchQuery.empty() ? L"\u641c\u7d22\u4e66\u7b7e" : g_outlineSearchQuery;
             Text(dc, searchShown, searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
@@ -15133,8 +15158,6 @@ namespace
             DeleteObject(searchFont);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
-            if (!g_outlineSearchExpanded)
-            {
             int favoriteSize = sizeBar.bottom - sizeBar.top;
             int favoriteRight = smallBtnNew.left - S(4);
             g_favoriteButtonRect = RECT{
@@ -15142,6 +15165,8 @@ namespace
                 sizeBar.top,
                 favoriteRight,
                 sizeBar.top + favoriteSize };
+            if (!g_outlineSearchExpanded)
+            {
             if (registerSidebarButtons)
                 AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
             bool favoriteHovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
@@ -20752,6 +20777,29 @@ namespace
                 HandleFavoriteClick(hwnd, x, y);
                 return 0;
             }
+            // The expanded bookmark search bar visually covers the favorite
+            // button's slot. Keep the button's hit target active so a click
+            // there still opens the favorite list instead of only collapsing
+            // the search bar.
+            if (Active() && g_sideMode == 0 && SidebarVisible() &&
+                !IsRectEmpty(&g_favoriteButtonRect) && Hit(g_favoriteButtonRect, x, y))
+            {
+                bool searchWasExpanded = g_outlineSearchExpanded;
+                if (g_outlineSearchExpanded)
+                {
+                    g_outlineSearchExpanded = false;
+                    g_outlineSearchFocused = false;
+                    g_outlineSearchCaretVisible = true;
+                    KillTimer(hwnd, 13);
+                }
+                g_pressedButtonRect = g_favoriteButtonRect;
+                g_hasPressedButton = true;
+                SetTimer(hwnd, 2, 90, nullptr);
+                g_favoriteListOpen = searchWasExpanded ? true : !g_favoriteListOpen;
+                g_hoverFavoriteItem = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_outlineSearchExpanded &&
                 !(g_sideMode == 0 && Hit(g_outlineSearchRect, x, y)))
             {
@@ -21138,14 +21186,14 @@ namespace
             if (Active() && g_sideMode == 0 && Hit(g_outlineSearchRect, x, y))
             {
                 RECT inputText{
-                    g_outlineSearchRect.left + S(10),
+                    g_outlineSearchRect.left + S(2),
                     g_outlineSearchRect.top,
                     g_outlineSearchRect.right - S(10),
                     g_outlineSearchRect.bottom };
                 g_outlineSearchExpanded = true;
                 g_outlineSearchFocused = true;
                 g_outlineSearchCaretIndex = CaretIndexFromPoint(
-                    hwnd, g_outlineSearchQuery, inputText, 10, x, false);
+                    hwnd, g_outlineSearchQuery, inputText, 2, x, false);
                 g_outlineSearchCaretVisible = true;
                 g_favoriteListOpen = false;
                 g_hoverFavoriteItem = -1;
