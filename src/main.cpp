@@ -3187,6 +3187,8 @@ namespace
         g_sidebarContentHeight = tab.outlineLayoutContentHeight;
     }
 
+    COLORREF TextSelectionFillColor();
+
     void DrawHighlightedOutlineText(HDC dc, std::wstring const& title, RECT textRect, COLORREF textColor)
     {
         std::wstring query = LowerCopy(g_outlineSearchQuery);
@@ -3229,7 +3231,7 @@ namespace
         }
         lines.push_back({ lineStart, static_cast<int>(title.size()) });
 
-        COLORREF markFill = IsDarkTheme() ? MixColor(T().panel2, RGB(245, 164, 72), 0.24) : RGB(255, 250, 235);
+        COLORREF markFill = TextSelectionFillColor();
         for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
         {
             int start = lines[lineIndex].first;
@@ -3253,11 +3255,11 @@ namespace
                 GetTextExtentPoint32W(dc, before.c_str(), static_cast<int>(before.size()), &beforeSize);
                 GetTextExtentPoint32W(dc, hit.c_str(), static_cast<int>(hit.size()), &hitSize);
                 RECT mark{
-                    textRect.left + beforeSize.cx - S(2),
-                    lineRect.top + S(2),
-                    textRect.left + beforeSize.cx + hitSize.cx + S(2),
-                    lineRect.bottom - S(2) };
-                RoundFill(dc, mark, S(3), markFill, markFill);
+                    textRect.left + beforeSize.cx,
+                    lineRect.top + S(1),
+                    textRect.left + beforeSize.cx + hitSize.cx,
+                    lineRect.bottom - S(1) };
+                Fill(dc, mark, markFill);
                 RECT hitRect{
                     textRect.left + beforeSize.cx,
                     lineRect.top,
@@ -3480,7 +3482,7 @@ namespace
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         // Match 收藏.svg's soft star points. A rounded polygon keeps the icon
         // vector-sharp at every DPI while preserving the hollow toolbar form.
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.20f, S(1.0f)));
+        Gdiplus::Pen pen(GdiColor(color, 218), std::max<Gdiplus::REAL>(1.0f, S(0.9f)));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
@@ -4001,6 +4003,21 @@ namespace
         g_buttons.push_back(Button{ id, r, std::move(text), std::move(tip) });
     }
 
+    bool IsBookmarkToolbarButton(int id)
+    {
+        return id == CmdOutlineToggleAll || id == CmdSidebarContentClose ||
+            id == CmdFavoriteListToggle || id == CmdOutlineSmall ||
+            id == CmdOutlineLarge;
+    }
+
+    void RemoveBookmarkToolbarButtons()
+    {
+        std::erase_if(g_buttons, [](Button const& button)
+        {
+            return IsBookmarkToolbarButton(button.id);
+        });
+    }
+
     void DrawButton(HDC dc, const Button& b)
     {
         bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &b.rect);
@@ -4150,8 +4167,8 @@ namespace
         float cy = static_cast<float>(r.top + r.bottom) * 0.5f;
         // Open the chevron by another roughly twenty degrees while keeping
         // its button footprint and stroke aligned with the close control.
-        float dx = S(3.0f);
-        float dy = S(1.7f);
+        float dx = S(3.4f);
+        float dy = S(1.9f);
         Gdiplus::PointF points[3]{};
         if (collapse)
         {
@@ -14682,6 +14699,10 @@ namespace
     void PaintSidebar(HDC dc, PdfTab& tab, RECT paintClip)
     {
         g_sidebarContentCloseRect = {};
+        // Rebuild these five hit targets from the same geometry used for
+        // painting. This prevents a search-box resize or theme redraw from
+        // leaving stale toolbar buttons in the global hit-test list.
+        RemoveBookmarkToolbarButtons();
         if (!SidebarRailVisible() || SidebarTotalWidth() <= 0) return;
         g_favoriteButtonRect = {};
         g_outlineToggleAllRect = {};
@@ -14756,8 +14777,7 @@ namespace
         g_sidebarContentCloseRect = RECT{
             g_sidebar.right - S(31), g_sidebar.top + S(3),
             g_sidebar.right - S(1), g_sidebar.top + S(33) };
-        if (registerSidebarButtons)
-            AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
+        AddButton(CmdSidebarContentClose, g_sidebarContentCloseRect, L"", L"关闭侧栏面板");
         bool closeHovered = Hit(g_sidebarContentCloseRect, g_mousePos.x, g_mousePos.y);
         bool closePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_sidebarContentCloseRect);
         DrawBookmarkToolbarFeedback(dc, g_sidebarContentCloseRect, closeHovered, closePressed);
@@ -14775,8 +14795,7 @@ namespace
                 g_sidebarContentCloseRect.top,
                 g_sidebarContentCloseRect.left - S(4),
                 g_sidebarContentCloseRect.bottom };
-            if (registerSidebarButtons)
-                AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, L"", collapseAll ? L"收起所有书签" : L"展开所有书签");
+            AddButton(CmdOutlineToggleAll, g_outlineToggleAllRect, L"", collapseAll ? L"收起所有书签" : L"展开所有书签");
             bool toggleHovered = Hit(g_outlineToggleAllRect, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_outlineToggleAllRect);
             DrawBookmarkToolbarFeedback(dc, g_outlineToggleAllRect, toggleHovered, togglePressed);
@@ -15170,7 +15189,7 @@ namespace
                 COLORREF searchLine = g_outlineSearchFocused
                     ? MixColor(T().line, T().accent, 0.56)
                     : searchFill;
-                RoundFill(dc, g_outlineSearchRect, searchHeight, searchFill, searchLine);
+            RoundFill(dc, g_outlineSearchRect, S(8), searchFill, searchLine);
             }
             RECT searchText{
                 g_sidebar.left + S(14), g_outlineSearchRect.top,
@@ -15198,8 +15217,7 @@ namespace
             RECT divider{ g_favoriteButtonRect.left - S(9), sizeBar.top + S(7),
                 g_favoriteButtonRect.left - S(8), sizeBar.bottom - S(7) };
             Fill(dc, divider, MixColor(T().line, T().paper, IsDarkTheme() ? 0.20 : 0.35));
-            if (registerSidebarButtons)
-                AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
+            AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
             bool favoriteHovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
             bool favoritePressed = g_hasPressedButton &&
                 EqualRect(&g_pressedButtonRect, &g_favoriteButtonRect);
@@ -15209,8 +15227,8 @@ namespace
                 g_favoriteButtonRect.right - S(5), g_favoriteButtonRect.bottom - S(5) };
             DrawFavoriteIcon(dc, favoriteGlyph,
                 favoritePressed || favoriteHovered ? T().accent : SidebarIconColor(), false);
-            if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"减小书签字号");
-            if (registerSidebarButtons) AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"增大书签字号");
+            AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"减小书签字号");
+            AddButton(CmdOutlineLarge, largeBtnNew, L"A+", L"增大书签字号");
             bool smallHovered = Hit(smallBtnNew, g_mousePos.x, g_mousePos.y);
             bool largeHovered = Hit(largeBtnNew, g_mousePos.x, g_mousePos.y);
             bool smallPressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &smallBtnNew);
