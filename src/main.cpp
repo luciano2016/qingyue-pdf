@@ -495,6 +495,16 @@ namespace
         long long createdAt{};
     };
 
+    PdfTab* Active();
+    bool SamePath(std::wstring const& a, std::wstring const& b);
+
+    bool FavoriteBelongsToActiveTab(FavoriteItem const& item)
+    {
+        PdfTab* tab = Active();
+        if (!tab) return false;
+        return SamePath(tab->path, item.path);
+    }
+
     struct LastSessionItem
     {
         std::wstring path;
@@ -3488,7 +3498,6 @@ namespace
         TouchRecentProgress(*tab, false);
         UpdateVertScrollBar(hwnd);
         RequestPageNavigationRepaint(hwnd, *tab);
-        g_favoriteListOpen = false;
         g_hoverFavoriteItem = -1;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -3557,6 +3566,9 @@ namespace
         g_favoriteListContentHeight = 0;
         if (!g_favoriteListOpen || !SidebarVisible()) return;
 
+        PdfTab* activeTab = Active();
+        if (!activeTab) return;
+
         int availableWidth = std::max<int>(S(1),
             static_cast<int>(g_stage.right - g_sidebar.left - S(8)));
         int width = std::min<int>(S(300), availableWidth);
@@ -3568,10 +3580,17 @@ namespace
             : g_sidebar.top + S(68);
         int maxBodyHeight = std::max<int>(rowH,
             g_sidebar.bottom - panelTop - headerH - S(8));
-        int bodyHeight = g_favorites.empty()
+        std::vector<int> favoriteOrder;
+        favoriteOrder.reserve(g_favorites.size());
+        for (int index = 0; index < static_cast<int>(g_favorites.size()); ++index)
+        {
+            if (FavoriteBelongsToActiveTab(g_favorites[static_cast<size_t>(index)]))
+                favoriteOrder.push_back(index);
+        }
+        int bodyHeight = favoriteOrder.empty()
             ? S(32)
             : std::min<int>(maxBodyHeight,
-                std::max<int>(rowH, static_cast<int>(g_favorites.size()) * rowH));
+                std::max<int>(rowH, static_cast<int>(favoriteOrder.size()) * rowH));
         int anchorX = !IsRectEmpty(&g_favoriteButtonRect)
             ? (g_favoriteButtonRect.left + g_favoriteButtonRect.right) / 2
             : g_sidebar.left + S(30);
@@ -3586,14 +3605,14 @@ namespace
             panelLeft + width, panelTop + headerH + bodyHeight + S(8) };
         if (panel.right <= panel.left) return;
         g_favoriteListRect = panel;
-        HFONT favoriteFont = Font(10);
+        HFONT favoriteFont = Font(9);
         HGDIOBJ oldFavoriteFont = SelectObject(dc, favoriteFont);
         DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 28 : 18);
         RoundFill(dc, panel, S(8), MenuPopupFill(), MenuPopupBorder());
 
         RECT heading{ panel.left + S(12), panel.top + S(7), panel.right - S(12), panel.top + headerH };
         Text(dc, L"收藏", heading, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
-        if (g_favorites.empty())
+        if (favoriteOrder.empty())
         {
             RECT empty{ panel.left + S(12), panel.top + S(36), panel.right - S(12), panel.bottom - S(8) };
             Text(dc, L"暂无收藏", empty, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
@@ -3604,7 +3623,7 @@ namespace
 
         RECT content{ panel.left + S(5), panel.top + headerH,
             panel.right - S(5), panel.bottom - S(8) };
-        g_favoriteListContentHeight = static_cast<int>(g_favorites.size()) * rowH;
+        g_favoriteListContentHeight = static_cast<int>(favoriteOrder.size()) * rowH;
         bool needsScroll = g_favoriteListContentHeight > content.bottom - content.top;
         if (needsScroll)
             content.right -= S(10);
@@ -3618,10 +3637,6 @@ namespace
 
         int saved = SaveDC(dc);
         IntersectClipRect(dc, content.left, content.top, content.right, content.bottom);
-        std::vector<int> favoriteOrder;
-        favoriteOrder.reserve(g_favorites.size());
-        for (int index = 0; index < static_cast<int>(g_favorites.size()); ++index)
-            favoriteOrder.push_back(index);
         std::stable_sort(favoriteOrder.begin(), favoriteOrder.end(),
             [&](int left, int right)
             {
@@ -16785,6 +16800,8 @@ namespace
                     }
                 }
             }
+            if (g_favoriteListOpen && !IsRectEmpty(&g_favoriteListRect))
+                PaintFavoriteList(dc);
         }
         ReleaseDC(hwnd, dc);
         return presented;
