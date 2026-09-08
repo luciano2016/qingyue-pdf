@@ -378,6 +378,9 @@ namespace
         // reopen or hide another document's rail or content panel.
         bool sidebarRailOpen{ true };
         bool sidebarContentOpen{ true };
+        // The expanded content-panel width belongs to this document Tab.
+        // Zero means an older state file has no per-Tab width yet.
+        int sidebarWidth{};
         bool sidebarStateExplicit{};
         double zoom{ 1.0 };
         // Every zoom transition keeps the previous complete page generation
@@ -469,6 +472,7 @@ namespace
         bool hasExactPosition{};
         bool sidebarRailOpen{ true };
         bool sidebarContentOpen{ true };
+        int sidebarWidth{};
         bool hasSidebarState{};
     };
 
@@ -518,6 +522,7 @@ namespace
         bool hasPageOffset{};
         bool sidebarRailOpen{ true };
         bool sidebarContentOpen{ true };
+        int sidebarWidth{};
         bool hasSidebarState{};
     };
 
@@ -3192,7 +3197,7 @@ namespace
     COLORREF TextSelectionFillColor();
 
     void DrawHighlightedOutlineText(HDC dc, std::wstring const& title, RECT textRect,
-        COLORREF textColor, bool selected)
+        COLORREF textColor)
     {
         std::wstring query = LowerCopy(g_outlineSearchQuery);
         if (query.empty())
@@ -3235,7 +3240,6 @@ namespace
         lines.push_back({ lineStart, static_cast<int>(title.size()) });
 
         COLORREF markFill = TextSelectionFillColor();
-        COLORREF matchText = selected ? T().accent : textColor;
         for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
         {
             int start = lines[lineIndex].first;
@@ -3263,16 +3267,16 @@ namespace
                     lineRect.top + S(1),
                     textRect.left + beforeSize.cx + hitSize.cx,
                     lineRect.bottom - S(1) };
-                // The selected bookmark row already has its own selected
-                // surface. Do not stack search yellow over it.
-                if (!selected)
-                    Fill(dc, mark, markFill);
+                // A selected bookmark uses the same fill as text selected in
+                // the reading area. Keep the fill limited to the match so it
+                // does not cover adjacent bookmark text.
+                Fill(dc, mark, markFill);
                 RECT hitRect{
                     textRect.left + beforeSize.cx,
                     lineRect.top,
                     textRect.left + beforeSize.cx + hitSize.cx + S(1),
                     lineRect.bottom };
-                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, matchText);
+                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, textColor);
             }
         }
     }
@@ -5428,6 +5432,7 @@ namespace
                     if (parts.size() >= 8) item.sidebarRailOpen = std::atoi(parts[7].c_str()) != 0;
                     if (parts.size() >= 9) item.sidebarContentOpen = std::atoi(parts[8].c_str()) != 0;
                     if (parts.size() >= 10) item.hasSidebarState = std::atoi(parts[9].c_str()) != 0;
+                    if (parts.size() >= 11) item.sidebarWidth = std::max(0, std::atoi(parts[10].c_str()));
                     item.path = FromUtf8(parts[3]);
                     if (!item.path.empty()) g_lastSessionTabs.push_back(item);
                 }
@@ -5458,6 +5463,7 @@ namespace
                     if (parts.size() >= 13) item.sidebarRailOpen = std::atoi(parts[12].c_str()) != 0;
                     if (parts.size() >= 14) item.sidebarContentOpen = std::atoi(parts[13].c_str()) != 0;
                     if (parts.size() >= 15) item.hasSidebarState = std::atoi(parts[14].c_str()) != 0;
+                    if (parts.size() >= 16) item.sidebarWidth = std::max(0, std::atoi(parts[15].c_str()));
                     g_recent.push_back(item);
                 }
             }
@@ -5528,7 +5534,8 @@ namespace
             out << "lastSessionTab=" << item.page << '\t' << item.scrollY << '\t' << item.zoom << '\t'
                 << ToUtf8(item.path) << '\t' << item.pageOffsetY << '\t' << item.sidebarScrollY << '\t'
                 << item.selectedOutlineRow << '\t' << (item.sidebarRailOpen ? 1 : 0) << '\t'
-                << (item.sidebarContentOpen ? 1 : 0) << '\t' << (item.hasSidebarState ? 1 : 0) << "\n";
+                << (item.sidebarContentOpen ? 1 : 0) << '\t' << (item.hasSidebarState ? 1 : 0) << '\t'
+                << item.sidebarWidth << "\n";
         }
         for (auto const& item : g_recent)
         {
@@ -5537,7 +5544,8 @@ namespace
                 << item.sidebarScrollY << '\t' << item.selectedOutlineRow << '\t'
                 << item.scrollY << '\t' << item.zoom << '\t' << item.pageOffsetY << '\t'
                 << (item.hasPageOffset ? 1 : 0) << '\t' << (item.sidebarRailOpen ? 1 : 0) << '\t'
-                << (item.sidebarContentOpen ? 1 : 0) << '\t' << (item.hasSidebarState ? 1 : 0) << "\n";
+                << (item.sidebarContentOpen ? 1 : 0) << '\t' << (item.hasSidebarState ? 1 : 0) << '\t'
+                << item.sidebarWidth << "\n";
         }
         for (auto const& item : g_favorites)
         {
@@ -6149,6 +6157,7 @@ namespace
             item.selectedOutlineRow = it->selectedOutlineRow;
             item.sidebarRailOpen = it->sidebarRailOpen;
             item.sidebarContentOpen = it->sidebarContentOpen;
+            item.sidebarWidth = tab.sidebarWidth;
             item.hasSidebarState = it->hasSidebarState;
             item.favorite = it->favorite;
             item.pinned = it->pinned;
@@ -6179,6 +6188,7 @@ namespace
             item.selectedOutlineRow = tab.selectedOutlineRow;
             item.sidebarRailOpen = tab.sidebarRailOpen;
             item.sidebarContentOpen = tab.sidebarContentOpen;
+            item.sidebarWidth = tab.sidebarWidth;
             item.hasSidebarState = tab.sidebarStateExplicit;
             g_recent.insert(g_recent.begin(), std::move(item));
             SortRecent();
@@ -6191,6 +6201,7 @@ namespace
             it->selectedOutlineRow = tab.selectedOutlineRow;
             it->sidebarRailOpen = tab.sidebarRailOpen;
             it->sidebarContentOpen = tab.sidebarContentOpen;
+            it->sidebarWidth = tab.sidebarWidth;
             it->hasSidebarState = tab.sidebarStateExplicit;
         }
         if (saveNow) SaveState();
@@ -11721,6 +11732,7 @@ namespace
             tab->sidebarContentOpen = recentPosition.sidebarContentOpen;
             tab->sidebarStateExplicit = true;
         }
+        tab->sidebarWidth = recentPosition.sidebarWidth;
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
@@ -11838,6 +11850,7 @@ namespace
         tab.selectedOutlineRow = item.selectedOutlineRow;
         tab.sidebarRailOpen = item.sidebarRailOpen;
         tab.sidebarContentOpen = item.sidebarContentOpen;
+        tab.sidebarWidth = item.sidebarWidth;
         tab.sidebarStateExplicit = item.hasSidebarState;
         TouchRecentProgress(tab, false);
     }
@@ -11865,6 +11878,9 @@ namespace
             item.selectedOutlineRow = (g_active == i) ? g_selectedOutlineRow : tab->selectedOutlineRow;
             item.sidebarRailOpen = (g_active == i) ? g_sidebarRailOpen : tab->sidebarRailOpen;
             item.sidebarContentOpen = (g_active == i) ? g_sidebarOpen : tab->sidebarContentOpen;
+            item.sidebarWidth = (g_active == i)
+                ? std::max(g_sidebarExpandedWidth, g_sidebarWidth)
+                : (tab->sidebarWidth > 0 ? tab->sidebarWidth : g_sidebarExpandedWidth);
             item.hasSidebarState = true;
             g_lastSessionTabs.push_back(item);
         }
@@ -12062,6 +12078,8 @@ namespace
         GetClientRect(hwnd, &client);
         g_sidebarWidth = g_sidebarTargetWidth;
         if (g_sidebarWidth >= S(180)) g_sidebarExpandedWidth = g_sidebarWidth;
+        if (PdfTab* active = Active())
+            active->sidebarWidth = g_sidebarExpandedWidth;
         g_sidebarResizePending = false;
         g_lastSidebarResizeMs = GetTickCount64();
         KillTimer(hwnd, 1);
@@ -13389,6 +13407,9 @@ namespace
         tab.collapsedOutlineRows = g_collapsedOutlineRows;
         tab.sidebarRailOpen = g_sidebarRailOpen;
         tab.sidebarContentOpen = g_sidebarOpen;
+        tab.sidebarWidth = std::clamp(
+            std::max(g_sidebarExpandedWidth, g_sidebarWidth),
+            SidebarMinimumWidth(), S(520));
         tab.sidebarStateExplicit = true;
     }
 
@@ -13425,6 +13446,17 @@ namespace
             g_collapsedOutlineRows.clear();
             return;
         }
+
+        int restoredWidth = tab->sidebarWidth > 0
+            ? tab->sidebarWidth
+            : g_sidebarExpandedWidth;
+        restoredWidth = std::clamp(restoredWidth, SidebarMinimumWidth(), S(520));
+        g_sidebarExpandedWidth = restoredWidth;
+        g_sidebarWidth = restoredWidth;
+        g_sidebarTargetWidth = restoredWidth;
+        tab->sidebarWidth = restoredWidth;
+        g_sidebarAnimating = false;
+        KillTimer(hwnd, 11);
 
         int mode = ActiveSidebarModeIndex();
         g_sidebarRailOpen = tab->sidebarRailOpen;
@@ -15419,7 +15451,7 @@ namespace
                     RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
                     DrawBookmarkIcon(dc, mark, markColor, false);
                     if (!g_outlineSearchQuery.empty() && !compactOutline)
-                        DrawHighlightedOutlineText(dc, label, tx, rowText, selected);
+                        DrawHighlightedOutlineText(dc, label, tx, rowText);
                     else
                         Text(dc, label, tx,
                             compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
@@ -18882,6 +18914,7 @@ namespace
         replacement.savedScrollY = tab.savedScrollY;
         replacement.sidebarRailOpen = tab.sidebarRailOpen;
         replacement.sidebarContentOpen = tab.sidebarContentOpen;
+        replacement.sidebarWidth = tab.sidebarWidth;
         replacement.sidebarStateExplicit = tab.sidebarStateExplicit;
 
         try
