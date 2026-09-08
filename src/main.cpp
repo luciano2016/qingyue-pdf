@@ -378,6 +378,7 @@ namespace
         // reopen or hide another document's rail or content panel.
         bool sidebarRailOpen{ true };
         bool sidebarContentOpen{ true };
+        bool sidebarStateExplicit{};
         double zoom{ 1.0 };
         // Every zoom transition keeps the previous complete page generation
         // visible until the new viewport coverage is ready. The raster
@@ -465,6 +466,9 @@ namespace
         int pageOffsetY{};
         bool hasPageOffset{};
         bool hasExactPosition{};
+        bool sidebarRailOpen{ true };
+        bool sidebarContentOpen{ true };
+        bool hasSidebarState{};
     };
 
     enum class FavoriteKind
@@ -501,6 +505,9 @@ namespace
         int sidebarScrollY{};
         int selectedOutlineRow{ -1 };
         bool hasPageOffset{};
+        bool sidebarRailOpen{ true };
+        bool sidebarContentOpen{ true };
+        bool hasSidebarState{};
     };
 
     enum class HomeAction
@@ -3120,6 +3127,7 @@ namespace
     void UpdateVertScrollBar(HWND hwnd);
     void RequestPageNavigationRepaint(HWND hwnd, PdfTab& tab, bool waitForComplete = true);
     void RestoreActiveTabSidebarState(HWND hwnd);
+    void ScrollToPage(PdfTab& tab, int page);
     int PageOffsetFromScroll(PdfTab const& tab, int page, int scrollY);
     int PageH(PdfTab const& tab, int page);
     int PageTopScroll(PdfTab const& tab, int page);
@@ -3443,32 +3451,43 @@ namespace
         if (!tab || !SamePath(tab->path, item.path)) return;
 
         tab->zoom = std::clamp(item.zoom, 0.0833, 64.0);
-        tab->currentPage = std::clamp(item.page, 0, std::max(0, tab->pageCount - 1));
-        if (g_continuousRead)
-        {
-            g_contentHeight = ContinuousContentHeight(*tab);
-            int stageHeight = std::max<int>(1, static_cast<int>(g_stage.bottom - g_stage.top));
-            int maxScroll = std::max<int>(0, g_contentHeight - stageHeight);
-            int target = item.hasPageOffset
-                ? PageTopScroll(*tab, tab->currentPage) + item.pageOffsetY
-                : item.scrollY;
-            if (item.hasNorm)
-                target = PageTopScroll(*tab, tab->currentPage) +
-                    static_cast<int>(std::clamp(item.norm.y0, 0.0f, 1.0f) * PageH(*tab, tab->currentPage)) -
-                    std::max<int>(0, static_cast<int>(g_stage.bottom - g_stage.top) / 3);
-            g_scrollY = std::clamp(target, 0, maxScroll);
-        }
-        else
-        {
-            g_scrollY = 0;
-        }
-        if (item.kind == FavoriteKind::Outline && item.outlineRow >= 0 && item.outlineRow < static_cast<int>(tab->outline.size()))
+        int targetPage = std::clamp(item.page, 0, std::max(0, tab->pageCount - 1));
+        bool outlineTarget = item.kind == FavoriteKind::Outline &&
+            item.outlineRow >= 0 && item.outlineRow < static_cast<int>(tab->outline.size());
+        if (outlineTarget)
         {
             g_selectedOutlineRow = item.outlineRow;
             tab->selectedOutlineRow = item.outlineRow;
+            if (g_continuousRead)
+                ScrollToOutline(*tab, item.outlineRow);
+            else
+                ScrollToPage(*tab, targetPage);
+        }
+        else
+        {
+            tab->currentPage = targetPage;
+            if (g_continuousRead)
+            {
+                g_contentHeight = ContinuousContentHeight(*tab);
+                int stageHeight = std::max<int>(1, static_cast<int>(g_stage.bottom - g_stage.top));
+                int maxScroll = std::max<int>(0, g_contentHeight - stageHeight);
+                int target = item.hasPageOffset
+                    ? PageTopScroll(*tab, targetPage) + item.pageOffsetY
+                    : item.scrollY;
+                if (item.hasNorm)
+                    target = PageTopScroll(*tab, targetPage) +
+                        static_cast<int>(std::clamp(item.norm.y0, 0.0f, 1.0f) * PageH(*tab, targetPage)) -
+                        std::max<int>(0, static_cast<int>(g_stage.bottom - g_stage.top) / 3);
+                g_scrollY = std::clamp(target, 0, maxScroll);
+            }
+            else
+            {
+                g_scrollY = 0;
+            }
         }
         TouchRecentProgress(*tab, false);
         UpdateVertScrollBar(hwnd);
+        RequestPageNavigationRepaint(hwnd, *tab);
         g_favoriteListOpen = false;
         g_hoverFavoriteItem = -1;
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -3540,7 +3559,7 @@ namespace
 
         int availableWidth = std::max<int>(S(1),
             static_cast<int>(g_stage.right - g_sidebar.left - S(8)));
-        int width = std::min<int>(S(560), availableWidth);
+        int width = std::min<int>(S(300), availableWidth);
         width = std::max<int>(S(220), width);
         int rowH = S(34);
         int headerH = S(30);
@@ -3599,12 +3618,22 @@ namespace
 
         int saved = SaveDC(dc);
         IntersectClipRect(dc, content.left, content.top, content.right, content.bottom);
+        std::vector<int> favoriteOrder;
+        favoriteOrder.reserve(g_favorites.size());
+        for (int index = 0; index < static_cast<int>(g_favorites.size()); ++index)
+            favoriteOrder.push_back(index);
+        std::stable_sort(favoriteOrder.begin(), favoriteOrder.end(),
+            [&](int left, int right)
+            {
+                return g_favorites[static_cast<size_t>(left)].page <
+                    g_favorites[static_cast<size_t>(right)].page;
+            });
         int y = content.top - g_favoriteListScrollY;
-        for (int i = 0; i < static_cast<int>(g_favorites.size()); ++i)
+        for (int i = 0; i < static_cast<int>(favoriteOrder.size()); ++i)
         {
             if (y + rowH >= content.top && y <= content.bottom)
             {
-                int favoriteIndex = static_cast<int>(g_favorites.size()) - 1 - i;
+                int favoriteIndex = favoriteOrder[static_cast<size_t>(i)];
                 FavoriteItem const& item = g_favorites[static_cast<size_t>(favoriteIndex)];
                 RECT row{ content.left, y, content.right, y + rowH };
                 int visibleIndex = static_cast<int>(g_favoriteItemRects.size());
@@ -5172,6 +5201,9 @@ namespace
                     }
                     if (parts.size() >= 6) item.sidebarScrollY = std::max(0, std::atoi(parts[5].c_str()));
                     if (parts.size() >= 7) item.selectedOutlineRow = std::atoi(parts[6].c_str());
+                    if (parts.size() >= 8) item.sidebarRailOpen = std::atoi(parts[7].c_str()) != 0;
+                    if (parts.size() >= 9) item.sidebarContentOpen = std::atoi(parts[8].c_str()) != 0;
+                    if (parts.size() >= 10) item.hasSidebarState = std::atoi(parts[9].c_str()) != 0;
                     item.path = FromUtf8(parts[3]);
                     if (!item.path.empty()) g_lastSessionTabs.push_back(item);
                 }
@@ -5199,6 +5231,9 @@ namespace
                     if (parts.size() >= 10) item.zoom = std::clamp(std::atof(parts[9].c_str()), 0.0833, 64.0);
                     if (parts.size() >= 11) item.pageOffsetY = std::atoi(parts[10].c_str());
                     if (parts.size() >= 12) item.hasPageOffset = std::atoi(parts[11].c_str()) != 0;
+                    if (parts.size() >= 13) item.sidebarRailOpen = std::atoi(parts[12].c_str()) != 0;
+                    if (parts.size() >= 14) item.sidebarContentOpen = std::atoi(parts[13].c_str()) != 0;
+                    if (parts.size() >= 15) item.hasSidebarState = std::atoi(parts[14].c_str()) != 0;
                     g_recent.push_back(item);
                 }
             }
@@ -5268,7 +5303,8 @@ namespace
         {
             out << "lastSessionTab=" << item.page << '\t' << item.scrollY << '\t' << item.zoom << '\t'
                 << ToUtf8(item.path) << '\t' << item.pageOffsetY << '\t' << item.sidebarScrollY << '\t'
-                << item.selectedOutlineRow << "\n";
+                << item.selectedOutlineRow << '\t' << (item.sidebarRailOpen ? 1 : 0) << '\t'
+                << (item.sidebarContentOpen ? 1 : 0) << '\t' << (item.hasSidebarState ? 1 : 0) << "\n";
         }
         for (auto const& item : g_recent)
         {
@@ -5276,7 +5312,8 @@ namespace
                 << (item.favorite ? 1 : 0) << '\t' << (item.pinned ? 1 : 0) << '\t' << item.pinnedAt << '\t'
                 << item.sidebarScrollY << '\t' << item.selectedOutlineRow << '\t'
                 << item.scrollY << '\t' << item.zoom << '\t' << item.pageOffsetY << '\t'
-                << (item.hasPageOffset ? 1 : 0) << "\n";
+                << (item.hasPageOffset ? 1 : 0) << '\t' << (item.sidebarRailOpen ? 1 : 0) << '\t'
+                << (item.sidebarContentOpen ? 1 : 0) << '\t' << (item.hasSidebarState ? 1 : 0) << "\n";
         }
         for (auto const& item : g_favorites)
         {
@@ -5886,6 +5923,9 @@ namespace
         {
             item.sidebarScrollY = it->sidebarScrollY;
             item.selectedOutlineRow = it->selectedOutlineRow;
+            item.sidebarRailOpen = it->sidebarRailOpen;
+            item.sidebarContentOpen = it->sidebarContentOpen;
+            item.hasSidebarState = it->hasSidebarState;
             item.favorite = it->favorite;
             item.pinned = it->pinned;
             item.pinnedAt = it->pinnedAt;
@@ -5913,6 +5953,9 @@ namespace
             CaptureRecentPosition(item, tab);
             item.sidebarScrollY = std::max(0, tab.sidebarScrollY[0]);
             item.selectedOutlineRow = tab.selectedOutlineRow;
+            item.sidebarRailOpen = tab.sidebarRailOpen;
+            item.sidebarContentOpen = tab.sidebarContentOpen;
+            item.hasSidebarState = tab.sidebarStateExplicit;
             g_recent.insert(g_recent.begin(), std::move(item));
             SortRecent();
             if (g_recent.size() > 80) g_recent.resize(80);
@@ -5922,6 +5965,9 @@ namespace
             CaptureRecentPosition(*it, tab);
             it->sidebarScrollY = std::max(0, tab.sidebarScrollY[0]);
             it->selectedOutlineRow = tab.selectedOutlineRow;
+            it->sidebarRailOpen = tab.sidebarRailOpen;
+            it->sidebarContentOpen = tab.sidebarContentOpen;
+            it->hasSidebarState = tab.sidebarStateExplicit;
         }
         if (saveNow) SaveState();
     }
@@ -10669,7 +10715,6 @@ namespace
         UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_AutomationFocusChangedEventId);
         NotifyWinEvent(EVENT_OBJECT_FOCUS, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
     }
-    void ScrollToPage(PdfTab& tab, int page);
     void LoadAnnotationsFromPdf(PdfTab& tab);
 
     void ClearAnnotationFocus()
@@ -11447,6 +11492,12 @@ namespace
         int restoreSelectedOutlineRow = recent == g_recent.end() ? -1 : recent->selectedOutlineRow;
         LoadInitialPageGeometry(*tab);
         bool outlineLoadedSynchronously = TryLoadSmallDocumentOutline(*tab);
+        if (hasRecentPosition && recentPosition.hasSidebarState)
+        {
+            tab->sidebarRailOpen = recentPosition.sidebarRailOpen;
+            tab->sidebarContentOpen = recentPosition.sidebarContentOpen;
+            tab->sidebarStateExplicit = true;
+        }
         SaveActiveTabProgress();
         g_tabs.push_back(std::move(tab));
         g_active = static_cast<int>(g_tabs.size()) - 1;
@@ -11476,7 +11527,7 @@ namespace
         {
             g_scrollY = 0;
         }
-        if (openedFromHome)
+        if (openedFromHome && !(hasRecentPosition && recentPosition.hasSidebarState))
         {
             // Opening a document from the home page should start in the
             // document outline when one exists, independent of the sidebar
@@ -11484,6 +11535,11 @@ namespace
             g_sidebarRailOpen = true;
             g_sidebarOpen = true;
             g_sideMode = 0;
+        }
+        if (outlineLoadedSynchronously && Active()->outline.empty() && !Active()->sidebarStateExplicit)
+        {
+            Active()->sidebarRailOpen = true;
+            Active()->sidebarContentOpen = false;
         }
         RestoreActiveTabSidebarState(hwnd);
         UpdateRecent(*Active());
@@ -11557,6 +11613,9 @@ namespace
             item.hasPageOffset);
         tab.sidebarScrollY[0] = std::max(0, item.sidebarScrollY);
         tab.selectedOutlineRow = item.selectedOutlineRow;
+        tab.sidebarRailOpen = item.sidebarRailOpen;
+        tab.sidebarContentOpen = item.sidebarContentOpen;
+        tab.sidebarStateExplicit = item.hasSidebarState;
         TouchRecentProgress(tab, false);
     }
 
@@ -11581,6 +11640,9 @@ namespace
             item.hasPageOffset = g_continuousRead;
             item.sidebarScrollY = (g_active == i) ? g_sidebarScrollY : tab->sidebarScrollY[0];
             item.selectedOutlineRow = (g_active == i) ? g_selectedOutlineRow : tab->selectedOutlineRow;
+            item.sidebarRailOpen = (g_active == i) ? g_sidebarRailOpen : tab->sidebarRailOpen;
+            item.sidebarContentOpen = (g_active == i) ? g_sidebarOpen : tab->sidebarContentOpen;
+            item.hasSidebarState = true;
             g_lastSessionTabs.push_back(item);
         }
         if (!g_lastSessionTabs.empty())
@@ -13104,6 +13166,7 @@ namespace
         tab.collapsedOutlineRows = g_collapsedOutlineRows;
         tab.sidebarRailOpen = g_sidebarRailOpen;
         tab.sidebarContentOpen = g_sidebarOpen;
+        tab.sidebarStateExplicit = true;
     }
 
     void SaveActiveTabProgress()
@@ -14882,13 +14945,13 @@ namespace
             Text(dc, toggleText, toggleLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE, toggleColor);
             RECT largeBtnNew{ sizeBar.right - S(30), sizeBar.top, sizeBar.right, sizeBar.bottom };
             RECT smallBtnNew{ sizeBar.right - S(64), sizeBar.top, sizeBar.right - S(34), sizeBar.bottom };
-            int favoriteSize = panelTitleRect.bottom - panelTitleRect.top;
+            int favoriteSize = sizeBar.bottom - sizeBar.top;
             int favoriteRight = smallBtnNew.left - S(4);
             g_favoriteButtonRect = RECT{
                 favoriteRight - favoriteSize,
-                sizeBar.top + (sizeBar.bottom - sizeBar.top - favoriteSize) / 2,
+                sizeBar.top,
                 favoriteRight,
-                sizeBar.top + (sizeBar.bottom - sizeBar.top - favoriteSize) / 2 + favoriteSize };
+                sizeBar.top + favoriteSize };
             if (registerSidebarButtons)
                 AddButton(CmdFavoriteListToggle, g_favoriteButtonRect, L"", L"收藏列表");
             bool favoriteHovered = Hit(g_favoriteButtonRect, g_mousePos.x, g_mousePos.y);
@@ -14902,8 +14965,8 @@ namespace
                 RoundFill(dc, g_favoriteButtonRect, S(6), fill, fill);
             }
             RECT favoriteGlyph{
-                g_favoriteButtonRect.left + S(2), g_favoriteButtonRect.top + S(2),
-                g_favoriteButtonRect.right - S(2), g_favoriteButtonRect.bottom - S(2) };
+                g_favoriteButtonRect.left + S(5), g_favoriteButtonRect.top + S(5),
+                g_favoriteButtonRect.right - S(5), g_favoriteButtonRect.bottom - S(5) };
             DrawFavoriteIcon(dc, favoriteGlyph,
                 favoritePressed || favoriteHovered ? T().accent : SidebarIconColor(), false);
             if (registerSidebarButtons) AddButton(CmdOutlineSmall, smallBtnNew, L"A-", L"\u51cf\u5c0f\u76ee\u5f55\u5b57\u53f7");
@@ -18458,6 +18521,9 @@ namespace
         replacement.selectedOutlineRow = tab.selectedOutlineRow;
         replacement.collapsedOutlineRows = tab.collapsedOutlineRows;
         replacement.savedScrollY = tab.savedScrollY;
+        replacement.sidebarRailOpen = tab.sidebarRailOpen;
+        replacement.sidebarContentOpen = tab.sidebarContentOpen;
+        replacement.sidebarStateExplicit = tab.sidebarStateExplicit;
 
         try
         {
@@ -19955,6 +20021,11 @@ namespace
                             tab.outlineMetadataRetryCount = 0;
                             tab.outlineMetadataRequested = false;
                             tab.outlineMetadataLoaded = true;
+                            if (tab.outline.empty() && !tab.sidebarStateExplicit)
+                            {
+                                tab.sidebarRailOpen = true;
+                                tab.sidebarContentOpen = false;
+                            }
                             if (i == g_active)
                                 KillTimer(hwnd, 24);
                             if (i == g_active)
