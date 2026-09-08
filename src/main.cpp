@@ -12308,34 +12308,55 @@ namespace
             return;
         }
 
+        // Refresh the overlay geometry before choosing the window scroll
+        // region. A stale empty geometry is enough to let one frame carry the
+        // scrollbar along with the page.
+        RECT windowClient{};
+        GetClientRect(hwnd, &windowClient);
+        UpdateMainScrollRects(windowClient);
+
         // The scrollbars are transparent overlays painted inside g_stage.
         // Do not move their already-present pixels together with the page;
         // doing so makes the thumb visibly jump before its own repaint runs.
         RECT scrollClip = g_stage;
         if (!IsRectEmpty(&g_mainScrollTrackRect))
             scrollClip.right = std::min(scrollClip.right, g_mainScrollTrackRect.left);
+        else if (g_contentHeight > stageH + 1)
+            scrollClip.right = std::min(scrollClip.right, g_stage.right - S(20));
         if (!IsRectEmpty(&g_mainHScrollTrackRect))
             scrollClip.bottom = std::min(scrollClip.bottom, g_mainHScrollTrackRect.top);
+        else if (g_contentWidth > stageW + 1)
+            scrollClip.bottom = std::min(scrollClip.bottom, g_stage.bottom - S(20));
         if (IsRectEmpty(&scrollClip))
             scrollClip = g_stage;
 
         // Move the committed back-buffer together with the pixels already on
         // screen. Without this, the next WM_PAINT starts from a different
         // frame and exposes white/background strips around the page.
-        ShiftStageFrame(dx, dy, g_stage);
+        ShiftStageFrame(dx, dy, scrollClip);
         if (g_paintBufferDc)
         {
             RECT exposed{};
             ScrollDC(g_paintBufferDc, dx, dy, &scrollClip, &scrollClip, nullptr, &exposed);
         }
 
-        RECT invalid{};
-        int result = ScrollWindowEx(hwnd, dx, dy, &scrollClip, &scrollClip, nullptr, &invalid, SW_INVALIDATE);
-        if (result == ERROR)
+        // ScrollWindowEx operates on the window's composed pixels and can
+        // carry an overlay along with the reader even when its clip rectangle
+        // looks correct. Move the visible reader pixels directly instead;
+        // the scrollbar overlay is outside this DC operation and therefore
+        // never gets a transient second position.
+        HDC windowDc = GetDC(hwnd);
+        if (!windowDc)
         {
             RequestStageRepaint(hwnd, includeStatus);
             return;
         }
+        RECT invalid{};
+        ScrollDC(windowDc, dx, dy, &scrollClip, &scrollClip, nullptr, &invalid);
+        ReleaseDC(hwnd, windowDc);
+        if (IsRectEmpty(&invalid))
+            invalid = g_stage;
+        InvalidateRect(hwnd, &invalid, FALSE);
 
         // The target was verified in ScrollStageTo before this fast path, so
         // painting the exposed strip is bounded to cached pixels. Finish it
