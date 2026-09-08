@@ -3197,7 +3197,7 @@ namespace
     COLORREF TextSelectionFillColor();
 
     void DrawHighlightedOutlineText(HDC dc, std::wstring const& title, RECT textRect,
-        COLORREF textColor)
+        COLORREF textColor, bool selected)
     {
         std::wstring query = LowerCopy(g_outlineSearchQuery);
         if (query.empty())
@@ -3240,6 +3240,7 @@ namespace
         lines.push_back({ lineStart, static_cast<int>(title.size()) });
 
         COLORREF markFill = TextSelectionFillColor();
+        COLORREF matchText = selected ? markFill : textColor;
         for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
         {
             int start = lines[lineIndex].first;
@@ -3267,16 +3268,16 @@ namespace
                     lineRect.top + S(1),
                     textRect.left + beforeSize.cx + hitSize.cx,
                     lineRect.bottom - S(1) };
-                // A selected bookmark uses the same fill as text selected in
-                // the reading area. Keep the fill limited to the match so it
-                // does not cover adjacent bookmark text.
-                Fill(dc, mark, markFill);
+                // A selected bookmark changes only the match text color. Do
+                // not add another background over the selected row surface.
+                if (!selected)
+                    Fill(dc, mark, markFill);
                 RECT hitRect{
                     textRect.left + beforeSize.cx,
                     lineRect.top,
                     textRect.left + beforeSize.cx + hitSize.cx + S(1),
                     lineRect.bottom };
-                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, textColor);
+                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, matchText);
             }
         }
     }
@@ -15451,7 +15452,7 @@ namespace
                     RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
                     DrawBookmarkIcon(dc, mark, markColor, false);
                     if (!g_outlineSearchQuery.empty() && !compactOutline)
-                        DrawHighlightedOutlineText(dc, label, tx, rowText);
+                        DrawHighlightedOutlineText(dc, label, tx, rowText, selected);
                     else
                         Text(dc, label, tx,
                             compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
