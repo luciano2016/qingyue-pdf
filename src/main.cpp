@@ -1425,6 +1425,7 @@ namespace
     int g_hoverFavoriteItem{ -1 };
     int g_favoriteListScrollY{};
     int g_favoriteListContentHeight{};
+    int g_favoriteListVisibleHeight{};
     int g_favoriteListDragOffset{};
     int g_favoriteContextPage{ -1 };
     int g_favoriteContextOutlineRow{ -1 };
@@ -1780,6 +1781,7 @@ namespace
     bool g_annotationToolbarOpen{};
     bool g_annotationNoteOpen{};
     bool g_annotationNoteFocused{};
+    bool g_annotationSaveInProgress{};
     HWND g_annotationNoteEdit{};
     HFONT g_annotationNoteEditFont{};
     HBRUSH g_annotationNoteEditBrush{};
@@ -3189,7 +3191,8 @@ namespace
 
     COLORREF TextSelectionFillColor();
 
-    void DrawHighlightedOutlineText(HDC dc, std::wstring const& title, RECT textRect, COLORREF textColor)
+    void DrawHighlightedOutlineText(HDC dc, std::wstring const& title, RECT textRect,
+        COLORREF textColor, bool selected)
     {
         std::wstring query = LowerCopy(g_outlineSearchQuery);
         if (query.empty())
@@ -3232,6 +3235,7 @@ namespace
         lines.push_back({ lineStart, static_cast<int>(title.size()) });
 
         COLORREF markFill = TextSelectionFillColor();
+        COLORREF matchText = selected ? T().accent : textColor;
         for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
         {
             int start = lines[lineIndex].first;
@@ -3259,13 +3263,16 @@ namespace
                     lineRect.top + S(1),
                     textRect.left + beforeSize.cx + hitSize.cx,
                     lineRect.bottom - S(1) };
-                Fill(dc, mark, markFill);
+                // The selected bookmark row already has its own selected
+                // surface. Do not stack search yellow over it.
+                if (!selected)
+                    Fill(dc, mark, markFill);
                 RECT hitRect{
                     textRect.left + beforeSize.cx,
                     lineRect.top,
                     textRect.left + beforeSize.cx + hitSize.cx + S(1),
                     lineRect.bottom };
-                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, textColor);
+                Text(dc, hit, hitRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, matchText);
             }
         }
     }
@@ -3294,6 +3301,8 @@ namespace
     void AddFavoriteFromContext(HWND hwnd);
     void ActivateFavorite(HWND hwnd, int index);
     bool HandleFavoriteClick(HWND hwnd, int x, int y);
+    void Command(HWND hwnd, int id);
+    RECT SidebarPanelToggleRectForClient(RECT client);
     int ClampFavoriteListScrollValue(int value);
     void ScrollFavoriteListTo(HWND hwnd, int value);
     std::wstring FavoriteKindName(FavoriteKind kind);
@@ -3589,7 +3598,6 @@ namespace
             if (g_favorites.size() > 200) g_favorites.erase(g_favorites.begin());
             SaveState();
         }
-        g_favoriteListOpen = true;
         g_hoverFavoriteItem = -1;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -3672,10 +3680,11 @@ namespace
             int thumbTop = std::clamp<int>(y - thumbH / 2,
                 g_favoriteListScrollTrackRect.top,
                 g_favoriteListScrollTrackRect.bottom - thumbH);
-            ScrollFavoriteListTo(hwnd, MulDiv(
-                thumbTop - g_favoriteListScrollTrackRect.top,
-                std::max<int>(0, g_favoriteListContentHeight - trackH), travel));
-            return true;
+                ScrollFavoriteListTo(hwnd, MulDiv(
+                 thumbTop - g_favoriteListScrollTrackRect.top,
+                 std::max<int>(0, g_favoriteListContentHeight -
+                     std::max<int>(1, g_favoriteListVisibleHeight)), travel));
+                return true;
         }
         for (size_t i = 0; i < g_favoriteItemRects.size(); ++i)
         {
@@ -3706,6 +3715,7 @@ namespace
         g_favoriteListScrollTrackRect = {};
         g_favoriteListScrollThumbRect = {};
         g_favoriteListContentHeight = 0;
+        g_favoriteListVisibleHeight = 0;
         if (!g_favoriteListOpen || !SidebarVisible()) return;
 
         PdfTab* activeTab = Active();
@@ -3766,6 +3776,7 @@ namespace
         RECT content{ panel.left + S(5), panel.top + headerH,
             panel.right - S(5), panel.bottom - S(8) };
         g_favoriteListContentHeight = static_cast<int>(favoriteOrder.size()) * rowH;
+        g_favoriteListVisibleHeight = std::max<int>(1, content.bottom - content.top);
         bool needsScroll = g_favoriteListContentHeight > content.bottom - content.top;
         if (needsScroll)
             content.right -= S(10);
@@ -11242,8 +11253,7 @@ namespace
 
     int ClampFavoriteListScrollValue(int value)
     {
-        int visible = std::max<int>(1,
-            g_favoriteListScrollTrackRect.bottom - g_favoriteListScrollTrackRect.top);
+        int visible = std::max<int>(1, g_favoriteListVisibleHeight);
         int maxScroll = std::max<int>(0, g_favoriteListContentHeight - visible);
         return std::clamp(value, 0, maxScroll);
     }
@@ -13470,14 +13480,19 @@ namespace
         RestoreActiveTabSidebarState(hwnd);
     }
 
-    int SidebarRailItemAtPoint(int x, int y)
+    int SidebarRailItemAtPoint(HWND hwnd, int x, int y)
     {
         if (!Active() || !SidebarRailVisible()) return -1;
+        RECT client{};
+        if (!hwnd || !GetClientRect(hwnd, &client)) return -1;
         int tabWidth = S(34);
         int tabGap = S(5);
         int railWidth = S(44);
         int tabLeft = std::max<int>(0, (railWidth - tabWidth) / 2);
         if (x < tabLeft || x >= tabLeft + tabWidth) return -1;
+        // Use the same freshly rebuilt client geometry as the paint pass. In
+        // particular, do not let a stale toolbar/sidebar snapshot decide
+        // whether a rapid click belongs to the rail.
         int relativeY = y - g_sidebar.top - S(10);
         int stride = tabWidth + tabGap;
         if (relativeY < 0 || relativeY >= stride * 4) return -1;
@@ -13531,7 +13546,64 @@ namespace
             SetTimer(hwnd, 12, 500, nullptr);
         }
         InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateWindow(hwnd);
         return true;
+    }
+
+    bool HandleSidebarControlClick(HWND hwnd, int x, int y)
+    {
+        if (!Active()) return false;
+
+        // WM_LBUTTONDBLCLK is the second press of a fast double click. It
+        // must have exactly the same target priority as WM_LBUTTONDOWN;
+        // otherwise the page double-click handler consumes it and the user
+        // has to click a second time to toggle the sidebar.
+        RefreshReaderHitGeometry(hwnd);
+        if (int railItem = SidebarRailItemAtPoint(hwnd, x, y); railItem >= 0)
+        {
+            HandleSidebarRailClick(hwnd, railItem);
+            return true;
+        }
+        if (SidebarVisible() && Hit(g_sidebarContentCloseRect, x, y))
+        {
+            g_pressedButtonRect = g_sidebarContentCloseRect;
+            g_hasPressedButton = true;
+            SetTimer(hwnd, 2, 90, nullptr);
+            g_sidebarOpen = false;
+            g_favoriteListOpen = false;
+            SaveActiveTabSidebarState(*Active());
+            InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateWindow(hwnd);
+            return true;
+        }
+
+        RECT client{};
+        if (GetClientRect(hwnd, &client))
+        {
+            RECT panelToggle = SidebarPanelToggleRectForClient(client);
+            if (Hit(panelToggle, x, y))
+            {
+                g_pressedButtonRect = panelToggle;
+                g_hasPressedButton = true;
+                SetTimer(hwnd, 2, 90, nullptr);
+                InvalidateRect(hwnd, &panelToggle, FALSE);
+                Command(hwnd, CmdSidebarPanelToggle);
+                UpdateWindow(hwnd);
+                return true;
+            }
+        }
+        if (g_sideMode == 0 && SidebarVisible() &&
+            !IsRectEmpty(&g_outlineToggleAllRect) &&
+            Hit(g_outlineToggleAllRect, x, y))
+        {
+            g_pressedButtonRect = g_outlineToggleAllRect;
+            g_hasPressedButton = true;
+            SetTimer(hwnd, 2, 90, nullptr);
+            InvalidateRect(hwnd, &g_outlineToggleAllRect, FALSE);
+            Command(hwnd, CmdOutlineToggleAll);
+            return true;
+        }
+        return false;
     }
 
     void RestoreActiveTabPosition(HWND hwnd)
@@ -13598,17 +13670,14 @@ namespace
         if (PdfTab* target = Active())
         {
             ResumeActiveTabMetadata(hwnd, *target);
-            // The renderer is shared, but only this Tab's work is allowed to
-            // compete during activation. Completed caches on other Tabs stay
-            // intact and their suspended metadata resumes when revisited.
-            PrioritizePageRendersForTab(*target);
-            // Release the previous Tab's raster and hit-test caches at the
-            // switch boundary. Display-list destruction is deferred to the
-            // existing idle trim so activation never waits on a worker-held
-            // document lock.
-            TrimBackgroundRenderCaches();
-            QueueInitialViewportPreview(hwnd, *target);
-            SchedulePagePrefetch(hwnd);
+            // Do not cancel a MuPDF render or walk every inactive Tab while
+            // processing the mouse click. Those are maintenance operations,
+            // so defer them until the newly selected Tab has had a chance to
+            // paint its already committed frame.
+            // Initial raster scheduling and cache arbitration are deliberately
+            // posted after the cached frame has been presented. This keeps a
+            // large PDF from making the tab click wait on the shared worker.
+            SetTimer(hwnd, 25, 1, nullptr);
         }
         ScheduleIdleCacheTrim(hwnd);
         SetTitle();
@@ -15350,7 +15419,7 @@ namespace
                     RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
                     DrawBookmarkIcon(dc, mark, markColor, false);
                     if (!g_outlineSearchQuery.empty() && !compactOutline)
-                        DrawHighlightedOutlineText(dc, label, tx, rowText);
+                        DrawHighlightedOutlineText(dc, label, tx, rowText, selected);
                     else
                         Text(dc, label, tx,
                             compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
@@ -16826,7 +16895,9 @@ namespace
         HFONT f = Font(10);
         HGDIOBJ oldFont = SelectObject(dc, f);
         std::wstring pageSize = L"-- x -- \u5398\u7c73";
-        if (tab && !tab->pages.empty())
+        if (g_annotationSaveInProgress)
+            pageSize = L"\u6b63\u5728\u4fdd\u5b58\u6807\u6ce8...";
+        else if (tab && !tab->pages.empty())
         {
             auto const& p = tab->pages[static_cast<size_t>(tab->currentPage)];
             wchar_t buf[80]{};
@@ -18879,6 +18950,20 @@ namespace
             return;
         }
 
+        // PDF rewriting is synchronous because the document handle must stay
+        // locked while MuPDF creates the replacement file. Give the user an
+        // immediate status frame before entering that blocking operation.
+        g_annotationSaveInProgress = true;
+        SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateWindow(hwnd);
+        auto finishSaveStatus = [&]()
+        {
+            g_annotationSaveInProgress = false;
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            InvalidateRect(hwnd, nullptr, FALSE);
+        };
+
         std::filesystem::path source(tab.path);
         std::filesystem::path temp = source;
         temp += L".quietpdf-save.tmp.pdf";
@@ -18935,6 +19020,7 @@ namespace
         if (!saved || !std::filesystem::exists(temp))
         {
             try { std::filesystem::remove(temp); } catch (...) {}
+            finishSaveStatus();
             MessageBoxW(hwnd, L"PDF \u6807\u6ce8\u5199\u5165\u5931\u8d25\uff0c\u539f\u6587\u4ef6\u672a\u4fee\u6539\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
@@ -18959,6 +19045,7 @@ namespace
             RestoreScrollAfterReload(hwnd, tab, oldScroll);
             std::wstring msg = L"PDF 已生成临时保存文件，但替换原文件失败。\n\n原因：" + LastErrorText(replaceError) +
                 L"\n\n请确认这个 PDF 没有被其它程序占用。\n临时文件：\n" + temp.wstring();
+            finishSaveStatus();
             MessageBoxW(hwnd, msg.c_str(), L"保存", MB_OK | MB_ICONWARNING);
             return;
         }
@@ -18967,6 +19054,7 @@ namespace
         {
             if (!ReloadPdfTab(tab, source.wstring(), page, zoom))
             {
+                finishSaveStatus();
                 MessageBoxW(hwnd, L"PDF 已保存，但重新载入失败。请重新打开文件。", L"保存", MB_OK | MB_ICONWARNING);
                 return;
             }
@@ -18988,6 +19076,7 @@ namespace
         tab.dirty = false;
         TouchRecentProgress(tab, true);
         SetTitle();
+        finishSaveStatus();
         RECT client{};
         GetClientRect(hwnd, &client);
         RECT chrome{ 0, 0, client.right, g_stage.top };
@@ -20686,6 +20775,19 @@ namespace
                 POINT pt{};
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
+                if (Active())
+                {
+                    RECT client{};
+                    bool sidebarControl = SidebarRailItemAtPoint(hwnd, pt.x, pt.y) >= 0;
+                    if (GetClientRect(hwnd, &client))
+                        sidebarControl = sidebarControl || Hit(SidebarPanelToggleRectForClient(client), pt.x, pt.y);
+                    sidebarControl = sidebarControl || (SidebarVisible() && Hit(g_sidebarContentCloseRect, pt.x, pt.y));
+                    if (sidebarControl)
+                    {
+                        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                        return TRUE;
+                    }
+                }
                 if (g_customZoomOpen)
                 {
                     HCURSOR cursor = LoadCursorW(nullptr,
@@ -20803,6 +20905,8 @@ namespace
             int y = GET_Y_LPARAM(lParam);
             if (g_customZoomOpen || ConfirmationDialogOpen())
                 return 0;
+            if (HandleSidebarControlClick(hwnd, x, y))
+                return 0;
             if (PdfTab* tab = Active())
             {
                 int page = -1;
@@ -20864,52 +20968,11 @@ namespace
                 g_pressedButtonRect = RECT{};
                 InvalidateRect(hwnd, &g_sidebar, FALSE);
             }
-            // Resolve rail clicks from the current geometry before any
-            // scroll/content hit tests. The painted rectangle list can still
-            // describe the previous panel width during an immediate toggle.
-            if (int railItem = SidebarRailItemAtPoint(x, y); railItem >= 0)
-            {
-                HandleSidebarRailClick(hwnd, railItem);
+            // Resolve all sidebar controls before scroll/content hit tests.
+            // The same dispatcher is also used by WM_LBUTTONDBLCLK so a fast
+            // second press cannot fall through into page selection.
+            if (HandleSidebarControlClick(hwnd, x, y))
                 return 0;
-            }
-            if (SidebarVisible() && Hit(g_sidebarContentCloseRect, x, y))
-            {
-                g_pressedButtonRect = g_sidebarContentCloseRect;
-                g_hasPressedButton = true;
-                SetTimer(hwnd, 2, 90, nullptr);
-                g_sidebarOpen = false;
-                g_favoriteListOpen = false;
-                if (PdfTab* active = Active()) SaveActiveTabSidebarState(*active);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            RECT currentPanelToggle{};
-            {
-                RECT client{};
-                GetClientRect(hwnd, &client);
-                currentPanelToggle = SidebarPanelToggleRectForClient(client);
-                g_sidebarPanelToggleRect = currentPanelToggle;
-            }
-            if (Hit(currentPanelToggle, x, y))
-            {
-                g_pressedButtonRect = currentPanelToggle;
-                g_hasPressedButton = true;
-                SetTimer(hwnd, 2, 90, nullptr);
-                InvalidateRect(hwnd, &currentPanelToggle, FALSE);
-                Command(hwnd, CmdSidebarPanelToggle);
-                return 0;
-            }
-            if (g_sideMode == 0 && SidebarVisible() &&
-                !IsRectEmpty(&g_outlineToggleAllRect) &&
-                Hit(g_outlineToggleAllRect, x, y))
-            {
-                g_pressedButtonRect = g_outlineToggleAllRect;
-                g_hasPressedButton = true;
-                SetTimer(hwnd, 2, 90, nullptr);
-                InvalidateRect(hwnd, &g_outlineToggleAllRect, FALSE);
-                Command(hwnd, CmdOutlineToggleAll);
-                return 0;
-            }
             if (HandleFavoriteClick(hwnd, x, y))
                 return 0;
             // Directory navigation has priority over page selection and all
@@ -22591,6 +22654,22 @@ namespace
                     else
                         SetTimer(hwnd, 24, 500, nullptr);
                 }
+                return 0;
+            }
+            if (wParam == 25)
+            {
+                KillTimer(hwnd, 25);
+                if (PdfTab* tab = Active())
+                {
+                    // This work is intentionally outside ActivateTab's
+                    // mouse-message transaction. It may cancel stale work or
+                    // inspect large inactive caches, but the selected Tab is
+                    // already visible by the time it runs.
+                    PrioritizePageRendersForTab(*tab);
+                    QueueInitialViewportPreview(hwnd, *tab);
+                    SchedulePagePrefetch(hwnd);
+                }
+                ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
             break;
