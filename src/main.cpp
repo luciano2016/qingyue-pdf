@@ -3278,7 +3278,7 @@ namespace
                 if (depth > collapsedDepth) continue;
                 collapsedDepth = -1;
             }
-            int baseRowH = S(depth == 0 ? 36 : 32);
+            int baseRowH = S(depth == 0 ? 32 : 28);
             int lineX = g_sidebar.left + S(10 + depth * 18);
             int iconLeft = lineX + S(12);
             int pageLeft = g_sidebar.right - S(30);
