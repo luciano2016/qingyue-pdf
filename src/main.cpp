@@ -15063,7 +15063,7 @@ namespace
             bool toggleHovered = Hit(g_outlineToggleAllRect, g_mousePos.x, g_mousePos.y);
             bool togglePressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &g_outlineToggleAllRect);
             DrawBookmarkToolbarFeedback(dc, g_outlineToggleAllRect, toggleHovered, togglePressed);
-            DrawOutlineToggleGlyph(dc, g_outlineToggleAllRect, collapseAll,
+            DrawOutlineToggleGlyph(dc, g_outlineToggleAllRect, !collapseAll,
                 togglePressed || toggleHovered ? T().accent : SidebarIconColor());
         }
 
@@ -15450,7 +15450,7 @@ namespace
                 ? searchMaxWidth
                 : std::min<int>(searchMaxWidth, searchMinWidth);
             searchWidth = std::clamp(searchWidth, S(1), searchMaxWidth);
-            int searchHeight = S(26);
+            int searchHeight = S(28);
             int searchTop = sizeBar.top + (sizeBar.bottom - sizeBar.top - searchHeight) / 2;
             g_outlineSearchRect = RECT{ sizeBar.left, searchTop, sizeBar.left + searchWidth, searchTop + searchHeight };
             COLORREF searchFill = MixColor(T().paper, T().accent, IsDarkTheme() ? 0.10 : 0.06);
