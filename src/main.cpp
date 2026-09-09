@@ -12220,7 +12220,10 @@ namespace
 
     RECT SidebarScrollRect()
     {
-        int top = g_sidebar.top + S(g_sideMode == 0 ? 76 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
+        // Keep the bookmark header outside the scrolling viewport. The extra
+        // breathing room prevents the first row and its tree connector from
+        // appearing to slide underneath the fixed title/tool row.
+        int top = g_sidebar.top + S(g_sideMode == 0 ? 84 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
         return RECT{ g_sidebar.left, top, g_sidebar.right, g_sidebar.bottom };
     }
 
@@ -15519,7 +15522,7 @@ namespace
             HFONT outlineFont = Font(EffectiveOutlineFont());
             SelectObject(dc, outlineFont);
             int clipDc = SaveDC(dc);
-            RECT scrollArea{ g_sidebar.left, g_sidebar.top + S(76), g_sidebar.right, g_sidebar.bottom };
+            RECT scrollArea = SidebarScrollRect();
             IntersectClipRect(dc, scrollArea.left, scrollArea.top, scrollArea.right, scrollArea.bottom);
             int rows = static_cast<int>(tab.outline.size());
             bool compactOutline = rows > 512;
@@ -15558,7 +15561,8 @@ namespace
                 int y = scrollArea.top + it->top - g_sidebarScrollY;
                 RECT row{ g_sidebar.left + S(3), y, g_sidebar.right - S(3), y + rowH };
                 int page = it->page;
-                if (visible(row))
+                RECT visibleRow{};
+                if (IntersectRect(&visibleRow, &row, &scrollArea))
                 {
                     g_sidebarRowPages.push_back(page);
                     g_sidebarRowRects.push_back(row);
@@ -15625,6 +15629,16 @@ namespace
             DeleteObject(treePen);
             SelectObject(dc, f);
             DeleteObject(outlineFont);
+
+            // A quiet boundary makes the fixed header and scrolling list read
+            // as two separate regions without adding another highlight band.
+            RECT headerDivider{
+                g_sidebar.left,
+                g_sidebar.top + S(76),
+                g_sidebar.right,
+                g_sidebar.top + S(77)
+            };
+            GlassDivider(dc, headerDivider);
         }
         ClampSidebarScroll();
         PaintSidebarScrollBar(dc);
