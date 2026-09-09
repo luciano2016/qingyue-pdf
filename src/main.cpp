@@ -2660,6 +2660,11 @@ namespace
 
     void RedrawMainScrollBarNow(HWND hwnd)
     {
+        // During a drag, the document may already have a large invalid region
+        // queued. Forcing a top-level WM_PAINT here would merge that region
+        // with the thumb feedback and block the input message on page paint.
+        // The drag path presents the small overlay directly instead.
+        if (g_draggingMainScroll) return;
         // Keep the two overlays as separate update regions. Their bounding
         // rectangle would cover most of the reader and make a thumb drag
         // synchronously repaint the whole viewport.
@@ -2674,6 +2679,7 @@ namespace
 
     PdfTab* Active();
     void SyncSidebarProgressFromScrollFast(HWND hwnd, PdfTab& tab, int scrollY);
+    bool PresentMainScrollBarNow(HWND hwnd, RECT oldThumb);
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame,
         bool immediateRepaint, bool dragFrame);
 
@@ -2707,6 +2713,7 @@ namespace
             newScroll = g_mainScrollDragStartPos + MulDiv(dragDelta, maxScroll, travel);
 
         int oldTarget = g_dragScrollTarget;
+        RECT oldThumb = g_mainScrollThumbRect;
         int liveTop = std::clamp<int>(pointerY - g_mainScrollDragOffset, track.top, track.bottom - thumbH);
         bool liveChanged = !g_mainScrollThumbLive || g_mainScrollThumbLiveTop != liveTop;
         g_mainScrollThumbLive = true;
@@ -2720,7 +2727,12 @@ namespace
         // maintenance may inspect the PDF and can take much longer than one
         // input message on a large file; it must never delay pointer feedback.
         if (redrawNow && liveChanged)
-            RedrawMainScrollBarNow(hwnd);
+        {
+            if (!PresentMainScrollBarNow(hwnd, oldThumb))
+            {
+                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+            }
+        }
 
         // The first input sample publishes g_dragScrollTarget before the
         // coalesced message is handled. On that message oldTarget therefore
@@ -20379,6 +20391,36 @@ namespace
         }
     }
 
+    bool PresentMainScrollBarNow(HWND hwnd, RECT oldThumb)
+    {
+        if (!hwnd || IsRectEmpty(&g_mainScrollTrackRect)) return false;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HDC dc = GetDC(hwnd);
+        if (!dc) return false;
+
+        RECT newThumb = g_mainScrollThumbRect;
+        auto repaint = [&](RECT area)
+        {
+            if (IsRectEmpty(&area)) return;
+            int state = SaveDC(dc);
+            IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+            // The stage frame is the committed page underlay. Restoring only
+            // the old and new thumb rectangles removes the previous overlay
+            // without invalidating or repainting the document viewport.
+            RestoreStageFrame(dc, area);
+            PaintMainScrollBar(dc, client, area);
+            RestoreDC(dc, state);
+        };
+
+        repaint(oldThumb);
+        if (!EqualRect(&oldThumb, &newThumb))
+            repaint(newThumb);
+        ReleaseDC(hwnd, dc);
+        return true;
+    }
+
     void RefreshMainScrollHover(HWND hwnd, POINT point);
 
     bool BeginMainScrollDrag(HWND hwnd, POINT pointer, MainScrollDragOwner owner)
@@ -20425,7 +20467,11 @@ namespace
             g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
         g_mainScrollDragGeometryValid = !IsRectEmpty(&g_mainScrollDragTrackRect);
         SetCapture(hwnd);
-        InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+        // Make the pressed/hovered thumb visible without routing the update
+        // through a pending page invalidation. This keeps the first drag
+        // frame as responsive as subsequent pointer samples.
+        if (!PresentMainScrollBarNow(hwnd, g_mainScrollThumbRect))
+            InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
         return true;
     }
 
