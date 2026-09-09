@@ -15420,7 +15420,7 @@ namespace
                 return;
             }
             KillTimer(g_hwnd, 7);
-            RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(34), g_sidebar.right - S(12), g_sidebar.top + S(68) };
+            RECT sizeBar{ g_sidebar.left + S(12), g_sidebar.top + S(31), g_sidebar.right - S(12), g_sidebar.top + S(65) };
 
             // The second row follows the compact Sumatra-style order:
             // search, divider, favorite, smaller text, larger text.
@@ -17573,7 +17573,7 @@ namespace
         ReleaseDC(g_hwnd, dc);
 
         int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
-        measure->itemWidth = IsCheckboxMenuItem(item->id) ? std::max(S(96), textW + S(46)) : std::max(S(112), textW + (shortcut.empty() ? S(54) : S(62)));
+        measure->itemWidth = IsCheckboxMenuItem(item->id) ? std::max(S(96), textW + S(54)) : std::max(S(112), textW + (shortcut.empty() ? S(54) : S(62)));
         measure->itemHeight = ThemedMenuRowHeight(item);
         return true;
     }
@@ -17674,7 +17674,9 @@ namespace
         HGDIOBJ old = SelectObject(draw->hDC, font);
         RECT textRect{ r.left + ThemedMenuTextLeft(item), r.top, r.right - S(10), r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
-        Text(draw->hDC, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(disabled));
+        UINT mainTextFlags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        if (!IsCheckboxMenuItem(item->id)) mainTextFlags |= DT_END_ELLIPSIS;
+        Text(draw->hDC, mainText, textRect, mainTextFlags, MenuPopupText(disabled));
         if (!shortcut.empty())
         {
             RECT shortcutRect{ std::max(textRect.right + S(6), r.right - S(70)), r.top, r.right - S(10), r.bottom };
@@ -17738,7 +17740,9 @@ namespace
         int rightInset = item.id == 2511 ? S(22) : S(10);
         RECT textRect{ r.left + ThemedMenuTextLeft(&item), r.top, r.right - rightInset, r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
-        Text(dc, mainText, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, MenuPopupText(item.disabled));
+        UINT mainTextFlags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        if (!IsCheckboxMenuItem(item.id)) mainTextFlags |= DT_END_ELLIPSIS;
+        Text(dc, mainText, textRect, mainTextFlags, MenuPopupText(item.disabled));
         if (!shortcut.empty())
         {
             RECT shortcutRect{ std::max(textRect.right + S(6), r.right - S(70)), r.top, r.right - S(10), r.bottom };
@@ -18335,7 +18339,7 @@ namespace
                 SelectObject(dc, oldRowFont);
                 DeleteObject(rowFont);
                 int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
-                width = std::max(width, IsCheckboxMenuItem(item->id) ? textW + S(46) : textW + (shortcut.empty() ? S(54) : S(62)));
+                width = std::max(width, IsCheckboxMenuItem(item->id) ? textW + S(54) : textW + (shortcut.empty() ? S(54) : S(62)));
             }
             height += rowH;
         }
