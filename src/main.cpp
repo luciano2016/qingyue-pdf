@@ -12223,7 +12223,7 @@ namespace
         // Keep the bookmark header outside the scrolling viewport. The extra
         // breathing room prevents the first row and its tree connector from
         // appearing to slide underneath the fixed title/tool row.
-        int top = g_sidebar.top + S(g_sideMode == 0 ? 81 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
+        int top = g_sidebar.top + S(g_sideMode == 0 ? 79 : (g_sideMode == 1 ? 80 : (g_sideMode == 2 ? 168 : 96)));
         return RECT{ g_sidebar.left, top, g_sidebar.right, g_sidebar.bottom };
     }
 
@@ -15634,9 +15634,9 @@ namespace
             // as two separate regions without adding another highlight band.
             RECT headerDivider{
                 g_sidebar.left,
-                g_sidebar.top + S(73),
+                g_sidebar.top + S(71),
                 g_sidebar.right,
-                g_sidebar.top + S(74)
+                g_sidebar.top + S(72)
             };
             GlassDivider(dc, headerDivider);
         }
