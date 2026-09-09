@@ -17275,7 +17275,6 @@ namespace
             Intersects(paintClip, g_favoriteListRect))
             PaintFavoriteList(dc);
         if (paintedPages) ClampScroll(g_hwnd);
-        PaintMainScrollBar(dc, client, paintClip);
         if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) || Intersects(paintClip, g_annotationNotePanelRect))
         PaintAnnotationToolbar(dc, *tab, client);
         return canFlush;
@@ -20602,6 +20601,12 @@ namespace
             if (IntersectRect(&committedStage, &g_stage, &dirty))
                 CommitStageFrame(mem, committedStage, fullStageDirty);
         }
+        // Keep the stable stage frame free of scrollbar pixels. The scrollbar
+        // is a transparent overlay and must be painted only after the frame
+        // has been committed; otherwise a later thumb drag restores the old
+        // thumb from the cached frame and draws a second one at the pointer.
+        if (!scrollBarOnly)
+            PaintMainScrollBar(mem, client, dirty);
         PaintSidebarPanelToggle(mem, client);
         if (repaintUi) PaintStatus(mem, client);
         PaintTabListOverlay(mem, client);
