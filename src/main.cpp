@@ -1458,7 +1458,6 @@ namespace
     std::vector<RECT> g_tabListItemRects;
     std::vector<int> g_tabListItemIds;
     constexpr UINT WM_QUIETPDF_FILE_CHANGED = WM_APP + 41;
-    constexpr UINT WM_QUIETPDF_DRAG_SCROLL = WM_APP + 42;
     constexpr UINT WM_QUIETPDF_PAGE_RENDERED = WM_APP + 43;
     constexpr UINT WM_QUIETPDF_HOME_THUMB_READY = WM_APP + 44;
     constexpr UINT WM_QUIETPDF_HOME_SCROLL_FRAME = WM_APP + 45;
@@ -1651,13 +1650,14 @@ namespace
     bool g_smoothSidebarScroll{};
     bool g_statusPinned{ true };
     bool g_statusReveal{};
+    enum class MainScrollDragOwner { None, Mouse, Pointer, Gesture };
     bool g_draggingMainScroll{};
+    MainScrollDragOwner g_mainScrollDragOwner{ MainScrollDragOwner::None };
     bool g_draggingMainHScroll{};
+    bool g_pointerMainScrollDrag{};
     bool g_draggingHomeScroll{};
     bool g_draggingSidebarScroll{};
-    bool g_dragScrollPosted{};
     bool g_mainScrollThumbLive{};
-    bool g_mainScrollDragFrameShifted{};
     bool g_mainScrollHover{};
     bool g_mainHScrollHover{};
     bool g_homeScrollHover{};
@@ -1678,6 +1678,8 @@ namespace
     bool g_sidebarProgressRefreshPending{};
     bool g_gesturePanning{};
     bool g_gestureSidebar{};
+    bool g_gestureMainScrollDrag{};
+    int g_gestureMainScrollLastY{};
     bool g_gestureZooming{};
     bool g_gestureZoomRenderSuppressed{};
     double g_gestureZoomStartDistance{};
@@ -2605,11 +2607,13 @@ namespace
         int mappedScrollY = presentationActive
             ? std::clamp(g_scrollY, 0, mappedMaxScroll)
             : g_scrollY;
-        bool keepVerticalTrack = g_draggingMainScroll && g_mainScrollDragGeometryValid &&
+        bool dragGeometry = g_mainScrollDragGeometryValid &&
+            !IsRectEmpty(&g_mainScrollDragTrackRect);
+        bool keepVerticalTrack = dragGeometry &&
             !IsRectEmpty(&g_mainScrollDragTrackRect);
         if (mappedMaxScroll > 0 || keepVerticalTrack)
         {
-            if (g_draggingMainScroll && g_mainScrollDragGeometryValid)
+            if (dragGeometry)
             {
                 // Keep the thumb-to-pointer mapping stable for the lifetime
                 // of a drag. Page geometry can be completed asynchronously;
@@ -2624,16 +2628,16 @@ namespace
             int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
             int mappedContentHeight = std::max<int>(1, mappedMaxScroll + mappedStageH);
             int thumbH = std::clamp(MulDiv(mappedStageH, trackH, mappedContentHeight), S(28), trackH);
-            if (g_draggingMainScroll && g_mainScrollDragGeometryValid)
+            if (dragGeometry)
                 thumbH = std::clamp(g_mainScrollDragThumbHeight, S(28), trackH);
-            else if (g_draggingMainScroll && g_mainScrollThumbLive && g_mainScrollThumbLiveHeight > 0)
+            else if (g_mainScrollThumbLive && g_mainScrollThumbLiveHeight > 0)
                 thumbH = std::clamp(g_mainScrollThumbLiveHeight, S(28), trackH);
-            int maxScroll = g_draggingMainScroll && g_mainScrollDragGeometryValid
+            int maxScroll = dragGeometry
                 ? std::max<int>(1, g_mainScrollDragMaxScroll)
                 : std::max<int>(1, mappedMaxScroll);
             int thumbTravel = std::max<int>(0, trackH - thumbH);
             int thumbTop = g_mainScrollTrackRect.top + MulDiv(mappedScrollY, thumbTravel, maxScroll);
-            if (g_draggingMainScroll && g_mainScrollThumbLive)
+            if (g_mainScrollThumbLive)
                 thumbTop = std::clamp<int>(g_mainScrollThumbLiveTop, g_mainScrollTrackRect.top, g_mainScrollTrackRect.bottom - thumbH);
             else if (g_scrollY >= maxScroll)
                 thumbTop = g_mainScrollTrackRect.bottom - thumbH;
@@ -2673,7 +2677,7 @@ namespace
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame,
         bool immediateRepaint, bool dragFrame);
 
-    void UpdateMainScrollDragStateFromPointer(HWND hwnd, int pointerY, bool redrawNow, bool updateContent = true)
+    void UpdateMainScrollDragStateFromPointer(HWND hwnd, int pointerY, bool redrawNow)
     {
         if (!g_draggingMainScroll || g_active < 0) return;
 
@@ -2712,25 +2716,29 @@ namespace
         g_mainScrollThumbRect = RECT{ track.left, liveTop, track.right, liveTop + thumbH };
         g_dragScrollTarget = std::clamp<int>(newScroll, 0, maxScroll);
 
-        if (g_dragScrollTarget != oldTarget)
-        {
-            g_lastMainScrollDragMoveMs = GetTickCount64();
-            if (updateContent)
-            {
-                // The page path is deliberately kept out of the raw mouse
-                // message. It may prune or reprioritize MuPDF work and must
-                // never delay the thumb's pointer-to-pixel mapping.
-                ScrollStageTo(hwnd, g_dragScrollTarget, true, false, true);
-            }
-            else if (!g_dragScrollPosted)
-            {
-                g_dragScrollPosted = true;
-                PostMessageW(hwnd, WM_QUIETPDF_DRAG_SCROLL, 0, 0);
-            }
-        }
-
+        // Publish the thumb before touching the document pipeline. Queue
+        // maintenance may inspect the PDF and can take much longer than one
+        // input message on a large file; it must never delay pointer feedback.
         if (redrawNow && liveChanged)
             RedrawMainScrollBarNow(hwnd);
+
+        // The first input sample publishes g_dragScrollTarget before the
+        // coalesced message is handled. On that message oldTarget therefore
+        // equals the target, but g_scrollY is still the previous viewport.
+        // Compare with the committed document position as well, otherwise
+        // content movement is skipped until mouse-up performs the final
+        // commit.
+        if (g_dragScrollTarget != oldTarget || g_dragScrollTarget != g_scrollY)
+        {
+            g_lastMainScrollDragMoveMs = GetTickCount64();
+            // Commit the viewport in the same input message as the pointer
+            // sample. Deferring this behind a posted message makes both the
+            // page and the thumb wait until the pointer is released when the
+            // input queue is busy. ScrollStageTo only publishes the viewport
+            // and queues rendering; it does not synchronously render a page.
+            ScrollStageTo(hwnd, g_dragScrollTarget, true, false, true);
+        }
+
     }
 
     void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip)
@@ -2740,7 +2748,11 @@ namespace
         {
             // The track is an overlay: leave its background transparent so
             // the page or reading surface remains visible underneath it.
-            bool active = g_draggingMainScroll || Hit(g_mainScrollTrackRect, g_mousePos.x, g_mousePos.y);
+            // Hover is maintained from WM_MOUSEMOVE/WM_NCMOUSEMOVE in client
+            // coordinates. Do not sample the system cursor again here: a
+            // paint can run after capture or DPI conversion changed the
+            // message coordinates, which makes the thumb appear to jump.
+            bool active = g_draggingMainScroll || g_mainScrollHover;
             int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
             int trackW = active ? S(7) : std::max(2, S(3));
             RECT visualThumb{ centerX - trackW / 2, g_mainScrollThumbRect.top, centerX + (trackW + 1) / 2, g_mainScrollThumbRect.bottom };
@@ -2748,7 +2760,7 @@ namespace
         }
         if (!IsRectEmpty(&g_mainHScrollTrackRect) && (Intersects(paintClip, g_mainHScrollTrackRect) || Intersects(paintClip, g_mainHScrollThumbRect)))
         {
-            bool hActive = g_draggingMainHScroll || Hit(g_mainHScrollTrackRect, g_mousePos.x, g_mousePos.y);
+            bool hActive = g_draggingMainHScroll || g_mainHScrollHover;
             int centerY = (g_mainHScrollTrackRect.top + g_mainHScrollTrackRect.bottom) / 2;
             int h = hActive ? S(7) : std::max(2, S(3));
             RECT visualH{ g_mainHScrollThumbRect.left, centerY - h / 2, g_mainHScrollThumbRect.right, centerY + (h + 1) / 2 };
@@ -12101,7 +12113,11 @@ namespace
         }
         int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
         int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
-        g_scrollY = std::clamp(g_scrollY, 0, maxScroll);
+        // During a thumb drag the mapping was captured at button-down. An
+        // asynchronous layout/render completion must not clamp the live
+        // position against a newer extent and move the thumb backwards.
+        if (!g_draggingMainScroll)
+            g_scrollY = std::clamp(g_scrollY, 0, maxScroll);
         g_scrollX = std::clamp(g_scrollX, 0, maxScrollX);
         if (tab && g_continuousRead)
         {
@@ -12308,7 +12324,6 @@ namespace
         KillTimer(hwnd, 6);
     }
 
-    void ShiftStageFrame(int dx, int dy, RECT clip);
     RECT MainReaderPixelClip();
     bool EnsurePaintBuffer(HDC targetDc, int width, int height);
     bool EnsureStageFrameBuffer(HDC targetDc, int width, int height);
@@ -12333,90 +12348,14 @@ namespace
 
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
     {
-        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
-        int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
-        if ((dx == 0 && dy == 0) || std::abs(dx) >= stageW || std::abs(dy) >= stageH || IsRectEmpty(&g_stage))
-        {
-            RequestStageRepaint(hwnd, includeStatus);
-            return;
-        }
+        UNREFERENCED_PARAMETER(dx);
+        UNREFERENCED_PARAMETER(dy);
 
-        // Refresh the overlay geometry before choosing the window scroll
-        // region. A stale empty geometry is enough to let one frame carry the
-        // scrollbar along with the page.
-        RECT windowClient{};
-        GetClientRect(hwnd, &windowClient);
-        UpdateMainScrollRects(windowClient);
-
-        // The scrollbar is a transparent overlay, not part of the committed
-        // page frame. Restore its underlay before moving the whole reader;
-        // otherwise ScrollDC carries the old thumb to a second position and
-        // the next paint has no reliable pixels with which to erase it.
-        if (g_paintBufferDc && g_stageFrameValid && g_stageFrameDc)
-        {
-            if (!IsRectEmpty(&g_mainScrollTrackRect))
-                RestoreStageFrame(g_paintBufferDc, g_mainScrollTrackRect);
-            if (!IsRectEmpty(&g_mainHScrollTrackRect))
-                RestoreStageFrame(g_paintBufferDc, g_mainHScrollTrackRect);
-        }
-
-        // Move one complete reader frame. The scrollbars are repainted as an
-        // overlay below, so they must not be excluded from the pixel move:
-        // their underlying page pixels have to move with the document too.
-        RECT scrollClip = g_stage;
-        ShiftStageFrame(dx, dy, scrollClip);
-        if (g_paintBufferDc)
-        {
-            RECT exposed{};
-            ScrollDC(g_paintBufferDc, dx, dy, &scrollClip, &scrollClip, nullptr, &exposed);
-        }
-
-        // Prepare the window surface in the same way as the back-buffer, then
-        // move the whole reader in one operation. The subsequent full-track
-        // invalidation removes both the old and new overlay positions.
-        HDC windowDc = GetDC(hwnd);
-        if (!windowDc)
-        {
-            RequestStageRepaint(hwnd, includeStatus);
-            return;
-        }
-        if (g_stageFrameValid && g_stageFrameDc)
-        {
-            if (!IsRectEmpty(&g_mainScrollTrackRect))
-                RestoreStageFrame(windowDc, g_mainScrollTrackRect);
-            if (!IsRectEmpty(&g_mainHScrollTrackRect))
-                RestoreStageFrame(windowDc, g_mainHScrollTrackRect);
-        }
-        RECT invalid{};
-        ScrollDC(windowDc, dx, dy, &scrollClip, &scrollClip, nullptr, &invalid);
-        ReleaseDC(hwnd, windowDc);
-        if (IsRectEmpty(&invalid))
-            invalid = g_stage;
-        InvalidateRect(hwnd, &invalid, FALSE);
-
-        // UpdateWindow may synchronously dispatch WM_PAINT. Publish the
-        // shifted-frame state before that happens so PaintPages restores one
-        // frame instead of drawing target pages over it.
-        if (g_draggingMainScroll)
-            g_mainScrollDragFrameShifted = true;
-
-        // Finish the cached exposed strip before updating the transparent
-        // scrollbar overlays. Both overlay tracks are invalidated in full so
-        // an old thumb cannot survive at its previous position.
-        UpdateWindow(hwnd);
-        if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
-        if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
-
-        if (includeStatus)
-        {
-            RECT client{};
-            GetClientRect(hwnd, &client);
-            RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
-            InvalidateRect(hwnd, &status, FALSE);
-        }
-        g_lastStageRepaintMs = GetTickCount64();
-        g_stageRepaintPending = false;
-        KillTimer(hwnd, 6);
+        // The reader is always presented from one clean back-buffer paint.
+        // Do not shift either the window surface or the committed frame here:
+        // shifting a frame and then painting the new viewport can duplicate
+        // page content when the target is only partially cached.
+        RequestStageRepaint(hwnd, includeStatus);
     }
     void RequestSidebarRepaint(HWND hwnd)
     {
@@ -12607,7 +12546,9 @@ namespace
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
             g_contentWidth = ReadingContentWidth(*tab);
         }
-        int maxScroll = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+        int maxScroll = (g_draggingMainScroll && g_mainScrollDragGeometryValid)
+            ? std::max<int>(0, g_mainScrollDragMaxScroll)
+            : std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
         g_scrollX = std::clamp(g_scrollX, 0, std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left)));
         int old = g_scrollY;
         g_scrollY = std::clamp(newScrollY, 0, maxScroll);
@@ -16403,29 +16344,15 @@ namespace
         // Keep the last committed frame underneath an in-flight scrollbar
         // target. Available pages or tiles can then be painted immediately;
         // unfinished regions remain stable instead of flashing the background.
-        bool dragPresentation = g_draggingMainScroll && g_pageNavigationPending &&
-            g_mainScrollDragFrameShifted &&
-            g_stageFrameValid && g_stageFrameDc;
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
-
-        // A thumb drag has one presentation source at a time. Once the
-        // committed frame has been shifted, return it directly and wait for
-        // release to submit the target viewport. Painting target pages here
-        // would put a second, differently positioned copy over the frame and
-        // is the source of the duplicated-page artefact.
-        if (dragPresentation)
-        {
-            RestoreStageFrame(dc, stageDirty);
-            return true;
-        }
 
         // A page-level fallback must cover every visible page before the
         // transition surface is repainted. If one old page representation is
         // missing, leave the already submitted back-buffer frame untouched
         // and continue rendering the target in the background.
-        if (!dragPresentation && zoomPresentationPending &&
+        if (zoomPresentationPending &&
             !ZoomFallbackVisibleContentReady(tab) && g_stageFrameValid)
         {
             QueueVisibleZoomContent(tab);
@@ -16458,7 +16385,7 @@ namespace
                 if (!BuildSpreadPageRect(tab, start, y, i, pageRect)) continue;
                 if (!Intersects(pageRect, stageDirty)) continue;
                 hadVisiblePage = true;
-                if (!zoomPresentationPending && !lightPaint && !dragPresentation)
+                if (!zoomPresentationPending && !lightPaint)
                 {
                     RECT shadowRight1{ pageRect.right, pageRect.top + S(1), pageRect.right + std::max(1, S(1)), pageRect.bottom + S(1) };
                     RECT shadowRight2{ pageRect.right + std::max(1, S(1)), pageRect.top + S(2), pageRect.right + std::max(2, S(2)), pageRect.bottom + S(2) };
@@ -16485,7 +16412,7 @@ namespace
                          {
                              QueuePageRender(g_hwnd, tab, i, 0);
                          }
-                          if (!zoomPresentationPending && !dragPresentation)
+                          if (!zoomPresentationPending)
                               Fill(dc, drawRect, PdfPageBackgroundColor());
                           PageImage* fallback = FindZoomFallbackPage(tab, i);
                          if (!zoomPresentationPending && image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
@@ -16518,7 +16445,7 @@ namespace
                     }
                     else
                     {
-                          if (!zoomPresentationPending && !dragPresentation)
+                          if (!zoomPresentationPending)
                               Fill(dc, drawRect, PdfPageBackgroundColor());
                          bool fallbackPainted = false;
                          PageImage* fallback = FindZoomFallbackPage(tab, i);
@@ -16699,12 +16626,10 @@ namespace
         // page. The caller keeps the previous committed frame until the
         // worker supplies the missing image/tile, preventing white blocks
         // during a fast scroll.
-        if (missingVisiblePage && !dragPresentation && (g_stageFrameValid || g_pageNavigationPending))
+        if (missingVisiblePage && (g_stageFrameValid || g_pageNavigationPending))
             return false;
         if (g_pageNavigationPending)
         {
-            if (dragPresentation)
-                return true;
             // Render completions invalidate small tile rectangles. During a
             // discrete page change, wait for the whole visible spread and
             // schedule one full-stage paint so the new page is committed as
@@ -16712,8 +16637,7 @@ namespace
             if (!CurrentZoomVisibleContentReady(tab))
                 return false;
             g_pageNavigationPending = false;
-            InvalidateRect(g_hwnd, &g_stage, FALSE);
-            return false;
+            return true;
         }
         return true;
     }
@@ -20456,11 +20380,72 @@ namespace
         }
     }
 
-    void ShiftStageFrame(int dx, int dy, RECT clip)
+    void RefreshMainScrollHover(HWND hwnd, POINT point);
+
+    bool BeginMainScrollDrag(HWND hwnd, POINT pointer, MainScrollDragOwner owner)
     {
-        if (!g_stageFrameValid || !g_stageFrameDc || IsRectEmpty(&clip)) return;
-        RECT exposed{};
-        ScrollDC(g_stageFrameDc, dx, dy, &clip, &clip, nullptr, &exposed);
+        if (g_active < 0) return false;
+        if (g_draggingMainScroll) return g_mainScrollDragOwner == owner;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        UpdateMainScrollRects(client);
+        if (!Hit(g_mainScrollThumbRect, pointer.x, pointer.y)) return false;
+
+        CancelStageMotion(hwnd);
+        if (PdfTab* tab = Active())
+        {
+            // Once the user grabs the scrollbar, the pointer becomes the
+            // authoritative viewport. A late metadata/layout completion must
+            // not reapply the session position captured when the document was
+            // opened and pull the viewport back to the initial location.
+            tab->pendingSessionPosition = false;
+            tab->pendingSessionPageOffset = false;
+            g_contentHeight = g_continuousRead
+                ? ContinuousContentHeight(*tab)
+                : SinglePageContentHeight(*tab);
+            g_contentWidth = ReadingContentWidth(*tab);
+            UpdateMainScrollRects(client);
+        }
+
+        g_draggingMainScroll = true;
+        g_mainScrollDragOwner = owner;
+        g_mainScrollDragOffset = pointer.y - g_mainScrollThumbRect.top;
+        g_mainScrollDragStartY = pointer.y;
+        g_mainScrollDragStartPos = g_scrollY;
+        g_dragScrollTarget = g_scrollY;
+        g_dragOutlinePreviewRow = g_selectedOutlineRow;
+        g_lastMainScrollDragMoveMs = GetTickCount64();
+        g_mainScrollThumbLive = true;
+        g_mainScrollThumbLiveTop = g_mainScrollThumbRect.top;
+        g_mainScrollThumbLiveHeight = std::max<int>(1,
+            g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
+        g_mainScrollDragTrackRect = g_mainScrollTrackRect;
+        g_mainScrollDragThumbHeight = g_mainScrollThumbLiveHeight;
+        g_mainScrollDragMaxScroll = std::max<int>(0,
+            g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
+        g_mainScrollDragGeometryValid = !IsRectEmpty(&g_mainScrollDragTrackRect);
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+        return true;
+    }
+
+    void FinishMainScrollDrag(HWND hwnd, int pointerY, MainScrollDragOwner owner)
+    {
+        if (!g_draggingMainScroll || g_mainScrollDragOwner != owner) return;
+        UpdateMainScrollDragStateFromPointer(hwnd, pointerY, true);
+        g_draggingMainScroll = false;
+        g_mainScrollDragOwner = MainScrollDragOwner::None;
+        g_lastMainScrollDragMoveMs = 0;
+        g_mainScrollThumbLive = false;
+        g_mainScrollDragGeometryValid = false;
+        g_mainScrollDragTrackRect = {};
+        CommitMainScrollDragTarget(hwnd);
+        g_dragOutlinePreviewRow = -1;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        g_mousePos.y = pointerY;
+        RefreshMainScrollHover(hwnd, g_mousePos);
+        InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
     }
 
     RECT MainReaderPixelClip()
@@ -20601,6 +20586,14 @@ namespace
             shouldFlush = PaintReader(mem, client, dirty);
             readerPainted = Intersects(dirty, g_stage);
         }
+        else
+        {
+            // A scrollbar invalidation deliberately skips PaintReader so a
+            // hover or drag never repaints the PDF. Paint the transparent
+            // overlay itself here; otherwise the back buffer only contains
+            // the restored underlay and the visible thumb remains frozen.
+            PaintMainScrollBar(mem, client, dirty);
+        }
         bool fullStageDirty = RectContains(dirty, g_stage);
         if (readerPainted && shouldFlush && !g_pageNavigationPending &&
             !g_draggingMainScroll)
@@ -20712,6 +20705,57 @@ namespace
         }
     }
 
+    bool GetPointerClientPoint(HWND hwnd, WPARAM wParam, POINT& point)
+    {
+        POINTER_INFO info{};
+        if (!GetPointerInfo(GET_POINTERID_WPARAM(wParam), &info)) return false;
+        // Windows can promote a mouse contact to WM_POINTER messages. The
+        // mouse drag already has WM_MOUSEMOVE as its sole owner; accepting
+        // PT_MOUSE here lets two coordinate streams fight over one drag and
+        // pulls the thumb back to an older sample. Touch/pen contacts and
+        // precision-touchpad gestures use the non-mouse path below.
+        if (info.pointerType == PT_MOUSE) return false;
+        point = info.ptPixelLocation;
+        ScreenToClient(hwnd, &point);
+        return true;
+    }
+
+    void RefreshMainScrollHover(HWND hwnd, POINT point)
+    {
+        bool oldVertical = g_mainScrollHover;
+        bool oldHorizontal = g_mainHScrollHover;
+        RECT oldVerticalRect = g_mainScrollTrackRect;
+        RECT oldHorizontalRect = g_mainHScrollTrackRect;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        UpdateMainScrollRects(client);
+
+        bool overlayHit = g_favoriteListOpen &&
+            !IsRectEmpty(&g_favoriteListRect) &&
+            Hit(g_favoriteListRect, point.x, point.y);
+        RECT verticalHot = g_mainScrollTrackRect;
+        RECT horizontalHot = g_mainHScrollTrackRect;
+        // The visible thumb is intentionally narrow. Keep a wider invisible
+        // hit strip so hover remains reliable at the edge of the reader and
+        // does not depend on landing on the anti-aliased pixels themselves.
+        InflateRect(&verticalHot, S(8), S(2));
+        InflateRect(&horizontalHot, S(2), S(8));
+        g_mainScrollHover = !overlayHit && Hit(verticalHot, point.x, point.y);
+        g_mainHScrollHover = !overlayHit && Hit(horizontalHot, point.x, point.y);
+
+        if (oldVertical != g_mainScrollHover)
+        {
+            if (!IsRectEmpty(&oldVerticalRect)) InvalidateRect(hwnd, &oldVerticalRect, FALSE);
+            if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+        }
+        if (oldHorizontal != g_mainHScrollHover)
+        {
+            if (!IsRectEmpty(&oldHorizontalRect)) InvalidateRect(hwnd, &oldHorizontalRect, FALSE);
+            if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+        }
+    }
+
     LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         switch (msg)
@@ -20756,22 +20800,6 @@ namespace
             return 0;
         case WM_QUIETPDF_REFRESH_FILE_WATCH:
             StartActiveFileWatcher(hwnd);
-            return 0;
-        case WM_QUIETPDF_DRAG_SCROLL:
-            g_dragScrollPosted = false;
-            if (g_draggingMainScroll && g_active >= 0)
-            {
-                POINT cursor{};
-                if (GetCursorPos(&cursor))
-                {
-                    ScreenToClient(hwnd, &cursor);
-                    g_mousePos = cursor;
-                    UpdateMainScrollDragStateFromPointer(hwnd, cursor.y, false, true);
-                }
-                // Do not commit here. The drag is still active, so another
-                // pointer sample may supersede this target immediately. The
-                // release handler performs the single authoritative commit.
-            }
             return 0;
         case WM_QUIETPDF_HOME_SCROLL_FRAME:
             g_homeScrollFramePosted = false;
@@ -20885,7 +20913,7 @@ namespace
                         tab.outlineLayoutFont = 0;
                         tab.outlineLayoutDpi = 0;
                         tab.outlineLayoutCollapseVersion = 0;
-                        if (i == g_active)
+                        if (i == g_active && !g_draggingMainScroll)
                         {
                             // Preserve the exact viewport. During startup
                             // restore, translate the saved page-relative offset
@@ -21217,6 +21245,8 @@ namespace
                 POINT pt{};
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
+                if (Active())
+                    RefreshMainScrollHover(hwnd, pt);
                 if (Active())
                 {
                     RECT client{};
@@ -21679,38 +21709,10 @@ namespace
                 GetClientRect(hwnd, &client);
                 UpdateMainScrollRects(client);
             }
-            if (Active() && Hit(g_mainScrollThumbRect, x, y))
+            bool pointerAlreadyDragging = g_draggingMainScroll;
+            if (Active() && BeginMainScrollDrag(hwnd, POINT{ x, y }, MainScrollDragOwner::Mouse))
             {
-                CancelStageMotion(hwnd);
-                RECT client{};
-                GetClientRect(hwnd, &client);
-                if (PdfTab* tab = Active())
-                {
-                    g_contentHeight = g_continuousRead
-                        ? ContinuousContentHeight(*tab)
-                        : SinglePageContentHeight(*tab);
-                    g_contentWidth = ReadingContentWidth(*tab);
-                    UpdateMainScrollRects(client);
-                }
-                g_draggingMainScroll = true;
-                g_mainScrollDragOffset = y - g_mainScrollThumbRect.top;
-                g_mainScrollDragStartY = y;
-                g_mainScrollDragStartPos = g_scrollY;
-                g_dragScrollTarget = g_scrollY;
-                g_dragOutlinePreviewRow = g_selectedOutlineRow;
-                g_lastMainScrollDragMoveMs = GetTickCount64();
-                g_dragScrollPosted = false;
-                g_mainScrollDragFrameShifted = false;
-                g_mainScrollThumbLive = true;
-                g_mainScrollThumbLiveTop = g_mainScrollThumbRect.top;
-                g_mainScrollThumbLiveHeight = std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
-                g_mainScrollDragTrackRect = g_mainScrollTrackRect;
-                g_mainScrollDragThumbHeight = g_mainScrollThumbLiveHeight;
-                g_mainScrollDragMaxScroll = std::max<int>(0,
-                    g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
-                g_mainScrollDragGeometryValid = !IsRectEmpty(&g_mainScrollDragTrackRect);
-                SetCapture(hwnd);
-                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+                if (!pointerAlreadyDragging) g_pointerMainScrollDrag = false;
                 return 0;
             }
             if (Active() && Hit(g_mainScrollTrackRect, x, y))
@@ -22168,10 +22170,99 @@ namespace
             }
             return 0;
         }
+        case WM_POINTERDOWN:
+        {
+            POINT point{};
+            if (GetPointerClientPoint(hwnd, wParam, point))
+            {
+                g_mousePos = point;
+                if (!g_draggingMainScroll && Active() && BeginMainScrollDrag(hwnd, point, MainScrollDragOwner::Pointer))
+                {
+                    g_pointerMainScrollDrag = true;
+                    return 0;
+                }
+            }
+            break;
+        }
+        case WM_POINTERUPDATE:
+        {
+            POINT point{};
+            if (g_pointerMainScrollDrag && GetPointerClientPoint(hwnd, wParam, point))
+            {
+                g_mousePos = point;
+                UpdateMainScrollDragStateFromPointer(hwnd, point.y, true);
+                return 0;
+            }
+            break;
+        }
+        case WM_POINTERUP:
+        {
+            POINT point{};
+            if (g_pointerMainScrollDrag)
+            {
+                if (!GetPointerClientPoint(hwnd, wParam, point)) point = g_mousePos;
+                FinishMainScrollDrag(hwnd, point.y, MainScrollDragOwner::Pointer);
+                g_pointerMainScrollDrag = false;
+                g_gestureMainScrollDrag = false;
+                return 0;
+            }
+            break;
+        }
+        case WM_POINTERCAPTURECHANGED:
+            if (g_pointerMainScrollDrag)
+            {
+                FinishMainScrollDrag(hwnd, g_mousePos.y, MainScrollDragOwner::Pointer);
+                g_pointerMainScrollDrag = false;
+                g_gestureMainScrollDrag = false;
+                return 0;
+            }
+            break;
+        case WM_NCMOUSEMOVE:
+        {
+            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &point);
+            g_mousePos = point;
+            if (Active()) RefreshMainScrollHover(hwnd, point);
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+        {
+            bool oldMainScrollHover = g_mainScrollHover;
+            bool oldMainHScrollHover = g_mainHScrollHover;
+            bool oldHomeScrollHover = g_homeScrollHover;
+            bool oldSidebarScrollHover = g_sidebarScrollHover;
+            POINT currentPoint{};
+            bool haveCurrentPoint = GetCursorPos(&currentPoint) != FALSE;
+            if (haveCurrentPoint)
+                ScreenToClient(hwnd, &currentPoint);
+            if (Active() && haveCurrentPoint)
+                RefreshMainScrollHover(hwnd, currentPoint);
+            else
+            {
+                g_mainScrollHover = false;
+                g_mainHScrollHover = false;
+            }
+            g_homeScrollHover = false;
+            g_sidebarScrollHover = false;
+            if (oldMainScrollHover != g_mainScrollHover || g_draggingMainScroll)
+                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+            if (oldMainHScrollHover != g_mainHScrollHover || g_draggingMainHScroll)
+                InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+            if (oldHomeScrollHover)
+                InvalidateRect(hwnd, &g_homeScrollTrackRect, FALSE);
+            if (oldSidebarScrollHover)
+                InvalidateRect(hwnd, &g_sidebarScrollTrackRect, FALSE);
+            return 0;
+        }
         case WM_MOUSEMOVE:
         {
             int mx = GET_X_LPARAM(lParam);
             int my = GET_Y_LPARAM(lParam);
+            TRACKMOUSEEVENT trackMouse{};
+            trackMouse.cbSize = sizeof(trackMouse);
+            trackMouse.dwFlags = TME_LEAVE;
+            trackMouse.hwndTrack = hwnd;
+            TrackMouseEvent(&trackMouse);
             POINT oldMousePos = g_mousePos;
             POINT newMousePos{ mx, my };
             bool oldAnnotationToolHover = AnnotationToolbarClickableAt(oldMousePos);
@@ -22255,9 +22346,7 @@ namespace
                 SetCursor(LoadCursorW(nullptr, g_tabDetachArmed ? IDC_SIZEALL : IDC_ARROW));
                 return 0;
             }
-            bool oldMainScrollHover = g_mainScrollHover;
             bool oldSidebarPanelToggleHover = g_sidebarPanelToggleHover;
-            bool oldMainHScrollHover = g_mainHScrollHover;
             bool oldHomeScrollHover = g_homeScrollHover;
             bool oldSidebarScrollHover = g_sidebarScrollHover;
             // The sidebar hover state is used to invalidate the scrollbar
@@ -22265,17 +22354,10 @@ namespace
             // not the whole scrollable content area; otherwise moving from a
             // directory row to the scrollbar produces no state transition.
             UpdateSidebarScrollRects();
-            if (Active())
-            {
-                RECT client{};
-                GetClientRect(hwnd, &client);
-                UpdateMainScrollRects(client);
-            }
+            if (Active()) RefreshMainScrollHover(hwnd, newMousePos);
             bool favoriteOverlayHit = g_favoriteListOpen &&
                 !IsRectEmpty(&g_favoriteListRect) &&
                 Hit(g_favoriteListRect, mx, my);
-            g_mainScrollHover = !favoriteOverlayHit && Hit(g_mainScrollTrackRect, mx, my);
-            g_mainHScrollHover = !favoriteOverlayHit && Hit(g_mainHScrollTrackRect, mx, my);
             g_homeScrollHover = Hit(g_homeScrollTrackRect, mx, my);
             g_sidebarScrollHover = !favoriteOverlayHit && SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) &&
                 Hit(g_sidebarScrollTrackRect, mx, my);
@@ -22283,14 +22365,6 @@ namespace
             if (oldSidebarPanelToggleHover != g_sidebarPanelToggleHover)
             {
                 InvalidateRect(hwnd, &g_sidebarPanelToggleRect, FALSE);
-            }
-            if (oldMainScrollHover != g_mainScrollHover)
-            {
-                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
-            }
-            if (oldMainHScrollHover != g_mainHScrollHover)
-            {
-                InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
             }
             if (oldHomeScrollHover != g_homeScrollHover)
             {
@@ -22303,10 +22377,12 @@ namespace
             }
             if (g_draggingMainScroll)
             {
-                // Keep this path limited to the live thumb. Page movement and
-                // render queue maintenance run through one coalesced posted
-                // message, so a burst of mouse input cannot starve painting.
-                UpdateMainScrollDragStateFromPointer(hwnd, my, true, false);
+                // A pointer/gesture drag has its own input owner. Ignore
+                // promoted mouse motion so two coordinate streams cannot
+                // overwrite the same drag position.
+                if (g_mainScrollDragOwner != MainScrollDragOwner::Mouse)
+                    return 0;
+                UpdateMainScrollDragStateFromPointer(hwnd, my, true);
                 return 0;
             }
             if (g_draggingMainHScroll)
@@ -22786,18 +22862,9 @@ namespace
             }
             if (g_draggingMainScroll)
             {
-                UpdateMainScrollDragStateFromPointer(hwnd, GET_Y_LPARAM(lParam), true);
-                g_draggingMainScroll = false;
-                g_lastMainScrollDragMoveMs = 0;
-                g_mainScrollThumbLive = false;
-                g_dragScrollPosted = false;
-                g_mainScrollDragGeometryValid = false;
-                g_mainScrollDragTrackRect = {};
-                CommitMainScrollDragTarget(hwnd);
-                g_mainScrollDragFrameShifted = false;
-                g_dragOutlinePreviewRow = -1;
-                ReleaseCapture();
-                InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+                FinishMainScrollDrag(hwnd, GET_Y_LPARAM(lParam), MainScrollDragOwner::Mouse);
+                g_pointerMainScrollDrag = false;
+                g_gestureMainScrollDrag = false;
                 return 0;
             }
             if (g_draggingMainHScroll)
@@ -23183,11 +23250,25 @@ namespace
             }
             POINT pt{ info.ptsLocation.x, info.ptsLocation.y };
             ScreenToClient(hwnd, &pt);
+            g_mousePos = pt;
             if (info.dwID == GID_BEGIN)
             {
                 StopTouchMomentum(hwnd);
                 g_gesturePanning = false;
                 g_gestureSidebar = false;
+                g_gestureMainScrollDrag = false;
+                if (Active())
+                {
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
+                    UpdateMainScrollRects(client);
+                    if (!g_draggingMainScroll && Hit(g_mainScrollThumbRect, pt.x, pt.y) &&
+                        BeginMainScrollDrag(hwnd, pt, MainScrollDragOwner::Gesture))
+                    {
+                        g_gestureMainScrollDrag = true;
+                        g_gestureMainScrollLastY = pt.y;
+                    }
+                }
                 g_gestureZooming = false;
                 g_gestureZoomRenderSuppressed = false;
                 g_gestureZoomStartDistance = 0.0;
@@ -23198,7 +23279,14 @@ namespace
             }
             else if (info.dwID == GID_END)
             {
-                FlushTouchPan(hwnd);
+                if (g_gestureMainScrollDrag && g_draggingMainScroll)
+                {
+                    FinishMainScrollDrag(hwnd, g_gestureMainScrollLastY, MainScrollDragOwner::Gesture);
+                    g_gestureMainScrollDrag = false;
+                    g_pointerMainScrollDrag = false;
+                }
+                else
+                    FlushTouchPan(hwnd);
                 FinishGestureZoom(hwnd);
                 g_gesturePanning = false;
                 g_gestureSidebar = false;
@@ -23235,7 +23323,24 @@ namespace
                     CloseGestureInfoHandle(reinterpret_cast<HGESTUREINFO>(lParam));
                     return 0;
                 }
-                if ((info.dwFlags & GF_BEGIN) != 0 || !g_gesturePanning)
+                if (!g_gestureMainScrollDrag && (info.dwFlags & GF_BEGIN) != 0 && Active())
+                {
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
+                    UpdateMainScrollRects(client);
+                    if (!g_draggingMainScroll && Hit(g_mainScrollThumbRect, pt.x, pt.y) &&
+                        BeginMainScrollDrag(hwnd, pt, MainScrollDragOwner::Gesture))
+                    {
+                        g_gestureMainScrollDrag = true;
+                        g_gestureMainScrollLastY = pt.y;
+                    }
+                }
+                if (g_gestureMainScrollDrag && g_draggingMainScroll)
+                {
+                    g_gestureMainScrollLastY = pt.y;
+                    UpdateMainScrollDragStateFromPointer(hwnd, pt.y, true);
+                }
+                else if ((info.dwFlags & GF_BEGIN) != 0 || !g_gesturePanning)
                 {
                     g_gesturePanning = true;
                     g_gestureSidebar = SidebarVisible() && Hit(g_sidebar, pt.x, pt.y);
