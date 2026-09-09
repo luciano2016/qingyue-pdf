@@ -15632,11 +15632,12 @@ namespace
 
             // A quiet boundary makes the fixed header and scrolling list read
             // as two separate regions without adding another highlight band.
+            int dividerY = g_sidebar.top + S(71);
             RECT headerDivider{
                 g_sidebar.left,
-                g_sidebar.top + S(71),
+                dividerY,
                 g_sidebar.right,
-                g_sidebar.top + S(72)
+                dividerY + 1
             };
             GlassDivider(dc, headerDivider);
         }
