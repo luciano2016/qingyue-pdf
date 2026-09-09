@@ -3292,7 +3292,7 @@ namespace
             int nextIndex = displayIndex + 1 < rows ? displayRows[static_cast<size_t>(displayIndex + 1)] : -1;
             bool hasChildren = nextIndex >= 0 && tab.outline[static_cast<size_t>(nextIndex)].depth > depth;
             tab.outlineLayout.push_back(OutlineLayoutRow{ y, rowH, page, i, depth, textH, hasChildren });
-            y += rowH + S(4);
+            y += rowH + S(2);
             if (g_outlineSearchQuery.empty() && hasChildren && g_collapsedOutlineRows.find(i) != g_collapsedOutlineRows.end())
             {
                 collapsedDepth = depth;
@@ -15632,7 +15632,7 @@ namespace
 
             // A quiet boundary makes the fixed header and scrolling list read
             // as two separate regions without adding another highlight band.
-            int dividerY = g_sidebar.top + S(71);
+            int dividerY = g_sidebar.top + S(67);
             RECT headerDivider{
                 g_sidebar.left,
                 dividerY,
