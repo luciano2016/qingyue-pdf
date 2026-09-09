@@ -1657,6 +1657,7 @@ namespace
     bool g_draggingSidebarScroll{};
     bool g_dragScrollPosted{};
     bool g_mainScrollThumbLive{};
+    bool g_mainScrollDragFrameShifted{};
     bool g_mainScrollHover{};
     bool g_mainHScrollHover{};
     bool g_homeScrollHover{};
@@ -12347,24 +12348,22 @@ namespace
         GetClientRect(hwnd, &windowClient);
         UpdateMainScrollRects(windowClient);
 
-        // The scrollbars are transparent overlays painted inside g_stage.
-        // Do not move their already-present pixels together with the page;
-        // doing so makes the thumb visibly jump before its own repaint runs.
-        RECT scrollClip = g_stage;
-        if (!IsRectEmpty(&g_mainScrollTrackRect))
-            scrollClip.right = std::min(scrollClip.right, g_mainScrollTrackRect.left);
-        else if (g_contentHeight > stageH + 1)
-            scrollClip.right = std::min(scrollClip.right, g_stage.right - S(20));
-        if (!IsRectEmpty(&g_mainHScrollTrackRect))
-            scrollClip.bottom = std::min(scrollClip.bottom, g_mainHScrollTrackRect.top);
-        else if (g_contentWidth > stageW + 1)
-            scrollClip.bottom = std::min(scrollClip.bottom, g_stage.bottom - S(20));
-        if (IsRectEmpty(&scrollClip))
-            scrollClip = g_stage;
+        // The scrollbar is a transparent overlay, not part of the committed
+        // page frame. Restore its underlay before moving the whole reader;
+        // otherwise ScrollDC carries the old thumb to a second position and
+        // the next paint has no reliable pixels with which to erase it.
+        if (g_paintBufferDc && g_stageFrameValid && g_stageFrameDc)
+        {
+            if (!IsRectEmpty(&g_mainScrollTrackRect))
+                RestoreStageFrame(g_paintBufferDc, g_mainScrollTrackRect);
+            if (!IsRectEmpty(&g_mainHScrollTrackRect))
+                RestoreStageFrame(g_paintBufferDc, g_mainHScrollTrackRect);
+        }
 
-        // Move the committed back-buffer together with the pixels already on
-        // screen. The target was verified in ScrollStageTo before this fast
-        // path, so the newly exposed strip is bounded to cached pixels.
+        // Move one complete reader frame. The scrollbars are repainted as an
+        // overlay below, so they must not be excluded from the pixel move:
+        // their underlying page pixels have to move with the document too.
+        RECT scrollClip = g_stage;
         ShiftStageFrame(dx, dy, scrollClip);
         if (g_paintBufferDc)
         {
@@ -12372,16 +12371,21 @@ namespace
             ScrollDC(g_paintBufferDc, dx, dy, &scrollClip, &scrollClip, nullptr, &exposed);
         }
 
-        // ScrollWindowEx operates on the window's composed pixels and can
-        // carry an overlay along with the reader even when its clip rectangle
-        // looks correct. Move the visible reader pixels directly instead;
-        // the scrollbar overlay is outside this DC operation and therefore
-        // never gets a transient second position.
+        // Prepare the window surface in the same way as the back-buffer, then
+        // move the whole reader in one operation. The subsequent full-track
+        // invalidation removes both the old and new overlay positions.
         HDC windowDc = GetDC(hwnd);
         if (!windowDc)
         {
             RequestStageRepaint(hwnd, includeStatus);
             return;
+        }
+        if (g_stageFrameValid && g_stageFrameDc)
+        {
+            if (!IsRectEmpty(&g_mainScrollTrackRect))
+                RestoreStageFrame(windowDc, g_mainScrollTrackRect);
+            if (!IsRectEmpty(&g_mainHScrollTrackRect))
+                RestoreStageFrame(windowDc, g_mainHScrollTrackRect);
         }
         RECT invalid{};
         ScrollDC(windowDc, dx, dy, &scrollClip, &scrollClip, nullptr, &invalid);
@@ -12390,9 +12394,15 @@ namespace
             invalid = g_stage;
         InvalidateRect(hwnd, &invalid, FALSE);
 
+        // UpdateWindow may synchronously dispatch WM_PAINT. Publish the
+        // shifted-frame state before that happens so PaintPages restores one
+        // frame instead of drawing target pages over it.
+        if (g_draggingMainScroll)
+            g_mainScrollDragFrameShifted = true;
+
         // Finish the cached exposed strip before updating the transparent
-        // scrollbar overlays, keeping their update region independent from
-        // the reader update region.
+        // scrollbar overlays. Both overlay tracks are invalidated in full so
+        // an old thumb cannot survive at its previous position.
         UpdateWindow(hwnd);
         if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
         if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
@@ -12660,15 +12670,17 @@ namespace
         // viewport is already available. Shifting an incomplete page creates
         // an exposed strip that can be painted as a transient horizontal bar.
         // The asynchronous full-frame path handles the missing-page case.
-        UNREFERENCED_PARAMETER(dragFrame);
         bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        bool canPreserveFrame = targetReady && g_stageFrameValid &&
+        bool canPreserveFrame = (targetReady || dragFrame) && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         if (canPreserveFrame)
         {
-            g_pageNavigationPending = false;
+            // A drag shift is only a temporary presentation. Keep the
+            // navigation pending flag so PaintPages never mixes the target
+            // page generation into the shifted old frame.
+            g_pageNavigationPending = dragFrame;
             ScrollStagePixels(hwnd, 0, dy, pageChanged);
             RedrawMainScrollBarNow(hwnd);
         }
@@ -16392,10 +16404,22 @@ namespace
         // target. Available pages or tiles can then be painted immediately;
         // unfinished regions remain stable instead of flashing the background.
         bool dragPresentation = g_draggingMainScroll && g_pageNavigationPending &&
+            g_mainScrollDragFrameShifted &&
             g_stageFrameValid && g_stageFrameDc;
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
+
+        // A thumb drag has one presentation source at a time. Once the
+        // committed frame has been shifted, return it directly and wait for
+        // release to submit the target viewport. Painting target pages here
+        // would put a second, differently positioned copy over the frame and
+        // is the source of the duplicated-page artefact.
+        if (dragPresentation)
+        {
+            RestoreStageFrame(dc, stageDirty);
+            return true;
+        }
 
         // A page-level fallback must cover every visible page before the
         // transition surface is repainted. If one old page representation is
@@ -16411,10 +16435,7 @@ namespace
             // document disappears until the target generation completes.
             return false;
         }
-        if (dragPresentation)
-            RestoreStageFrame(dc, stageDirty);
-        else
-            Fill(dc, stageDirty, T().stage);
+        Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -21679,6 +21700,7 @@ namespace
                 g_dragOutlinePreviewRow = g_selectedOutlineRow;
                 g_lastMainScrollDragMoveMs = GetTickCount64();
                 g_dragScrollPosted = false;
+                g_mainScrollDragFrameShifted = false;
                 g_mainScrollThumbLive = true;
                 g_mainScrollThumbLiveTop = g_mainScrollThumbRect.top;
                 g_mainScrollThumbLiveHeight = std::max<int>(1, g_mainScrollThumbRect.bottom - g_mainScrollThumbRect.top);
@@ -22772,6 +22794,7 @@ namespace
                 g_mainScrollDragGeometryValid = false;
                 g_mainScrollDragTrackRect = {};
                 CommitMainScrollDragTarget(hwnd);
+                g_mainScrollDragFrameShifted = false;
                 g_dragOutlinePreviewRow = -1;
                 ReleaseCapture();
                 InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
