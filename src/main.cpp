@@ -15066,6 +15066,16 @@ namespace
             DeleteObject(f);
             return;
         }
+
+        if (IsGlassTheme())
+        {
+            RECT contentSurface{
+                g_sidebar.left + S(6),
+                g_sidebar.top + S(6),
+                g_sidebar.right - S(8),
+                g_sidebar.bottom - S(6) };
+            PaintCloudSurface(dc, contentSurface, S(14.0f), 242);
+        }
         // Keep the two top-row controls aligned with the two size controls
         // below: the chevron sits above A-, and close sits above A+.
         g_sidebarContentCloseRect = RECT{
@@ -20634,15 +20644,6 @@ namespace
             return;
         }
 
-        if (IsGlassTheme())
-        {
-            RECT contentSurface{
-                g_sidebar.left + S(6),
-                g_sidebar.top + S(6),
-                g_sidebar.right - S(8),
-                g_sidebar.bottom - S(6) };
-            PaintCloudSurface(dc, contentSurface, S(14.0f), 242);
-        }
         EnsureStageFrameBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom));
         HDC mem = g_paintBufferDc;
         int paintState = SaveDC(mem);
