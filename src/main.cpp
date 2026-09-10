@@ -15049,13 +15049,16 @@ namespace
             if (registerSidebarButtons) AddButton(0, tabRect, L"", i == 0 ? L"\u4e66\u7b7e" : (i == 1 ? L"\u7f29\u7565\u56fe" : (i == 2 ? L"\u67e5\u627e" : L"\u6ce8\u91ca")));
             bool hovered = g_mousePos.x >= tabRect.left && g_mousePos.x < tabRect.right && g_mousePos.y >= tabRect.top && g_mousePos.y < tabRect.bottom;
             bool active = i == g_sideMode;
+            RECT feedbackRect = tabRect;
+            if (active) InflateRect(&feedbackRect, -S(2), -S(2));
+            int feedbackRadius = active ? S(9) : S(7);
             if (hovered || active)
             {
-                if (IsAuroraTheme()) RoundFill(dc, tabRect, S(7), active ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill(), active ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill());
-                else if (IsWarmMistTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedFill() : SidebarHoverFill());
-                else if (IsBeigeTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
-                else if (IsDarkTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
-                else RoundFill(dc, tabRect, S(7), active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
+                if (IsAuroraTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill(), active ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill());
+                else if (IsWarmMistTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedFill() : SidebarHoverFill());
+                else if (IsBeigeTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
+                else if (IsDarkTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
+                else RoundFill(dc, feedbackRect, feedbackRadius, active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
             }
             COLORREF iconColor = active
                 ? (IsWarmMistTheme() ? RGB(255, 255, 255)
