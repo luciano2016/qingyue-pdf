@@ -2248,6 +2248,7 @@ namespace
     bool Hit(RECT r, int x, int y);
     bool Intersects(RECT a, RECT b);
     void RoundFill(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
+    void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
 
     void ApplyPdfThemeFor(int theme, std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
@@ -2875,6 +2876,32 @@ namespace
         path.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
         path.CloseFigure();
         g.FillPath(&brush, &path);
+    }
+
+    void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line)
+    {
+        float width = static_cast<float>(r.right - r.left);
+        float height = static_cast<float>(r.bottom - r.top);
+        if (width <= 1.0f || height <= 1.0f) return;
+
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::RectF bounds{
+            static_cast<float>(r.left) + 0.5f,
+            static_cast<float>(r.top) + 0.5f,
+            width - 1.0f,
+            height - 1.0f };
+        // GDI RoundRect receives the corner ellipse diameter. Preserve that
+        // sizing while switching the edge rasterization to GDI+.
+        float cornerRadius = std::clamp(
+            static_cast<float>(radius) * 0.5f,
+            0.5f,
+            std::min(bounds.Width, bounds.Height) * 0.5f);
+        Gdiplus::SolidBrush brush(GdiColor(fill));
+        Gdiplus::Pen pen(GdiColor(line), 1.0f);
+        FillGdiRoundRect(g, brush, bounds, cornerRadius);
+        DrawGdiRoundRect(g, pen, bounds, cornerRadius);
     }
 
     void DrawRoundedShadow(HDC dc, RECT r, float radius, int offsetX, int offsetY, int spread, BYTE alpha)
@@ -14085,7 +14112,7 @@ namespace
             {
                 COLORREF gapFill = MixColor(T().panel, T().stage, IsDarkTheme() ? 0.34 : 0.58);
                 COLORREF gapLine = MixColor(T().line, T().panel, IsDarkTheme() ? 0.30 : 0.42);
-                RoundFill(dc, r, S(9), gapFill, gapLine);
+                RoundFillAA(dc, r, S(9), gapFill, gapLine);
                 continue;
             }
             if (actualIndex >= totalTabs) break;
@@ -14102,13 +14129,13 @@ namespace
                     {
                         COLORREF tabFill = pressed ? MixColor(T().panel2, T().accent, 0.075) : (active ? MixColor(T().panel2, T().accent, 0.055) : SidebarHoverFill());
                         COLORREF tabLine = pressed ? MixColor(T().line, T().accent, 0.26) : (active ? MixColor(T().line, T().accent, 0.18) : MixColor(T().line, T().panel, 0.22));
-                        RoundFill(dc, r, S(9), tabFill, tabLine);
+                        RoundFillAA(dc, r, S(9), tabFill, tabLine);
                         UNREFERENCED_PARAMETER(pressed);
                     }
                     else
                     {
                         AlphaFill(dc, r, RGB(255, 255, 255), pressed ? 196 : (active ? 132 : 112));
-                        RoundFill(dc, r, S(9),
+                        RoundFillAA(dc, r, S(9),
                             pressed ? RGB(245, 249, 252) : (active ? RGB(239, 246, 251) : RGB(255, 255, 255)),
                             pressed ? RGB(198, 208, 220) : (active ? RGB(198, 211, 224) : RGB(230, 235, 241)));
                         AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), pressed ? 48 : 36);
@@ -14118,12 +14145,12 @@ namespace
                 {
                     if (IsAuroraTheme())
                     {
-                        RoundFill(dc, r, S(9), T().panel, MixColor(T().line, T().panel, 0.28));
+                        RoundFillAA(dc, r, S(9), T().panel, MixColor(T().line, T().panel, 0.28));
                     }
                     else
                     {
                         constexpr COLORREF tabBarFill = RGB(250, 251, 253);
-                        RoundFill(dc, r, S(9), tabBarFill, RGB(230, 235, 241));
+                        RoundFillAA(dc, r, S(9), tabBarFill, RGB(230, 235, 241));
                     }
                 }
             }
@@ -14145,7 +14172,7 @@ namespace
                         ? MixColor(T().line, T().accent, 0.34)
                         : ((active || hovered) ? T().line : MixColor(T().line, T().panel, IsDarkTheme() ? 0.20 : 0.14));
                 }
-                RoundFill(dc, r, S(9), fill, line);
+                RoundFillAA(dc, r, S(9), fill, line);
             }
             PdfTab const& tab = *g_tabs[static_cast<size_t>(actualIndex)];
             bool dirty = tab.dirty;
@@ -15054,11 +15081,16 @@ namespace
             int feedbackRadius = active ? S(9) : S(7);
             if (hovered || active)
             {
-                if (IsAuroraTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill(), active ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill());
-                else if (IsWarmMistTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedFill() : SidebarHoverFill());
-                else if (IsBeigeTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
-                else if (IsDarkTheme()) RoundFill(dc, feedbackRect, feedbackRadius, active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
-                else RoundFill(dc, feedbackRect, feedbackRadius, active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
+                auto fillFeedback = [&](COLORREF fill, COLORREF line)
+                {
+                    if (active) RoundFillAA(dc, feedbackRect, feedbackRadius, fill, line);
+                    else RoundFill(dc, feedbackRect, feedbackRadius, fill, line);
+                };
+                if (IsAuroraTheme()) fillFeedback(active ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill(), active ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill());
+                else if (IsWarmMistTheme()) fillFeedback(active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedFill() : SidebarHoverFill());
+                else if (IsBeigeTheme()) fillFeedback(active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
+                else if (IsDarkTheme()) fillFeedback(active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
+                else fillFeedback(active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
             }
             COLORREF iconColor = active
                 ? (IsWarmMistTheme() ? RGB(255, 255, 255)
@@ -15638,7 +15670,7 @@ namespace
                     bool hovered = !favoriteOverlayHit &&
                         !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered && !selected) RoundFill(dc, row, S(5), SidebarHoverFill(), SidebarHoverFill());
-                    if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(),
+                    if (selected) RoundFillAA(dc, row, S(4), SidebarSelectedFill(),
                         IsWarmMistTheme() ? SidebarSelectedFill() : SidebarSelectedBorder());
 
                     if (it->hasChildren)
