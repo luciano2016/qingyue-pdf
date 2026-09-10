@@ -16487,6 +16487,7 @@ namespace
                 RECT drawRect{};
                 if (IntersectRect(&drawRect, &pageRect, &stageDirty))
                 {
+                    bool pagePaintedRenderable = false;
                     int savedPageDc = SaveDC(dc);
                     IntersectClipRect(dc, pageRect.left, pageRect.top, pageRect.right, pageRect.bottom);
                     if (!UseTiledPageRendering(tab))
@@ -16506,11 +16507,15 @@ namespace
                             int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image->width) / std::max(1, pageW))), sx + 1, image->width);
                             int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image->height) / std::max(1, pageH))), sy + 1, image->height);
                              if (DrawCachedImagePart(dc, *image, drawRect, sx, sy, ex - sx, ey - sy))
+                             {
                                  paintedRenderable = true;
+                                 pagePaintedRenderable = true;
+                             }
                          }
                          else if (fallback && DrawCommittedPageImage(dc, *fallback, pageRect, drawRect))
                          {
                              paintedRenderable = true;
+                             pagePaintedRenderable = true;
                          }
                           else if (tab.zoomPresentationPending &&
                               DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect))
@@ -16521,6 +16526,7 @@ namespace
                               // old tile level as the presentation frame even
                               // though the target mode is whole-page.
                               paintedRenderable = true;
+                              pagePaintedRenderable = true;
                           }
                           else
                           {
@@ -16589,10 +16595,17 @@ namespace
                               QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
                           }
                           }
-                         if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted) paintedRenderable = true;
+                         if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted)
+                         {
+                             paintedRenderable = true;
+                             pagePaintedRenderable = true;
+                         }
                          if (targetMissing && !fallbackPainted && !oldZoomPainted && !coarsePainted && !targetPainted) missingVisiblePage = true;
                      }
-                    if (!zoomPresentationPending && IsDarkTheme())
+                    // Cached pages and old Tile generations contain the raw PDF
+                    // colors. Keep the dark-theme mask active while they serve
+                    // as the zoom presentation frame, or they flash white.
+                    if (IsDarkTheme() && (!zoomPresentationPending || pagePaintedRenderable))
                     {
                         AlphaFill(dc, pageRect, PdfOverlayColor(), PdfOverlayAlpha());
                     }
