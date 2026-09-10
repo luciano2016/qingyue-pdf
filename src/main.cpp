@@ -1439,6 +1439,7 @@ namespace
     RECT g_favoriteButtonRect{};
     RECT g_outlineToggleAllRect{};
     RECT g_outlineSearchRect{};
+    RECT g_outlineSearchClearRect{};
     RECT g_favoriteListRect{};
     RECT g_favoriteListScrollTrackRect{};
     RECT g_favoriteListScrollThumbRect{};
@@ -1569,7 +1570,7 @@ namespace
     int g_homeContentHeight{};
     int g_theme{};
     int g_lastLightTheme{ 0 };
-    int g_lastDarkTheme{ 4 };
+    int g_lastDarkTheme{ 6 };
     int g_viewMode{};
     int g_contextTab{ -1 };
     int g_contextRecent{ -1 };
@@ -1915,11 +1916,11 @@ namespace
     Theme g_themes[] = {
         { L"\u4e91\u6bcd\u767d", RGB(244,247,250), RGB(255,255,255), RGB(250,252,254), RGB(238,243,247), RGB(255,255,255), RGB(31,35,40), RGB(105,113,125), RGB(210,217,226), RGB(59,170,124) },
         { L"\u8f7b\u67d4\u7070", RGB(246,247,249), RGB(242,243,245), RGB(255,255,255), RGB(238,240,243), RGB(255,255,255), RGB(43,48,56), RGB(116,123,132), RGB(213,217,222), RGB(83,145,207) },
+        { L"\u6696\u96fe\u7070", RGB(247,246,244), RGB(250,249,247), RGB(242,241,239), RGB(247,246,244), RGB(255,255,255), RGB(37,49,61), RGB(113,128,150), RGB(220,229,232), RGB(93,151,143) },
         { L"\u62a4\u773c\u7c73", RGB(236,231,216), RGB(245,240,221), RGB(255,252,240), RGB(225,217,196), RGB(255,249,233), RGB(45,39,29), RGB(124,113,95), RGB(202,191,166), RGB(124,143,66) },
-        { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
-        { L"\u77f3\u58a8\u9ed1", RGB(16,18,21), RGB(29,32,36), RGB(44,48,54), RGB(16,18,21), RGB(35,39,44), RGB(229,231,233), RGB(135,141,149), RGB(48,52,58), RGB(183,188,195) },
         { L"\u6d45\u8349\u7eff", RGB(232,241,234), RGB(241,247,242), RGB(248,251,248), RGB(225,236,228), RGB(253,254,252), RGB(42,56,47), RGB(104,122,110), RGB(198,215,202), RGB(102,157,119) },
-        { L"\u6696\u96fe\u7070", RGB(247,246,244), RGB(250,249,247), RGB(242,241,239), RGB(247,246,244), RGB(255,255,255), RGB(37,49,61), RGB(113,128,150), RGB(220,229,232), RGB(93,151,143) }
+        { L"\u6781\u591c\u9ed1", RGB(12,14,20), RGB(25,29,38), RGB(38,44,56), RGB(8,10,15), RGB(30,34,43), RGB(243,246,251), RGB(169,178,191), RGB(58,65,78), RGB(126,162,255) },
+        { L"\u77f3\u58a8\u9ed1", RGB(16,18,21), RGB(29,32,36), RGB(44,48,54), RGB(16,18,21), RGB(35,39,44), RGB(229,231,233), RGB(135,141,149), RGB(48,52,58), RGB(183,188,195) }
     };
 
     Theme const& T()
@@ -1934,22 +1935,22 @@ namespace
 
     bool IsAuroraTheme()
     {
-        return g_theme == 5;
+        return g_theme == 4;
     }
 
     bool IsWarmMistTheme()
     {
-        return g_theme == 6;
+        return g_theme == 2;
     }
 
     bool IsGraphiteTheme()
     {
-        return g_theme == 4;
+        return g_theme == 6;
     }
 
     bool IsBeigeTheme()
     {
-        return g_theme == 2;
+        return g_theme == 3;
     }
 
     bool IsIdeaLightTheme()
@@ -2010,17 +2011,17 @@ namespace
 
     bool IsDarkTheme()
     {
-        return g_theme >= 3 && g_theme <= 4;
+        return g_theme == 5 || g_theme == 6;
     }
 
     bool IsLightThemeIndex(int theme)
     {
-        return theme == 0 || theme == 1 || theme == 2 || theme == 5 || theme == 6;
+        return theme >= 0 && theme <= 4;
     }
 
     bool IsDarkThemeIndex(int theme)
     {
-        return theme == 3 || theme == 4;
+        return theme == 5 || theme == 6;
     }
 
     int LastLightTheme()
@@ -2030,7 +2031,7 @@ namespace
 
     int LastDarkTheme()
     {
-        return IsDarkThemeIndex(g_lastDarkTheme) ? g_lastDarkTheme : 4;
+        return IsDarkThemeIndex(g_lastDarkTheme) ? g_lastDarkTheme : 6;
     }
 
     COLORREF ForegroundOn(COLORREF bg)
@@ -2251,10 +2252,10 @@ namespace
     void ApplyPdfThemeFor(int theme, std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
         int clampedTheme = std::clamp(theme, 0, static_cast<int>(std::size(g_themes)) - 1);
-        if (clampedTheme == 0 || clampedTheme == 1) return;
-        if (clampedTheme >= 3 && clampedTheme <= 4) return;
+        if (clampedTheme >= 0 && clampedTheme <= 2) return;
+        if (clampedTheme >= 5 && clampedTheme <= 6) return;
 
-        if (clampedTheme == 5)
+        if (clampedTheme == 4)
         {
             // Match SumatraPDF's page-bitmap recoloring model: one linear
             // channel mapping includes text, vectors, scans and images.
@@ -2277,7 +2278,7 @@ namespace
         // The green document mode uses a shared page background instead of a
         // separate white paper color, otherwise image rectangles remain
         // visibly brighter than text-only areas.
-        COLORREF paper = clampedTheme == 5 ? RGB(245, 250, 246) : g_themes[clampedTheme].paper;
+        COLORREF paper = clampedTheme == 4 ? RGB(245, 250, 246) : g_themes[clampedTheme].paper;
 
         if (lum > 185)
         {
@@ -2290,8 +2291,8 @@ namespace
 
     int PdfRenderThemeForUiTheme(int theme)
     {
-        if (theme == 2) return 2;
-        if (theme == 5) return 5;
+        if (theme == 3) return 3;
+        if (theme == 4) return 4;
         return 0;
     }
 
@@ -2311,8 +2312,8 @@ namespace
         // This is the white-pixel destination of the浅草绿 Plus-style
         // document palette.  Fallback painting must use the same color as a
         // completed page, otherwise a missing render briefly flashes white.
-        if (theme == 2) return RGB(255, 249, 233);
-        if (theme == 5) return RGB(245, 250, 246);
+        if (theme == 3) return RGB(255, 249, 233);
+        if (theme == 4) return RGB(245, 250, 246);
         return RGB(255, 255, 255);
     }
 
@@ -3367,7 +3368,9 @@ namespace
         lines.push_back({ lineStart, static_cast<int>(title.size()) });
 
         COLORREF markFill = TextSelectionFillColor();
-        COLORREF matchText = selected ? markFill : textColor;
+        COLORREF matchText = selected
+            ? (IsWarmMistTheme() ? RGB(37, 49, 61) : markFill)
+            : textColor;
         for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex)
         {
             int start = lines[lineIndex].first;
@@ -3891,7 +3894,7 @@ namespace
         g_favoriteListRect = panel;
         HFONT favoriteFont = Font(9);
         HGDIOBJ oldFavoriteFont = SelectObject(dc, favoriteFont);
-        DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 28 : 18);
+        DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 6 : 18);
         RoundFill(dc, panel, S(8), MenuPopupFill(), MenuPopupBorder());
 
         RECT heading{ panel.left + S(12), panel.top + S(7), panel.right - S(12), panel.top + headerH };
@@ -5121,15 +5124,15 @@ namespace
         pen.SetLineJoin(Gdiplus::LineJoinRound);
         float cx = (r.left + r.right) * 0.5f;
         float cy = (r.top + r.bottom) * 0.5f;
-        float outer = S(6.4f);
-        float inner = S(2.55f);
+        float outer = S(5.8f);
+        float inner = S(2.3f);
         for (int i = 0; i < 8; ++i)
         {
             double a = i * 3.14159265358979323846 / 4.0;
-            float x1 = cx + std::cos(a) * S(8.3f);
-            float y1 = cy + std::sin(a) * S(8.3f);
-            float x2 = cx + std::cos(a) * S(6.9f);
-            float y2 = cy + std::sin(a) * S(6.9f);
+            float x1 = cx + std::cos(a) * S(7.5f);
+            float y1 = cy + std::sin(a) * S(7.5f);
+            float x2 = cx + std::cos(a) * S(6.25f);
+            float y2 = cy + std::sin(a) * S(6.25f);
             g.DrawLine(&pen, x1, y1, x2, y2);
         }
         g.DrawEllipse(&pen, cx - outer, cy - outer, outer * 2.0f, outer * 2.0f);
@@ -5478,8 +5481,48 @@ namespace
         std::vector<std::string> lines;
         std::string line;
         while (std::getline(in, line)) lines.push_back(line);
+        bool themeSchema4 = std::find(lines.begin(), lines.end(), "themeSchema=4") != lines.end();
         bool themeSchema3 = std::find(lines.begin(), lines.end(), "themeSchema=3") != lines.end();
         bool themeSchema2 = std::find(lines.begin(), lines.end(), "themeSchema=2") != lines.end();
+        auto decodeThemeIndex = [&](int savedTheme)
+        {
+            if (themeSchema4)
+                return std::clamp(savedTheme, 0, static_cast<int>(std::size(g_themes)) - 1);
+            if (themeSchema3)
+            {
+                switch (std::clamp(savedTheme, 0, 6))
+                {
+                case 1: return 1; // soft gray
+                case 2: return 3; // eye-care beige
+                case 3: return 5; // night black
+                case 4: return 6; // graphite black
+                case 5: return 4; // aurora green
+                case 6: return 2; // warm mist gray
+                default: return 0; // mica white
+                }
+            }
+            if (themeSchema2)
+            {
+                switch (std::clamp(savedTheme, 0, 5))
+                {
+                case 1: return 3; // eye-care beige
+                case 2: return 5; // night black
+                case 3: return 6; // graphite black
+                case 4: return 4; // aurora green
+                case 5: return 1; // soft gray
+                default: return 0; // mica white
+                }
+            }
+            switch (savedTheme)
+            {
+            case 1: return 5; // legacy dark mica -> night black
+            case 2: return 4; // legacy aurora -> aurora green
+            case 3: return 6; // legacy graphite -> graphite black
+            case 4: return 3; // legacy eye-care paper -> eye-care beige
+            case 5: return 0; // legacy frosted mica -> mica white
+            default: return 0;
+            }
+        };
         bool sawLastLightTheme = false;
         bool sawLastDarkTheme = false;
         for (auto const& line : lines)
@@ -5487,40 +5530,16 @@ namespace
             if (line.rfind("theme=", 0) == 0)
             {
                 int savedTheme = std::atoi(line.c_str() + 6);
-                if (themeSchema3)
-                {
-                    g_theme = std::clamp(savedTheme, 0, static_cast<int>(std::size(g_themes)) - 1);
-                }
-                else if (themeSchema2)
-                {
-                    switch (std::clamp(savedTheme, 0, 5))
-                    {
-                    case 1: g_theme = 2; break; // schema2 eye-care beige -> eye-care beige
-                    case 2: g_theme = 3; break; // schema2 night black -> night black
-                    case 3: g_theme = 4; break; // schema2 graphite black -> graphite black
-                    case 4: g_theme = 5; break; // schema2 aurora green -> aurora green
-                    case 5: g_theme = 1; break; // schema2 IDEA light -> soft gray
-                    default: g_theme = 0; break;
-                    }
-                }
-                else switch (savedTheme)
-                {
-                case 1: g_theme = 3; break; // legacy dark mica -> night black
-                case 2: g_theme = 5; break; // legacy aurora -> aurora green
-                case 3: g_theme = 4; break; // legacy graphite -> graphite black
-                case 4: g_theme = 2; break; // legacy eye-care paper -> eye-care beige
-                case 5: g_theme = 0; break; // legacy frosted mica -> mica white
-                default: g_theme = 0; break;
-                }
+                g_theme = decodeThemeIndex(savedTheme);
             }
             else if (line.rfind("lastLightTheme=", 0) == 0)
             {
-                g_lastLightTheme = std::atoi(line.c_str() + 15);
+                g_lastLightTheme = decodeThemeIndex(std::atoi(line.c_str() + 15));
                 sawLastLightTheme = true;
             }
             else if (line.rfind("lastDarkTheme=", 0) == 0)
             {
-                g_lastDarkTheme = std::atoi(line.c_str() + 14);
+                g_lastDarkTheme = decodeThemeIndex(std::atoi(line.c_str() + 14));
                 sawLastDarkTheme = true;
             }
             else if (line.rfind("sidebar=", 0) == 0)
@@ -5645,7 +5664,7 @@ namespace
     void SaveState()
     {
         std::ofstream out(StatePath(), std::ios::binary | std::ios::trunc);
-        out << "themeSchema=3\n";
+        out << "themeSchema=4\n";
         out << "theme=" << g_theme << "\n";
         out << "lastLightTheme=" << LastLightTheme() << "\n";
         out << "lastDarkTheme=" << LastDarkTheme() << "\n";
@@ -9269,8 +9288,8 @@ namespace
         if (IsGlassTheme()) return RGB(255, 241, 168);
         if (IsIdeaLightTheme()) return RGB(166, 210, 255);
         if (IsBeigeTheme()) return RGB(220, 230, 188);
-        if (g_theme == 3) return RGB(142, 176, 255);
-        if (g_theme == 4) return RGB(238, 205, 145);
+        if (g_theme == 5) return RGB(142, 176, 255);
+        if (g_theme == 6) return RGB(238, 205, 145);
         if (IsAuroraTheme()) return RGB(195, 227, 201);
         if (IsWarmMistTheme()) return RGB(85, 179, 159);
         return MixColor(T().paper, T().accent, 0.36);
@@ -9281,8 +9300,8 @@ namespace
         if (IsGlassTheme()) return RGB(232, 190, 70);
         if (IsIdeaLightTheme()) return RGB(88, 148, 207);
         if (IsBeigeTheme()) return RGB(152, 166, 103);
-        if (g_theme == 3) return RGB(104, 139, 220);
-        if (g_theme == 4) return RGB(207, 158, 82);
+        if (g_theme == 5) return RGB(104, 139, 220);
+        if (g_theme == 6) return RGB(207, 158, 82);
         if (IsAuroraTheme()) return RGB(111, 157, 122);
         if (IsWarmMistTheme()) return RGB(93, 151, 143);
         return T().accent;
@@ -14985,6 +15004,7 @@ namespace
         g_favoriteButtonRect = {};
         g_outlineToggleAllRect = {};
         g_outlineSearchRect = {};
+        g_outlineSearchClearRect = {};
         bool favoriteOverlayHit = g_favoriteListOpen &&
             !IsRectEmpty(&g_favoriteListRect) &&
             Hit(g_favoriteListRect, g_mousePos.x, g_mousePos.y);
@@ -15031,7 +15051,7 @@ namespace
             if (hovered || active)
             {
                 if (IsAuroraTheme()) RoundFill(dc, tabRect, S(7), active ? MixColor(T().panel, T().accent, 0.075) : SidebarHoverFill(), active ? MixColor(T().line, T().accent, 0.16) : SidebarHoverFill());
-                else if (IsWarmMistTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
+                else if (IsWarmMistTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedFill() : SidebarHoverFill());
                 else if (IsBeigeTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
                 else if (IsDarkTheme()) RoundFill(dc, tabRect, S(7), active ? SidebarSelectedFill() : SidebarHoverFill(), active ? SidebarSelectedBorder() : SidebarHoverFill());
                 else RoundFill(dc, tabRect, S(7), active ? RGB(232, 238, 244) : T().panel2, active ? RGB(232, 238, 244) : T().line);
@@ -15478,9 +15498,28 @@ namespace
                     : searchFill;
             RoundFill(dc, g_outlineSearchRect, S(8), searchFill, searchLine);
             }
+            if (!g_outlineSearchQuery.empty())
+            {
+                int clearSize = S(20);
+                int clearTop = g_outlineSearchRect.top +
+                    (g_outlineSearchRect.bottom - g_outlineSearchRect.top - clearSize) / 2;
+                g_outlineSearchClearRect = RECT{
+                    g_outlineSearchRect.right - S(3) - clearSize,
+                    clearTop,
+                    g_outlineSearchRect.right - S(3),
+                    clearTop + clearSize };
+                bool clearHovered = Hit(g_outlineSearchClearRect, g_mousePos.x, g_mousePos.y);
+                if (clearHovered)
+                    RoundFill(dc, g_outlineSearchClearRect, S(5), SidebarHoverFill(), SidebarHoverFill());
+                DrawCloseGlyph(dc, g_outlineSearchClearRect,
+                    clearHovered ? T().accent : SidebarIconColor());
+            }
             RECT searchText{
                 g_sidebar.left + S(14), g_outlineSearchRect.top,
-                g_outlineSearchRect.right - S(8), g_outlineSearchRect.bottom };
+                g_outlineSearchQuery.empty()
+                    ? g_outlineSearchRect.right - S(8)
+                    : g_outlineSearchClearRect.left - S(2),
+                g_outlineSearchRect.bottom };
             std::wstring searchShown = g_outlineSearchQuery.empty() ? L"\u641c\u7d22\u4e66\u7b7e" : g_outlineSearchQuery;
             Text(dc, searchShown, searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 g_outlineSearchQuery.empty() ? T().muted : T().text);
@@ -15595,7 +15634,8 @@ namespace
                     bool hovered = !favoriteOverlayHit &&
                         !g_draggingSidebarScroll && Hit(row, g_mousePos.x, g_mousePos.y);
                     if (hovered && !selected) RoundFill(dc, row, S(5), SidebarHoverFill(), SidebarHoverFill());
-                    if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(), SidebarSelectedBorder());
+                    if (selected) RoundFill(dc, row, S(4), SidebarSelectedFill(),
+                        IsWarmMistTheme() ? SidebarSelectedFill() : SidebarSelectedBorder());
 
                     if (it->hasChildren)
                     {
@@ -15667,14 +15707,14 @@ namespace
     COLORREF PdfOverlayColor()
     {
         if (IsAuroraTheme()) return RGB(22, 38, 33);
-        if (g_theme == 4) return RGB(28, 25, 22);
+        if (IsGraphiteTheme()) return RGB(28, 25, 22);
         return RGB(7, 10, 20);
     }
 
     BYTE PdfOverlayAlpha()
     {
         if (IsAuroraTheme()) return 42;
-        if (g_theme == 4) return 40;
+        if (IsGraphiteTheme()) return 40;
         return 46;
     }
 
@@ -21373,7 +21413,10 @@ namespace
                 if (g_sideMode == 0 && SidebarVisible() &&
                     !IsRectEmpty(&g_outlineSearchRect) && Hit(g_outlineSearchRect, pt.x, pt.y))
                 {
-                    SetCursor(LoadCursorW(nullptr, g_outlineSearchFocused ? IDC_IBEAM : IDC_ARROW));
+                    bool clearButton = !IsRectEmpty(&g_outlineSearchClearRect) &&
+                        Hit(g_outlineSearchClearRect, pt.x, pt.y);
+                    SetCursor(LoadCursorW(nullptr,
+                        clearButton ? IDC_HAND : (g_outlineSearchFocused ? IDC_IBEAM : IDC_ARROW)));
                     return TRUE;
                 }
                 if (g_autoScrollActive)
@@ -21864,10 +21907,20 @@ namespace
             }
             if (Active() && g_sideMode == 0 && Hit(g_outlineSearchRect, x, y))
             {
+                if (!g_outlineSearchQuery.empty() && Hit(g_outlineSearchClearRect, x, y))
+                {
+                    g_outlineSearchQuery.clear();
+                    g_outlineSearchCaretIndex = 0;
+                    g_outlineSearchCaretVisible = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
                 RECT inputText{
                     g_sidebar.left + S(14),
                     g_outlineSearchRect.top,
-                    g_outlineSearchRect.right - S(8),
+                    g_outlineSearchQuery.empty()
+                        ? g_outlineSearchRect.right - S(8)
+                        : g_outlineSearchClearRect.left - S(2),
                     g_outlineSearchRect.bottom };
                 g_outlineSearchExpanded = true;
                 g_outlineSearchFocused = true;
