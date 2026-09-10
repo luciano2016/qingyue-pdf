@@ -3894,7 +3894,8 @@ namespace
         g_favoriteListRect = panel;
         HFONT favoriteFont = Font(9);
         HGDIOBJ oldFavoriteFont = SelectObject(dc, favoriteFont);
-        DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), IsDarkTheme() ? 6 : 18);
+        if (!IsDarkTheme())
+            DrawRoundedShadow(dc, panel, S(8), S(1), S(4), S(4), 18);
         RoundFill(dc, panel, S(8), MenuPopupFill(), MenuPopupBorder());
 
         RECT heading{ panel.left + S(12), panel.top + S(7), panel.right - S(12), panel.top + headerH };
