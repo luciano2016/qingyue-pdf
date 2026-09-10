@@ -2979,16 +2979,6 @@ namespace
         DrawGdiRoundRect(g, border, Rf(r), radius);
     }
 
-    // The light theme uses a restrained raised-surface treatment for the
-    // application chrome. Keep the document viewport itself untouched so
-    // page rendering and scroll presentation remain on their existing path.
-    void PaintCloudSurface(HDC dc, RECT r, float radius, BYTE alpha = 238)
-    {
-        if (!IsGlassTheme() || IsRectEmpty(&r)) return;
-        DrawRoundedShadow(dc, r, radius, S(1), S(3), S(5), 24);
-        GlassRoundedSurface(dc, r, alpha, radius, false);
-    }
-
     void FlatRoundedSurface(HDC dc, RECT r, float radius)
     {
         Gdiplus::Graphics g(dc);
@@ -13953,22 +13943,14 @@ namespace
     {
         if (g_immersive) return;
         RECT bar{ 0, 0, client.right, S(38) };
-        if (IsGlassTheme())
-        {
-            RECT shell{ S(8), S(4), client.right - S(8), S(36) };
-            PaintCloudSurface(dc, shell, S(13.0f), 242);
-        }
-        else
-        {
-            if (IsGraphiteTheme()) Fill(dc, bar, RGB(29, 32, 36));
-            else GlassSurface(dc, bar, g_statusPinned ? 154 : 188);
-            HPEN pen = CreatePen(PS_SOLID, 1, ChromeDividerColor());
-            auto oldPen = SelectObject(dc, pen);
-            MoveToEx(dc, 0, bar.bottom - 1, nullptr);
-            LineTo(dc, client.right, bar.bottom - 1);
-            SelectObject(dc, oldPen);
-            DeleteObject(pen);
-        }
+        if (IsGraphiteTheme()) Fill(dc, bar, RGB(29, 32, 36));
+        else GlassSurface(dc, bar, g_statusPinned ? 154 : 188);
+        HPEN pen = CreatePen(PS_SOLID, 1, ChromeDividerColor());
+        auto oldPen = SelectObject(dc, pen);
+        MoveToEx(dc, 0, bar.bottom - 1, nullptr);
+        LineTo(dc, client.right, bar.bottom - 1);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
         HFONT f = Font(9);
         auto oldFont = SelectObject(dc, f);
         int x = S(18);
@@ -14000,22 +13982,14 @@ namespace
         g_tabCountRect = {};
         if (g_immersive) return;
         RECT bar{ 0, S(38), client.right, S(76) };
-        if (IsGlassTheme())
-        {
-            RECT shell{ S(8), S(39), client.right - S(8), S(74) };
-            PaintCloudSurface(dc, shell, S(13.0f), 238);
-        }
-        else
-        {
-            if (IsGraphiteTheme()) Fill(dc, bar, RGB(35, 39, 44));
-            else GlassSurface(dc, bar, 142);
-            HPEN pen = CreatePen(PS_SOLID, 1, ChromeDividerColor());
-            auto oldPen = SelectObject(dc, pen);
-            MoveToEx(dc, 0, bar.bottom - 1, nullptr);
-            LineTo(dc, client.right, bar.bottom - 1);
-            SelectObject(dc, oldPen);
-            DeleteObject(pen);
-        }
+        if (IsGraphiteTheme()) Fill(dc, bar, RGB(35, 39, 44));
+        else GlassSurface(dc, bar, 142);
+        HPEN pen = CreatePen(PS_SOLID, 1, ChromeDividerColor());
+        auto oldPen = SelectObject(dc, pen);
+        MoveToEx(dc, 0, bar.bottom - 1, nullptr);
+        LineTo(dc, client.right, bar.bottom - 1);
+        SelectObject(dc, oldPen);
+        DeleteObject(pen);
         HFONT f = Font(9);
         auto oldFont = SelectObject(dc, f);
         int top = S(46);
@@ -15002,7 +14976,7 @@ namespace
             Hit(g_favoriteListRect, g_mousePos.x, g_mousePos.y);
         RECT sidebarFull{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.bottom };
         if (IsGraphiteTheme()) Fill(dc, sidebarFull, RGB(34, 37, 41));
-        else if (!IsGlassTheme()) GlassSurface(dc, sidebarFull, 128);
+        else GlassSurface(dc, sidebarFull, 128);
         g_sidebarRowPages.clear();
         g_sidebarRowRects.clear();
         g_sidebarRowIds.clear();
@@ -15020,11 +14994,7 @@ namespace
         int railW = S(44);
         RECT rail{ 0, g_sidebar.top, std::min<int>(railW, sidebarFull.right), g_sidebar.bottom };
         if (IsAuroraTheme()) Fill(dc, rail, T().panel);
-        else if (IsGlassTheme())
-        {
-            RECT railSurface{ S(8), rail.top + S(6), rail.right - S(4), rail.bottom - S(6) };
-            PaintCloudSurface(dc, railSurface, S(12.0f), 230);
-        }
+        else if (IsGlassTheme()) AlphaFill(dc, rail, RGB(247, 250, 253), 116);
         else if (IsGraphiteTheme()) Fill(dc, rail, RGB(34, 37, 41));
         else Fill(dc, rail, T().panel);
         RECT railLine{ rail.right - std::max(1, S(1)), rail.top, rail.right, rail.bottom };
@@ -15065,16 +15035,6 @@ namespace
             SelectObject(dc, oldFont);
             DeleteObject(f);
             return;
-        }
-
-        if (IsGlassTheme())
-        {
-            RECT contentSurface{
-                g_sidebar.left + S(6),
-                g_sidebar.top + S(6),
-                g_sidebar.right - S(8),
-                g_sidebar.bottom - S(6) };
-            PaintCloudSurface(dc, contentSurface, S(14.0f), 242);
         }
         // Keep the two top-row controls aligned with the two size controls
         // below: the chevron sits above A-, and close sits above A+.
@@ -17142,20 +17102,12 @@ namespace
         int barH = S(34);
         if (!g_statusPinned && g_statusOffset >= barH) return;
         RECT bar{ 0, client.bottom - barH + g_statusOffset, client.right, client.bottom + g_statusOffset };
-        if (IsGlassTheme())
-        {
-            RECT shell{ S(8), bar.top + S(2), client.right - S(8), bar.bottom - S(2) };
-            PaintCloudSurface(dc, shell, S(13.0f), 242);
-        }
-        else
-        {
-            if (IsGlassTheme() && !g_statusPinned)
-                Fill(dc, bar, ChromeBarColor());
-            if (IsGraphiteTheme()) Fill(dc, bar, RGB(29, 32, 36));
-            else GlassSurface(dc, bar, 154);
-            RECT topLine{ bar.left, bar.top, bar.right, bar.top + std::max(1, S(1)) };
-            GlassDivider(dc, topLine);
-        }
+        if (IsGlassTheme() && !g_statusPinned)
+            Fill(dc, bar, ChromeBarColor());
+        if (IsGraphiteTheme()) Fill(dc, bar, RGB(29, 32, 36));
+        else GlassSurface(dc, bar, 154);
+        RECT topLine{ bar.left, bar.top, bar.right, bar.top + std::max(1, S(1)) };
+        GlassDivider(dc, topLine);
         HFONT f = Font(10);
         HGDIOBJ oldFont = SelectObject(dc, f);
         std::wstring pageSize = L"-- x -- \u5398\u7c73";
@@ -20643,7 +20595,6 @@ namespace
             EndPaint(hwnd, &ps);
             return;
         }
-
         EnsureStageFrameBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom));
         HDC mem = g_paintBufferDc;
         int paintState = SaveDC(mem);
