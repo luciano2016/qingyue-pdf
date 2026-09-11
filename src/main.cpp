@@ -3598,10 +3598,12 @@ namespace
             TouchRecentProgress(*tab, false);
             UpdateVertScrollBar(hwnd);
             InvalidateRect(hwnd, &g_sidebar, FALSE);
-            // Do not hold the visible frame until every target raster is
-            // complete. Paint the committed viewport immediately and let
-            // render completions refresh only the missing page region.
-            RequestPageNavigationRepaint(hwnd, *tab, false);
+            // Keep the last complete viewport until the target page has been
+            // rendered. Allowing an incomplete navigation frame here can
+            // replace the committed page with an empty stage; the later
+            // render completion may then only invalidate a small region and
+            // leave the page blank until the next scroll repaint.
+            RequestPageNavigationRepaint(hwnd, *tab, true);
             return true;
         };
 
