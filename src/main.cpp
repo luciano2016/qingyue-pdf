@@ -3810,6 +3810,10 @@ namespace
         TouchRecentProgress(*tab, false);
         UpdateVertScrollBar(hwnd);
         RequestPageNavigationRepaint(hwnd, *tab);
+        // Navigation completes the popup action. Closing it here also prevents
+        // the underlying selected bookmark row from being composited together
+        // with the just-clicked favorite row on the next partial repaint.
+        g_favoriteListOpen = false;
         g_hoverFavoriteItem = -1;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -7902,6 +7906,49 @@ namespace
         QueuePageMetadata(hwnd, tab, tab.pageCount, 1);
         if (Active() == &tab)
             SetTimer(hwnd, 24, 500, nullptr);
+    }
+
+    void RefreshOutlineSearchLayout(HWND hwnd, bool resetScroll)
+    {
+        PdfTab* tab = Active();
+        if (tab)
+        {
+            // The filtered row count can change on every keystroke. Clearing
+            // the geometry key makes the next paint rebuild the visible rows
+            // immediately instead of reusing a layout from the previous query.
+            tab->outlineLayoutWidth = 0;
+            tab->outlineLayoutFont = 0;
+            tab->outlineLayoutDpi = 0;
+            tab->outlineLayoutRows = 0;
+            tab->outlineLayoutCollapseVersion = 0;
+            tab->outlineLayoutQuery.clear();
+            if (!tab->outlineMetadataLoaded && !tab->outlineMetadataRequested)
+                RequestOutlineMetadata(hwnd, *tab);
+        }
+        if (resetScroll)
+        {
+            g_sidebarScrollY = 0;
+            g_sidebarScrollTargetY = 0;
+        }
+        InvalidateRect(hwnd, &g_sidebar, FALSE);
+    }
+
+    void InsertOutlineSearchText(HWND hwnd, std::wstring const& text)
+    {
+        if (text.empty() || !g_outlineSearchFocused || g_sideMode != 0) return;
+        size_t maxLength = 120;
+        g_outlineSearchCaretIndex = std::clamp<int>(
+            g_outlineSearchCaretIndex, 0, static_cast<int>(g_outlineSearchQuery.size()));
+        size_t room = g_outlineSearchQuery.size() < maxLength
+            ? maxLength - g_outlineSearchQuery.size() : 0;
+        if (room == 0) return;
+        std::wstring inserted = text.substr(0, room);
+        g_outlineSearchQuery.insert(
+            g_outlineSearchQuery.begin() + g_outlineSearchCaretIndex,
+            inserted.begin(), inserted.end());
+        g_outlineSearchCaretIndex += static_cast<int>(inserted.size());
+        g_outlineSearchCaretVisible = true;
+        RefreshOutlineSearchLayout(hwnd, true);
     }
 
     bool OutlineRequestPending(PdfTab const& tab)
@@ -14343,7 +14390,8 @@ namespace
         g_tabListRect = RECT{ left, g_tabCountRect.bottom + S(6), left + panelW, g_tabCountRect.bottom + S(6) + panelH };
         g_tabListScrollY = ClampTabListScrollValue(client, g_tabListScrollY);
 
-        DrawRoundedShadow(dc, g_tabListRect, S(10.0f), S(1), S(4), S(5), IsDarkTheme() ? 42 : 22);
+        if (!IsDarkTheme())
+            DrawRoundedShadow(dc, g_tabListRect, S(10.0f), S(1), S(4), S(5), 22);
         // The tab list spans multiple surfaces (tab bar and reader area). A
         // flat opaque surface prevents the underlying surfaces from showing
         // through as an unintended horizontal color split.
@@ -21053,6 +21101,12 @@ namespace
                             tab.outlineMetadataRetryCount = 0;
                             tab.outlineMetadataRequested = false;
                             tab.outlineMetadataLoaded = true;
+                            tab.outlineLayoutWidth = 0;
+                            tab.outlineLayoutFont = 0;
+                            tab.outlineLayoutDpi = 0;
+                            tab.outlineLayoutRows = 0;
+                            tab.outlineLayoutCollapseVersion = 0;
+                            tab.outlineLayoutQuery.clear();
                             if (tab.outline.empty() && !tab.sidebarStateExplicit)
                             {
                                 tab.sidebarRailOpen = true;
@@ -21961,7 +22015,7 @@ namespace
                     g_outlineSearchQuery.clear();
                     g_outlineSearchCaretIndex = 0;
                     g_outlineSearchCaretVisible = true;
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    RefreshOutlineSearchLayout(hwnd, true);
                     return 0;
                 }
                 RECT inputText{
@@ -23796,7 +23850,7 @@ namespace
                     g_outlineSearchQuery.erase(static_cast<size_t>(g_outlineSearchCaretIndex), 1);
                     g_outlineSearchCaretVisible = true;
                     SetTimer(hwnd, 13, 500, nullptr);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    RefreshOutlineSearchLayout(hwnd, true);
                     return 0;
                 }
             }
@@ -23846,6 +23900,24 @@ namespace
                 PdfTab* tab = Active();
                 if (tab && !g_continuousRead) ScrollSinglePageByPixels(hwnd, *tab, -std::max<int>(S(80), g_stage.bottom - g_stage.top - S(56)));
                 else ScrollStageTo(hwnd, g_scrollY - (g_stage.bottom - g_stage.top));
+                return 0;
+            }
+            break;
+        case WM_IME_COMPOSITION:
+            if (g_outlineSearchFocused && g_sideMode == 0 && (lParam & GCS_RESULTSTR))
+            {
+                HIMC imc = ImmGetContext(hwnd);
+                if (imc)
+                {
+                    LONG bytes = ImmGetCompositionStringW(imc, GCS_RESULTSTR, nullptr, 0);
+                    if (bytes > 0)
+                    {
+                        std::wstring committed(static_cast<size_t>(bytes / sizeof(wchar_t)), L'\0');
+                        ImmGetCompositionStringW(imc, GCS_RESULTSTR, committed.data(), bytes);
+                        InsertOutlineSearchText(hwnd, committed);
+                    }
+                    ImmReleaseContext(hwnd, imc);
+                }
                 return 0;
             }
             break;
@@ -23975,7 +24047,7 @@ namespace
                 {
                     g_outlineSearchCaretVisible = true;
                     SetTimer(hwnd, 13, 500, nullptr);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    RefreshOutlineSearchLayout(hwnd, true);
                 }
                 return 0;
             }
