@@ -3778,6 +3778,19 @@ namespace
             // until an unrelated mouse move repaints that area.
             InflateRect(&oldRect, S(10), S(10));
         }
+        // The pointer can remain over a bookmark row after the popup closes.
+        // The popup suppresses bookmark hover while it is open, so repainting
+        // only the popup bounds would restore just part of that row. Include
+        // the whole content panel in this one-shot cleanup region.
+        RECT cleanupRect = oldRect;
+        if (!IsRectEmpty(&g_sidebar))
+        {
+            RECT combined{};
+            if (IsRectEmpty(&cleanupRect))
+                cleanupRect = g_sidebar;
+            else if (UnionRect(&combined, &cleanupRect, &g_sidebar))
+                cleanupRect = combined;
+        }
         g_favoriteListOpen = false;
         g_draggingFavoriteListScroll = false;
         g_hoverFavoriteItem = -1;
@@ -3791,17 +3804,17 @@ namespace
         g_favoriteItemIds.clear();
         g_favoriteListContentHeight = 0;
         g_favoriteListVisibleHeight = 0;
-        if (!IsRectEmpty(&oldRect))
+        if (!IsRectEmpty(&cleanupRect))
         {
             if (IsRectEmpty(&g_favoriteListStaleRect))
-                g_favoriteListStaleRect = oldRect;
+                g_favoriteListStaleRect = cleanupRect;
             else
             {
                 RECT combined{};
-                UnionRect(&combined, &g_favoriteListStaleRect, &oldRect);
+                UnionRect(&combined, &g_favoriteListStaleRect, &cleanupRect);
                 g_favoriteListStaleRect = combined;
             }
-            RedrawWindow(hwnd, &oldRect, nullptr,
+            RedrawWindow(hwnd, &cleanupRect, nullptr,
                 RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
         else
