@@ -21364,6 +21364,15 @@ namespace
                         // an oversized page, is presented atomically.
                         if (CurrentZoomVisibleContentReady(tab))
                             InvalidateRect(hwnd, &g_stage, FALSE);
+                        else
+                        {
+                            // The tile queue is intentionally bounded. Keep
+                            // feeding the next missing target tiles as each
+                            // one completes; otherwise the first batch can
+                            // exhaust without ever finishing navigation, and
+                            // a second bookmark click appears to be required.
+                            SchedulePagePrefetch(hwnd);
+                        }
                     }
                     else if (tab.zoomPresentationPending)
                     {
