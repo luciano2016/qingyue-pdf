@@ -1546,6 +1546,9 @@ namespace
     LONG_PTR g_preImmersiveExStyle{};
     int g_active{ -1 };
     bool g_pageNavigationPending{};
+    // A favorite jump should present the new viewport immediately. Missing
+    // target pixels are filled by the render worker on later invalidations.
+    bool g_allowIncompletePageNavigationFrame{};
     int g_scrollY{};
     int g_scrollX{};
     int g_stageScrollTarget{};
@@ -3771,6 +3774,16 @@ namespace
         g_favoriteListOpen = false;
         g_draggingFavoriteListScroll = false;
         g_hoverFavoriteItem = -1;
+        // The popup is an in-canvas overlay, not a child window. Clear its
+        // hit-test snapshot at the same time as the open flag so a subsequent
+        // click cannot see stale rows while the old pixels are being erased.
+        g_favoriteListRect = {};
+        g_favoriteListScrollTrackRect = {};
+        g_favoriteListScrollThumbRect = {};
+        g_favoriteItemRects.clear();
+        g_favoriteItemIds.clear();
+        g_favoriteListContentHeight = 0;
+        g_favoriteListVisibleHeight = 0;
         if (!IsRectEmpty(&oldRect))
         {
             if (IsRectEmpty(&g_favoriteListStaleRect))
@@ -3834,7 +3847,10 @@ namespace
         }
         TouchRecentProgress(*tab, false);
         UpdateVertScrollBar(hwnd);
-        RequestPageNavigationRepaint(hwnd, *tab);
+        // Favorite navigation must update the viewport immediately. Missing
+        // target pixels can be filled by the existing committed-page fallback
+        // while the requested page continues rendering in the background.
+        RequestPageNavigationRepaint(hwnd, *tab, false);
         // Navigation completes the popup action. Closing it here also prevents
         // the underlying selected bookmark row from being composited together
         // with the just-clicked favorite row on the next partial repaint.
@@ -12477,6 +12493,7 @@ namespace
             : SinglePageContentHeight(tab);
         g_contentWidth = ReadingContentWidth(tab);
         g_pageNavigationPending = waitForComplete;
+        g_allowIncompletePageNavigationFrame = !waitForComplete;
         UpdateVertScrollBar(hwnd);
 
         if (UseTiledPageRendering(tab))
@@ -13782,8 +13799,10 @@ namespace
         if (!Active()) return;
         if (mode == g_sideMode) return;
         if (PdfTab* tab = Active()) SaveActiveTabSidebarState(*tab);
-        g_favoriteListOpen = false;
-        g_hoverFavoriteItem = -1;
+        if (g_favoriteListOpen)
+            CloseFavoriteList(hwnd);
+        else
+            g_hoverFavoriteItem = -1;
         if (mode != 0)
         {
             g_outlineSearchFocused = false;
@@ -13885,7 +13904,7 @@ namespace
             g_hasPressedButton = true;
             SetTimer(hwnd, 2, 90, nullptr);
             g_sidebarOpen = false;
-            g_favoriteListOpen = false;
+            CloseFavoriteList(hwnd);
             SaveActiveTabSidebarState(*Active());
             InvalidateRect(hwnd, nullptr, FALSE);
             UpdateWindow(hwnd);
@@ -16825,8 +16844,11 @@ namespace
         // page. The caller keeps the previous committed frame until the
         // worker supplies the missing image/tile, preventing white blocks
         // during a fast scroll.
-        if (missingVisiblePage && (g_stageFrameValid || g_pageNavigationPending))
+        if (missingVisiblePage && (g_stageFrameValid || g_pageNavigationPending) &&
+            !g_allowIncompletePageNavigationFrame)
             return false;
+        if (g_allowIncompletePageNavigationFrame)
+            g_allowIncompletePageNavigationFrame = false;
         if (g_pageNavigationPending)
         {
             // Render completions invalidate small tile rectangles. During a
@@ -20263,15 +20285,20 @@ namespace
             break;
         case CmdFavoriteListToggle:
             if (!Active() || g_sideMode != 0) return;
-            g_favoriteListOpen = !g_favoriteListOpen;
-            g_hoverFavoriteItem = -1;
+            if (g_favoriteListOpen)
+                CloseFavoriteList(hwnd);
+            else
+            {
+                g_favoriteListOpen = true;
+                g_hoverFavoriteItem = -1;
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case CmdSidebarContentClose:
             if (Active())
             {
                 g_sidebarOpen = false;
-                g_favoriteListOpen = false;
+                CloseFavoriteList(hwnd);
                 SaveActiveTabSidebarState(*Active());
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -20842,6 +20869,14 @@ namespace
             // overlay itself here; otherwise the back buffer only contains
             // the restored underlay and the visible thumb remains frozen.
             PaintMainScrollBar(mem, client, dirty);
+        }
+        if (!IsRectEmpty(&g_favoriteListStaleRect) &&
+            Intersects(g_favoriteListStaleRect, dirty))
+        {
+            // The stale popup bounds are a foreground surface. Do not let the
+            // deferred page-frame policy defer this cleanup and leave its
+            // rounded panel visible over the newly selected bookmark.
+            shouldFlush = true;
         }
         bool fullStageDirty = RectContains(dirty, g_stage);
         if (readerPainted && shouldFlush && !g_pageNavigationPending &&
@@ -22064,8 +22099,7 @@ namespace
                     hwnd, g_outlineSearchQuery, inputText,
                     g_outlineSearchQuery.empty() ? 9 : 10, x, false);
                 g_outlineSearchCaretVisible = true;
-                g_favoriteListOpen = false;
-                g_hoverFavoriteItem = -1;
+                CloseFavoriteList(hwnd);
                 g_sidebarKeyboardFocus = false;
                 SetTimer(hwnd, 13, 500, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
