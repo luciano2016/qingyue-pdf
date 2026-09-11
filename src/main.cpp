@@ -3598,12 +3598,12 @@ namespace
             TouchRecentProgress(*tab, false);
             UpdateVertScrollBar(hwnd);
             InvalidateRect(hwnd, &g_sidebar, FALSE);
-            // Keep the last complete viewport until the target page has been
-            // rendered. Allowing an incomplete navigation frame here can
-            // replace the committed page with an empty stage; the later
-            // render completion may then only invalidate a small region and
-            // leave the page blank until the next scroll repaint.
-            RequestPageNavigationRepaint(hwnd, *tab, true);
+            // Show the target viewport immediately, but do not commit its
+            // incomplete pixels as the reusable frame. The target page is
+            // replaced atomically when its render completes, so one click is
+            // visibly acknowledged without exposing a blank/stale frame.
+            RequestPageNavigationRepaint(hwnd, *tab, false);
+            UpdateWindow(hwnd);
             return true;
         };
 
@@ -12516,7 +12516,10 @@ namespace
             ? ContinuousContentHeight(tab)
             : SinglePageContentHeight(tab);
         g_contentWidth = ReadingContentWidth(tab);
-        g_pageNavigationPending = waitForComplete;
+        // Keep navigation pending in both modes. In immediate mode the first
+        // paint is allowed to show only the target page surface; it must not
+        // become the committed frame until all visible target pixels exist.
+        g_pageNavigationPending = true;
         g_allowIncompletePageNavigationFrame = !waitForComplete;
         UpdateVertScrollBar(hwnd);
 
@@ -16872,7 +16875,15 @@ namespace
             !g_allowIncompletePageNavigationFrame)
             return false;
         if (g_allowIncompletePageNavigationFrame)
+        {
             g_allowIncompletePageNavigationFrame = false;
+            // An immediate navigation paint is intentionally visible even
+            // while its page image is missing. Leave the transaction pending
+            // so the next render completion can submit one complete frame.
+            if (CurrentZoomVisibleContentReady(tab))
+                g_pageNavigationPending = false;
+            return true;
+        }
         if (g_pageNavigationPending)
         {
             // Render completions invalidate small tile rectangles. During a
