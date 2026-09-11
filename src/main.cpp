@@ -3771,6 +3771,13 @@ namespace
     void CloseFavoriteList(HWND hwnd)
     {
         RECT oldRect = g_favoriteListRect;
+        if (!IsRectEmpty(&oldRect))
+        {
+            // DrawRoundedShadow expands beyond the popup bounds. Include the
+            // complete shadow footprint or its pale rounded edge can remain
+            // until an unrelated mouse move repaints that area.
+            InflateRect(&oldRect, S(10), S(10));
+        }
         g_favoriteListOpen = false;
         g_draggingFavoriteListScroll = false;
         g_hoverFavoriteItem = -1;
@@ -3794,7 +3801,8 @@ namespace
                 UnionRect(&combined, &g_favoriteListStaleRect, &oldRect);
                 g_favoriteListStaleRect = combined;
             }
-            InvalidateRect(hwnd, &oldRect, FALSE);
+            RedrawWindow(hwnd, &oldRect, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
         else
         {
