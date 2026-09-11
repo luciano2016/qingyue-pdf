@@ -6683,7 +6683,7 @@ namespace
                     }
                     if (rendered)
                     {
-                        if (applyTheme && (effectiveTheme == 2 || effectiveTheme == 5))
+                        if (applyTheme && (effectiveTheme == 3 || effectiveTheme == 4))
                         {
                             for (int y = 0; y < image.height; ++y)
                             {
@@ -6752,7 +6752,7 @@ namespace
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
-        if (components == 4 && (!applyTheme || (effectiveTheme != 2 && effectiveTheme != 5)))
+        if (components == 4 && (!applyTheme || (effectiveTheme != 3 && effectiveTheme != 4)))
         {
             for (int y = 0; y < image.height; ++y)
                 std::memcpy((dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4,
@@ -6881,7 +6881,7 @@ namespace
         auto* dibPixels = renderToDib ? image.AllocateDibPixels() : nullptr;
         if (!dibPixels)
             image.bgra.assign(static_cast<size_t>(image.width) * image.height * 4, 255);
-        if (components == 4 && renderTheme != 2 && renderTheme != 5)
+        if (components == 4 && renderTheme != 3 && renderTheme != 4)
         {
             for (int y = 0; y < image.height; ++y)
                 std::memcpy((dibPixels ? dibPixels : image.bgra.data()) + static_cast<size_t>(y) * image.width * 4,
@@ -6944,7 +6944,7 @@ namespace
                 }
                 if (rendered)
                 {
-                    if (renderTheme == 2 || renderTheme == 5)
+                    if (renderTheme == 3 || renderTheme == 4)
                     {
                         for (int y = 0; y < image.height; ++y)
                         {
