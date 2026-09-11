@@ -1441,6 +1441,7 @@ namespace
     RECT g_outlineSearchRect{};
     RECT g_outlineSearchClearRect{};
     RECT g_favoriteListRect{};
+    RECT g_favoriteListStaleRect{};
     RECT g_favoriteListScrollTrackRect{};
     RECT g_favoriteListScrollThumbRect{};
     std::vector<RECT> g_favoriteItemRects;
@@ -3764,6 +3765,30 @@ namespace
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
+    void CloseFavoriteList(HWND hwnd)
+    {
+        RECT oldRect = g_favoriteListRect;
+        g_favoriteListOpen = false;
+        g_draggingFavoriteListScroll = false;
+        g_hoverFavoriteItem = -1;
+        if (!IsRectEmpty(&oldRect))
+        {
+            if (IsRectEmpty(&g_favoriteListStaleRect))
+                g_favoriteListStaleRect = oldRect;
+            else
+            {
+                RECT combined{};
+                UnionRect(&combined, &g_favoriteListStaleRect, &oldRect);
+                g_favoriteListStaleRect = combined;
+            }
+            InvalidateRect(hwnd, &oldRect, FALSE);
+        }
+        else
+        {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+    }
+
     void ActivateFavorite(HWND hwnd, int index)
     {
         if (index < 0 || index >= static_cast<int>(g_favorites.size())) return;
@@ -3813,18 +3838,14 @@ namespace
         // Navigation completes the popup action. Closing it here also prevents
         // the underlying selected bookmark row from being composited together
         // with the just-clicked favorite row on the next partial repaint.
-        g_favoriteListOpen = false;
-        g_hoverFavoriteItem = -1;
-        InvalidateRect(hwnd, nullptr, FALSE);
+        CloseFavoriteList(hwnd);
     }
 
     bool HandleFavoriteClick(HWND hwnd, int x, int y)
     {
         if (g_favoriteListOpen && Hit(g_favoriteButtonRect, x, y))
         {
-            g_favoriteListOpen = false;
-            g_hoverFavoriteItem = -1;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            CloseFavoriteList(hwnd);
             return true;
         }
         if (!g_favoriteListOpen) return false;
@@ -3865,9 +3886,7 @@ namespace
         }
         if (!Hit(g_favoriteListRect, x, y) && !Hit(g_favoriteButtonRect, x, y))
         {
-            g_favoriteListOpen = false;
-            g_hoverFavoriteItem = -1;
-            InvalidateRect(hwnd, nullptr, FALSE);
+            CloseFavoriteList(hwnd);
             return false;
         }
         return true;
@@ -20798,6 +20817,17 @@ namespace
             if (IntersectRect(&underlay, &dirty, &g_mainHScrollTrackRect))
                 RestoreStageFrame(mem, underlay);
         }
+        if (!scrollBarOnly && g_stageFrameValid && !IsRectEmpty(&g_favoriteListStaleRect))
+        {
+            // A favorite popup can extend from the sidebar into the reader.
+            // Restore the committed page under its old bounds before the
+            // normal reader paint, so a deferred page commit cannot leave the
+            // popup's old page-number column on top of the new sidebar.
+            RECT staleStage{};
+            if (IntersectRect(&staleStage, &g_favoriteListStaleRect, &g_stage) &&
+                Intersects(staleStage, dirty))
+                RestoreStageFrame(mem, staleStage);
+        }
         bool shouldFlush = true;
         bool readerPainted = false;
         if (!scrollBarOnly)
@@ -20860,8 +20890,11 @@ namespace
             // Keep the previous page frame until the next complete commit.
             flushRect(g_sidebarPanelToggleRect);
             flushRect(g_tabListRect);
+            flushRect(g_favoriteListStaleRect);
 
         }
+        if (!IsRectEmpty(&g_favoriteListStaleRect) && Intersects(g_favoriteListStaleRect, dirty))
+            g_favoriteListStaleRect = {};
         RestoreDC(mem, paintState);
         EndPaint(hwnd, &ps);
     }
