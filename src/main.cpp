@@ -3806,6 +3806,11 @@ namespace
     {
         if (index < 0 || index >= static_cast<int>(g_favorites.size())) return;
         FavoriteItem const item = g_favorites[static_cast<size_t>(index)];
+        // Close the in-canvas popup before activating another Tab. Tab
+        // activation can present a cached frame synchronously; leaving the
+        // popup open until after that presentation redraws it over the new
+        // bookmark panel and leaves a visible rounded-panel ghost.
+        CloseFavoriteList(hwnd);
         OpenOrActivatePdf(hwnd, item.path);
         PdfTab* tab = Active();
         if (!tab || !SamePath(tab->path, item.path)) return;
@@ -3851,10 +3856,6 @@ namespace
         // target pixels can be filled by the existing committed-page fallback
         // while the requested page continues rendering in the background.
         RequestPageNavigationRepaint(hwnd, *tab, false);
-        // Navigation completes the popup action. Closing it here also prevents
-        // the underlying selected bookmark row from being composited together
-        // with the just-clicked favorite row on the next partial repaint.
-        CloseFavoriteList(hwnd);
     }
 
     bool HandleFavoriteClick(HWND hwnd, int x, int y)
