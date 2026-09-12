@@ -12531,27 +12531,54 @@ namespace
 
     void ShiftStageFrameForScroll(int dx, int dy)
     {
-        if (!g_stageFrameValid || !g_stageFrameDc || IsRectEmpty(&g_stage) ||
+        if (!g_stageFrameValid || !g_stageFrameDc || !g_paintBufferDc || IsRectEmpty(&g_stage) ||
             (dx == 0 && dy == 0))
             return;
 
         int width = std::max<int>(1, g_stage.right - g_stage.left);
         int height = std::max<int>(1, g_stage.bottom - g_stage.top);
-        int nextOffsetX = g_stageFrameOffsetX + dx;
-        int nextOffsetY = g_stageFrameOffsetY + dy;
-        if (std::abs(nextOffsetX) >= width || std::abs(nextOffsetY) >= height)
+        if (std::abs(dx) >= width || std::abs(dy) >= height)
         {
             g_stageFrameValid = false;
             g_stageFrameOffsetX = 0;
             g_stageFrameOffsetY = 0;
             return;
         }
-        // Keep the committed bitmap immutable while the user is moving. The
-        // viewport uses this offset as a read-only presentation transform;
-        // replacing the bitmap during the gesture is what caused old page
-        // fragments to be copied twice in facing-page layouts.
-        g_stageFrameOffsetX = nextOffsetX;
-        g_stageFrameOffsetY = nextOffsetY;
+
+        // Move the complete frame through the already allocated paint buffer.
+        // Copying source and destination in the same bitmap (ScrollDC or an
+        // overlapping BitBlt) is order-dependent and was the source of the
+        // duplicated fragments seen in facing-page layouts. The paint buffer
+        // gives this operation a temporary destination without adding a
+        // persistent page cache or another render surface.
+        int state = SaveDC(g_paintBufferDc);
+        IntersectClipRect(g_paintBufferDc, g_stage.left, g_stage.top,
+            g_stage.right, g_stage.bottom);
+        Fill(g_paintBufferDc, g_stage, T().stage);
+        RECT destination = g_stage;
+        OffsetRect(&destination, dx, dy);
+        RECT clippedDestination{};
+        if (IntersectRect(&clippedDestination, &destination, &g_stage))
+        {
+            RECT source = clippedDestination;
+            OffsetRect(&source, -dx, -dy);
+            BitBlt(g_paintBufferDc,
+                clippedDestination.left, clippedDestination.top,
+                clippedDestination.right - clippedDestination.left,
+                clippedDestination.bottom - clippedDestination.top,
+                g_stageFrameDc, source.left, source.top, SRCCOPY);
+        }
+        RestoreDC(g_paintBufferDc, state);
+
+        if (!BitBlt(g_stageFrameDc, g_stage.left, g_stage.top, width, height,
+            g_paintBufferDc, g_stage.left, g_stage.top, SRCCOPY))
+        {
+            g_stageFrameValid = false;
+        }
+        // The frame has already been physically advanced through a separate
+        // buffer, so no accumulated presentation offset remains.
+        g_stageFrameOffsetX = 0;
+        g_stageFrameOffsetY = 0;
     }
 
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
