@@ -13096,8 +13096,12 @@ namespace
         int sourceH = std::max<int>(1, reader.bottom - reader.top);
 
         int frameState = SaveDC(g_stageFrameDc);
-        IntersectClipRect(g_stageFrameDc, reader.left, reader.top, reader.right, reader.bottom);
-        Fill(g_stageFrameDc, reader, T().stage);
+        IntersectClipRect(g_stageFrameDc, g_stage.left, g_stage.top, g_stage.right, g_stage.bottom);
+        // The frame covers the complete reader, including the strips beneath
+        // the transparent scrollbars. Clear those strips too so a zoom
+        // transform cannot retain pixels from the previous scale at the
+        // edges and later feed them back into a facing-page layout.
+        Fill(g_stageFrameDc, g_stage, T().stage);
         int oldMode = SetStretchBltMode(g_stageFrameDc, COLORONCOLOR);
         StretchBlt(g_stageFrameDc,
             transformed.left, transformed.top,
@@ -16612,10 +16616,14 @@ namespace
             // document disappears until the target generation completes.
             return false;
         }
+        // The committed frame is only a presentation source. Always clear
+        // the target viewport first so the newly exposed strip has a known
+        // stage color; restore only the part that still overlaps the old
+        // viewport below. Copying an out-of-viewport source pixel here is
+        // what previously exposed the uninitialized black frame margins.
+        Fill(dc, stageDirty, T().stage);
         if (preserveScrolledFrame)
             RestoreStageFrame(dc, stageDirty);
-        else
-            Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -20780,21 +20788,33 @@ namespace
     bool RestoreStageFrame(HDC paintDc, RECT area)
     {
         if (!g_stageFrameValid || !g_stageFrameDc || IsRectEmpty(&area)) return false;
-        RECT clipped = area;
-        if (clipped.left < 0 || clipped.top < 0 || clipped.right > g_stageFrameW || clipped.bottom > g_stageFrameH)
-            return false;
-        // Scrollbar repainting happens after the reader has been presented.
-        // Restore the underlay at the same presentation offset instead of
-        // putting the old, unscrolled pixels under a transparent thumb.
-        int sourceX = clipped.left - g_stageFrameOffsetX;
-        int sourceY = clipped.top - g_stageFrameOffsetY;
-        if (sourceX < 0 || sourceY < 0 ||
-            sourceX + (clipped.right - clipped.left) > g_stageFrameW ||
-            sourceY + (clipped.bottom - clipped.top) > g_stageFrameH)
-            return false;
-        return BitBlt(paintDc, clipped.left, clipped.top,
-            clipped.right - clipped.left, clipped.bottom - clipped.top,
-            g_stageFrameDc, sourceX, sourceY, SRCCOPY) != FALSE;
+        // The frame bitmap is allocated at client size, but only g_stage is
+        // committed document pixels. Intersect both destination and source
+        // with that viewport before translating by the live scroll offset.
+        // Without this bound, a scroll that exposes a strip at the top or
+        // bottom copied uninitialized bitmap pixels (black bars) into the
+        // reader and into the next zoom presentation frame.
+        RECT destination{};
+        if (!IntersectRect(&destination, &area, &g_stage)) return false;
+        RECT sourceBounds = g_stage;
+        RECT frameBounds{ 0, 0, g_stageFrameW, g_stageFrameH };
+        if (!IntersectRect(&sourceBounds, &sourceBounds, &frameBounds)) return false;
+
+        RECT validDestination{
+            sourceBounds.left + g_stageFrameOffsetX,
+            sourceBounds.top + g_stageFrameOffsetY,
+            sourceBounds.right + g_stageFrameOffsetX,
+            sourceBounds.bottom + g_stageFrameOffsetY
+        };
+        if (!IntersectRect(&destination, &destination, &validDestination)) return false;
+
+        int sourceX = destination.left - g_stageFrameOffsetX;
+        int sourceY = destination.top - g_stageFrameOffsetY;
+        int width = destination.right - destination.left;
+        int height = destination.bottom - destination.top;
+        if (width <= 0 || height <= 0) return false;
+        return BitBlt(paintDc, destination.left, destination.top,
+            width, height, g_stageFrameDc, sourceX, sourceY, SRCCOPY) != FALSE;
     }
 
     void ReleasePaintBuffer()
