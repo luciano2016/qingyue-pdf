@@ -6586,7 +6586,12 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int spreadW = SpreadWidth(tab, start);
         int maxSpreadW = MaxSpreadWidth(tab);
-        if (maxSpreadW + S(56) <= stageW)
+        // A smaller spread must be centered in the current reader even when
+        // another page in the document is much wider. Using maxSpreadW here
+        // pushes a zoomed-out spread toward the far edge and clips its sides.
+        // Only a spread that itself exceeds the reader needs horizontal
+        // scrolling against the document-wide extent.
+        if (spreadW + S(56) <= stageW)
             return g_stage.left + (stageW - spreadW) / 2;
         return g_stage.left + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
     }
@@ -12882,7 +12887,14 @@ namespace
         bool facingFrameShift = facingContinuous && tab;
         bool targetReady = !facingFrameShift && tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        bool canPreserveFrame = (facingFrameShift ? true : (targetReady || dragFrame)) && g_stageFrameValid &&
+        // A shifted frame always exposes a newly uncovered strip at one edge
+        // of the reader. In a facing layout that strip has no valid pixels
+        // until the target spread is ready, so presenting the shifted frame
+        // would turn the stage background into a visible blank page fragment.
+        // Keep the last complete frame in place and atomically replace it once
+        // the new viewport is renderable. The single-page path keeps its
+        // established ready-check behavior.
+        bool canPreserveFrame = !facingFrameShift && (targetReady || dragFrame) && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         if (canPreserveFrame)
@@ -12963,7 +12975,9 @@ namespace
         bool facingFrameShift = facingContinuous && tab;
         bool targetReady = !facingFrameShift && tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        bool canPreserveFrame = (facingFrameShift || targetReady) && g_stageFrameValid &&
+        // See the vertical-scroll path above: never shift a facing frame into
+        // an uncovered horizontal strip. Wait for a complete target viewport.
+        bool canPreserveFrame = !facingFrameShift && targetReady && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         if (canPreserveFrame)
@@ -13110,6 +13124,35 @@ namespace
         };
     }
 
+    bool ZoomSourcePagesFullyVisible(PdfTab const& tab)
+    {
+        RECT reader = MainReaderPixelClip();
+        if (IsRectEmpty(&reader) || tab.pageCount <= 0) return false;
+
+        int firstPage = g_continuousRead
+            ? std::max(0, FirstVisibleSpreadStart(tab))
+            : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        bool foundPage = false;
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > reader.bottom) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                RECT pageRect{};
+                if (!BuildSpreadPageRect(tab, start, y, start + j, pageRect)) continue;
+                if (!Intersects(pageRect, reader)) continue;
+                foundPage = true;
+                if (pageRect.left < reader.left || pageRect.top < reader.top ||
+                    pageRect.right > reader.right || pageRect.bottom > reader.bottom)
+                    return false;
+            }
+        }
+        return foundPage;
+    }
+
     bool PresentZoomTransform(HWND hwnd, POINT anchor, double scale)
     {
         if (!g_stageFrameValid || !g_stageFrameDc || scale <= 0.0 ||
@@ -13215,7 +13258,13 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
-        if (UseFacingContinuousPresentation())
+        // A zoom-out transform can only scale pixels that were already in the
+        // old viewport. If a facing page was clipped by any reader edge, the
+        // transform would permanently show a cropped page while the smaller
+        // target is being rendered. Keep the last complete frame in that case;
+        // the target generation will atomically reveal all four edges.
+        bool zoomOutWouldRevealEdges = clampedZoom < oldZoom && !ZoomSourcePagesFullyVisible(tab);
+        if (UseFacingContinuousPresentation() && !zoomOutWouldRevealEdges)
         {
             // Keep the last complete facing-page frame under the pointer
             // while MuPDF renders the new zoom generation. This applies to
@@ -13256,7 +13305,12 @@ namespace
             if (!hasRect) return;
             int pageW = std::max<int>(1, newPageRect.right - newPageRect.left);
             int desiredX = newPageRect.left + static_cast<int>(anchorX * pageW + 0.5) - clientPt.x;
-            int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
+            // `tab.zoom` already contains the target zoom here. Do not use
+            // the previous generation's g_contentWidth, or a zoom-out can
+            // retain an oversized horizontal scroll range and move the
+            // smaller facing spread partly outside the reader.
+            int targetContentWidth = ReadingContentWidth(tab);
+            int maxScrollX = std::max<int>(0, targetContentWidth - std::max<int>(1, g_stage.right - g_stage.left));
             g_scrollX = std::clamp(desiredX, 0, maxScrollX);
         };
         if (g_continuousRead)
@@ -16659,12 +16713,23 @@ namespace
         return painted;
     }
 
+    bool RectContains(RECT outer, RECT inner);
+
     bool PaintPages(HDC dc, PdfTab& tab, RECT paintClip)
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
         if (tab.zoomPresentationPending && !ZoomRenderDeferred() && CurrentZoomVisibleContentReady(tab))
         {
+            // Render completion usually invalidates only the tile/page that
+            // finished. Do not release the transaction on that small paint:
+            // committing it would turn a partial target into the next
+            // scrolling frame and expose gaps on the following scroll.
+            if (!RectContains(paintClip, g_stage))
+            {
+                InvalidateRect(g_hwnd, &g_stage, FALSE);
+                return false;
+            }
             tab.zoomPresentationPending = false;
             ReleaseZoomFallback(tab);
         }
@@ -17001,6 +17066,14 @@ namespace
                 // frame exists, the caller keeps it intact until the target
                 // spread is ready.
                 return !g_stageFrameValid;
+            }
+            if (!RectContains(paintClip, g_stage))
+            {
+                // A small completion invalidation is not enough to establish
+                // an atomic facing-page frame. Wait for the full-stage paint
+                // requested above before clearing the pending state.
+                InvalidateRect(g_hwnd, &g_stage, FALSE);
+                return false;
             }
             g_pageNavigationPending = false;
             return true;
