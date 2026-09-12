@@ -8454,7 +8454,8 @@ namespace
     {
         if (tab.pageCount <= 0) return;
         PreparePageCache(tab);
-        bool rapidScroll = MainScrollDragRecentlyMoved() || (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
+        bool rapidScroll = g_draggingMainScroll || MainScrollDragRecentlyMoved() ||
+            (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil);
         if (rapidScroll)
         {
             int visibleBudget = 6;
@@ -8790,7 +8791,8 @@ namespace
     {
         PdfTab* tab = Active();
         if (!tab || tab->pageCount <= 0) return;
-        bool scrolling = (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil) ||
+        bool scrolling = g_draggingMainScroll ||
+            (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil) ||
             MainScrollDragRecentlyMoved() || g_draggingMainHScroll || g_smoothStageScroll ||
             g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
         if (UseTiledPageRendering(*tab))
@@ -12505,6 +12507,7 @@ namespace
     }
 
     RECT MainReaderPixelClip();
+    bool PresentShiftedStageFrameNow(HWND hwnd);
     bool EnsurePaintBuffer(HDC targetDc, int width, int height);
     bool EnsureStageFrameBuffer(HDC targetDc, int width, int height);
 
@@ -12587,6 +12590,11 @@ namespace
         // are filled as their current page/tile becomes available, so input
         // never waits for a complete spread and no second page bitmap is kept.
         ShiftStageFrameForScroll(dx, dy);
+        // Publish the shifted complete frame immediately. WM_PAINT may be
+        // deferred behind a large reader invalidation; presenting this small
+        // blit here keeps the document moving with the pointer/wheel while
+        // the target pages are prepared in the background.
+        PresentShiftedStageFrameNow(hwnd);
         RequestStageRepaint(hwnd, includeStatus);
     }
     void RequestSidebarRepaint(HWND hwnd)
@@ -12612,9 +12620,10 @@ namespace
         if (g_hasContentSelection || g_selectingContent || g_annotationToolbarOpen || g_annotationNoteOpen)
             return false;
         return g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil;
-    }    bool StageScrollPaintInProgress()
+    }
+    bool StageScrollPaintInProgress()
     {
-        return StageLightPaintActive() || MainScrollDragRecentlyMoved() || g_draggingMainHScroll ||
+        return StageLightPaintActive() || MainScrollDragRecentlyMoved() || g_draggingMainScroll || g_draggingMainHScroll ||
             g_smoothStageScroll || g_touchPanQueued || g_touchMomentum || g_autoScrollActive;
     }
 
@@ -16772,32 +16781,52 @@ namespace
                           else
                           {
                               bool paintTiles = !ZoomRenderDeferred() || !fallbackPainted;
-                          bool coarseComplete = false;
-                          if (paintTiles)
-                          {
-                              for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
-                                  coarseComplete = TileLevelFullyCached(tab, i, pageRect, drawRect, level);
-                          }
-                          if (paintTiles && !fallbackPainted && targetMissing && !coarseComplete)
-                              oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
-                          if (paintTiles && targetMissing)
-                          {
-                              for (int level = targetLevel; level >= 1; --level)
+                              bool coarseComplete = false;
+                              int completeCoarseLevel = -1;
+                              if (paintTiles)
+                              {
+                                  for (int level = targetLevel; level >= 1 && !coarseComplete; --level)
+                                  {
+                                      if (TileLevelFullyCached(tab, i, pageRect, drawRect, level))
+                                      {
+                                          coarseComplete = true;
+                                          completeCoarseLevel = level;
+                                      }
+                                  }
+                              }
+
+                              // During motion, submit one complete representation
+                              // only. Mixing an old frame with a few new tiles
+                              // creates the clipped halves and white seams seen
+                              // at the exposed edge of a page.
+                              if (paintTiles && stageScrolling && targetMissing &&
+                                  !fallbackPainted && !coarseComplete)
+                              {
+                                  oldZoomPainted = DrawCompleteOldZoomTiles(dc, tab, i, pageRect, drawRect);
+                              }
+                              else if (paintTiles && !stageScrolling &&
+                                  !fallbackPainted && targetMissing && !coarseComplete)
+                              {
+                                  oldZoomPainted = DrawOldZoomTiles(dc, tab, i, pageRect, drawRect);
+                              }
+                              if (paintTiles && coarseComplete && !fallbackPainted && !oldZoomPainted)
                               {
                                   bool ignoredMissing = false;
-                                  coarsePainted |= DrawTileLevel(dc, tab, i, pageRect, drawRect, level, false, ignoredMissing);
+                                  coarsePainted = DrawTileLevel(dc, tab, i, pageRect, drawRect,
+                                      completeCoarseLevel, false, ignoredMissing);
                               }
-                          }
-                          if (paintTiles)
-                          {
-                              bool ignoredMissing = false;
-                              targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
-                          }
-                          if (targetMissing && !ZoomRenderDeferred())
-                          {
-                              int queueBudget = stageScrolling ? 4 : 12;
-                              QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
-                          }
+                              if (paintTiles && (!stageScrolling || !targetMissing) &&
+                                  !fallbackPainted && !oldZoomPainted &&
+                                  (!coarseComplete || !stageScrolling || !targetMissing))
+                              {
+                                  bool ignoredMissing = false;
+                                  targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
+                              }
+                              if (targetMissing && !ZoomRenderDeferred())
+                              {
+                                  int queueBudget = stageScrolling ? 4 : 12;
+                                  QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, drawRect, 0, -8, queueBudget);
+                              }
                           }
                          if (fallbackPainted || oldZoomPainted || coarsePainted || targetPainted)
                          {
@@ -16928,7 +16957,7 @@ namespace
         // worker supplies the missing image/tile, preventing white blocks
         // during a fast scroll.
         if (missingVisiblePage && (g_stageFrameValid || g_pageNavigationPending) &&
-            !g_allowIncompletePageNavigationFrame && !preserveScrolledFrame)
+            !g_allowIncompletePageNavigationFrame)
             return false;
         if (preserveScrolledFrame)
             g_pageNavigationPending = false;
@@ -20844,6 +20873,25 @@ namespace
             width, height, g_stageFrameDc, sourceX, sourceY, SRCCOPY) != FALSE;
     }
 
+    bool PresentShiftedStageFrameNow(HWND hwnd)
+    {
+        if (!hwnd || !g_stageFrameValid || !g_stageFrameDc || IsRectEmpty(&g_stage))
+            return false;
+        RECT reader = MainReaderPixelClip();
+        if (IsRectEmpty(&reader)) return false;
+
+        HDC dc = GetDC(hwnd);
+        if (!dc) return false;
+        int state = SaveDC(dc);
+        IntersectClipRect(dc, reader.left, reader.top, reader.right, reader.bottom);
+        bool presented = BitBlt(dc, reader.left, reader.top,
+            reader.right - reader.left, reader.bottom - reader.top,
+            g_stageFrameDc, reader.left, reader.top, SRCCOPY) != FALSE;
+        RestoreDC(dc, state);
+        ReleaseDC(hwnd, dc);
+        return presented;
+    }
+
     void ReleasePaintBuffer()
     {
         if (g_paintBufferDc)
@@ -20980,8 +21028,9 @@ namespace
             shouldFlush = true;
         }
         bool fullStageDirty = RectContains(dirty, g_stage);
+        bool scrollingPresentation = StageScrollPaintInProgress();
         if (readerPainted && shouldFlush && !g_pageNavigationPending &&
-            !g_draggingMainScroll)
+            (!scrollingPresentation || fullStageDirty))
         {
             RECT committedStage{};
             if (IntersectRect(&committedStage, &g_stage, &dirty))
