@@ -12885,7 +12885,7 @@ namespace
         // 2.5.9 ready-check path and never enters this branch.
         bool facingContinuous = UseFacingContinuousPresentation();
         bool facingFrameShift = facingContinuous && tab;
-        bool targetReady = !facingFrameShift && tab && !tab->zoomPresentationPending &&
+        bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
         // A shifted frame always exposes a newly uncovered strip at one edge
         // of the reader. In a facing layout that strip has no valid pixels
@@ -12907,7 +12907,10 @@ namespace
         }
         else
         {
-            g_pageNavigationPending = true;
+            // Facing layouts do not shift an incomplete frame. If the target
+            // viewport is already cached, repaint it immediately; otherwise
+            // keep the previous complete frame until render completion.
+            g_pageNavigationPending = facingFrameShift ? !targetReady : true;
             // Present the thumb before invalidating the reader. The latter
             // is intentionally asynchronous and may contain an uncached page.
             RedrawMainScrollBarNow(hwnd);
@@ -12973,7 +12976,7 @@ namespace
         UpdateVertScrollBar(hwnd);
         bool facingContinuous = UseFacingContinuousPresentation();
         bool facingFrameShift = facingContinuous && tab;
-        bool targetReady = !facingFrameShift && tab && !tab->zoomPresentationPending &&
+        bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
         // See the vertical-scroll path above: never shift a facing frame into
         // an uncovered horizontal strip. Wait for a complete target viewport.
@@ -12988,7 +12991,7 @@ namespace
         }
         else
         {
-            g_pageNavigationPending = true;
+            g_pageNavigationPending = facingFrameShift ? !targetReady : true;
             RedrawMainScrollBarNow(hwnd);
             RequestStageRepaint(hwnd, false);
         }
