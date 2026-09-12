@@ -12537,26 +12537,21 @@ namespace
 
         int width = std::max<int>(1, g_stage.right - g_stage.left);
         int height = std::max<int>(1, g_stage.bottom - g_stage.top);
-        if (std::abs(dx) >= width || std::abs(dy) >= height)
+        int nextOffsetX = g_stageFrameOffsetX + dx;
+        int nextOffsetY = g_stageFrameOffsetY + dy;
+        if (std::abs(nextOffsetX) >= width || std::abs(nextOffsetY) >= height)
         {
             g_stageFrameValid = false;
             g_stageFrameOffsetX = 0;
             g_stageFrameOffsetY = 0;
             return;
         }
-
-        RECT update{};
-        if (!ScrollDC(g_stageFrameDc, dx, dy, &g_stage, &g_stage, nullptr, &update))
-        {
-            g_stageFrameValid = false;
-            g_stageFrameOffsetX = 0;
-            g_stageFrameOffsetY = 0;
-            return;
-        }
-        if (!IsRectEmpty(&update))
-            Fill(g_stageFrameDc, update, T().stage);
-        g_stageFrameOffsetX = 0;
-        g_stageFrameOffsetY = 0;
+        // Keep the committed bitmap immutable while the user is moving. The
+        // viewport uses this offset as a read-only presentation transform;
+        // replacing the bitmap during the gesture is what caused old page
+        // fragments to be copied twice in facing-page layouts.
+        g_stageFrameOffsetX = nextOffsetX;
+        g_stageFrameOffsetY = nextOffsetY;
     }
 
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
@@ -16600,7 +16595,8 @@ namespace
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
-        bool preserveScrolledFrame = stageScrolling && g_stageFrameValid && !zoomPresentationPending;
+        bool preserveScrolledFrame = stageScrolling && g_stageFrameValid &&
+            !zoomPresentationPending && !g_pageNavigationPending;
 
         // A page-level fallback must cover every visible page before the
         // transition surface is repainted. If one old page representation is
