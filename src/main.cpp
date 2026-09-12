@@ -12529,15 +12529,42 @@ namespace
         RequestStageRepaint(hwnd, true);
     }
 
+    void ShiftStageFrameForScroll(int dx, int dy)
+    {
+        if (!g_stageFrameValid || !g_stageFrameDc || IsRectEmpty(&g_stage) ||
+            (dx == 0 && dy == 0))
+            return;
+
+        int width = std::max<int>(1, g_stage.right - g_stage.left);
+        int height = std::max<int>(1, g_stage.bottom - g_stage.top);
+        if (std::abs(dx) >= width || std::abs(dy) >= height)
+        {
+            g_stageFrameValid = false;
+            g_stageFrameOffsetX = 0;
+            g_stageFrameOffsetY = 0;
+            return;
+        }
+
+        RECT update{};
+        if (!ScrollDC(g_stageFrameDc, dx, dy, &g_stage, &g_stage, nullptr, &update))
+        {
+            g_stageFrameValid = false;
+            g_stageFrameOffsetX = 0;
+            g_stageFrameOffsetY = 0;
+            return;
+        }
+        if (!IsRectEmpty(&update))
+            Fill(g_stageFrameDc, update, T().stage);
+        g_stageFrameOffsetX = 0;
+        g_stageFrameOffsetY = 0;
+    }
+
     void ScrollStagePixels(HWND hwnd, int dx, int dy, bool includeStatus)
     {
-        UNREFERENCED_PARAMETER(dx);
-        UNREFERENCED_PARAMETER(dy);
-
-        // The reader is always presented from one clean back-buffer paint.
-        // Do not shift either the window surface or the committed frame here:
-        // shifting a frame and then painting the new viewport can duplicate
-        // page content when the target is only partially cached.
+        // Move the last complete viewport immediately. Newly exposed strips
+        // are filled as their current page/tile becomes available, so input
+        // never waits for a complete spread and no second page bitmap is kept.
+        ShiftStageFrameForScroll(dx, dy);
         RequestStageRepaint(hwnd, includeStatus);
     }
     void RequestSidebarRepaint(HWND hwnd)
@@ -12718,6 +12745,7 @@ namespace
     }
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame = false, bool immediateRepaint = false, bool dragFrame = false)
     {
+        UNREFERENCED_PARAMETER(dragFrame);
         PdfTab* tab = Active();
         // A real document scroll means the user's viewport is authoritative;
         // stop carrying a previous directory click through that scroll.
@@ -12783,28 +12811,22 @@ namespace
             return;
         }
 
-        if (!immediateRepaint)
-            MarkStageScrolling(hwnd);
+        MarkStageScrolling(hwnd);
 
         bool pageChanged = tab && oldPage != tab->currentPage;
         UpdateVertScrollBar(hwnd);
 
-        // The pointer and thumb are always updated in the current mouse
-        // message, but the reader is shifted only when the complete target
-        // viewport is already available. Shifting an incomplete page creates
-        // an exposed strip that can be painted as a transient horizontal bar.
-        // The asynchronous full-frame path handles the missing-page case.
-        bool targetReady = tab && !tab->zoomPresentationPending &&
-            CurrentZoomVisibleContentReady(*tab);
-        bool canPreserveFrame = (targetReady || dragFrame) && g_stageFrameValid &&
+        // The pointer and thumb are updated in the current input message.
+        // When a committed frame exists, the reader moves that frame first;
+        // newly exposed content is then filled by the asynchronous renderer.
+        bool canPreserveFrame = g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         if (canPreserveFrame)
         {
-            // A drag shift is only a temporary presentation. Keep the
-            // navigation pending flag so PaintPages never mixes the target
-            // page generation into the shifted old frame.
-            g_pageNavigationPending = dragFrame;
+            // The shifted committed frame is the live scroll presentation.
+            // A mouse-up still requests an authoritative complete frame.
+            g_pageNavigationPending = false;
             ScrollStagePixels(hwnd, 0, dy, pageChanged);
             RedrawMainScrollBarNow(hwnd);
         }
@@ -12874,9 +12896,7 @@ namespace
         }
         MarkStageScrolling(hwnd);
         UpdateVertScrollBar(hwnd);
-        bool targetReady = tab && !tab->zoomPresentationPending &&
-            CurrentZoomVisibleContentReady(*tab);
-        bool canPreserveFrame = targetReady && g_stageFrameValid &&
+        bool canPreserveFrame = g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         if (canPreserveFrame)
@@ -13126,6 +13146,10 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
+        // Keep zoom input visible immediately by transforming the last
+        // committed viewport. MuPDF replaces this frame atomically when the
+        // target page/tile generation is ready.
+        PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
         CancelObsoletePageRendersForZoom(tab);
         // Keep the last complete presentation frame for one short quiet
         // period. Lower zoom levels often finish rendering faster than the
@@ -16576,6 +16600,7 @@ namespace
         bool hadVisiblePage = false;
         bool paintedRenderable = false;
         bool missingVisiblePage = false;
+        bool preserveScrolledFrame = stageScrolling && g_stageFrameValid && !zoomPresentationPending;
 
         // A page-level fallback must cover every visible page before the
         // transition surface is repainted. If one old page representation is
@@ -16591,7 +16616,10 @@ namespace
             // document disappears until the target generation completes.
             return false;
         }
-        Fill(dc, stageDirty, T().stage);
+        if (preserveScrolledFrame)
+            RestoreStageFrame(dc, stageDirty);
+        else
+            Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -16642,7 +16670,7 @@ namespace
                          {
                              QueuePageRender(g_hwnd, tab, i, 0);
                          }
-                          if (!zoomPresentationPending)
+                          if (!zoomPresentationPending && !preserveScrolledFrame)
                               Fill(dc, drawRect, PdfPageBackgroundColor());
                           PageImage* fallback = FindZoomFallbackPage(tab, i);
                          if (!zoomPresentationPending && image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
@@ -16680,7 +16708,7 @@ namespace
                     }
                     else
                     {
-                          if (!zoomPresentationPending)
+                          if (!zoomPresentationPending && !preserveScrolledFrame)
                               Fill(dc, drawRect, PdfPageBackgroundColor());
                          bool fallbackPainted = false;
                          PageImage* fallback = FindZoomFallbackPage(tab, i);
@@ -16869,8 +16897,10 @@ namespace
         // worker supplies the missing image/tile, preventing white blocks
         // during a fast scroll.
         if (missingVisiblePage && (g_stageFrameValid || g_pageNavigationPending) &&
-            !g_allowIncompletePageNavigationFrame)
+            !g_allowIncompletePageNavigationFrame && !preserveScrolledFrame)
             return false;
+        if (preserveScrolledFrame)
+            g_pageNavigationPending = false;
         if (g_allowIncompletePageNavigationFrame)
             g_allowIncompletePageNavigationFrame = false;
         if (g_pageNavigationPending)
@@ -17452,7 +17482,9 @@ namespace
         if (!tab)
         {
             g_sidebar = {};
-            g_stage = RECT{ 0, S(76), client.right, client.bottom };
+            int top = g_immersive ? 0 : S(76);
+            int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+            g_stage = RECT{ 0, top, client.right, client.bottom - bottom };
             g_mainScrollTrackRect = {};
             g_mainScrollThumbRect = {};
             g_mainHScrollTrackRect = {};
@@ -19647,7 +19679,9 @@ namespace
             SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
-            DisableNativeScrollbars(hwnd);
+        DisableNativeScrollbars(hwnd);
+        RefreshReaderHitGeometry(hwnd);
+        UpdateVertScrollBar(hwnd);
         InvalidateRect(hwnd, nullptr, TRUE);
     }
 
@@ -20850,7 +20884,7 @@ namespace
             RECT sidebarControls{ 0, g_sidebar.top, g_sidebar.right, g_sidebar.top + S(86) };
             if (Intersects(dirty, sidebarControls)) uiDirty = true;
         }
-        bool repaintUi = uiDirty || g_buttons.empty();
+        bool repaintUi = !g_immersive && (uiDirty || g_buttons.empty());
         if (repaintUi)
         {
             g_buttons.clear();
