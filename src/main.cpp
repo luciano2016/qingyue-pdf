@@ -12571,11 +12571,16 @@ namespace
         // a stable underlay until the target spread is ready.
         if (std::abs(dx) >= width || std::abs(dy) >= height)
             return;
-        // Do not expose an ever-growing stage-colored strip during a burst of
-        // wheel/touch input. Once this frame has moved far enough, keep it
-        // stable until the newly visible spread can be committed atomically.
+        // Keep the frame movable for the whole touchpad burst. The frame
+        // already contains the previous presentation, so once the motion
+        // guard is reached we can rebase the motion counter and continue
+        // shifting that presentation instead of freezing the reader until a
+        // newly exposed spread finishes rendering.
         if (std::abs(nextMotionX) > maxMotionX || std::abs(nextMotionY) > maxMotionY)
-            return;
+        {
+            nextMotionX = dx;
+            nextMotionY = dy;
+        }
 
         // Use the paint buffer as a temporary destination. Copying an
         // overlapping source and destination in the committed frame can
@@ -12887,21 +12892,23 @@ namespace
         bool facingFrameShift = facingContinuous && tab;
         bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        // A shifted frame always exposes a newly uncovered strip at one edge
-        // of the reader. In a facing layout that strip has no valid pixels
-        // until the target spread is ready, so presenting the shifted frame
-        // would turn the stage background into a visible blank page fragment.
-        // Keep the last complete frame in place and atomically replace it once
-        // the new viewport is renderable. The single-page path keeps its
-        // established ready-check behavior.
+        // A facing layout may expose a new strip before its target spread is
+        // ready. Keep the committed frame moving for interactive input, then
+        // atomically replace it once the new viewport is renderable. The
+        // single-page path keeps its established ready-check behavior.
+        bool canShiftFacingFrame = facingFrameShift && g_stageFrameValid &&
+            !g_annotationToolbarOpen && !g_annotationNoteOpen &&
+            std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         bool canPreserveFrame = !facingFrameShift && (targetReady || dragFrame) && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
-        if (canPreserveFrame)
+        if (canShiftFacingFrame || canPreserveFrame)
         {
-            // The target is rendered in the background. PaintPages keeps this
-            // shifted frame until the complete visible spread is available.
-            g_pageNavigationPending = facingContinuous ? true : dragFrame;
+            // Touchpad and wheel input must move the committed presentation
+            // immediately, even when the newly exposed spread is not ready.
+            // PaintPages keeps this shifted frame on screen and commits the
+            // target atomically after the render worker finishes it.
+            g_pageNavigationPending = facingFrameShift ? !targetReady : dragFrame;
             ScrollStagePixels(hwnd, 0, dy, pageChanged);
             RedrawMainScrollBarNow(hwnd);
         }
@@ -12978,14 +12985,17 @@ namespace
         bool facingFrameShift = facingContinuous && tab;
         bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        // See the vertical-scroll path above: never shift a facing frame into
-        // an uncovered horizontal strip. Wait for a complete target viewport.
+        // Use the same retained-frame rule for horizontal movement so a
+        // touchpad gesture cannot freeze the facing layout while tiles render.
+        bool canShiftFacingFrame = facingFrameShift && g_stageFrameValid &&
+            !g_annotationToolbarOpen && !g_annotationNoteOpen &&
+            std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         bool canPreserveFrame = !facingFrameShift && targetReady && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
-        if (canPreserveFrame)
+        if (canShiftFacingFrame || canPreserveFrame)
         {
-            g_pageNavigationPending = facingContinuous;
+            g_pageNavigationPending = facingFrameShift ? !targetReady : facingContinuous;
             ScrollStagePixels(hwnd, old - g_scrollX, 0, false);
             RedrawMainScrollBarNow(hwnd);
         }
