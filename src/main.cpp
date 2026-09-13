@@ -6581,18 +6581,29 @@ namespace
         return std::max<int>(stageW, MaxSpreadWidth(tab) + S(56));
     }
 
+    int PreferredFacingScrollX(PdfTab const& tab)
+    {
+        if (g_viewMode == 0) return 0;
+        int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+        int contentW = ReadingContentWidth(tab);
+        int maxScroll = std::max<int>(0, contentW - stageW);
+        // Facing layouts use one shared horizontal document extent. Start in
+        // its center so a narrow first spread is not parked at the far edge
+        // when a later spread is wider. Single-page positioning is unchanged.
+        return maxScroll / 2;
+    }
+
     int SpreadX(PdfTab const& tab, int start)
     {
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int spreadW = SpreadWidth(tab, start);
         int maxSpreadW = MaxSpreadWidth(tab);
-        // A smaller spread must be centered in the current reader even when
-        // another page in the document is much wider. Using maxSpreadW here
-        // pushes a zoomed-out spread toward the far edge and clips its sides.
-        // Only a spread that itself exceeds the reader needs horizontal
-        // scrolling against the document-wide extent.
-        if (spreadW + S(56) <= stageW)
+        if (g_viewMode == 0 && spreadW + S(56) <= stageW)
             return g_stage.left + (stageW - spreadW) / 2;
+        // Facing layouts share one document-wide horizontal extent. Keep each
+        // spread in that coordinate system; centering against the current
+        // reader width makes the result depend on DPI and can move a spread
+        // to the far right when another page is wider.
         return g_stage.left + S(28) + (maxSpreadW - spreadW) / 2 - g_scrollX;
     }
 
@@ -12066,6 +12077,8 @@ namespace
         {
             g_scrollY = 0;
         }
+        if (Active() && g_viewMode != 0)
+            g_scrollX = PreferredFacingScrollX(*Active());
         if (openedFromHome && !(hasRecentPosition && recentPosition.hasSidebarState))
         {
             // Opening a document from the home page should start in the
@@ -14183,6 +14196,8 @@ namespace
         EnsureTabWindowVisible(g_active);
         g_tabListOpen = false;
         RestoreActiveTabPosition(hwnd);
+        if (PdfTab* target = Active(); target && g_viewMode != 0)
+            g_scrollX = PreferredFacingScrollX(*target);
         RestoreActiveTabSidebarState(hwnd);
         // A pending page-navigation commit belongs to the previous Tab. Do
         // not make the new Tab wait for that old viewport to become complete.
@@ -16770,19 +16785,17 @@ namespace
             // document disappears until the target generation completes.
             return false;
         }
-        // Facing-page scrolling is presented from the shifted committed
-        // frame while the target spread is rendered. Do not paint or flush a
-        // partial spread: the render worker invalidates the full stage only
-        // after CurrentZoomVisibleContentReady() becomes true.
-        bool holdFacingScrollFrame = UseFacingContinuousPresentation() &&
+        // Facing-page scrolling uses the shifted committed frame as the
+        // underlay while the target spread is rendered. The single-page path
+        // keeps its original clear-and-draw behavior. Do not return before
+        // the page loop: that used to leave the paint buffer cleared and turn
+        // the entire reader into the stage background during a scroll.
+        bool preserveFacingFrame = UseFacingContinuousPresentation() &&
             g_pageNavigationPending && g_stageFrameValid && !zoomPresentationPending;
-        if (holdFacingScrollFrame)
-        {
-            if (!CurrentZoomVisibleContentReady(tab))
-                return false;
-            g_pageNavigationPending = false;
-        }
-        Fill(dc, stageDirty, T().stage);
+        if (preserveFacingFrame)
+            RestoreStageFrame(dc, stageDirty);
+        else
+            Fill(dc, stageDirty, T().stage);
         int savedDc = SaveDC(dc);
         IntersectClipRect(dc, stageDirty.left, stageDirty.top, stageDirty.right, stageDirty.bottom);
         int content = g_continuousRead ? ContinuousContentHeight(tab) : SinglePageContentHeight(tab);
@@ -16833,7 +16846,7 @@ namespace
                          {
                              QueuePageRender(g_hwnd, tab, i, 0);
                          }
-                          if (!zoomPresentationPending)
+                          if (!zoomPresentationPending && !preserveFacingFrame)
                               Fill(dc, drawRect, PdfPageBackgroundColor());
                           PageImage* fallback = FindZoomFallbackPage(tab, i);
                          if (!zoomPresentationPending && image && (image->dib || !image->bgra.empty()) && image->width > 0 && image->height > 0)
@@ -16871,7 +16884,7 @@ namespace
                     }
                     else
                     {
-                          if (!zoomPresentationPending)
+                          if (!zoomPresentationPending && !preserveFacingFrame)
                               Fill(dc, drawRect, PdfPageBackgroundColor());
                          bool fallbackPainted = false;
                          PageImage* fallback = FindZoomFallbackPage(tab, i);
@@ -17683,7 +17696,10 @@ namespace
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         int splitW = side ? std::max(1, S(1)) : 0;
         g_stage = RECT{ side + splitW, top, client.right, client.bottom - bottom };
-        if (!EqualRect(&oldStage, &g_stage))
+        bool stageChanged = !EqualRect(&oldStage, &g_stage);
+        if (stageChanged && g_viewMode != 0)
+            g_scrollX = PreferredFacingScrollX(*tab);
+        if (stageChanged)
         {
             // A resize, sidebar transition, or immersive-mode switch changes
             // the coordinate system. The old frame cannot be used as a
@@ -17749,6 +17765,8 @@ namespace
         int side = SidebarTotalWidth();
         int splitW = side ? std::max(1, S(1)) : 0;
         g_stage = RECT{ side + splitW, top, client.right, client.bottom - bottom };
+        if (g_viewMode != 0)
+            g_scrollX = PreferredFacingScrollX(*tab);
         RECT stage = g_stage;
         if (!IsRectEmpty(&stage))
         {
@@ -20284,7 +20302,23 @@ namespace
         if (id >= 2300 && id <= 2302)
         {
             int oldPage = tab ? tab->currentPage : 0;
+            int oldViewMode = g_viewMode;
             g_viewMode = id - 2300;
+            if (oldViewMode != g_viewMode)
+            {
+                // A committed frame belongs to the previous page geometry.
+                // Do not let its pending transaction suppress the first full
+                // paint after switching between single, facing, and book
+                // layouts. This reset is layout-scoped; single-page scroll
+                // behavior itself remains unchanged.
+                g_pageNavigationPending = false;
+                g_allowIncompletePageNavigationFrame = false;
+                g_stageFrameValid = false;
+                g_stageFrameOffsetX = 0;
+                g_stageFrameOffsetY = 0;
+                g_stageFrameMotionX = 0;
+                g_stageFrameMotionY = 0;
+            }
             if (tab)
             {
                 tab->currentPage = std::clamp(oldPage, 0, tab->pageCount - 1);
@@ -20293,7 +20327,10 @@ namespace
                 int maxY = std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
                 int maxX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
                 g_scrollY = std::clamp(g_continuousRead ? SpreadTopScroll(*tab, oldPage) : g_scrollY, 0, maxY);
-                g_scrollX = std::clamp(g_scrollX, 0, maxX);
+                if (g_viewMode != 0)
+                    g_scrollX = std::clamp(PreferredFacingScrollX(*tab), 0, maxX);
+                else
+                    g_scrollX = std::clamp(g_scrollX, 0, maxX);
                 UpdateVertScrollBar(hwnd);
             }
             SaveState();
@@ -20303,6 +20340,13 @@ namespace
         if (id == 2303)
         {
             g_continuousRead = !g_continuousRead;
+            g_pageNavigationPending = false;
+            g_allowIncompletePageNavigationFrame = false;
+            g_stageFrameValid = false;
+            g_stageFrameOffsetX = 0;
+            g_stageFrameOffsetY = 0;
+            g_stageFrameMotionX = 0;
+            g_stageFrameMotionY = 0;
             if (tab)
             {
                 if (g_continuousRead) ScrollToPage(*tab, tab->currentPage);
@@ -21530,6 +21574,8 @@ namespace
                             {
                                 g_scrollY = std::clamp(g_scrollY, 0, SinglePageMaxScroll(tab));
                             }
+                            if (g_viewMode != 0 && !g_draggingMainScroll)
+                                g_scrollX = PreferredFacingScrollX(tab);
                             UpdateVertScrollBar(hwnd);
                             InvalidateRect(hwnd, nullptr, FALSE);
                         }
