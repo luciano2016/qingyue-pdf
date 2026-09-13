@@ -6613,12 +6613,6 @@ namespace
             // beyond the reader after returning from double-page view.
             return g_stage.left + S(28) - g_scrollX;
         }
-        // A facing spread that fits in the reader is always centered in the
-        // reader. The document-wide extent is only needed while the current
-        // spread is wider than the viewport; otherwise a wider spread later
-        // in the document would leave the current pair parked at the left.
-        if (spreadW + S(56) <= stageW)
-            return g_stage.left + (stageW - spreadW) / 2;
         // Facing layouts share one document-wide horizontal extent. Keep each
         // spread in that coordinate system; centering against the current
         // reader width makes the result depend on DPI and can move a spread
@@ -12873,23 +12867,17 @@ namespace
                     continue;
                 }
 
-                // The first scroll representation is one complete page, even
-                // when the final zoom uses tiles. A drag can present this
-                // bounded low-resolution page immediately, then replace it
-                // with current-zoom tiles without exposing tile-shaped gaps.
-                QueueZoomPreviewRender(hwnd, tab, page, -52 + queued);
-
                 int pageW = PageW(tab, page);
                 int pageH = PageH(tab, page);
                 int targetLevel = TileLevelForPage(tab, page, pageW, pageH);
-                int budget = 3;
+                int budget = 4;
                 if (targetLevel >= 1)
-                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, pageRect,
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect,
                         targetLevel, -36 + queued, budget);
                 if (budget > 0)
-                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, pageRect,
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect,
                         0, -28 + queued, budget);
-                queued += 3 - budget;
+                queued += 4 - budget;
             }
             if (!g_continuousRead) break;
         }
@@ -13055,22 +13043,11 @@ namespace
         {
             if (target != g_scrollY)
                 ScrollStageTo(hwnd, target, true, false);
-            if (UseFacingContinuousPresentation())
-            {
-                // A scrollbar release is still a scroll transaction. Keep
-                // the complete-frame rule, but allow a complete low-resolution
-                // page fallback instead of waiting for every final tile.
-                g_pageNavigationPending = false;
-                g_facingScrollPending = true;
-                PrimeFacingScrollCoverage(hwnd, *tab);
-                RequestStageRepaint(hwnd, true);
-            }
-            else
-            {
-                // Single-page mode keeps its established atomic navigation
-                // path and cache policy.
-                RequestPageNavigationRepaint(hwnd, *tab, true);
-            }
+            // The drag path deliberately shows the last frame while the
+            // pointer is moving. On release, request one authoritative
+            // complete viewport submission even when the last pointer move
+            // already set g_scrollY to the final target.
+            RequestPageNavigationRepaint(hwnd, *tab, true);
             SaveActiveTabProgress();
             if (g_continuousRead) SyncSidebarProgressFromScroll(hwnd, *tab);
         }
@@ -16797,38 +16774,24 @@ namespace
                     continue;
                 hadVisiblePage = true;
 
-                auto committed = tab.cache.find(page);
-                bool committedReady = currentPageCacheGeneration && committed != tab.cache.end() &&
-                    committed->second.width > 0 && committed->second.height > 0 &&
-                    (committed->second.dib || !committed->second.bgra.empty());
-                if (committedReady) continue;
-
-                // A complete preview page is a valid scroll presentation for
-                // both whole-page and tiled rendering. It must be checked
-                // before the Tile cache so a partially filled tile grid can
-                // never win over the atomic page fallback.
-                PageImage* fallback = FindZoomFallbackPage(tab, page);
-                if (fallback && fallback->width > 0 && fallback->height > 0 &&
-                    (fallback->dib || !fallback->bgra.empty()))
-                    continue;
-
                 if (!UseTiledPageRendering(tab))
                 {
+                    auto committed = tab.cache.find(page);
+                    bool committedReady = currentPageCacheGeneration && committed != tab.cache.end() &&
+                        committed->second.width > 0 && committed->second.height > 0 &&
+                        (committed->second.dib || !committed->second.bgra.empty());
+                    if (committedReady || FindZoomFallbackPage(tab, page)) continue;
                     return false;
                 }
 
                 int pageW = PageW(tab, page);
                 int pageH = PageH(tab, page);
-                // Check the complete page, not only the strip currently
-                // visible at the reader edge. A spread is committed as two
-                // complete pages, so the next scroll cannot reveal stitched
-                // half-pages or a blank tile region.
-                if (TileLevelFullyCached(tab, page, pageRect, pageRect, 0)) continue;
+                if (TileLevelFullyCached(tab, page, pageRect, visible, 0)) continue;
 
                 int targetLevel = TileLevelForPage(tab, page, pageW, pageH);
                 bool coarseReady = false;
                 for (int level = targetLevel; level >= 1 && !coarseReady; --level)
-                    coarseReady = TileLevelFullyCached(tab, page, pageRect, pageRect, level);
+                    coarseReady = TileLevelFullyCached(tab, page, pageRect, visible, level);
                 if (coarseReady) continue;
 
                 // A complete tile level from the previous zoom generation is
@@ -16838,7 +16801,7 @@ namespace
                 {
                     int oldZoomKey = TileZoomKey(tab.zoomFallbackZoom);
                     for (int level = 0; level <= 6 && !coarseReady; ++level)
-                        coarseReady = TileLevelFullyCachedAtZoom(tab, page, pageRect, pageRect, oldZoomKey, level);
+                        coarseReady = TileLevelFullyCachedAtZoom(tab, page, pageRect, visible, oldZoomKey, level);
                 }
                 if (!coarseReady) return false;
             }
@@ -17108,49 +17071,7 @@ namespace
                           bool oldZoomPainted = false;
                           bool coarsePainted = false;
                           bool targetPainted = false;
-                           bool atomicFacingPresentation = preserveFacingFrame && !zoomPresentationPending;
-                           if (atomicFacingPresentation)
-                           {
-                               // During facing-page scrolling never mix a
-                               // partially completed tile grid into the
-                               // committed frame. Prefer a complete preview,
-                               // then one complete coarse level, and only then
-                               // the final tile level.
-                               int completeLevel = -1;
-                               if (!fallbackPainted)
-                               {
-                                   if (TileLevelFullyCached(tab, i, pageRect, pageRect, 0))
-                                       completeLevel = 0;
-                                   else
-                                   {
-                                       for (int level = targetLevel; level >= 1 && completeLevel < 0; --level)
-                                       {
-                                           if (TileLevelFullyCached(tab, i, pageRect, pageRect, level))
-                                               completeLevel = level;
-                                       }
-                                   }
-                               }
-                               if (completeLevel >= 0)
-                               {
-                                   bool ignoredMissing = false;
-                                   if (completeLevel == 0)
-                                       targetPainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, 0, false, ignoredMissing);
-                                   else
-                                       coarsePainted = DrawTileLevel(dc, tab, i, pageRect, drawRect, completeLevel, false, ignoredMissing);
-                               }
-                               else
-                               {
-                                   // Keep feeding the whole-page fallback and
-                                   // full-page coarse coverage. The previous
-                                   // committed frame remains underneath until
-                                   // one of them is complete.
-                                   QueueZoomPreviewRender(g_hwnd, tab, i, -52);
-                                   int queueBudget = 4;
-                                   QueueVisibleTilesForPageLevel(g_hwnd, tab, i, pageRect, pageRect,
-                                       targetLevel >= 1 ? targetLevel : 0, -8, queueBudget);
-                               }
-                           }
-                           else if (zoomPresentationPending)
+                          if (zoomPresentationPending)
                           {
                               // A high-zoom transition has one source of truth:
                               // the previous complete frame. Target tiles are
