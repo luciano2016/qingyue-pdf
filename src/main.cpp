@@ -1546,6 +1546,11 @@ namespace
     LONG_PTR g_preImmersiveExStyle{};
     int g_active{ -1 };
     bool g_pageNavigationPending{};
+    // Facing-page scrolling has its own presentation transaction. It is
+    // intentionally separate from bookmark navigation and zoom transitions:
+    // scrolling may commit a complete low-resolution coverage frame before
+    // the final-resolution tiles arrive.
+    bool g_facingScrollPending{};
     // A favorite jump should present the new viewport immediately. Missing
     // target pixels are filled by the render worker on later invalidations.
     bool g_allowIncompletePageNavigationFrame{};
@@ -6598,8 +6603,16 @@ namespace
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int spreadW = SpreadWidth(tab, start);
         int maxSpreadW = MaxSpreadWidth(tab);
-        if (g_viewMode == 0 && spreadW + S(56) <= stageW)
-            return g_stage.left + (stageW - spreadW) / 2;
+        if (g_viewMode == 0)
+        {
+            if (spreadW + S(56) <= stageW)
+                return g_stage.left + (stageW - spreadW) / 2;
+            // Single-page mode owns a page-local horizontal viewport. Using
+            // the widest page in the document here is a facing-layout rule:
+            // on a mixed-size PDF it can move the current page completely
+            // beyond the reader after returning from double-page view.
+            return g_stage.left + S(28) - g_scrollX;
+        }
         // Facing layouts share one document-wide horizontal extent. Keep each
         // spread in that coordinate system; centering against the current
         // reader width makes the result depend on DPI and can move a spread
@@ -7630,6 +7643,7 @@ namespace
     }
 
     bool CurrentZoomVisibleContentReady(PdfTab& tab);
+    bool FacingScrollVisibleContentReady(PdfTab& tab);
     bool RestoreStageFrame(HDC paintDc, RECT area);
 
     bool HasReusableTabPage(PdfTab const& tab)
@@ -12044,6 +12058,7 @@ namespace
         // the previous document's committed frame must not suppress its
         // first normal paint.
         g_pageNavigationPending = false;
+        g_facingScrollPending = false;
         g_allowIncompletePageNavigationFrame = false;
         g_stageFrameValid = false;
         g_stageFrameOffsetX = 0;
@@ -12816,6 +12831,58 @@ namespace
         }
     }
 
+    // Sumatra-style scroll priming: queue the cheapest complete representation
+    // for the newly visible facing pages before asking the presentation layer
+    // to move. A complete coarse tile level is enough to keep the viewport
+    // continuous; final tiles can replace it asynchronously afterward.
+    void PrimeFacingScrollCoverage(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.pageCount <= 0) return;
+
+        RECT view = g_stage;
+        int padY = std::max<int>(S(48), (g_stage.bottom - g_stage.top) / 5);
+        InflateRect(&view, S(8), padY);
+        int firstVisible = g_continuousRead
+            ? std::max(0, FirstVisibleSpreadStart(tab))
+            : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int queued = 0;
+        for (int start = firstVisible; start < tab.pageCount && queued < 8; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > view.bottom) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && queued < 8; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                RECT drawRect{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect) ||
+                    !IntersectRect(&drawRect, &pageRect, &view))
+                    continue;
+
+                if (!UseTiledPageRendering(tab))
+                {
+                    QueuePageRender(hwnd, tab, page, -28 + queued);
+                    ++queued;
+                    continue;
+                }
+
+                int pageW = PageW(tab, page);
+                int pageH = PageH(tab, page);
+                int targetLevel = TileLevelForPage(tab, page, pageW, pageH);
+                int budget = 4;
+                if (targetLevel >= 1)
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect,
+                        targetLevel, -36 + queued, budget);
+                if (budget > 0)
+                    QueueVisibleTilesForPageLevel(hwnd, tab, page, pageRect, drawRect,
+                        0, -28 + queued, budget);
+                queued += 4 - budget;
+            }
+            if (!g_continuousRead) break;
+        }
+    }
+
     bool VisiblePagesReadyForPixelScroll(HWND hwnd, PdfTab& tab)
     {
         if (UseTiledPageRendering(tab))
@@ -12898,18 +12965,19 @@ namespace
         bool pageChanged = tab && oldPage != tab->currentPage;
         UpdateVertScrollBar(hwnd);
 
-        // Facing-page continuous reading uses the last complete frame as an
-        // interactive presentation surface. Single-page reading retains the
-        // 2.5.9 ready-check path and never enters this branch.
+        // Facing-page scrolling has a retained presentation frame of its own.
+        // Prime a complete coarse representation first, then move the frame
+        // immediately when that representation covers the new viewport.
+        // Single-page reading retains the 2.5.9 path below.
         bool facingContinuous = UseFacingContinuousPresentation();
         bool facingFrameShift = facingContinuous && tab;
+        if (facingFrameShift)
+            PrimeFacingScrollCoverage(hwnd, *tab);
+        bool facingCoverageReady = facingFrameShift && !tab->zoomPresentationPending &&
+            FacingScrollVisibleContentReady(*tab);
         bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        // A facing layout may expose a new strip before its target spread is
-        // ready. Keep the committed frame moving for interactive input, then
-        // atomically replace it once the new viewport is renderable. The
-        // single-page path keeps its established ready-check behavior.
-        bool canShiftFacingFrame = facingFrameShift && g_stageFrameValid &&
+        bool canShiftFacingFrame = facingFrameShift && facingCoverageReady && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         bool canPreserveFrame = !facingFrameShift && (targetReady || dragFrame) && g_stageFrameValid &&
@@ -12917,20 +12985,33 @@ namespace
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         if (canShiftFacingFrame || canPreserveFrame)
         {
-            // Touchpad and wheel input must move the committed presentation
-            // immediately, even when the newly exposed spread is not ready.
-            // PaintPages keeps this shifted frame on screen and commits the
-            // target atomically after the render worker finishes it.
-            g_pageNavigationPending = facingFrameShift ? !targetReady : dragFrame;
+            if (facingFrameShift)
+            {
+                g_pageNavigationPending = false;
+                g_facingScrollPending = false;
+            }
+            else
+            {
+                g_pageNavigationPending = dragFrame;
+            }
             ScrollStagePixels(hwnd, 0, dy, pageChanged);
             RedrawMainScrollBarNow(hwnd);
         }
         else
         {
-            // Facing layouts do not shift an incomplete frame. If the target
-            // viewport is already cached, repaint it immediately; otherwise
-            // keep the previous complete frame until render completion.
-            g_pageNavigationPending = facingFrameShift ? !targetReady : true;
+            if (facingFrameShift)
+            {
+                // Keep the old complete frame visible only until a complete
+                // coarse/fallback representation is available. The worker
+                // will invalidate the stage and commit that representation;
+                // this is a short render handoff, not a permanent freeze.
+                g_pageNavigationPending = false;
+                g_facingScrollPending = true;
+            }
+            else
+            {
+                g_pageNavigationPending = true;
+            }
             // Present the thumb before invalidating the reader. The latter
             // is intentionally asynchronous and may contain an uncached page.
             RedrawMainScrollBarNow(hwnd);
@@ -12942,7 +13023,7 @@ namespace
                 MaintainVisibleTileRenderQueueForScroll(*tab);
             else
                 MaintainVisiblePageRenderQueueForScroll(*tab);
-            if (g_pageNavigationPending && UseTiledPageRendering(*tab))
+            if ((g_pageNavigationPending || g_facingScrollPending) && UseTiledPageRendering(*tab))
                 QueueVisibleCommittedPagesForScroll(hwnd, *tab);
         }
         if (tab && !UseTiledPageRendering(*tab) && !StageScrollPaintInProgress())
@@ -12996,11 +13077,15 @@ namespace
         UpdateVertScrollBar(hwnd);
         bool facingContinuous = UseFacingContinuousPresentation();
         bool facingFrameShift = facingContinuous && tab;
+        if (facingFrameShift)
+            PrimeFacingScrollCoverage(hwnd, *tab);
+        bool facingCoverageReady = facingFrameShift && !tab->zoomPresentationPending &&
+            FacingScrollVisibleContentReady(*tab);
         bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
-        // Use the same retained-frame rule for horizontal movement so a
-        // touchpad gesture cannot freeze the facing layout while tiles render.
-        bool canShiftFacingFrame = facingFrameShift && g_stageFrameValid &&
+        // Horizontal facing movement uses the same complete-coverage rule as
+        // vertical scrolling; the scrollbar never exposes a background strip.
+        bool canShiftFacingFrame = facingFrameShift && facingCoverageReady && g_stageFrameValid &&
             !g_annotationToolbarOpen && !g_annotationNoteOpen &&
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         bool canPreserveFrame = !facingFrameShift && targetReady && g_stageFrameValid &&
@@ -13008,13 +13093,29 @@ namespace
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         if (canShiftFacingFrame || canPreserveFrame)
         {
-            g_pageNavigationPending = facingFrameShift ? !targetReady : facingContinuous;
+            if (facingFrameShift)
+            {
+                g_pageNavigationPending = false;
+                g_facingScrollPending = false;
+            }
+            else
+            {
+                g_pageNavigationPending = facingContinuous;
+            }
             ScrollStagePixels(hwnd, old - g_scrollX, 0, false);
             RedrawMainScrollBarNow(hwnd);
         }
         else
         {
-            g_pageNavigationPending = facingFrameShift ? !targetReady : true;
+            if (facingFrameShift)
+            {
+                g_pageNavigationPending = false;
+                g_facingScrollPending = true;
+            }
+            else
+            {
+                g_pageNavigationPending = true;
+            }
             RedrawMainScrollBarNow(hwnd);
             RequestStageRepaint(hwnd, false);
         }
@@ -14202,6 +14303,7 @@ namespace
         // A pending page-navigation commit belongs to the previous Tab. Do
         // not make the new Tab wait for that old viewport to become complete.
         g_pageNavigationPending = false;
+        g_facingScrollPending = false;
         g_stageIdleRefreshPending = false;
         g_stageLightPaintUntil = 0;
         g_smoothStageScroll = false;
@@ -16641,6 +16743,73 @@ namespace
         return hadVisiblePage;
     }
 
+    bool FacingScrollVisibleContentReady(PdfTab& tab)
+    {
+        if (tab.pageCount <= 0 || tab.zoomPresentationPending) return true;
+
+        int firstPage = g_continuousRead
+            ? std::max(0, FirstVisibleSpreadStart(tab))
+            : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        bool hadVisiblePage = false;
+        bool currentPageCacheGeneration = tab.cachedZoom == tab.zoom &&
+            tab.cachedDpi == g_dpi && tab.cachedTheme == PdfRenderTheme();
+
+        for (int start = firstPage; start < lastPage; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            RECT spreadRect{ SpreadX(tab, start), y,
+                SpreadX(tab, start) + SpreadWidth(tab, start), y + SpreadHeight(tab, start) };
+            if (g_continuousRead && spreadRect.top > g_stage.bottom) break;
+            if (!Intersects(spreadRect, g_stage)) continue;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                RECT visible{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect) ||
+                    !IntersectRect(&visible, &pageRect, &g_stage))
+                    continue;
+                hadVisiblePage = true;
+
+                if (!UseTiledPageRendering(tab))
+                {
+                    auto committed = tab.cache.find(page);
+                    bool committedReady = currentPageCacheGeneration && committed != tab.cache.end() &&
+                        committed->second.width > 0 && committed->second.height > 0 &&
+                        (committed->second.dib || !committed->second.bgra.empty());
+                    if (committedReady || FindZoomFallbackPage(tab, page)) continue;
+                    return false;
+                }
+
+                int pageW = PageW(tab, page);
+                int pageH = PageH(tab, page);
+                if (TileLevelFullyCached(tab, page, pageRect, visible, 0)) continue;
+
+                int targetLevel = TileLevelForPage(tab, page, pageW, pageH);
+                bool coarseReady = false;
+                for (int level = targetLevel; level >= 1 && !coarseReady; --level)
+                    coarseReady = TileLevelFullyCached(tab, page, pageRect, visible, level);
+                if (coarseReady) continue;
+
+                // A complete tile level from the previous zoom generation is
+                // also a valid retained presentation source. It is scaled as
+                // one unit and replaced by current-zoom tiles later.
+                if (tab.zoomFallbackZoom > 0.0)
+                {
+                    int oldZoomKey = TileZoomKey(tab.zoomFallbackZoom);
+                    for (int level = 0; level <= 6 && !coarseReady; ++level)
+                        coarseReady = TileLevelFullyCachedAtZoom(tab, page, pageRect, visible, oldZoomKey, level);
+                }
+                if (!coarseReady) return false;
+            }
+            if (!g_continuousRead) break;
+        }
+        return hadVisiblePage;
+    }
+
     bool ZoomFallbackVisibleContentReady(PdfTab& tab)
     {
         if (tab.pageCount <= 0) return true;
@@ -16791,7 +16960,8 @@ namespace
         // the page loop: that used to leave the paint buffer cleared and turn
         // the entire reader into the stage background during a scroll.
         bool preserveFacingFrame = UseFacingContinuousPresentation() &&
-            g_pageNavigationPending && g_stageFrameValid && !zoomPresentationPending;
+            (g_pageNavigationPending || g_facingScrollPending) &&
+            g_stageFrameValid && !zoomPresentationPending;
         if (preserveFacingFrame)
             RestoreStageFrame(dc, stageDirty);
         else
@@ -17077,6 +17247,24 @@ namespace
             return false;
         if (g_allowIncompletePageNavigationFrame)
             g_allowIncompletePageNavigationFrame = false;
+        if (g_facingScrollPending)
+        {
+            // A scroll transaction may commit a complete coarse/fallback
+            // representation. It must not wait for final-resolution tiles,
+            // but it also must never commit an uncovered background region.
+            if (!FacingScrollVisibleContentReady(tab))
+            {
+                InvalidateRect(g_hwnd, &g_stage, FALSE);
+                return false;
+            }
+            if (!RectContains(paintClip, g_stage))
+            {
+                InvalidateRect(g_hwnd, &g_stage, FALSE);
+                return false;
+            }
+            g_facingScrollPending = false;
+            return true;
+        }
         if (g_pageNavigationPending)
         {
             // Render completions invalidate small tile rectangles. During a
@@ -20306,12 +20494,24 @@ namespace
             g_viewMode = id - 2300;
             if (oldViewMode != g_viewMode)
             {
+                // A layout change starts a new viewport transaction. Any
+                // zoom presentation owned by the previous layout is no
+                // longer a valid source or completion gate for the new one.
+                CancelStageMotion(hwnd);
+                g_zoomRenderDeferUntil = 0;
+                KillTimer(hwnd, 21);
+                if (tab)
+                {
+                    tab->zoomPresentationPending = false;
+                    ReleaseZoomFallback(*tab);
+                }
                 // A committed frame belongs to the previous page geometry.
                 // Do not let its pending transaction suppress the first full
                 // paint after switching between single, facing, and book
                 // layouts. This reset is layout-scoped; single-page scroll
                 // behavior itself remains unchanged.
                 g_pageNavigationPending = false;
+                g_facingScrollPending = false;
                 g_allowIncompletePageNavigationFrame = false;
                 g_stageFrameValid = false;
                 g_stageFrameOffsetX = 0;
@@ -20330,8 +20530,14 @@ namespace
                 if (g_viewMode != 0)
                     g_scrollX = std::clamp(PreferredFacingScrollX(*tab), 0, maxX);
                 else
-                    g_scrollX = std::clamp(g_scrollX, 0, maxX);
+                    // Facing layouts and single-page layout do not share the
+                    // same horizontal coordinate system. A facing offset can
+                    // place the single page outside the reader after a mode
+                    // switch, even though the scrollbar range is valid.
+                    g_scrollX = 0;
                 UpdateVertScrollBar(hwnd);
+                QueueInitialViewportPreview(hwnd, *tab);
+                SchedulePagePrefetch(hwnd);
             }
             SaveState();
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -20341,6 +20547,7 @@ namespace
         {
             g_continuousRead = !g_continuousRead;
             g_pageNavigationPending = false;
+            g_facingScrollPending = false;
             g_allowIncompletePageNavigationFrame = false;
             g_stageFrameValid = false;
             g_stageFrameOffsetX = 0;
@@ -21672,7 +21879,17 @@ namespace
                 }
                 if (inserted && i == g_active)
                 {
-                    if (g_pageNavigationPending)
+                    if (g_facingScrollPending)
+                    {
+                        // Scroll presentation is allowed to settle on a
+                        // complete coarse/fallback frame. Do not wait for
+                        // final-resolution tiles before moving the viewport.
+                        if (FacingScrollVisibleContentReady(tab))
+                            InvalidateRect(hwnd, &g_stage, FALSE);
+                        else
+                            SchedulePagePrefetch(hwnd);
+                    }
+                    else if (g_pageNavigationPending)
                     {
                         // A committed full page, or complete tile coverage for
                         // an oversized page, is presented atomically.
