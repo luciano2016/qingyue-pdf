@@ -13563,8 +13563,7 @@ namespace
 
     bool PresentZoomTransform(HWND hwnd, POINT anchor, double scale)
     {
-        if (!g_stageFrameValid || !g_stageFrameDc || scale <= 0.0 ||
-            IsRectEmpty(&g_stage))
+        if (scale <= 0.0 || IsRectEmpty(&g_stage))
             return false;
 
         RECT client{};
@@ -13586,6 +13585,28 @@ namespace
         {
             ReleaseDC(hwnd, windowDc);
             return false;
+        }
+
+        // A low-zoom render can leave the retained frame invalid for a short
+        // interval even though the previous page is already visible in the
+        // window. Seed the compositor from that reader-only surface so every
+        // wheel sample still gets an immediate proportional transform. The
+        // scrollbars are outside `reader`, so their pixels cannot become part
+        // of the zoom source; the next complete render replaces this snapshot.
+        if (!g_stageFrameValid)
+        {
+            if (!BitBlt(g_stageFrameDc, reader.left, reader.top,
+                reader.right - reader.left, reader.bottom - reader.top,
+                windowDc, reader.left, reader.top, SRCCOPY))
+            {
+                ReleaseDC(hwnd, windowDc);
+                return false;
+            }
+            g_stageFrameValid = true;
+            g_stageFrameOffsetX = 0;
+            g_stageFrameOffsetY = 0;
+            g_stageFrameMotionX = 0;
+            g_stageFrameMotionY = 0;
         }
 
         // First materialize the currently presented frame in a separate
@@ -13682,7 +13703,14 @@ namespace
         // Keep this path for clipped facing pages too: a zoom-out can reveal
         // an edge outside the old viewport, but it must never make the whole
         // reader disappear while that edge renders.
-        if (UseFacingContinuousPresentation())
+        // A zoom-out can reveal page edges that were outside the old reader
+        // viewport. A screen snapshot cannot contain those pixels, so
+        // transforming it would manufacture a clipped page border. Keep the
+        // last complete frame until the target generation supplies the full
+        // spread; zoom-in remains safe because it never reveals new edges.
+        bool sourcePagesFullyVisible = ZoomSourcePagesFullyVisible(tab);
+        bool canPresentZoomTransform = clampedZoom >= oldZoom || sourcePagesFullyVisible;
+        if (UseFacingContinuousPresentation() && canPresentZoomTransform)
             PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
 
         // PaintPages keeps the transformed committed frame intact until the
@@ -22183,20 +22211,11 @@ namespace
         {
             if (!IsRectEmpty(&oldVerticalRect)) InvalidateRect(hwnd, &oldVerticalRect, FALSE);
             if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
-            // With a committed frame, the scrollbar-only paint can restore
-            // the exact page pixels beneath the transparent thumb. If the
-            // frame is not valid yet, repaint the reader as well; copying the
-            // screen in that state would copy the old green thumb underneath
-            // the new dark one and leave two bars visible.
-            if (!g_stageFrameValid && !IsRectEmpty(&g_stage))
-                InvalidateRect(hwnd, &g_stage, FALSE);
         }
         if (oldHorizontal != g_mainHScrollHover)
         {
             if (!IsRectEmpty(&oldHorizontalRect)) InvalidateRect(hwnd, &oldHorizontalRect, FALSE);
             if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
-            if (!g_stageFrameValid && !IsRectEmpty(&g_stage))
-                InvalidateRect(hwnd, &g_stage, FALSE);
         }
     }
 
