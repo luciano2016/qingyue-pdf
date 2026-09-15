@@ -13780,16 +13780,12 @@ namespace
         // The old complete result remains the presentation frame; the new
         // result is committed only after the visible viewport is complete.
         tab.zoomPresentationPending = true;
-        // A tooltip belongs to the previous pointer/layout frame. Clear it
-        // when zoom starts; otherwise each retained-frame repaint can draw it
-        // once, then the target-frame swap can remove it, creating a flash.
-        RECT oldHoverTipRect = g_hoverTipRect;
-        bool hadHoverTip = g_hasHoverTip;
-        g_hasHoverTip = false;
-        g_hoverTipIsPdfLink = false;
-        g_hoverTip.clear();
-        if (hadHoverTip && !IsRectEmpty(&oldHoverTipRect))
-            InvalidateRect(hwnd, &oldHoverTipRect, FALSE);
+        // Keep the pointer's tooltip state, but repaint its old rectangle
+        // without the tooltip while the zoom transaction is in flight. This
+        // prevents a one-frame flash without losing the tooltip forever when
+        // the pointer remains over the same toolbar button.
+        if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipRect))
+            InvalidateRect(hwnd, &g_hoverTipRect, FALSE);
         g_pageNavigationPending = false;
         // Zoom supersedes an in-flight facing scroll. If this flag survives
         // the zoom change, a later partial paint can restore the pre-zoom
@@ -22309,6 +22305,12 @@ namespace
             flushRect(g_sidebarPanelToggleRect);
             flushRect(g_tabListRect);
             flushRect(g_favoriteListStaleRect);
+            // During a zoom transaction the tooltip state is retained but
+            // its old pixels must still be erased from the screen. The next
+            // timer tick invalidates this same rect and draws it again after
+            // the target frame is committed.
+            if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipRect))
+                flushRect(g_hoverTipRect);
             // Scrollbars are independent transparent overlays. A deferred
             // reader paint must not defer their current thumb as well, or a
             // zoom transaction makes them disappear until the next gesture.
@@ -24920,6 +24922,15 @@ namespace
                 KillTimer(hwnd, 21);
                 g_zoomRenderDeferUntil = 0;
                 InvalidateRect(hwnd, &g_stage, FALSE);
+                if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipRect))
+                    InvalidateRect(hwnd, &g_hoverTipRect, FALSE);
+                if (Active())
+                {
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
+                    RECT toggle = SidebarPanelToggleRectForClient(client);
+                    if (!IsRectEmpty(&toggle)) InvalidateRect(hwnd, &toggle, FALSE);
+                }
                 SchedulePagePrefetch(hwnd);
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
