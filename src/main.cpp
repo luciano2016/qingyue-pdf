@@ -1609,6 +1609,7 @@ namespace
     RECT g_pressedButtonRect{};
     RECT g_hoverButtonRect{};
     RECT g_hoverTipRect{};
+    RECT g_hoverTipPaintRect{};
     RECT g_pageInputRect{};
     RECT g_homeSearchRect{};
     RECT g_homeSearchClearRect{};
@@ -5352,6 +5353,10 @@ namespace
             y = g_hoverTipRect.bottom + S(9);
         y = std::clamp<int>(y, S(8), static_cast<int>(client.bottom) - h - S(8));
         RECT box{ x, y, x + w, y + h };
+        // Keep the actual painted bounds separate from the button/link anchor.
+        // Zoom cleanup must invalidate this box, otherwise only the anchor is
+        // repainted and the old tooltip can remain as a clipped half-panel.
+        g_hoverTipPaintRect = box;
         COLORREF fillColor = g_hoverTipIsPdfLink
             ? (IsDarkTheme() ? MixColor(T().panel2, T().accent, 0.12) : RGB(255, 250, 222))
             : T().panel2;
@@ -13784,8 +13789,8 @@ namespace
         // without the tooltip while the zoom transaction is in flight. This
         // prevents a one-frame flash without losing the tooltip forever when
         // the pointer remains over the same toolbar button.
-        if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipRect))
-            InvalidateRect(hwnd, &g_hoverTipRect, FALSE);
+        if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
+            InvalidateRect(hwnd, &g_hoverTipPaintRect, FALSE);
         g_pageNavigationPending = false;
         // Zoom supersedes an in-flight facing scroll. If this flag survives
         // the zoom change, a later partial paint can restore the pre-zoom
@@ -13873,6 +13878,8 @@ namespace
         GetClientRect(hwnd, &client);
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         InvalidateRect(hwnd, &status, FALSE);
+        RECT toggle = SidebarPanelToggleRectForClient(client);
+        if (!IsRectEmpty(&toggle)) InvalidateRect(hwnd, &toggle, FALSE);
         SchedulePagePrefetch(hwnd);
         ScheduleIdleCacheTrim(hwnd);
     }
@@ -22309,8 +22316,8 @@ namespace
             // its old pixels must still be erased from the screen. The next
             // timer tick invalidates this same rect and draws it again after
             // the target frame is committed.
-            if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipRect))
-                flushRect(g_hoverTipRect);
+            if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
+                flushRect(g_hoverTipPaintRect);
             // Scrollbars are independent transparent overlays. A deferred
             // reader paint must not defer their current thumb as well, or a
             // zoom transaction makes them disappear until the next gesture.
@@ -24922,8 +24929,8 @@ namespace
                 KillTimer(hwnd, 21);
                 g_zoomRenderDeferUntil = 0;
                 InvalidateRect(hwnd, &g_stage, FALSE);
-                if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipRect))
-                    InvalidateRect(hwnd, &g_hoverTipRect, FALSE);
+                if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
+                    InvalidateRect(hwnd, &g_hoverTipPaintRect, FALSE);
                 if (Active())
                 {
                     RECT client{};
