@@ -6693,6 +6693,14 @@ namespace
     bool UseTiledPageRendering(PdfTab const& tab)
     {
         if (tab.pageCount <= 0 || tab.pages.empty()) return false;
+        // Facing layouts must not switch between whole-page and tiled
+        // presentation at an arbitrary zoom threshold. That switch was the
+        // source of the 50%-74% frozen/blurry steps and the reverse 82%-50%
+        // zoom-out stall: the old whole-page cache could not be produced
+        // before the next input sample, while the tile path was responsive.
+        // Keep the established single-page path unchanged and use the same
+        // visible-tile pipeline for double-page/book views at every zoom.
+        if (g_viewMode != 0) return true;
         int page = std::clamp(tab.currentPage, 0, static_cast<int>(tab.pages.size()) - 1);
         PageInfo const& info = tab.pages[static_cast<size_t>(page)];
         double pixelScale = tab.zoom * static_cast<double>(g_dpi) / 72.0;
@@ -13711,6 +13719,22 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
+        // Give every wheel sample an immediate visual response from the last
+        // committed frame. The renderer still owns the target generation and
+        // replaces this transformed frame atomically when both pages are
+        // complete. Without this handoff, low zoom steps only changed the
+        // status value while PaintPages kept returning the old frame until a
+        // worker result arrived, making 50%-74% look frozen.
+        //
+        // The retained frame is the input-stage presentation source. It must
+        // be transformed for both zoom directions: gating zoom-out on the old
+        // pages being fully inside the reader makes an oversized page stay at
+        // the old ratio until a worker result arrives. Newly exposed edges
+        // remain the reader surface until the target-generation tiles commit;
+        // they must never block the proportional input response.
+        if (UseFacingContinuousPresentation())
+            PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
+
         // PaintPages keeps the transformed committed frame intact until the
         // target generation has complete visible coverage, then replaces it.
         CancelObsoletePageRendersForZoom(tab);
