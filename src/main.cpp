@@ -7718,6 +7718,8 @@ namespace
     bool CurrentZoomVisibleContentReady(PdfTab& tab);
     bool FacingScrollVisibleContentReady(PdfTab& tab);
     bool RestoreStageFrame(HDC paintDc, RECT area);
+    void QueueVisibleZoomContent(PdfTab& tab);
+    bool PresentZoomFallbackLayout(HWND hwnd, PdfTab& tab);
 
     bool HasReusableTabPage(PdfTab const& tab)
     {
@@ -8509,7 +8511,12 @@ namespace
                 [&](PageRenderRequest const& queued)
                 { return queued.priority > priority || (queued.priority == priority && queued.viewportGeneration < request.viewportGeneration); });
             g_pageRenderQueue.insert(insertAt, request);
-            constexpr size_t maxQueuedTileRenders = 4;
+            // A facing spread normally needs more than four visible tiles
+            // (two pages, often two rows each). Limiting the queue to four
+            // lets the coarse scroll work occupy the queue and leaves one
+            // page visibly soft throughout a zoom transaction. Keep this
+            // bounded: it is request metadata, not an additional pixel cache.
+            constexpr size_t maxQueuedTileRenders = 16;
             auto queuedTileCount = [&]()
             {
                 return static_cast<size_t>(std::count_if(
@@ -12558,6 +12565,14 @@ namespace
             g_contentHeight = g_continuousRead ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
             g_contentWidth = ReadingContentWidth(*tab);
         }
+        // Keep the custom scrollbar geometry in the same transaction as the
+        // content extent. Zoom can add/remove the horizontal bar and change
+        // the reader clip before WM_PAINT gets a chance to call
+        // PaintMainScrollBar; leaving the old rectangles here lets the paint
+        // code classify the new invalidation against stale geometry.
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        UpdateMainScrollRects(client);
         DisableNativeScrollbars(hwnd);
     }
 
@@ -13674,11 +13689,10 @@ namespace
         CancelStageMotion(hwnd);
         double oldZoom = tab.zoom;
         PreservePageCacheForZoomTransition(tab, oldZoom);
-        // Facing previews are keyed by page and are only valid for the zoom
-        // generation that produced them. Never stretch a preview from the
-        // previous zoom after the viewport geometry changes; the next scroll
-        // will queue a fresh bounded preview if it needs one.
-        tab.facingPreviewCache.clear();
+        // Keep complete facing previews as a safe page-level handoff while
+        // the target zoom is rendered. They are full page images, so mapping
+        // them to the new spread geometry cannot create the clipped screen
+        // rectangles produced by scaling the old reader screenshot.
         tab.facingPreviewDpi = g_dpi;
         tab.facingPreviewTheme = PdfRenderTheme();
         // Keep the old complete frame visible while the target generation is
@@ -13697,22 +13711,6 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
-        // Make the zoom gesture visible immediately from the one committed
-        // frame. This is a screen-space presentation only; it does not enter
-        // the page cache and is replaced atomically by the target generation.
-        // Keep this path for clipped facing pages too: a zoom-out can reveal
-        // an edge outside the old viewport, but it must never make the whole
-        // reader disappear while that edge renders.
-        // A zoom-out can reveal page edges that were outside the old reader
-        // viewport. A screen snapshot cannot contain those pixels, so
-        // transforming it would manufacture a clipped page border. Keep the
-        // last complete frame until the target generation supplies the full
-        // spread; zoom-in remains safe because it never reveals new edges.
-        bool sourcePagesFullyVisible = ZoomSourcePagesFullyVisible(tab);
-        bool canPresentZoomTransform = clampedZoom >= oldZoom || sourcePagesFullyVisible;
-        if (UseFacingContinuousPresentation() && canPresentZoomTransform)
-            PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
-
         // PaintPages keeps the transformed committed frame intact until the
         // target generation has complete visible coverage, then replaces it.
         CancelObsoletePageRendersForZoom(tab);
@@ -13786,13 +13784,32 @@ namespace
         }
 
         if (g_viewMode != 0 && UseTiledPageRendering(tab))
-            PrimeFacingScrollCoverage(hwnd, tab);
+        {
+            // Zooming must compete only for the target-resolution visible
+            // tiles. PrimeFacingScrollCoverage intentionally queues a coarse
+            // scroll handoff first, which kept 50%-74% facing pages blurry
+            // until the worker happened to finish level 0.
+            if (tab.zoomPresentationPending)
+                QueueVisibleZoomContent(tab);
+            else
+                PrimeFacingScrollCoverage(hwnd, tab);
+        }
         else if (!UseTiledPageRendering(tab))
             WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
+        RECT oldVerticalScroll = g_mainScrollTrackRect;
+        RECT oldHorizontalScroll = g_mainHScrollTrackRect;
         UpdateVertScrollBar(hwnd);
 
-        if (!IsRectEmpty(&g_mainScrollTrackRect)) InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
-        if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+        // Compose the new facing layout only from complete page-level sources.
+        // If an old page is not available in full, leave the previous complete
+        // frame untouched until the worker supplies a valid replacement.
+        if (UseFacingContinuousPresentation())
+            PresentZoomFallbackLayout(hwnd, tab);
+
+        RECT verticalScrollDirty = UnionRectSafe(oldVerticalScroll, g_mainScrollTrackRect);
+        RECT horizontalScrollDirty = UnionRectSafe(oldHorizontalScroll, g_mainHScrollTrackRect);
+        if (!IsRectEmpty(&verticalScrollDirty)) InvalidateRect(hwnd, &verticalScrollDirty, FALSE);
+        if (!IsRectEmpty(&horizontalScrollDirty)) InvalidateRect(hwnd, &horizontalScrollDirty, FALSE);
         InvalidateRect(hwnd, &g_stage, FALSE);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -16954,6 +16971,105 @@ namespace
         int ex = std::clamp<int>(static_cast<int>(std::ceil((drawRect.right - pageRect.left) * static_cast<double>(image.width) / pageW)), sx + 1, image.width);
         int ey = std::clamp<int>(static_cast<int>(std::ceil((drawRect.bottom - pageRect.top) * static_cast<double>(image.height) / pageH)), sy + 1, image.height);
         return DrawCachedImagePart(dc, image, drawRect, sx, sy, ex - sx, ey - sy);
+    }
+
+    bool PresentZoomFallbackLayout(HWND hwnd, PdfTab& tab)
+    {
+        if (!hwnd || tab.pageCount <= 0 || IsRectEmpty(&g_stage)) return false;
+
+        RECT reader = MainReaderPixelClip();
+        if (IsRectEmpty(&reader)) return false;
+
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HDC windowDc = GetDC(hwnd);
+        if (!windowDc) return false;
+        bool buffersReady = EnsurePaintBuffer(windowDc,
+            std::max<int>(1, client.right), std::max<int>(1, client.bottom));
+        buffersReady = buffersReady && EnsureStageFrameBuffer(windowDc,
+            std::max<int>(1, client.right), std::max<int>(1, client.bottom));
+        if (!buffersReady)
+        {
+            ReleaseDC(hwnd, windowDc);
+            return false;
+        }
+
+        HDC dc = g_paintBufferDc;
+        int state = SaveDC(dc);
+        IntersectClipRect(dc, reader.left, reader.top, reader.right, reader.bottom);
+        Fill(dc, reader, T().stage);
+
+        int firstPage = g_continuousRead
+            ? std::max(0, FirstVisibleSpreadStart(tab))
+            : FirstPageInSpread(std::clamp(tab.currentPage, 0, tab.pageCount - 1));
+        int lastPage = g_continuousRead ? tab.pageCount : NextSpreadStart(tab, firstPage);
+        bool hadVisiblePage = false;
+        bool complete = true;
+
+        for (int start = firstPage; start < lastPage && complete; start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > reader.bottom) break;
+
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                RECT visible{};
+                if (!BuildSpreadPageRect(tab, start, y, page, pageRect) ||
+                    !IntersectRect(&visible, &pageRect, &reader))
+                    continue;
+                hadVisiblePage = true;
+
+                bool painted = false;
+                if (PageImage* fallback = FindZoomFallbackPage(tab, page))
+                    painted = DrawCommittedPageImage(dc, *fallback, pageRect, visible);
+                if (!painted && UseTiledPageRendering(tab))
+                    painted = DrawCompleteOldZoomTiles(dc, tab, page, pageRect, visible);
+                if (!painted)
+                {
+                    // A facing preview is a complete page image. It is lower
+                    // resolution than the target, but is always geometrically
+                    // safe because it covers the whole source page.
+                    if (PageImage* preview = FindFacingPreviewPage(tab, page))
+                        painted = DrawCommittedPageImage(dc, *preview, pageRect, visible);
+                }
+                if (!painted)
+                {
+                    complete = false;
+                    break;
+                }
+
+                if (IsDarkTheme())
+                    AlphaFill(dc, visible, PdfOverlayColor(), PdfOverlayAlpha());
+            }
+        }
+
+        RestoreDC(dc, state);
+        if (!complete || !hadVisiblePage)
+        {
+            ReleaseDC(hwnd, windowDc);
+            return false;
+        }
+
+        int width = reader.right - reader.left;
+        int height = reader.bottom - reader.top;
+        if (!BitBlt(g_stageFrameDc, reader.left, reader.top, width, height,
+            g_paintBufferDc, reader.left, reader.top, SRCCOPY))
+        {
+            ReleaseDC(hwnd, windowDc);
+            return false;
+        }
+        g_stageFrameValid = true;
+        g_stageFrameOffsetX = 0;
+        g_stageFrameOffsetY = 0;
+        g_stageFrameMotionX = 0;
+        g_stageFrameMotionY = 0;
+        BitBlt(windowDc, reader.left, reader.top, width, height,
+            g_stageFrameDc, reader.left, reader.top, SRCCOPY);
+        ReleaseDC(hwnd, windowDc);
+        return true;
     }
 
     bool ZoomPreviewVisibleContentReady(PdfTab& tab)
@@ -22064,10 +22180,25 @@ namespace
             {
                 RECT readerDirty{};
                 if (IntersectRect(&readerDirty, &dirty, &g_stage))
+                {
+                    // The custom scrollbars are transparent overlays inside
+                    // the reader rect. The final retained-frame copy must
+                    // restore only the page pixels; copying the whole reader
+                    // rectangle here would erase the freshly painted thumbs
+                    // after every zoom or complete page commit.
+                    int frameState = SaveDC(dc);
+                    ExcludeClipRect(dc, g_mainScrollTrackRect.left,
+                        g_mainScrollTrackRect.top, g_mainScrollTrackRect.right,
+                        g_mainScrollTrackRect.bottom);
+                    ExcludeClipRect(dc, g_mainHScrollTrackRect.left,
+                        g_mainHScrollTrackRect.top, g_mainHScrollTrackRect.right,
+                        g_mainHScrollTrackRect.bottom);
                     BitBlt(dc, readerDirty.left, readerDirty.top,
                         readerDirty.right - readerDirty.left,
                         readerDirty.bottom - readerDirty.top,
                         g_stageFrameDc, readerDirty.left, readerDirty.top, SRCCOPY);
+                    RestoreDC(dc, frameState);
+                }
             }
         }
         else
@@ -22094,6 +22225,11 @@ namespace
             flushRect(g_sidebarPanelToggleRect);
             flushRect(g_tabListRect);
             flushRect(g_favoriteListStaleRect);
+            // Scrollbars are independent transparent overlays. A deferred
+            // reader paint must not defer their current thumb as well, or a
+            // zoom transaction makes them disappear until the next gesture.
+            flushRect(g_mainScrollTrackRect);
+            flushRect(g_mainHScrollTrackRect);
 
         }
         if (!IsRectEmpty(&g_favoriteListStaleRect) && Intersects(g_favoriteListStaleRect, dirty))
