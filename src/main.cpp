@@ -2624,7 +2624,10 @@ namespace
         g_mainScrollThumbRect = {};
         g_mainHScrollTrackRect = {};
         g_mainHScrollThumbRect = {};
-        if (g_immersive || g_active < 0) return;
+        // Immersive mode removes the chrome, not document navigation. Keep
+        // the custom scrollbars available for facing pages whose spread can
+        // exceed the viewport in either direction.
+        if (g_active < 0) return;
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int trackW = S(12);
@@ -12762,6 +12765,7 @@ namespace
     }
 
     RECT MainReaderPixelClip();
+    void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip);
     bool PresentShiftedStageFrameNow(HWND hwnd);
     bool EnsurePaintBuffer(HDC targetDc, int width, int height);
     bool EnsureStageFrameBuffer(HDC targetDc, int width, int height);
@@ -13632,12 +13636,15 @@ namespace
             g_stageFrameMotionY = 0;
         }
 
-        // First materialize the currently presented frame in a separate
-        // buffer. The committed frame may be offset by an active scroll; using
-        // it directly as both StretchBlt source and destination would make
-        // overlapping transforms undefined and would reintroduce stale bars.
-        Fill(g_paintBufferDc, reader, T().stage);
-        RECT visibleDest = reader;
+        // Materialize the currently presented frame in a separate buffer. The
+        // committed frame includes the page pixels underneath the transparent
+        // scrollbar overlays. Transforming only `reader` leaves those pixels
+        // at the old zoom, so a subsequent scrollbar-only repaint can expose
+        // an old page behind the track. Keep the scrollbar out of the window
+        // copy, but keep its underlay in the same transformed frame.
+        RECT sourceArea = g_stageFrameValid ? g_stage : reader;
+        Fill(g_paintBufferDc, sourceArea, T().stage);
+        RECT visibleDest = sourceArea;
         if (g_stageFrameOffsetX > 0) visibleDest.left += g_stageFrameOffsetX;
         else if (g_stageFrameOffsetX < 0) visibleDest.right += g_stageFrameOffsetX;
         if (g_stageFrameOffsetY > 0) visibleDest.top += g_stageFrameOffsetY;
@@ -13654,27 +13661,27 @@ namespace
         }
 
         RECT transformed{
-            anchor.x + static_cast<int>(std::floor((reader.left - anchor.x) * scale)),
-            anchor.y + static_cast<int>(std::floor((reader.top - anchor.y) * scale)),
-            anchor.x + static_cast<int>(std::ceil((reader.right - anchor.x) * scale)),
-            anchor.y + static_cast<int>(std::ceil((reader.bottom - anchor.y) * scale))
+            anchor.x + static_cast<int>(std::floor((sourceArea.left - anchor.x) * scale)),
+            anchor.y + static_cast<int>(std::floor((sourceArea.top - anchor.y) * scale)),
+            anchor.x + static_cast<int>(std::ceil((sourceArea.right - anchor.x) * scale)),
+            anchor.y + static_cast<int>(std::ceil((sourceArea.bottom - anchor.y) * scale))
         };
-        int sourceW = std::max<int>(1, reader.right - reader.left);
-        int sourceH = std::max<int>(1, reader.bottom - reader.top);
+        int sourceW = std::max<int>(1, sourceArea.right - sourceArea.left);
+        int sourceH = std::max<int>(1, sourceArea.bottom - sourceArea.top);
 
         // The area outside the transformed reader is part of the viewer
         // surface, not part of the old page. Keeping old pixels there makes a
         // zoom-out appear stuck at the previous size because the old page edge
         // remains visible around the smaller transformed page.
-        Fill(g_stageFrameDc, reader, T().stage);
+        Fill(g_stageFrameDc, sourceArea, T().stage);
         int frameState = SaveDC(g_stageFrameDc);
-        IntersectClipRect(g_stageFrameDc, reader.left, reader.top, reader.right, reader.bottom);
+        IntersectClipRect(g_stageFrameDc, g_stage.left, g_stage.top, g_stage.right, g_stage.bottom);
         int oldMode = SetStretchBltMode(g_stageFrameDc, COLORONCOLOR);
         StretchBlt(g_stageFrameDc,
             transformed.left, transformed.top,
             transformed.right - transformed.left,
             transformed.bottom - transformed.top,
-            g_paintBufferDc, reader.left, reader.top, sourceW, sourceH,
+            g_paintBufferDc, sourceArea.left, sourceArea.top, sourceW, sourceH,
             SRCCOPY);
         SetStretchBltMode(g_stageFrameDc, oldMode);
         RestoreDC(g_stageFrameDc, frameState);
@@ -13733,7 +13740,18 @@ namespace
         // remain the reader surface until the target-generation tiles commit;
         // they must never block the proportional input response.
         if (UseFacingContinuousPresentation())
-            PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
+        {
+            // A screen-space transform cannot restore page pixels that were
+            // outside the old reader viewport. During zoom-out that would
+            // make all four page edges appear clipped until a later repaint.
+            // Prefer the complete page-level fallback for that case; while
+            // it is being prepared, PaintPages keeps the last complete frame
+            // instead of presenting a cropped transform.
+            bool zoomOut = clampedZoom < oldZoom;
+            bool sourceFullyVisible = ZoomSourcePagesFullyVisible(tab);
+            if (!zoomOut || sourceFullyVisible)
+                PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
+        }
 
         // PaintPages keeps the transformed committed frame intact until the
         // target generation has complete visible coverage, then replaces it.
@@ -21743,15 +21761,27 @@ namespace
     bool PresentMainScrollBarNow(HWND hwnd, RECT oldThumb)
     {
         if (!hwnd || IsRectEmpty(&g_mainScrollTrackRect)) return false;
-        // Scrollbar feedback must use the same WM_PAINT compositor as the
-        // reader. A GetDC overlay can race a pending page paint and put the
-        // old thumb or its underlay back over the new frame.
         RECT dirty = oldThumb;
         UnionRect(&dirty, &dirty, &g_mainScrollThumbRect);
+        UnionRect(&dirty, &dirty, &g_mainScrollTrackRect);
         InflateRect(&dirty, S(2), S(2));
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HDC dc = GetDC(hwnd);
+        if (dc && g_stageFrameValid && RestoreStageFrame(dc, dirty))
+        {
+            // Hover and drag feedback is a small overlay transaction. Restore
+            // the clean page underlay first, then draw exactly one current
+            // thumb. This removes the previous black/green thumb instead of
+            // painting the new state on top of stale screen pixels.
+            PaintMainScrollBar(dc, client, dirty);
+            ReleaseDC(hwnd, dc);
+            return true;
+        }
+        if (dc) ReleaseDC(hwnd, dc);
         InvalidateRect(hwnd, &dirty, FALSE);
         RedrawWindow(hwnd, &dirty, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
-        return true;
+        return false;
     }
 
     void RefreshMainScrollHover(HWND hwnd, POINT point);
@@ -22066,16 +22096,20 @@ namespace
         bool scrollBarOnly = verticalScrollOnly || horizontalScrollOnly;
         if (scrollBarOnly && !RestoreStageFrame(mem, dirty))
         {
-            // A native reader scroll can invalidate the retained stage frame
-            // before this small scrollbar paint arrives. Copy the pixels that
-            // are already on screen instead of restoring an old frame or
-            // clearing the transparent track to the theme background.
-            if (!BitBlt(mem, dirty.left, dirty.top, dirtyW, dirtyH,
-                dc, dirty.left, dirty.top, SRCCOPY))
+            // Never copy the window back into the paint buffer here. The
+            // screen may still contain the previous thumb, so that fallback
+            // would turn the old overlay into the new underlay and produce a
+            // black/green double thumb. Repaint the small underlay from the
+            // current reader cache instead; if it is not available, the
+            // reader surface is the only honest fallback for a transparent
+            // scrollbar track.
+            if (PdfTab* tab = Active())
             {
-                if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty, g_homeScrollLightPaint);
-                else Fill(mem, dirty, T().bg);
+                Fill(mem, dirty, T().stage);
+                PaintPages(mem, *tab, dirty);
             }
+            else if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty, g_homeScrollLightPaint);
+            else Fill(mem, dirty, T().bg);
         }
         else if (!scrollBarOnly)
         {
@@ -22177,7 +22211,12 @@ namespace
         PaintClearRecentDialog(mem, client);
         PaintCustomZoomDialog(mem, client);
         PaintTabDragOverlay(mem);
-        if (!g_customZoomOpen) PaintHoverTip(mem, client);
+        // A zoom transaction is still showing the last committed frame. A
+        // tooltip painted on top of that frame can appear for one WM_PAINT and
+        // disappear on the atomic target-frame swap, which looks like a flash
+        // after every zoom step.
+        bool zoomPresentationPending = Active() && Active()->zoomPresentationPending;
+        if (!g_customZoomOpen && !zoomPresentationPending) PaintHoverTip(mem, client);
         auto flushRect = [&](RECT r)
         {
             RECT clipped{};
@@ -22376,6 +22415,25 @@ namespace
         {
             if (!IsRectEmpty(&oldHorizontalRect)) InvalidateRect(hwnd, &oldHorizontalRect, FALSE);
             if (!IsRectEmpty(&g_mainHScrollTrackRect)) InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+        }
+
+        // Hover is a transparent overlay. An invalidation alone can leave the
+        // old thumb visible until WM_PAINT, and the next paint may then draw
+        // the new state over it. Restore the committed underlay and publish
+        // one current scrollbar image immediately whenever hover changes.
+        if (oldVertical != g_mainScrollHover || oldHorizontal != g_mainHScrollHover)
+        {
+            RECT oldOverlay{};
+            if (oldVertical != g_mainScrollHover) oldOverlay = oldVerticalRect;
+            if (oldHorizontal != g_mainHScrollHover)
+                oldOverlay = UnionRectSafe(oldOverlay, oldHorizontalRect);
+            if (!PresentMainScrollBarNow(hwnd, oldOverlay))
+            {
+                if (oldVertical != g_mainScrollHover)
+                    InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+                if (oldHorizontal != g_mainHScrollHover)
+                    InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
+            }
         }
     }
 
