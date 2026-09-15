@@ -12741,6 +12741,8 @@ namespace
 
     constexpr ULONGLONG kZoomPresentationDebounceMs = 72;
 
+    RECT SidebarPanelToggleRectForClient(RECT client);
+
     void RequestStageRepaint(HWND hwnd, bool includeStatus)
     {
         RECT client{};
@@ -12758,6 +12760,14 @@ namespace
         {
             RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
             InvalidateRect(hwnd, &status, FALSE);
+        }
+        // The rail toggle is outside g_stage. Include it in the same update
+        // transaction so a zoom/frame commit cannot leave the expand button
+        // behind on the old surface or make it disappear until mouse motion.
+        if (Active())
+        {
+            RECT toggle = SidebarPanelToggleRectForClient(client);
+            if (!IsRectEmpty(&toggle)) InvalidateRect(hwnd, &toggle, FALSE);
         }
         g_lastStageRepaintMs = GetTickCount64();
         g_stageRepaintPending = false;
@@ -13770,6 +13780,16 @@ namespace
         // The old complete result remains the presentation frame; the new
         // result is committed only after the visible viewport is complete.
         tab.zoomPresentationPending = true;
+        // A tooltip belongs to the previous pointer/layout frame. Clear it
+        // when zoom starts; otherwise each retained-frame repaint can draw it
+        // once, then the target-frame swap can remove it, creating a flash.
+        RECT oldHoverTipRect = g_hoverTipRect;
+        bool hadHoverTip = g_hasHoverTip;
+        g_hasHoverTip = false;
+        g_hoverTipIsPdfLink = false;
+        g_hoverTip.clear();
+        if (hadHoverTip && !IsRectEmpty(&oldHoverTipRect))
+            InvalidateRect(hwnd, &oldHoverTipRect, FALSE);
         g_pageNavigationPending = false;
         // Zoom supersedes an in-flight facing scroll. If this flag survives
         // the zoom change, a later partial paint can restore the pre-zoom
@@ -22216,7 +22236,8 @@ namespace
         // disappear on the atomic target-frame swap, which looks like a flash
         // after every zoom step.
         bool zoomPresentationPending = Active() && Active()->zoomPresentationPending;
-        if (!g_customZoomOpen && !zoomPresentationPending) PaintHoverTip(mem, client);
+        if (!g_customZoomOpen && !zoomPresentationPending && !ZoomRenderDeferred())
+            PaintHoverTip(mem, client);
         auto flushRect = [&](RECT r)
         {
             RECT clipped{};
