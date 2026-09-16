@@ -1686,6 +1686,10 @@ namespace
     int g_homePresentedScrollY{};
     bool g_sidebarScrollHover{};
     bool g_sidebarPanelToggleHover{};
+    // The toggle is foreground chrome. A full reader repaint must submit it
+    // once after the window has been cleared, but subsequent page paints must
+    // leave its already-presented pixels untouched.
+    bool g_sidebarPanelTogglePresented{};
     bool g_stageRepaintPending{};
     bool g_sidebarRepaintPending{};
     bool g_sidebarResizePending{};
@@ -18415,6 +18419,39 @@ namespace
         DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
     }
 
+    void PaintSidebarPanelToggleUnderlay(HDC dc, RECT client, RECT paintRect)
+    {
+        if (!dc || IsRectEmpty(&paintRect)) return;
+        int top = g_immersive ? 0 : S(76);
+        int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+        int side = SidebarTotalWidth();
+        if (side <= 0) return;
+
+        RECT sidebarFull{ 0, top, side, client.bottom - bottom };
+        RECT rail{ 0, top, std::min<int>(S(44), sidebarFull.right), sidebarFull.bottom };
+        int state = SaveDC(dc);
+        IntersectClipRect(dc, paintRect.left, paintRect.top,
+            paintRect.right, paintRect.bottom);
+        if (IsGraphiteTheme())
+        {
+            Fill(dc, paintRect, RGB(34, 37, 41));
+        }
+        else if (IsGlassTheme())
+        {
+            // Reproduce the same base -> sidebar glass -> rail order used by
+            // Paint(), so clearing a stale toggle never creates a small
+            // rectangular patch with a different backdrop.
+            PaintGlassBackdrop(dc, paintRect, false);
+            GlassSurface(dc, sidebarFull, 128);
+            AlphaFill(dc, rail, RGB(247, 250, 253), 116);
+        }
+        else
+        {
+            Fill(dc, paintRect, T().panel);
+        }
+        RestoreDC(dc, state);
+    }
+
     void PaintSidebarPanelToggleAtomic(HDC dc, RECT client)
     {
         if (!dc || !Active()) return;
@@ -18426,7 +18463,9 @@ namespace
         // the window DC would accumulate alpha in the rounded corners.
         if (!g_paintBufferDc || !g_paintBufferBitmap)
         {
+            PaintSidebarPanelToggleUnderlay(dc, client, paintRect);
             PaintSidebarPanelToggle(dc, client);
+            g_sidebarPanelTogglePresented = true;
             return;
         }
 
@@ -18447,7 +18486,17 @@ namespace
                 RestoreStageFrame(g_paintBufferDc, paintRect);
         }
         else
-            GlassSurface(g_paintBufferDc, paintRect, 128);
+        {
+            // The expanded rail already has its authoritative GlassSurface
+            // on the window. Rebuilding only this small rectangle produces a
+            // visible rectangular patch at the panel's bottom edge. Keep the
+            // existing panel pixels and draw the overlay in place instead.
+            PaintSidebarPanelToggleUnderlay(dc, client, paintRect);
+            PaintSidebarPanelToggle(dc, client);
+            RestoreDC(g_paintBufferDc, state);
+            g_sidebarPanelTogglePresented = true;
+            return;
+        }
         PaintSidebarPanelToggle(g_paintBufferDc, client);
         RestoreDC(g_paintBufferDc, state);
 
@@ -18456,6 +18505,7 @@ namespace
             paintRect.right - paintRect.left, paintRect.bottom - paintRect.top,
             g_paintBufferDc, paintRect.left, paintRect.top, SRCCOPY);
         RestoreDC(dc, targetState);
+        g_sidebarPanelTogglePresented = true;
     }
     void PaintStatus(HDC dc, RECT client)
     {
@@ -18653,6 +18703,10 @@ namespace
             g_stageFrameOffsetY = 0;
             g_stageFrameMotionX = 0;
             g_stageFrameMotionY = 0;
+            // The rail toggle is positioned from the same viewport geometry.
+            // A first layout or sidebar transition therefore needs one fresh
+            // foreground submission even when the update region is stage-only.
+            g_sidebarPanelTogglePresented = false;
         }
         if (!side)
         {
@@ -20829,6 +20883,11 @@ namespace
         g_stageFrameMotionX = 0;
         g_stageFrameMotionY = 0;
         g_mainScrollPresentationValid = false;
+        // RefreshReaderHitGeometry updates g_stage before the first WM_PAINT,
+        // so PaintReader cannot reliably detect this viewport transition from
+        // its old-stage comparison alone. Force the sidebar toggle to rebuild
+        // against the immersive/non-immersive rail surface.
+        g_sidebarPanelTogglePresented = false;
         g_buttons.clear();
         InvalidateRect(hwnd, nullptr, TRUE);
     }
@@ -21508,6 +21567,7 @@ namespace
             g_tabListOpen = false;
             break;
         case CmdSidebarPanelToggle:
+            g_sidebarPanelTogglePresented = false;
             if (g_immersive)
             {
                 g_sidebarRailOpen = !g_sidebarRailOpen;
@@ -22464,7 +22524,10 @@ namespace
         if (nativePaintClip)
             DeleteObject(nativePaintClip);
         RECT toggleRect = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
-        bool presentToggle = !IsRectEmpty(&toggleRect) && Intersects(dirty, toggleRect);
+        bool broadStageDirty = !IsRectEmpty(&g_stage) && RectContains(dirty, g_stage);
+        bool presentToggle = !IsRectEmpty(&toggleRect) &&
+            (!g_sidebarPanelTogglePresented ||
+                (Intersects(dirty, toggleRect) && !broadStageDirty));
         // The paint rectangle is only known after PaintHoverTip calculates
         // the current box. A newly entered tooltip therefore cannot be
         // gated by the old rectangle; use the state flag for its first
