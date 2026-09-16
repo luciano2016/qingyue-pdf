@@ -12748,6 +12748,28 @@ namespace
 
     RECT SidebarPanelToggleRectForClient(RECT client);
 
+    RECT SidebarPanelTogglePaintRectForClient(RECT client)
+    {
+        RECT r = SidebarPanelToggleRectForClient(client);
+        if (IsRectEmpty(&r)) return r;
+        // DrawRoundedShadow is offset down/right and extends beyond the
+        // button. Keep that whole antialiased footprint out of page moves;
+        // protecting only the fill rect leaves dirty shadow corners behind.
+        r.left -= S(3);
+        r.top -= S(1);
+        r.right += S(5);
+        r.bottom += S(7);
+        return r;
+    }
+
+    void ExcludeSidebarPanelToggle(HDC dc, RECT client)
+    {
+        if (!dc || !Active()) return;
+        RECT toggle = SidebarPanelTogglePaintRectForClient(client);
+        if (!IsRectEmpty(&toggle))
+            ExcludeClipRect(dc, toggle.left, toggle.top, toggle.right, toggle.bottom);
+    }
+
     void RequestStageRepaint(HWND hwnd, bool includeStatus)
     {
         RECT client{};
@@ -12765,14 +12787,6 @@ namespace
         {
             RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
             InvalidateRect(hwnd, &status, FALSE);
-        }
-        // The rail toggle is outside g_stage. Include it in the same update
-        // transaction so a zoom/frame commit cannot leave the expand button
-        // behind on the old surface or make it disappear until mouse motion.
-        if (Active())
-        {
-            RECT toggle = SidebarPanelToggleRectForClient(client);
-            if (!IsRectEmpty(&toggle)) InvalidateRect(hwnd, &toggle, FALSE);
         }
         g_lastStageRepaintMs = GetTickCount64();
         g_stageRepaintPending = false;
@@ -12901,8 +12915,33 @@ namespace
                 bool shiftedFrame = ShiftStageFrameForScroll(dx, dy);
                 if (shiftedFrame)
                 {
-                    ScrollWindowEx(hwnd, dx, dy, &reader, &reader, nullptr, nullptr,
-                        SW_INVALIDATE | SW_SCROLLCHILDREN);
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
+                    RECT toggle = SidebarPanelTogglePaintRectForClient(client);
+                    RECT overlap{};
+                    bool splitToggle = !IsRectEmpty(&toggle) &&
+                        IntersectRect(&overlap, &toggle, &reader);
+                    auto scrollRect = [&](RECT part)
+                    {
+                        if (!IsRectEmpty(&part))
+                            ScrollWindowEx(hwnd, dx, dy, &part, nullptr, nullptr,
+                                nullptr, SW_INVALIDATE | SW_SCROLLCHILDREN);
+                    };
+                    if (!splitToggle)
+                    {
+                        scrollRect(reader);
+                    }
+                    else
+                    {
+                        // ScrollWindowEx's HRGN argument is an output/update
+                        // region, not an exclusion region. Split the reader
+                        // around the overlay instead, so the button's pixels
+                        // are never moved or invalidated by page scrolling.
+                        scrollRect(RECT{ reader.left, reader.top, reader.right, overlap.top });
+                        scrollRect(RECT{ reader.left, overlap.bottom, reader.right, reader.bottom });
+                        scrollRect(RECT{ reader.left, overlap.top, overlap.left, overlap.bottom });
+                        scrollRect(RECT{ overlap.right, overlap.top, reader.right, overlap.bottom });
+                    }
                     // The retained frame was rebased before the native move.
                     // Keep it valid so the exposed edge and transparent
                     // scrollbar underlay can be painted into it next.
@@ -13701,9 +13740,22 @@ namespace
         SetStretchBltMode(g_stageFrameDc, oldMode);
         RestoreDC(g_stageFrameDc, frameState);
 
-        BitBlt(windowDc, reader.left, reader.top,
-            reader.right - reader.left, reader.bottom - reader.top,
-            g_stageFrameDc, reader.left, reader.top, SRCCOPY);
+        // Present the complete stage underlay, including the pixels beneath
+        // the transparent scrollbar tracks. Copying only `reader` leaves
+        // those strips at the previous zoom while the thumb is repainted at
+        // the new zoom, which makes the scrollbar background show stale page
+        // content. The scrollbar itself is restored immediately below.
+        int windowState = SaveDC(windowDc);
+        ExcludeSidebarPanelToggle(windowDc, client);
+        BitBlt(windowDc, g_stage.left, g_stage.top,
+            g_stage.right - g_stage.left, g_stage.bottom - g_stage.top,
+            g_stageFrameDc, g_stage.left, g_stage.top, SRCCOPY);
+        RestoreDC(windowDc, windowState);
+        // The transformed copy also covers the transparent scrollbar strips.
+        // Repaint the current thumb immediately on top of that same frame;
+        // waiting for a later scrollbar-only WM_PAINT leaves the old thumb or
+        // its old underlay visible for one zoom sample.
+        PaintMainScrollBar(windowDc, client, g_stage);
         ReleaseDC(hwnd, windowDc);
         g_stageFrameOffsetX = 0;
         g_stageFrameOffsetY = 0;
@@ -13878,8 +13930,6 @@ namespace
         GetClientRect(hwnd, &client);
         RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
         InvalidateRect(hwnd, &status, FALSE);
-        RECT toggle = SidebarPanelToggleRectForClient(client);
-        if (!IsRectEmpty(&toggle)) InvalidateRect(hwnd, &toggle, FALSE);
         SchedulePagePrefetch(hwnd);
         ScheduleIdleCacheTrim(hwnd);
     }
@@ -17131,8 +17181,11 @@ namespace
         g_stageFrameOffsetY = 0;
         g_stageFrameMotionX = 0;
         g_stageFrameMotionY = 0;
+        int windowState = SaveDC(windowDc);
+        ExcludeSidebarPanelToggle(windowDc, client);
         BitBlt(windowDc, reader.left, reader.top, width, height,
             g_stageFrameDc, reader.left, reader.top, SRCCOPY);
+        RestoreDC(windowDc, windowState);
         ReleaseDC(hwnd, windowDc);
         return true;
     }
@@ -18361,6 +18414,49 @@ namespace
         RoundFill(dc, r, S(8), fill, line);
         DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
     }
+
+    void PaintSidebarPanelToggleAtomic(HDC dc, RECT client)
+    {
+        if (!dc || !Active()) return;
+        RECT paintRect = SidebarPanelTogglePaintRectForClient(client);
+        if (IsRectEmpty(&paintRect)) return;
+
+        // The shadow is translucent. Compose it on a clean underlay first,
+        // then copy the complete overlay once; painting it repeatedly onto
+        // the window DC would accumulate alpha in the rounded corners.
+        if (!g_paintBufferDc || !g_paintBufferBitmap)
+        {
+            PaintSidebarPanelToggle(dc, client);
+            return;
+        }
+
+        int state = SaveDC(g_paintBufferDc);
+        IntersectClipRect(g_paintBufferDc, paintRect.left, paintRect.top,
+            paintRect.right, paintRect.bottom);
+        if (!SidebarRailVisible())
+        {
+            // Rebuild the small underlay from the same stage/page path used
+            // by the reader. A raw retained-frame copy can contain undefined
+            // pixels outside its last committed dirty edge, which shows up as
+            // a rectangular patch around the translucent shadow.
+            Fill(g_paintBufferDc, paintRect, T().stage);
+            PdfTab* tab = Active();
+            if (tab && !tab->zoomPresentationPending && !ZoomRenderDeferred())
+                PaintPages(g_paintBufferDc, *tab, paintRect);
+            else if (g_stageFrameValid && g_stageFrameDc)
+                RestoreStageFrame(g_paintBufferDc, paintRect);
+        }
+        else
+            GlassSurface(g_paintBufferDc, paintRect, 128);
+        PaintSidebarPanelToggle(g_paintBufferDc, client);
+        RestoreDC(g_paintBufferDc, state);
+
+        int targetState = SaveDC(dc);
+        BitBlt(dc, paintRect.left, paintRect.top,
+            paintRect.right - paintRect.left, paintRect.bottom - paintRect.top,
+            g_paintBufferDc, paintRect.left, paintRect.top, SRCCOPY);
+        RestoreDC(dc, targetState);
+    }
     void PaintStatus(HDC dc, RECT client)
     {
         PdfTab* tab = Active();
@@ -18702,7 +18798,7 @@ namespace
             RECT splitter{ side, top, side + std::max(1, S(1)), client.bottom - bottom };
             GlassDivider(dc, splitter);
         }
-        PaintSidebarPanelToggle(dc, client);
+        PaintSidebarPanelToggleAtomic(dc, client);
         PaintStatus(dc, client);
         ReleaseDC(hwnd, dc);
 
@@ -21947,6 +22043,9 @@ namespace
         if (!dc) return false;
         int state = SaveDC(dc);
         IntersectClipRect(dc, reader.left, reader.top, reader.right, reader.bottom);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        ExcludeSidebarPanelToggle(dc, client);
         // The drag path must not share the WM_PAINT back buffer. A paint can
         // clear or partially redraw that buffer immediately after the input
         // sample; copying from it here was the source of transient black
@@ -22080,6 +22179,28 @@ namespace
         }
     }
 
+    void PresentForegroundChrome(HWND hwnd, bool presentToggle, bool presentTip)
+    {
+        if (!hwnd || (!presentToggle && !presentTip)) return;
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        HDC dc = GetDC(hwnd);
+        if (!dc) return;
+
+        // A scrollbar repaint can have a clip that covers only the scrollbar
+        // strip. The rail toggle overlaps that strip near the lower-left
+        // corner, so drawing it inside that clipped WM_PAINT can submit only
+        // half of the button. Re-submit the complete chrome rect after
+        // EndPaint, when no update-region clip can truncate it.
+        if (presentToggle && !g_favoriteListOpen && !g_tabListOpen)
+            PaintSidebarPanelToggleAtomic(dc, client);
+
+        bool zoomPresentationPending = Active() && Active()->zoomPresentationPending;
+        if (presentTip && !g_customZoomOpen && !zoomPresentationPending && !ZoomRenderDeferred())
+            PaintHoverTip(dc, client);
+        ReleaseDC(hwnd, dc);
+    }
+
     void Paint(HWND hwnd)
     {
         PAINTSTRUCT ps{};
@@ -22088,6 +22209,7 @@ namespace
         GetClientRect(hwnd, &client);
         RECT dirty = ps.rcPaint;
         if (IsRectEmpty(&dirty)) dirty = client;
+        RECT protectedToggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
         int dirtyW = std::max<int>(1, dirty.right - dirty.left);
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
         if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
@@ -22228,7 +22350,6 @@ namespace
         }
         if (!scrollBarOnly)
             PaintMainScrollBar(mem, client, dirty);
-        PaintSidebarPanelToggle(mem, client);
         if (repaintUi) PaintStatus(mem, client);
         PaintTabListOverlay(mem, client);
         PaintClearRecentDialog(mem, client);
@@ -22238,9 +22359,6 @@ namespace
         // tooltip painted on top of that frame can appear for one WM_PAINT and
         // disappear on the atomic target-frame swap, which looks like a flash
         // after every zoom step.
-        bool zoomPresentationPending = Active() && Active()->zoomPresentationPending;
-        if (!g_customZoomOpen && !zoomPresentationPending && !ZoomRenderDeferred())
-            PaintHoverTip(mem, client);
         auto flushRect = [&](RECT r)
         {
             RECT clipped{};
@@ -22248,11 +22366,23 @@ namespace
             int w = clipped.right - clipped.left;
             int h = clipped.bottom - clipped.top;
             if (w > 0 && h > 0)
+            {
+                int state = SaveDC(dc);
+                if (!IsRectEmpty(&protectedToggle))
+                    ExcludeClipRect(dc, protectedToggle.left, protectedToggle.top,
+                        protectedToggle.right, protectedToggle.bottom);
                 BitBlt(dc, clipped.left, clipped.top, w, h, mem, clipped.left, clipped.top, SRCCOPY);
+                RestoreDC(dc, state);
+            }
         };
         if (shouldFlush)
         {
+            int state = SaveDC(dc);
+            if (!IsRectEmpty(&protectedToggle))
+                ExcludeClipRect(dc, protectedToggle.left, protectedToggle.top,
+                    protectedToggle.right, protectedToggle.bottom);
             BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
+            RestoreDC(dc, state);
             // The page frame is the authoritative surface for facing views.
             // A nested layout correction can leave the memory-DC copy behind
             // a stale reader repaint even though CommitStageFrame succeeded.
@@ -22280,6 +22410,9 @@ namespace
                     ExcludeClipRect(dc, g_mainHScrollTrackRect.left,
                         g_mainHScrollTrackRect.top, g_mainHScrollTrackRect.right,
                         g_mainHScrollTrackRect.bottom);
+                    if (!IsRectEmpty(&protectedToggle))
+                        ExcludeClipRect(dc, protectedToggle.left, protectedToggle.top,
+                            protectedToggle.right, protectedToggle.bottom);
                     BitBlt(dc, readerDirty.left, readerDirty.top,
                         readerDirty.right - readerDirty.left,
                         readerDirty.bottom - readerDirty.top,
@@ -22309,14 +22442,13 @@ namespace
             // stage commit, flushing these rectangles would copy the freshly
             // cleared back-buffer background over the page and expose bars.
             // Keep the previous page frame until the next complete commit.
-            flushRect(g_sidebarPanelToggleRect);
             flushRect(g_tabListRect);
             flushRect(g_favoriteListStaleRect);
             // During a zoom transaction the tooltip state is retained but
             // its old pixels must still be erased from the screen. The next
             // timer tick invalidates this same rect and draws it again after
             // the target frame is committed.
-            if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
+            if (!IsRectEmpty(&g_hoverTipPaintRect))
                 flushRect(g_hoverTipPaintRect);
             // Scrollbars are independent transparent overlays. A deferred
             // reader paint must not defer their current thumb as well, or a
@@ -22328,9 +22460,22 @@ namespace
         if (!IsRectEmpty(&g_favoriteListStaleRect) && Intersects(g_favoriteListStaleRect, dirty))
             g_favoriteListStaleRect = {};
         RestoreDC(mem, paintState);
+
         if (nativePaintClip)
             DeleteObject(nativePaintClip);
+        RECT toggleRect = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
+        bool presentToggle = !IsRectEmpty(&toggleRect) && Intersects(dirty, toggleRect);
+        // The paint rectangle is only known after PaintHoverTip calculates
+        // the current box. A newly entered tooltip therefore cannot be
+        // gated by the old rectangle; use the state flag for its first
+        // presentation, while the old rectangle still handles cleanup.
+        bool presentTip = Intersects(dirty, g_hoverTipPaintRect) ||
+            Intersects(dirty, g_hoverTipRect);
         EndPaint(hwnd, &ps);
+        // These are foreground chrome overlays, not part of the retained PDF
+        // frame. Submit them after EndPaint so a scrollbar-only clip cannot
+        // truncate the rail toggle or the tooltip.
+        PresentForegroundChrome(hwnd, presentToggle, presentTip);
     }
 
     bool HandleDocumentArrowKey(HWND hwnd, WPARAM key)
@@ -24931,13 +25076,6 @@ namespace
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
                     InvalidateRect(hwnd, &g_hoverTipPaintRect, FALSE);
-                if (Active())
-                {
-                    RECT client{};
-                    GetClientRect(hwnd, &client);
-                    RECT toggle = SidebarPanelToggleRectForClient(client);
-                    if (!IsRectEmpty(&toggle)) InvalidateRect(hwnd, &toggle, FALSE);
-                }
                 SchedulePagePrefetch(hwnd);
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
