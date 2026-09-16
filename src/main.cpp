@@ -13797,33 +13797,6 @@ namespace
             anchorX = std::clamp(static_cast<double>(clientPt.x - pageRect.left) / static_cast<double>(pageW), 0.0, 1.0);
             anchorY = std::clamp(static_cast<double>(clientPt.y - pageRect.top) / static_cast<double>(pageH), 0.0, 1.0);
         }
-        // Give every wheel sample an immediate visual response from the last
-        // committed frame. The renderer still owns the target generation and
-        // replaces this transformed frame atomically when both pages are
-        // complete. Without this handoff, low zoom steps only changed the
-        // status value while PaintPages kept returning the old frame until a
-        // worker result arrived, making 50%-74% look frozen.
-        //
-        // The retained frame is the input-stage presentation source. It must
-        // be transformed for both zoom directions: gating zoom-out on the old
-        // pages being fully inside the reader makes an oversized page stay at
-        // the old ratio until a worker result arrives. Newly exposed edges
-        // remain the reader surface until the target-generation tiles commit;
-        // they must never block the proportional input response.
-        if (UseFacingContinuousPresentation())
-        {
-            // A screen-space transform cannot restore page pixels that were
-            // outside the old reader viewport. During zoom-out that would
-            // make all four page edges appear clipped until a later repaint.
-            // Prefer the complete page-level fallback for that case; while
-            // it is being prepared, PaintPages keeps the last complete frame
-            // instead of presenting a cropped transform.
-            bool zoomOut = clampedZoom < oldZoom;
-            bool sourceFullyVisible = ZoomSourcePagesFullyVisible(tab);
-            if (!zoomOut || sourceFullyVisible)
-                PresentZoomTransform(hwnd, clientPt, clampedZoom / oldZoom);
-        }
-
         // PaintPages keeps the transformed committed frame intact until the
         // target generation has complete visible coverage, then replaces it.
         CancelObsoletePageRendersForZoom(tab);
@@ -13859,6 +13832,7 @@ namespace
 
         auto restoreHorizontalAnchor = [&]()
         {
+            if (UseFacingContinuousPresentation()) return;
             int savedScrollX = g_scrollX;
             g_scrollX = 0;
             RECT newPageRect{};
@@ -13887,6 +13861,8 @@ namespace
             int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
             g_scrollY = std::clamp(desiredScroll, 0, maxScroll);
             tab.currentPage = PageFromScroll(tab, g_scrollY);
+            if (UseFacingContinuousPresentation())
+                g_scrollX = PreferredFacingScrollX(tab);
             TouchRecentProgress(tab, false);
             SyncSidebarProgressFromScroll(hwnd, tab);
         }
@@ -13898,6 +13874,8 @@ namespace
             g_contentWidth = ReadingContentWidth(tab);
             restoreHorizontalAnchor();
             g_scrollY = std::clamp(desiredScroll, 0, SinglePageMaxScroll(tab));
+            if (UseFacingContinuousPresentation())
+                g_scrollX = PreferredFacingScrollX(tab);
             TouchRecentProgress(tab, false);
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
@@ -13922,8 +13900,13 @@ namespace
         // Compose the new facing layout only from complete page-level sources.
         // If an old page is not available in full, leave the previous complete
         // frame untouched until the worker supplies a valid replacement.
-        if (UseFacingContinuousPresentation())
-            PresentZoomFallbackLayout(hwnd, tab);
+        // The transition surface must be made from complete cached pages at
+        // the target geometry. A transformed screenshot of the old viewport
+        // has no pixels for a page portion that was previously outside the
+        // viewport, so it exposes the reader background at the lower/right
+        // edge during zoom. This page-level handoff works for single, double,
+        // and book layouts and keeps the layout's own centering rules.
+        PresentZoomFallbackLayout(hwnd, tab);
 
         RECT verticalScrollDirty = UnionRectSafe(oldVerticalScroll, g_mainScrollTrackRect);
         RECT horizontalScrollDirty = UnionRectSafe(oldHorizontalScroll, g_mainHScrollTrackRect);
@@ -17096,7 +17079,12 @@ namespace
     {
         if (!hwnd || tab.pageCount <= 0 || IsRectEmpty(&g_stage)) return false;
 
-        RECT reader = MainReaderPixelClip();
+        // The custom scrollbars are transparent overlays. Their track area
+        // still needs the same target-generation page underlay as the rest
+        // of the stage; composing only MainReaderPixelClip() leaves the
+        // previous zoom's pixels under the track and creates a thin, shifted
+        // strip along the right/bottom edge.
+        RECT reader = g_stage;
         if (IsRectEmpty(&reader)) return false;
 
         RECT client{};
