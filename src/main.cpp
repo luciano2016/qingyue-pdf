@@ -447,6 +447,12 @@ namespace
         int outlineMetadataRetryCount{};
         int metadataPagesLoaded{};
         bool metadataGeometryComplete{};
+        // The annotation index is loaded independently of the first paint.
+        // Keep its completion state so an edit can synchronously establish a
+        // complete baseline before a save, and so late metadata cannot erase
+        // edits made while the background request was running.
+        bool annotationsMetadataLoaded{};
+        bool annotationsMetadataRequested{};
         int outlineCollapseVersion{};
         // Startup restoration initially uses a fallback page-size index. Keep
         // the saved position as an offset from its page so the final geometry
@@ -1161,6 +1167,7 @@ namespace
         using MatchPageNumberFn = int(__cdecl*)(fz_context*, fz_document*, int, const char*, int*, fz_quad*, int, int);
         using SaveAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, const char*, const QuietPdfAnnotation*, int);
         using LoadAnnotationsFn = int(__cdecl*)(fz_context*, fz_document*, QuietPdfAnnotationInfo*, int);
+        using LastErrorFn = const char*(__cdecl*)();
         using PageBoundsFn = int(__cdecl*)(fz_context*, fz_document*, fz_rect*, int);
         using PageBoundsRangeFn = int(__cdecl*)(fz_context*, fz_document*, int, fz_rect*, int);
         using SelectTextFn = int(__cdecl*)(fz_context*, fz_document*, int, float, float, float, float, fz_quad*, int, char*, int);
@@ -1233,6 +1240,7 @@ namespace
             GetOptional(matchPageNumber, "fz_match_page_number");
             Get(saveAnnotations, "quiet_pdf_save_annotations");
             Get(loadAnnotations, "quiet_pdf_load_annotations");
+            GetOptional(lastError, "quiet_pdf_last_error");
             Get(pageBounds, "quiet_pdf_get_page_bounds");
             GetOptional(pageBoundsRange, "quiet_pdf_get_page_bounds_range");
             Get(selectText, "quiet_pdf_select_text");
@@ -1288,6 +1296,7 @@ namespace
         MatchPageNumberFn matchPageNumber{};
         SaveAnnotationsFn saveAnnotations{};
         LoadAnnotationsFn loadAnnotations{};
+        LastErrorFn lastError{};
         PageBoundsFn pageBounds{};
         PageBoundsRangeFn pageBoundsRange{};
         SelectTextFn selectText{};
@@ -1471,6 +1480,7 @@ namespace
     constexpr UINT WM_QUIETPDF_HOME_SCROLL_FRAME = WM_APP + 45;
     constexpr UINT WM_QUIETPDF_REFRESH_FILE_WATCH = WM_APP + 46;
     constexpr UINT WM_QUIETPDF_RETRY_OUTLINE = WM_APP + 47;
+    constexpr UINT WM_QUIETPDF_RETRY_ANNOTATIONS = WM_APP + 48;
 
     struct PageRenderRequest
     {
@@ -1488,11 +1498,13 @@ namespace
         double zoom{};
         double renderZoom{};
         bool metadata{};
+        bool annotationsMetadata{};
         int metadataPageCount{};
         int metadataPageStart{};
         int metadataPhase{};
         int metadataBatchSize{};
         bool thumbnail{};
+        int thumbnailSize{};
         bool facingPreview{};
         int level{};
         unsigned long long viewportGeneration{};
@@ -1509,13 +1521,14 @@ namespace
         std::vector<OutlineItem> metadataOutline;
         std::vector<PdfAnnotation> metadataAnnotations;
         bool metadataOutlineRead{};
+        bool metadataAnnotationsRead{};
     };
     bool EnsureImageDib(PageImage& image);
     bool DrawCachedImagePart(HDC dc, PageImage& image, RECT dest, int sx, int sy, int sw, int sh);
     bool DrawCachedImage(HDC dc, PageImage& image, RECT dest);
     void LoadPageGeometry(PdfTab& tab);
     void CollectOutline(PdfTab& tab, fz_outline* item, int depth);
-    void LoadAnnotationsFromPdf(PdfTab& tab);
+    bool LoadAnnotationsFromPdf(PdfTab& tab);
     void ResetSuspendedMetadataRequest(PageRenderRequest const& request);
 
     std::mutex g_pageRenderMutex;
@@ -1581,6 +1594,10 @@ namespace
     int g_thumbSize{ 116 };
     constexpr int ThumbSizeMin = 82;
     constexpr int ThumbSizeMax = 320;
+    // Thumbnail quality is independent from the sidebar slider. Render one
+    // stable source bitmap at the largest supported display width, then scale
+    // that bitmap while the user drags the slider.
+    constexpr int ThumbnailRenderWidth = ThumbSizeMax;
     int g_homeThumbWidth{};
     int g_homeScrollY{};
     int g_homeContentHeight{};
@@ -1591,6 +1608,10 @@ namespace
     int g_contextTab{ -1 };
     int g_contextRecent{ -1 };
     int g_contextFavorite{ -1 };
+    PdfTab* g_contextImageTab{};
+    int g_contextImagePage{ -1 };
+    RECT g_contextImagePageRect{};
+    fz_rect g_contextImageNorm{};
     int g_lastSessionActive{ -1 };
     int g_searchCurrent{};
     int g_selectedOutlineRow{ -1 };
@@ -1796,6 +1817,10 @@ namespace
     int g_outlineSearchCaretIndex{};
     int g_pageCaretIndex{};
     int g_homeSearchCaretIndex{};
+    int g_searchSelectionAnchor{ -1 };
+    int g_outlineSearchSelectionAnchor{ -1 };
+    int g_pageSelectionAnchor{ -1 };
+    int g_homeSearchSelectionAnchor{ -1 };
     std::wstring g_homeSearchQuery;
     std::vector<SearchResult> g_searchResults;
     std::set<int> g_collapsedOutlineRows;
@@ -1897,6 +1922,101 @@ namespace
     {
         return g_confirmClearRecent || g_confirmDeleteAllAnnotations;
     }
+
+    int CaretXCurrentFont(HDC dc, const std::wstring& text, RECT r, int index, bool centered);
+
+    bool EditorHasSelection(int caret, int anchor)
+    {
+        return anchor >= 0 && anchor != caret;
+    }
+
+    void EditorClamp(std::wstring const& text, int& caret, int& anchor)
+    {
+        int length = static_cast<int>(text.size());
+        caret = std::clamp(caret, 0, length);
+        if (anchor >= 0) anchor = std::clamp(anchor, 0, length);
+    }
+
+    void EditorSelectAll(std::wstring const& text, int& caret, int& anchor)
+    {
+        anchor = 0;
+        caret = static_cast<int>(text.size());
+    }
+
+    void EditorMove(std::wstring const& text, int& caret, int& anchor,
+        UINT key, bool extendSelection)
+    {
+        EditorClamp(text, caret, anchor);
+        if (extendSelection)
+        {
+            if (anchor < 0) anchor = caret;
+            if (key == VK_LEFT) caret = std::max(0, caret - 1);
+            else if (key == VK_RIGHT) caret = std::min(static_cast<int>(text.size()), caret + 1);
+            else if (key == VK_HOME) caret = 0;
+            else if (key == VK_END) caret = static_cast<int>(text.size());
+            return;
+        }
+
+        if (EditorHasSelection(caret, anchor))
+        {
+            int start = std::min(caret, anchor);
+            int end = std::max(caret, anchor);
+            if (key == VK_LEFT || key == VK_HOME) caret = start;
+            else if (key == VK_RIGHT || key == VK_END) caret = end;
+            anchor = -1;
+            return;
+        }
+
+        anchor = -1;
+        if (key == VK_LEFT) caret = std::max(0, caret - 1);
+        else if (key == VK_RIGHT) caret = std::min(static_cast<int>(text.size()), caret + 1);
+        else if (key == VK_HOME) caret = 0;
+        else if (key == VK_END) caret = static_cast<int>(text.size());
+    }
+
+    bool EditorDeleteSelection(std::wstring& text, int& caret, int& anchor)
+    {
+        EditorClamp(text, caret, anchor);
+        if (!EditorHasSelection(caret, anchor)) return false;
+        int start = std::min(caret, anchor);
+        int end = std::max(caret, anchor);
+        text.erase(static_cast<size_t>(start), static_cast<size_t>(end - start));
+        caret = start;
+        anchor = -1;
+        return true;
+    }
+
+    bool EditorBackspace(std::wstring& text, int& caret, int& anchor)
+    {
+        if (EditorDeleteSelection(text, caret, anchor)) return true;
+        EditorClamp(text, caret, anchor);
+        if (caret <= 0) return false;
+        text.erase(static_cast<size_t>(caret - 1), 1);
+        --caret;
+        return true;
+    }
+
+    bool EditorDeleteForward(std::wstring& text, int& caret, int& anchor)
+    {
+        if (EditorDeleteSelection(text, caret, anchor)) return true;
+        EditorClamp(text, caret, anchor);
+        if (caret >= static_cast<int>(text.size())) return false;
+        text.erase(static_cast<size_t>(caret), 1);
+        return true;
+    }
+
+    bool EditorInsert(std::wstring& text, int& caret, int& anchor, wchar_t ch, size_t maxLength)
+    {
+        if (text.size() >= maxLength && !EditorHasSelection(caret, anchor)) return false;
+        EditorDeleteSelection(text, caret, anchor);
+        if (text.size() >= maxLength) return false;
+        text.insert(text.begin() + caret, ch);
+        ++caret;
+        return true;
+    }
+
+    void PaintEditorSelection(HDC dc, std::wstring const& text, RECT box,
+        int caret, int anchor, bool centered);
     RECT g_zoomDialogRect{};
     RECT g_zoomDialogInputRect{};
     RECT g_zoomDialogConfirmRect{};
@@ -1914,6 +2034,7 @@ namespace
     bool g_customZoomFocused{};
     std::wstring g_customZoomText;
     size_t g_customZoomCaretIndex{};
+    int g_customZoomSelectionAnchor{ -1 };
     struct ThemedMenuItem
     {
         std::wstring text;
@@ -2010,6 +2131,29 @@ namespace
     {
         if (!SidebarRailVisible()) return 0;
         return std::max<int>(S(44), g_sidebarOpen ? g_sidebarWidth : S(44));
+    }
+
+    void InvalidateSidebarChrome(HWND hwnd)
+    {
+        if (!hwnd) return;
+
+        RECT client{};
+        if (!GetClientRect(hwnd, &client)) return;
+
+        int top = g_immersive ? 0 : S(76);
+        int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+        int side = SidebarTotalWidth();
+        if (side <= 0) return;
+
+        // The one-pixel divider belongs to the sidebar's presentation band.
+        // Invalidate it together with the sidebar so BeginPaint's native clip
+        // always contains the divider; a separate GetDC draw can otherwise be
+        // overwritten or clipped on the first document paint.
+        int splitW = std::max(1, S(1));
+        RECT sidebarChrome{ 0, top, side + splitW, client.bottom - bottom };
+        if (!IsRectEmpty(&sidebarChrome))
+            RedrawWindow(hwnd, &sidebarChrome, nullptr,
+                RDW_INVALIDATE | RDW_NOERASE);
     }
 
     bool UsesBackdropTheme()
@@ -2622,6 +2766,7 @@ namespace
     }
 
     RECT HomeContentViewportRect(RECT client);
+    RECT SidebarPanelTogglePaintRectForClient(RECT client);
 
     void UpdateMainScrollRects(RECT client)
     {
@@ -2636,7 +2781,10 @@ namespace
         int stageH = std::max<int>(1, g_stage.bottom - g_stage.top);
         int stageW = std::max<int>(1, g_stage.right - g_stage.left);
         int trackW = S(12);
-        int gutter = S(3);
+        // The fixed track is a true edge slot. Keeping a gutter here makes
+        // the thumb look detached from its rail, especially when the reader
+        // background is close to the window background.
+        int gutter = 0;
         bool presentationActive = g_mainScrollPresentationValid &&
             g_mainScrollPresentationStageHeight == stageH &&
             (g_stageLightPaintUntil != 0 && GetTickCount64() < g_stageLightPaintUntil ||
@@ -2667,7 +2815,10 @@ namespace
             }
             else
             {
-                g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top + S(8), client.right - gutter, g_stage.bottom - S(8) };
+                // Let the two fixed slots overlap at the bottom-right corner.
+                // Both slots use the same opaque track surface, so the
+                // intersection is a filled corner rather than a missing tile.
+                g_mainScrollTrackRect = RECT{ client.right - gutter - trackW, g_stage.top, client.right - gutter, g_stage.bottom };
             }
             int trackH = std::max<int>(1, g_mainScrollTrackRect.bottom - g_mainScrollTrackRect.top);
             int mappedContentHeight = std::max<int>(1, mappedMaxScroll + mappedStageH);
@@ -2690,15 +2841,25 @@ namespace
         if (g_contentWidth > stageW + 1)
         {
             int trackH = S(12);
-            int rightInset = IsRectEmpty(&g_mainScrollTrackRect) ? S(16) : S(22);
-            g_mainHScrollTrackRect = RECT{ g_stage.left + S(14), g_stage.bottom - gutter - trackH, g_stage.right - rightInset, g_stage.bottom - gutter };
-            int trackLen = std::max<int>(1, g_mainHScrollTrackRect.right - g_mainHScrollTrackRect.left);
-            int thumbW = std::clamp(MulDiv(stageW, trackLen, std::max(1, g_contentWidth)), S(40), trackLen);
-            int maxScroll = std::max<int>(1, g_contentWidth - stageW);
-            int thumbTravel = std::max<int>(0, trackLen - thumbW);
-            int thumbLeft = g_mainHScrollTrackRect.left + MulDiv(g_scrollX, thumbTravel, maxScroll);
-            if (g_scrollX >= maxScroll) thumbLeft = g_mainHScrollTrackRect.right - thumbW;
-            g_mainHScrollThumbRect = RECT{ thumbLeft, g_mainHScrollTrackRect.top, thumbLeft + thumbW, g_mainHScrollTrackRect.bottom };
+            // If both bars exist, the vertical rail owns the lower-right
+            // corner. Stop the horizontal rail at its left edge so the two
+            // opaque surfaces never paint over one another.
+            int horizontalRight = g_stage.right;
+            if (!IsRectEmpty(&g_mainScrollTrackRect))
+                horizontalRight = std::min(horizontalRight, static_cast<int>(g_mainScrollTrackRect.left));
+            if (horizontalRight > g_stage.left)
+                g_mainHScrollTrackRect = RECT{ g_stage.left, g_stage.bottom - gutter - trackH,
+                    horizontalRight, g_stage.bottom - gutter };
+            if (!IsRectEmpty(&g_mainHScrollTrackRect))
+            {
+                int trackLen = std::max<int>(1, g_mainHScrollTrackRect.right - g_mainHScrollTrackRect.left);
+                int thumbW = std::clamp(MulDiv(stageW, trackLen, std::max(1, g_contentWidth)), S(40), trackLen);
+                int maxScroll = std::max<int>(1, g_contentWidth - stageW);
+                int thumbTravel = std::max<int>(0, trackLen - thumbW);
+                int thumbLeft = g_mainHScrollTrackRect.left + MulDiv(g_scrollX, thumbTravel, maxScroll);
+                if (g_scrollX >= maxScroll) thumbLeft = g_mainHScrollTrackRect.right - thumbW;
+                g_mainHScrollThumbRect = RECT{ thumbLeft, g_mainHScrollTrackRect.top, thumbLeft + thumbW, g_mainHScrollTrackRect.bottom };
+            }
         }
     }
 
@@ -2726,7 +2887,8 @@ namespace
 
     PdfTab* Active();
     void SyncSidebarProgressFromScrollFast(HWND hwnd, PdfTab& tab, int scrollY);
-    bool PresentMainScrollBarNow(HWND hwnd, RECT oldThumb);
+    void PaintMainScrollTrackBackground(HDC dc, RECT paintClip);
+    bool PresentMainScrollBarNow(HWND hwnd, RECT oldVerticalOverlay = {}, RECT oldHorizontalOverlay = {});
     void ScrollStageTo(HWND hwnd, int newScrollY, bool animatedFrame,
         bool immediateRepaint, bool dragFrame);
 
@@ -2800,13 +2962,10 @@ namespace
 
     }
 
-    void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip)
+    void PaintMainScrollThumbs(HDC dc, RECT paintClip)
     {
-        UpdateMainScrollRects(client);
         if (!IsRectEmpty(&g_mainScrollTrackRect) && (Intersects(paintClip, g_mainScrollTrackRect) || Intersects(paintClip, g_mainScrollThumbRect)))
         {
-            // The track is an overlay: leave its background transparent so
-            // the page or reading surface remains visible underneath it.
             // Hover is maintained from WM_MOUSEMOVE/WM_NCMOUSEMOVE in client
             // coordinates. Do not sample the system cursor again here: a
             // paint can run after capture or DPI conversion changed the
@@ -2825,6 +2984,28 @@ namespace
             RECT visualH{ g_mainHScrollThumbRect.left, centerY - h / 2, g_mainHScrollThumbRect.right, centerY + (h + 1) / 2 };
             RoundFill(dc, visualH, S(5), ScrollThumbColor(hActive), ScrollThumbColor(hActive));
         }
+    }
+
+    void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip)
+    {
+        UpdateMainScrollRects(client);
+        // The track is a fixed reader-surface slot, not a transparent window
+        // over the PDF. Page pixels are clipped before this point, so filling
+        // the slot is deterministic and never requires restoring an old page.
+        PaintMainScrollTrackBackground(dc, paintClip);
+        PaintMainScrollThumbs(dc, paintClip);
+    }
+
+    void PaintMainScrollTrackBackground(HDC dc, RECT paintClip)
+    {
+        auto fillTrack = [&](RECT track)
+        {
+            RECT clipped{};
+            if (IntersectRect(&clipped, &track, &paintClip))
+                Fill(dc, clipped, ScrollTrackColor());
+        };
+        fillTrack(g_mainScrollTrackRect);
+        fillTrack(g_mainHScrollTrackRect);
     }
 
     void UpdateHomeScrollRects(RECT client)
@@ -3212,6 +3393,19 @@ namespace
         return std::clamp<int>(x, static_cast<int>(r.left) + S(1), static_cast<int>(r.right) - S(2));
     }
 
+    void PaintEditorSelection(HDC dc, std::wstring const& text, RECT box,
+        int caret, int anchor, bool centered)
+    {
+        if (!EditorHasSelection(caret, anchor) || text.empty()) return;
+        int start = std::min(caret, anchor);
+        int end = std::max(caret, anchor);
+        int x1 = CaretXCurrentFont(dc, text, box, start, centered);
+        int x2 = CaretXCurrentFont(dc, text, box, end, centered);
+        RECT selected{ std::min(x1, x2), box.top + S(3), std::max(x1, x2), box.bottom - S(3) };
+        if (selected.right > selected.left)
+            Fill(dc, selected, MixColor(T().accent, T().paper, IsDarkTheme() ? 0.28 : 0.12));
+    }
+
     int CaretIndexFromPoint(HWND hwnd, const std::wstring& text, RECT r, int fontPt, int x, bool centered)
     {
         HDC dc = GetDC(hwnd);
@@ -3317,11 +3511,26 @@ namespace
         return rows;
     }
 
+    int OutlinePageColumnWidth(HDC dc, PdfTab const& tab)
+    {
+        int maxPage = 0;
+        for (OutlineItem const& item : tab.outline)
+            maxPage = std::max(maxPage, item.page + 1);
+
+        std::wstring pageText = std::to_wstring(maxPage);
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, pageText.c_str(), static_cast<int>(pageText.size()), &extent);
+        // Keep enough room for the widest page number plus a small gap from
+        // the title and a stable right inset. The same column is used by the
+        // layout and paint passes so wrapping cannot drift from the hit rows.
+        return std::max<int>(S(28), extent.cx + S(10));
+    }
+
     void EnsureOutlineLayout(HDC dc, PdfTab& tab, int layoutWidth)
     {
         std::vector<int> displayRows = FilteredOutlineRows(tab);
         int rows = static_cast<int>(displayRows.size());
-        bool compactOutline = tab.outline.size() > 512;
+        int pageColumnWidth = OutlinePageColumnWidth(dc, tab);
         if ((g_resizingSidebar || g_sidebarAnimating) && !tab.outlineLayout.empty())
         {
             g_sidebarContentHeight = tab.outlineLayoutContentHeight;
@@ -3354,12 +3563,11 @@ namespace
             int baseRowH = S(depth == 0 ? 32 : 28);
             int lineX = g_sidebar.left + S(10 + depth * 18);
             int iconLeft = lineX + S(12);
-            int pageLeft = g_sidebar.right - S(30);
+            int pageRight = g_sidebar.right - S(6);
+            int pageLeft = pageRight - pageColumnWidth;
             int textWidth = std::max(24, pageLeft - (iconLeft + S(10) + S(5)) - S(4));
             std::wstring label = tab.outline[static_cast<size_t>(i)].title;
-            int textH = compactOutline
-                ? S(16)
-                : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            int textH = MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
             int rowH = std::max(baseRowH, textH + S(8));
             int page = tab.outline[static_cast<size_t>(i)].page;
             int nextIndex = displayIndex + 1 < rows ? displayRows[static_cast<size_t>(displayIndex + 1)] : -1;
@@ -7247,7 +7455,7 @@ namespace
             for (auto const& entry : tab.facingPreviewCache) total += entry.second.CacheBytes();
             return total;
         };
-        while (tab.facingPreviewCache.size() > 4 || cacheBytes() > 16ull * 1024ull * 1024ull)
+        while (tab.facingPreviewCache.size() > 8 || cacheBytes() > 40ull * 1024ull * 1024ull)
         {
             auto victim = tab.facingPreviewCache.end();
             int worstDistance = -1;
@@ -7510,7 +7718,9 @@ namespace
             a.zoom == b.zoom && a.renderZoom == b.renderZoom && a.metadata == b.metadata &&
             a.metadataPageCount == b.metadataPageCount && a.metadataPageStart == b.metadataPageStart &&
             a.metadataPhase == b.metadataPhase && a.metadataBatchSize == b.metadataBatchSize &&
-            a.thumbnail == b.thumbnail && a.facingPreview == b.facingPreview && a.level == b.level &&
+            a.annotationsMetadata == b.annotationsMetadata &&
+            a.thumbnail == b.thumbnail && a.thumbnailSize == b.thumbnailSize &&
+            a.facingPreview == b.facingPreview && a.level == b.level &&
             a.dpi == b.dpi && a.theme == b.theme &&
             _wcsicmp(a.path.c_str(), b.path.c_str()) == 0;
     }
@@ -7550,7 +7760,12 @@ namespace
                 if (request.metadata)
                 {
                     renderTab.pageCount = request.metadataPageCount;
-                    if (request.metadataPhase == 0)
+                    if (request.annotationsMetadata)
+                    {
+                        result->metadataAnnotationsRead = LoadAnnotationsFromPdf(renderTab);
+                        result->metadataAnnotations = std::move(renderTab.annotations);
+                    }
+                    else if (request.metadataPhase == 0)
                     {
                         int start = std::clamp(request.metadataPageStart, 0, renderTab.pageCount);
                         int batch = std::clamp(request.metadataBatchSize, 1, 64);
@@ -7599,8 +7814,9 @@ namespace
                     }
                     else
                     {
-                        LoadAnnotationsFromPdf(renderTab);
-                        result->metadataAnnotations = std::move(renderTab.annotations);
+                        // Phase 2 is retained as the geometry/layout
+                        // completion marker. Annotation loading has its own
+                        // request so it cannot be delayed behind geometry.
                     }
                 }
                 else
@@ -7644,7 +7860,7 @@ namespace
                 g_pageRenderActive = false;
                 stale = g_pageRenderStop || g_pageRenderCanceledSerial == request.serial;
                 stopping = g_pageRenderStop;
-                if (stale && request.metadata && request.metadataPhase == 1)
+                if (stale && request.metadata && (request.metadataPhase == 1 || request.annotationsMetadata))
                     ResetSuspendedMetadataRequest(request);
                 if (g_pageRenderCanceledSerial == request.serial)
                     g_pageRenderCanceledSerial = 0;
@@ -7665,11 +7881,15 @@ namespace
                     if (IsWindow(request.target))
                         PostMessageW(request.target, WM_QUIETPDF_RETRY_OUTLINE, 0, 0);
                 }
+                else if (request.annotationsMetadata && !stopping)
+                {
+                    if (IsWindow(request.target))
+                        PostMessageW(request.target, WM_QUIETPDF_RETRY_ANNOTATIONS, 0, 0);
+                }
                 continue;
             }
             bool hasMetadata = request.metadata &&
-                (request.metadataPhase == 0 ? !result->metadataPages.empty()
-                 : true);
+                (request.annotationsMetadata || request.metadataPhase != 0 || !result->metadataPages.empty());
             bool hasImage = result->image.dib || !result->image.bgra.empty();
             if (!stale && (hasMetadata || hasImage) && IsWindow(request.target))
             {
@@ -7681,6 +7901,11 @@ namespace
                     {
                         ResetSuspendedMetadataRequest(request);
                         PostMessageW(request.target, WM_QUIETPDF_RETRY_OUTLINE, 0, 0);
+                    }
+                    else if (request.annotationsMetadata)
+                    {
+                        ResetSuspendedMetadataRequest(request);
+                        PostMessageW(request.target, WM_QUIETPDF_RETRY_ANNOTATIONS, 0, 0);
                     }
                     continue;
                 }
@@ -7792,7 +8017,7 @@ namespace
 
     void ResetSuspendedMetadataRequest(PageRenderRequest const& request)
     {
-        if (!request.metadata) return;
+        if (!request.metadata && !request.thumbnail) return;
         for (auto& ownedTab : g_tabs)
         {
             if (!ownedTab || ownedTab->renderSession != request.session ||
@@ -7800,6 +8025,8 @@ namespace
                 continue;
             if (request.thumbnail)
                 ownedTab->thumbRenderPending.erase(request.page);
+            else if (request.annotationsMetadata && !ownedTab->annotationsMetadataLoaded)
+                ownedTab->annotationsMetadataRequested = false;
             else if (request.metadataPhase == 1 && !ownedTab->outlineMetadataLoaded)
                 ownedTab->outlineMetadataRequested = false;
         }
@@ -7833,8 +8060,10 @@ namespace
 
         for (auto& request : g_pageRenderQueue)
         {
-            if (request.metadata && request.metadataPhase == 1)
-                request.priority = -28;
+            if (request.metadata && request.annotationsMetadata)
+                request.priority = 8;
+            else if (request.metadata && request.metadataPhase == 1)
+                request.priority = -8;
             else if (request.metadata)
                 request.priority = -20;
             else
@@ -7861,9 +8090,12 @@ namespace
                 {
                     // Metadata is independent of the zoom generation. A
                     // pinch must not discard the pending outline request.
-                    return !request.metadata &&
+                    bool obsolete = !request.metadata &&
                         request.documentVersion == tab.renderVersion &&
                         _wcsicmp(request.path.c_str(), tab.path.c_str()) == 0;
+                    if (obsolete)
+                        ResetSuspendedMetadataRequest(request);
+                    return obsolete;
                 }),
             g_pageRenderQueue.end());
         // The active render is part of the same obsolete zoom generation. Letting
@@ -7875,6 +8107,7 @@ namespace
             g_pageRenderActiveRequest.documentVersion == tab.renderVersion &&
             _wcsicmp(g_pageRenderActiveRequest.path.c_str(), tab.path.c_str()) == 0)
         {
+            ResetSuspendedMetadataRequest(g_pageRenderActiveRequest);
             AbortActivePageRenderLocked();
         }
     }
@@ -8075,7 +8308,9 @@ namespace
             if (g_pageRenderActive &&
                 g_pageRenderActiveRequest.session == tab.renderSession &&
                 !g_pageRenderActiveRequest.facingPreview &&
-                (!g_pageRenderActiveRequest.metadata || g_pageRenderActiveRequest.metadataPhase == 1))
+                (!g_pageRenderActiveRequest.metadata ||
+                 g_pageRenderActiveRequest.metadataPhase == 1 ||
+                 g_pageRenderActiveRequest.annotationsMetadata))
             {
                 if (g_pageRenderActiveRequest.metadata)
                     ResetSuspendedMetadataRequest(g_pageRenderActiveRequest);
@@ -8109,7 +8344,7 @@ namespace
                 { return queued.priority > request.priority; });
             g_pageRenderQueue.insert(insertAt, std::move(request));
 
-            constexpr size_t maxQueuedFacingPreviews = 6;
+            constexpr size_t maxQueuedFacingPreviews = 10;
             auto isFacingPreview = [](PageRenderRequest const& queued)
             { return queued.facingPreview; };
             while (std::count_if(g_pageRenderQueue.begin(), g_pageRenderQueue.end(), isFacingPreview) > maxQueuedFacingPreviews)
@@ -8126,28 +8361,30 @@ namespace
     // renderer finishes the first preview. Keep the single renderer moving
     // toward the latest viewport without cancelling the current complete
     // page handoff.
-    void CancelStaleFacingPreviews(PdfTab const& tab)
+    void CancelStaleFacingPreviews(PdfTab const& tab, std::vector<int> const& targetPages)
     {
         std::lock_guard<std::mutex> lock(g_pageRenderMutex);
         // Let an in-flight complete-page preview finish. Cancelling it on
         // every pointer sample meant that a fast drag could continuously
         // cancel the only request capable of covering the newly exposed edge,
         // leaving the presentation frame with a large empty strip. Queued
-        // previews are still replaced below, so at most one stale render can
-        // finish before the latest viewport takes priority.
+        // previews outside the latest target are removed below, while pages
+        // shared by adjacent targets stay queued and can actually finish.
         g_pageRenderQueue.erase(
             std::remove_if(
                 g_pageRenderQueue.begin(), g_pageRenderQueue.end(),
                 [&](PageRenderRequest const& request)
                 {
-                    return request.facingPreview && request.session == tab.renderSession &&
+                    bool sameDocument = request.facingPreview && request.session == tab.renderSession &&
                         request.documentVersion == tab.renderVersion &&
                         _wcsicmp(request.path.c_str(), tab.path.c_str()) == 0;
+                    return sameDocument &&
+                        std::find(targetPages.begin(), targetPages.end(), request.page) == targetPages.end();
                 }),
             g_pageRenderQueue.end());
     }
 
-    void QueuePageMetadata(HWND hwnd, PdfTab const& tab, int pageStart = 0, int phase = 0)
+    void QueuePageMetadata(HWND hwnd, PdfTab const& tab, int pageStart = 0, int phase = 0, bool annotations = false)
     {
         if (!hwnd || !tab.renderSession || tab.pageCount <= 0) return;
         EnsurePageRenderWorker();
@@ -8160,7 +8397,8 @@ namespace
         request.metadata = true;
         request.metadataPageCount = tab.pageCount;
         request.metadataPageStart = std::clamp(pageStart, 0, tab.pageCount);
-        request.metadataPhase = std::clamp(phase, 0, 2);
+        request.annotationsMetadata = annotations;
+        request.metadataPhase = annotations ? 0 : std::clamp(phase, 0, 2);
         request.metadataBatchSize = 48;
         request.dpi = g_dpi;
         request.theme = PdfRenderTheme();
@@ -8170,7 +8408,10 @@ namespace
         // The outline is the first user-visible sidebar payload. It must run
         // before normal page prefetch and before the full geometry index; the
         // latter is only needed to refine scrolling after the first paint.
-        request.priority = phase == 1 ? -21 : 24;
+        // The first visible page must win over metadata on a cold open. The
+        // page/tile queue can then establish a stable frame while these small
+        // asynchronous scans continue in the same worker.
+        request.priority = annotations ? 8 : (phase == 1 ? -8 : 24);
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
@@ -8197,6 +8438,14 @@ namespace
         QueuePageMetadata(hwnd, tab, tab.pageCount, 1);
         if (Active() == &tab)
             SetTimer(hwnd, 24, 500, nullptr);
+    }
+
+    void RequestAnnotationsMetadata(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.annotationsMetadataRequested || tab.annotationsMetadataLoaded)
+            return;
+        tab.annotationsMetadataRequested = true;
+        QueuePageMetadata(hwnd, tab, tab.pageCount, 0, true);
     }
 
     void RefreshOutlineSearchLayout(HWND hwnd, bool resetScroll)
@@ -8273,6 +8522,8 @@ namespace
             if (Active() == &tab)
                 SetTimer(hwnd, 24, 500, nullptr);
         }
+        if (!tab.annotationsMetadataLoaded && !tab.annotationsMetadataRequested)
+            RequestAnnotationsMetadata(hwnd, tab);
     }
 
     int TileZoomKey(double zoom)
@@ -8931,6 +9182,7 @@ namespace
         request.zoom = tab.zoom;
         request.renderZoom = thumbZoom;
         request.thumbnail = true;
+        request.thumbnailSize = ThumbnailRenderWidth;
         request.viewportGeneration = g_viewportGeneration;
         request.dpi = g_dpi;
         request.theme = PdfRenderTheme();
@@ -8987,6 +9239,20 @@ namespace
                 QueueFacingPreviewRender(hwnd, tab, start + i, -40 + i);
             return;
         }
+
+        // A large single-page document uses tiles at high zoom. Queue one
+        // complete low-resolution page first so the reader can show a useful
+        // first frame while the target-resolution tiles are rendered. Without
+        // this handoff the initial paint has only the stage background and
+        // stays white until every visible tile arrives. The preview is a
+        // fallback only; it is replaced by the normal tile presentation as
+        // soon as the visible target level is complete.
+        if (UseTiledPageRendering(tab))
+        {
+            QueueZoomPreviewRender(hwnd, tab, anchorPage, -40);
+            return;
+        }
+
         QueuePageRender(hwnd, tab, anchorPage, -32);
         if (!g_continuousRead && SpreadPageCount(tab, FirstPageInSpread(anchorPage)) > 1)
         {
@@ -8996,13 +9262,16 @@ namespace
 
     PageImage& EnsureThumb(PdfTab& tab, int index)
     {
-        if (tab.cachedThumbSize != g_thumbSize || tab.cachedThumbTheme != PdfRenderTheme())
+        if (tab.cachedThumbTheme != PdfRenderTheme())
         {
             tab.thumbCache.clear();
             tab.thumbRenderPending.clear();
-            tab.cachedThumbSize = g_thumbSize;
             tab.cachedThumbTheme = PdfRenderTheme();
         }
+        // The slider changes presentation size only. Do not invalidate the
+        // source bitmap or cancel a render on every mouse sample; a thumbnail
+        // is rendered once at ThumbnailRenderWidth and reused at every size.
+        tab.cachedThumbSize = ThumbnailRenderWidth;
         auto it = tab.thumbCache.find(index);
         if (it == tab.thumbCache.end())
         {
@@ -9031,10 +9300,12 @@ namespace
                 tab.thumbCache.erase(victim);
             }
         }
-        if (!it->second.dib && it->second.bgra.empty() && tab.thumbRenderPending.insert(index).second)
+        bool hasPixels = it->second.dib || !it->second.bgra.empty();
+        if (!hasPixels && tab.thumbRenderPending.insert(index).second)
         {
             double pageWidthPixelsAtZoom1 = tab.pages[static_cast<size_t>(index)].widthPt * static_cast<double>(g_dpi) / 72.0;
-            double thumbZoom = std::max(0.04, static_cast<double>(g_thumbSize) / std::max(1.0, pageWidthPixelsAtZoom1));
+            double thumbZoom = std::max(0.04, static_cast<double>(ThumbnailRenderWidth) /
+                std::max(1.0, pageWidthPixelsAtZoom1));
             QueueThumbRender(g_hwnd, tab, index, thumbZoom);
         }
         return it->second;
@@ -9202,6 +9473,7 @@ namespace
         g_scrollY = g_continuousRead ? SpreadTopScroll(tab, page) : 0;
     }
 
+    void RequestPageNavigationRepaint(HWND hwnd, PdfTab& tab, bool waitForComplete);
     void UpdateVertScrollBar(HWND hwnd);
 
     double AnnotationTopNorm(PdfAnnotation const& annotation)
@@ -9884,6 +10156,79 @@ namespace
         };
     }
 
+    void PaintPageAnnotations(HDC dc, PdfTab const& tab, int page, RECT pageRect)
+    {
+        for (PdfAnnotation const& annotation : tab.annotations)
+        {
+            if (annotation.page != page) continue;
+            COLORREF annotationColor = AnnotationColor(annotation);
+            bool hasCjkText = false;
+            bool hasLatinOrDigitText = false;
+            for (wchar_t ch : annotation.text)
+            {
+                bool cjk = (ch >= 0x3400 && ch <= 0x4DBF) ||
+                    (ch >= 0x4E00 && ch <= 0x9FFF) ||
+                    (ch >= 0xF900 && ch <= 0xFAFF);
+                if (cjk)
+                    hasCjkText = true;
+                else if ((ch >= L'A' && ch <= L'Z') ||
+                    (ch >= L'a' && ch <= L'z') ||
+                    (ch >= L'0' && ch <= L'9'))
+                    hasLatinOrDigitText = true;
+            }
+            bool cjkOnlyText = hasCjkText && !hasLatinOrDigitText;
+            auto drawSegment = [&](RECT mark)
+            {
+                RECT visibleMark{};
+                if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
+                if (annotation.kind == AnnotationKind::Highlight)
+                {
+                    RECT fillMark{
+                        visibleMark.left,
+                        std::max(pageRect.top, visibleMark.top - S(1)),
+                        visibleMark.right,
+                        std::min(pageRect.bottom, visibleMark.bottom + S(1))
+                    };
+                    MultiplyHighlightFill(dc, fillMark, annotationColor, IsDarkTheme() ? 88 : 122);
+                }
+                else
+                {
+                    float markHeight = static_cast<float>(std::max<LONG>(1, mark.bottom - mark.top));
+                    float bottom = static_cast<float>(mark.bottom);
+                    float lineWidth = std::max(1.0f, markHeight / 16.0f);
+                    float lineY = bottom - markHeight * (3.0f / 7.0f);
+                    if (annotation.kind == AnnotationKind::Underline)
+                    {
+                        lineY = cjkOnlyText
+                            ? bottom + std::max(1.0f, lineWidth * 0.65f)
+                            : bottom - std::max(1.0f, markHeight * 0.18f);
+                    }
+                    float halfWidth = lineWidth * 0.5f;
+                    lineY = std::clamp(lineY,
+                        static_cast<float>(pageRect.top) + halfWidth,
+                        static_cast<float>(pageRect.bottom) - halfWidth);
+
+                    Gdiplus::Graphics markGraphics(dc);
+                    markGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                    markGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+                    Gdiplus::Pen markPen(GdiColor(annotationColor), lineWidth);
+                    markPen.SetStartCap(Gdiplus::LineCapFlat);
+                    markPen.SetEndCap(Gdiplus::LineCapFlat);
+                    markGraphics.DrawLine(&markPen,
+                        static_cast<float>(visibleMark.left), lineY,
+                        static_cast<float>(visibleMark.right), lineY);
+                }
+            };
+            if (!annotation.segments.empty())
+            {
+                for (auto const& segment : annotation.segments)
+                    drawSegment(DenormalizeAnnotationSegment(segment, pageRect));
+            }
+            else
+                drawSegment(DenormalizeAnnotationRect(annotation, pageRect));
+        }
+    }
+
     bool NearlySameSegment(AnnotationSegment const& a, AnnotationSegment const& b)
     {
         constexpr double eps = 0.0015;
@@ -10302,7 +10647,65 @@ namespace
         return !g_selectionQuads.empty();
     }
 
-    bool TrySelectImageAtPoint(PdfTab& tab, int page, RECT pageRect, POINT clientPt)
+    bool SelectAllDocumentText(PdfTab& tab)
+    {
+        if (!g_pdf.selectTextWithMargins || tab.pageCount <= 0 || !tab.doc)
+            return false;
+
+        std::vector<TextSelectionSegment> segments;
+        std::vector<fz_quad> allQuads;
+        std::wstring allText;
+        segments.reserve(static_cast<size_t>(tab.pageCount));
+
+        // Build the complete selection from document coordinates. This does
+        // not depend on the current viewport, so pages become highlighted as
+        // they enter view in continuous, facing, and single-page modes.
+        PdfDocumentLock pdfLock(tab);
+        for (int page = 0; page < tab.pageCount; ++page)
+        {
+            std::vector<fz_quad> quads(16384);
+            std::string text(1024 * 1024, '\0');
+            int count = g_pdf.selectTextWithMargins(
+                tab.ctx, tab.doc, page,
+                0.0f, 0.0f, 1.0f, 1.0f,
+                0, 0,
+                quads.data(), static_cast<int>(quads.size()),
+                text.data(), static_cast<int>(text.size()));
+            if (count <= 0)
+                continue;
+
+            count = std::min<int>(count, static_cast<int>(quads.size()));
+            quads.resize(static_cast<size_t>(count));
+            std::wstring pageText = FromUtf8(text.c_str());
+            if (!allText.empty() && !pageText.empty())
+                allText.push_back(L'\n');
+            allText += pageText;
+            allQuads.insert(allQuads.end(), quads.begin(), quads.end());
+            segments.push_back(TextSelectionSegment{ page, std::move(quads), std::move(pageText) });
+        }
+
+        if (segments.empty() || allQuads.empty())
+            return false;
+
+        g_selectingContent = false;
+        g_hasContentSelection = true;
+        g_selectionIsImage = false;
+        g_selectionPage = 0;
+        g_selectionEndPage = tab.pageCount - 1;
+        g_selectionPageRect = {};
+        g_selectionStart = POINT{};
+        g_selectionEnd = POINT{};
+        g_selectionStartNorm = fz_point{ 0.0f, 0.0f };
+        g_selectionNorm = fz_rect{ 0.0f, 0.0f, 1.0f, 1.0f };
+        g_selectionQuads = std::move(allQuads);
+        g_selectionSegments = std::move(segments);
+        g_selectionText = std::move(allText);
+        ResetDragSelectionLatch();
+        NotifyUiaSelectionChanged();
+        return true;
+    }
+
+    bool FindImageRectAtPoint(PdfTab& tab, int page, RECT pageRect, POINT clientPt, fz_rect& imageRect)
     {
         if (!g_pdf.findImageAtPoint || page < 0 || page >= tab.pageCount || IsRectEmpty(&pageRect))
             return false;
@@ -10312,9 +10715,18 @@ namespace
         double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
         float x = std::clamp(static_cast<float>((clientPt.x - pageRect.left) / pageW), 0.0f, 1.0f);
         float y = std::clamp(static_cast<float>((clientPt.y - pageRect.top) / pageH), 0.0f, 1.0f);
-        fz_rect imageRect{};
         if (g_pdf.findImageAtPoint(tab.ctx, tab.doc, page, x, y, &imageRect) <= 0)
             return false;
+        return true;
+    }
+
+    bool TrySelectImageAtPoint(PdfTab& tab, int page, RECT pageRect, POINT clientPt)
+    {
+        fz_rect imageRect{};
+        if (!FindImageRectAtPoint(tab, page, pageRect, clientPt, imageRect))
+            return false;
+        double pageW = std::max<int>(1, pageRect.right - pageRect.left);
+        double pageH = std::max<int>(1, pageRect.bottom - pageRect.top);
 
         RECT hitRect{
             pageRect.left + static_cast<int>(std::floor(imageRect.x0 * pageW)),
@@ -10433,6 +10845,35 @@ namespace
         return !image.bgra.empty();
     }
 
+    bool BuildContextImage(PdfTab& tab, PageImage& image)
+    {
+        if (g_contextImageTab != &tab || g_contextImagePage < 0 ||
+            g_contextImagePage >= tab.pageCount || IsRectEmpty(&g_contextImagePageRect))
+            return false;
+
+        int pageW = std::max<int>(1, g_contextImagePageRect.right - g_contextImagePageRect.left);
+        int pageH = std::max<int>(1, g_contextImagePageRect.bottom - g_contextImagePageRect.top);
+        RECT selected{
+            g_contextImagePageRect.left + static_cast<int>(std::floor(g_contextImageNorm.x0 * pageW)),
+            g_contextImagePageRect.top + static_cast<int>(std::floor(g_contextImageNorm.y0 * pageH)),
+            g_contextImagePageRect.left + static_cast<int>(std::ceil(g_contextImageNorm.x1 * pageW)),
+            g_contextImagePageRect.top + static_cast<int>(std::ceil(g_contextImageNorm.y1 * pageH))
+        };
+        selected.left = std::clamp(selected.left, g_contextImagePageRect.left, g_contextImagePageRect.right - 1);
+        selected.top = std::clamp(selected.top, g_contextImagePageRect.top, g_contextImagePageRect.bottom - 1);
+        selected.right = std::clamp(selected.right, selected.left + 1, g_contextImagePageRect.right);
+        selected.bottom = std::clamp(selected.bottom, selected.top + 1, g_contextImagePageRect.bottom);
+
+        RECT tile{
+            selected.left - g_contextImagePageRect.left,
+            selected.top - g_contextImagePageRect.top,
+            selected.right - g_contextImagePageRect.left,
+            selected.bottom - g_contextImagePageRect.top
+        };
+        image = RenderPageTile(tab, g_contextImagePage, tile);
+        return !image.bgra.empty();
+    }
+
     bool HasCopyableTextSelection()
     {
         return !g_selectionText.empty() || (g_selectingContent && !g_lastDragSelectionText.empty());
@@ -10476,6 +10917,17 @@ namespace
         if (!tab) return false;
         PageImage image;
         if (!BuildSelectionImage(*tab, image)) return false;
+        return CopyImageToClipboard(hwnd, image);
+    }
+
+    bool CopyContextImageToClipboard(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        if (!tab || !g_contextImageTab || tab != g_contextImageTab)
+            return false;
+        PageImage image;
+        if (!BuildContextImage(*tab, image))
+            return false;
         return CopyImageToClipboard(hwnd, image);
     }
 
@@ -11486,7 +11938,7 @@ namespace
         UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(provider), UIA_AutomationFocusChangedEventId);
         NotifyWinEvent(EVENT_OBJECT_FOCUS, g_hwnd, OBJID_CLIENT, CHILDID_SELF);
     }
-    void LoadAnnotationsFromPdf(PdfTab& tab);
+    bool LoadAnnotationsFromPdf(PdfTab& tab);
 
     void ClearAnnotationFocus()
     {
@@ -11668,9 +12120,11 @@ namespace
         int maxRight = std::max<int>(startX + tileW, client.right - S(42));
         int availableW = std::max<int>(tileW, maxRight - startX);
         int columns = std::max<int>(1, (availableW + gapX) / (tileW + gapX));
+        bool showEmptySearch = !g_homeSearchQuery.empty() && recentCount == 0;
         size_t tileCount = 1 + recentCount;
         size_t rows = std::max<size_t>(1, (tileCount + static_cast<size_t>(columns) - 1) / static_cast<size_t>(columns));
-        return S(16) + static_cast<int>(rows) * tileH + std::max<int>(0, static_cast<int>(rows) - 1) * gapY + S(24);
+        int top = showEmptySearch ? S(102) : S(16);
+        return top + static_cast<int>(rows) * tileH + std::max<int>(0, static_cast<int>(rows) - 1) * gapY + S(24);
     }
 
     int ComputeHomeListContentHeight(size_t recentCount, bool showEmptySearch)
@@ -11937,11 +12391,10 @@ namespace
             g_sidebarScrollY = desired;
             RequestSidebarRepaint(hwnd);
         }
-        else
-        {
-            RECT area = SidebarScrollRect();
-            InvalidateRect(hwnd, &area, FALSE);
-        }
+        // During a fast reader scroll the page-change path already queued the
+        // thumbnail selection repaint. The idle reconciliation below often
+        // finds the same page and sidebar offset; repainting again here makes
+        // the selected card visibly blink at the end of a fast scroll.
     }
 
     int StableOutlineRowDuringMainScroll(PdfTab const& tab, int scrollY);
@@ -12030,6 +12483,7 @@ namespace
         g_pageCaretVisible = true;
         g_pageInputText = std::to_wstring(tab->currentPage + 1);
         g_pageCaretIndex = static_cast<int>(g_pageInputText.size());
+        g_pageSelectionAnchor = -1;
         SetTimer(hwnd, 10, 500, nullptr);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -12043,6 +12497,7 @@ namespace
         g_pageInputFocused = false;
         g_pageInputText.clear();
         g_pageCaretIndex = 0;
+        g_pageSelectionAnchor = -1;
         KillTimer(hwnd, 10);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -12057,6 +12512,12 @@ namespace
         {
             int page = std::clamp(_wtoi(g_pageInputText.c_str()), 1, tab->pageCount);
             ScrollToPage(*tab, page - 1);
+            // Page entry is a navigation transaction, not only a coordinate
+            // change. Queue the target viewport and keep the retained frame
+            // until its complete visible coverage has been committed.
+            g_facingScrollPending = false;
+            g_mainScrollPresentationValid = false;
+            RequestPageNavigationRepaint(hwnd, *tab, true);
         }
         CancelPageInput(hwnd);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -12343,6 +12804,7 @@ namespace
         // first paint and responsive opening.
         if (!outlineLoadedSynchronously)
             RequestOutlineMetadata(hwnd, *Active());
+        RequestAnnotationsMetadata(hwnd, *Active());
         QueueInitialViewportPreview(hwnd, *Active());
         SchedulePagePrefetch(hwnd);
         // Geometry is deliberately queued behind the outline and the visible
@@ -12752,26 +13214,26 @@ namespace
 
     RECT SidebarPanelToggleRectForClient(RECT client);
 
-    RECT SidebarPanelTogglePaintRectForClient(RECT client)
+    RECT ImmersiveExitPanelRectForClient(RECT client)
     {
-        RECT r = SidebarPanelToggleRectForClient(client);
-        if (IsRectEmpty(&r)) return r;
-        // DrawRoundedShadow is offset down/right and extends beyond the
-        // button. Keep that whole antialiased footprint out of page moves;
-        // protecting only the fill rect leaves dirty shadow corners behind.
-        r.left -= S(3);
-        r.top -= S(1);
-        r.right += S(5);
-        r.bottom += S(7);
+        if (!g_immersive || !Active()) return RECT{};
+        return RECT{ client.right - S(154), client.bottom - S(48),
+            client.right - S(18), client.bottom - S(21) };
+    }
+
+    RECT ImmersiveExitPanelPaintRectForClient(RECT client)
+    {
+        RECT r = ImmersiveExitPanelRectForClient(client);
+        if (!IsRectEmpty(&r)) InflateRect(&r, S(5), S(5));
         return r;
     }
 
-    void ExcludeSidebarPanelToggle(HDC dc, RECT client)
+    RECT SidebarPanelTogglePaintRectForClient(RECT client)
     {
-        if (!dc || !Active()) return;
-        RECT toggle = SidebarPanelTogglePaintRectForClient(client);
-        if (!IsRectEmpty(&toggle))
-            ExcludeClipRect(dc, toggle.left, toggle.top, toggle.right, toggle.bottom);
+        // The control has no shadow layer. Keep the protected area exactly
+        // equal to the button so page-frame copies cannot preserve or expose
+        // stale pixels around its top and right edges.
+        return SidebarPanelToggleRectForClient(client);
     }
 
     void RequestStageRepaint(HWND hwnd, bool includeStatus)
@@ -12787,7 +13249,7 @@ namespace
         {
             InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
         }
-        if (includeStatus)
+        if (includeStatus && !g_immersive)
         {
             RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
             InvalidateRect(hwnd, &status, FALSE);
@@ -12799,6 +13261,10 @@ namespace
 
     RECT MainReaderPixelClip();
     void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip);
+    void PaintSidebarPanelToggle(HDC dc, RECT client);
+    void PaintSidebarPanelToggleAtomic(HDC dc, RECT client);
+    void PaintStatus(HDC dc, RECT client);
+    void PaintImmersiveExitAtomic(HDC dc, RECT client);
     bool PresentShiftedStageFrameNow(HWND hwnd);
     bool EnsurePaintBuffer(HDC targetDc, int width, int height);
     bool EnsureStageFrameBuffer(HDC targetDc, int width, int height);
@@ -12922,29 +13388,60 @@ namespace
                     RECT client{};
                     GetClientRect(hwnd, &client);
                     RECT toggle = SidebarPanelTogglePaintRectForClient(client);
-                    RECT overlap{};
-                    bool splitToggle = !IsRectEmpty(&toggle) &&
-                        IntersectRect(&overlap, &toggle, &reader);
+                    RECT immersiveExit = ImmersiveExitPanelPaintRectForClient(client);
+                    std::vector<RECT> scrollParts{ reader };
+                    auto excludeOverlay = [&](RECT overlay)
+                    {
+                        if (IsRectEmpty(&overlay)) return;
+                        std::vector<RECT> next;
+                        next.reserve(scrollParts.size() * 4);
+                        for (RECT part : scrollParts)
+                        {
+                            RECT overlap{};
+                            if (!IntersectRect(&overlap, &part, &overlay))
+                            {
+                                next.push_back(part);
+                                continue;
+                            }
+                            RECT topPart{ part.left, part.top, part.right, overlap.top };
+                            RECT bottomPart{ part.left, overlap.bottom, part.right, part.bottom };
+                            RECT leftPart{ part.left, overlap.top, overlap.left, overlap.bottom };
+                            RECT rightPart{ overlap.right, overlap.top, part.right, overlap.bottom };
+                            if (!IsRectEmpty(&topPart)) next.push_back(topPart);
+                            if (!IsRectEmpty(&bottomPart)) next.push_back(bottomPart);
+                            if (!IsRectEmpty(&leftPart)) next.push_back(leftPart);
+                            if (!IsRectEmpty(&rightPart)) next.push_back(rightPart);
+                        }
+                        scrollParts = std::move(next);
+                    };
+                    excludeOverlay(toggle);
+                    excludeOverlay(immersiveExit);
                     auto scrollRect = [&](RECT part)
                     {
                         if (!IsRectEmpty(&part))
                             ScrollWindowEx(hwnd, dx, dy, &part, nullptr, nullptr,
                                 nullptr, SW_INVALIDATE | SW_SCROLLCHILDREN);
                     };
-                    if (!splitToggle)
+                    // ScrollWindowEx accepts only a rectangular source. Split
+                    // the reader around foreground controls so page pixels
+                    // never move either control or leave a shifted ghost.
+                    for (RECT part : scrollParts) scrollRect(part);
+                    // The scrollbar tracks are fixed opaque slots. Do not
+                    // restore the shifted page frame into them: that was the
+                    // source of stale page strips and duplicate content at
+                    // the right and bottom edges during fast scrolling.
+                    RECT verticalTrack = g_mainScrollTrackRect;
+                    RECT horizontalTrack = g_mainHScrollTrackRect;
+                    if (!IsRectEmpty(&verticalTrack) || !IsRectEmpty(&horizontalTrack))
                     {
-                        scrollRect(reader);
-                    }
-                    else
-                    {
-                        // ScrollWindowEx's HRGN argument is an output/update
-                        // region, not an exclusion region. Split the reader
-                        // around the overlay instead, so the button's pixels
-                        // are never moved or invalidated by page scrolling.
-                        scrollRect(RECT{ reader.left, reader.top, reader.right, overlap.top });
-                        scrollRect(RECT{ reader.left, overlap.bottom, reader.right, reader.bottom });
-                        scrollRect(RECT{ reader.left, overlap.top, overlap.left, overlap.bottom });
-                        scrollRect(RECT{ overlap.right, overlap.top, reader.right, overlap.bottom });
+                        HDC dc = GetDC(hwnd);
+                        if (dc)
+                        {
+                            PaintMainScrollTrackBackground(dc, verticalTrack);
+                            PaintMainScrollTrackBackground(dc, horizontalTrack);
+                            PaintMainScrollBar(dc, client, g_stage);
+                            ReleaseDC(hwnd, dc);
+                        }
                     }
                     // The retained frame was rebased before the native move.
                     // Keep it valid so the exposed edge and transparent
@@ -12962,10 +13459,10 @@ namespace
             {
                 InvalidateRect(hwnd, &reader, FALSE);
             }
-            if (includeStatus)
-            {
-                RECT client{};
-                GetClientRect(hwnd, &client);
+                if (includeStatus && !g_immersive)
+                {
+                    RECT client{};
+                    GetClientRect(hwnd, &client);
                 RECT status{ 0, client.bottom - S(34), client.right, client.bottom };
                 InvalidateRect(hwnd, &status, FALSE);
             }
@@ -13150,12 +13647,6 @@ namespace
     {
         if (tab.pageCount <= 0) return;
 
-        // The viewport changed again while an older spread was rendering.
-        // Rebase the coverage transaction on this input sample so the worker
-        // does not spend the whole drag completing pages that are already
-        // behind the pointer.
-        CancelStaleFacingPreviews(tab);
-
         RECT view = g_stage;
         int padY = std::max<int>(S(48), (g_stage.bottom - g_stage.top) / 5);
         InflateRect(&view, S(8), padY);
@@ -13168,6 +13659,36 @@ namespace
             int previous = PreviousSpreadStart(tab, firstVisible);
             if (previous >= 0) startAt = previous;
         }
+
+        // Build the latest coverage set before touching the worker queue.
+        // Repeated pointer samples retain requests shared by adjacent
+        // viewports instead of deleting and recreating every pending page.
+        std::vector<int> targetPages;
+        targetPages.reserve(8);
+        for (int start = startAt; start < tab.pageCount && targetPages.size() < 8;
+            start = NextSpreadStart(tab, start))
+        {
+            int y = g_continuousRead ? SpreadVisualTop(tab, start) : g_stage.top + S(28) - g_scrollY;
+            if (g_continuousRead && y > view.bottom) break;
+            int count = SpreadPageCount(tab, start);
+            for (int j = 0; j < count && targetPages.size() < 8; ++j)
+            {
+                int page = start + j;
+                RECT pageRect{};
+                RECT visible{};
+                if (BuildSpreadPageRect(tab, start, y, page, pageRect) &&
+                    IntersectRect(&visible, &pageRect, &view))
+                    targetPages.push_back(page);
+            }
+            if (!g_continuousRead) break;
+        }
+        CancelStaleFacingPreviews(tab, targetPages);
+        if (!tab.zoomPresentationPending)
+        {
+            for (size_t i = 0; i < targetPages.size(); ++i)
+                QueueFacingPreviewRender(hwnd, tab, targetPages[i], -44 + static_cast<int>(i));
+        }
+
         int queued = 0;
         for (int start = startAt; start < tab.pageCount && queued < 8; start = NextSpreadStart(tab, start))
         {
@@ -13182,15 +13703,6 @@ namespace
                 if (!BuildSpreadPageRect(tab, start, y, page, pageRect) ||
                     !IntersectRect(&drawRect, &pageRect, &view))
                     continue;
-
-                // A complete page preview is the scroll transaction's stable
-                // coverage. It is independent of zoom fallback and therefore
-                // cannot combine pixels from two zoom generations. A zoom
-                // transaction already has its retained old frame, so do not
-                // enqueue another low-resolution image that could outrank the
-                // target-resolution tiles.
-                if (!tab.zoomPresentationPending)
-                    QueueFacingPreviewRender(hwnd, tab, page, -44 + queued);
 
                 if (!UseTiledPageRendering(tab))
                 {
@@ -13331,6 +13843,7 @@ namespace
             // the cache as one atomic double-buffered frame when coverage is
             // ready. Until then PaintPages keeps the last complete frame.
             g_pageNavigationPending = false;
+            g_allowIncompletePageNavigationFrame = false;
             g_facingScrollPending = !facingCoverageReady;
             if (facingCoverageReady)
             {
@@ -13707,8 +14220,13 @@ namespace
         else if (g_stageFrameOffsetX < 0) visibleDest.right += g_stageFrameOffsetX;
         if (g_stageFrameOffsetY > 0) visibleDest.top += g_stageFrameOffsetY;
         else if (g_stageFrameOffsetY < 0) visibleDest.bottom += g_stageFrameOffsetY;
+        // The custom scrollbars are transparent overlays inside `stage`.
+        // Include the full stage in the transform source, including the
+        // pixels underneath both tracks. Restricting this copy to `reader`
+        // left the track underlay at the theme color (or an older frame) and
+        // became visible as a stale page strip after zoom-then-drag.
         RECT visibleSource{};
-        if (IntersectRect(&visibleSource, &visibleDest, &reader))
+        if (IntersectRect(&visibleSource, &visibleDest, &sourceArea))
         {
             int sourceX = visibleSource.left - g_stageFrameOffsetX;
             int sourceY = visibleSource.top - g_stageFrameOffsetY;
@@ -13744,22 +14262,45 @@ namespace
         SetStretchBltMode(g_stageFrameDc, oldMode);
         RestoreDC(g_stageFrameDc, frameState);
 
-        // Present the complete stage underlay, including the pixels beneath
-        // the transparent scrollbar tracks. Copying only `reader` leaves
-        // those strips at the previous zoom while the thumb is repainted at
-        // the new zoom, which makes the scrollbar background show stale page
-        // content. The scrollbar itself is restored immediately below.
-        int windowState = SaveDC(windowDc);
-        ExcludeSidebarPanelToggle(windowDc, client);
-        BitBlt(windowDc, g_stage.left, g_stage.top,
+        // Compose the complete presentation frame off-screen. Foreground
+        // chrome is part of this one transaction when it lies in the reader
+        // (immersive mode); it is never covered and then repainted on the
+        // HWND. The old two-submit sequence left the previous page color in
+        // the toggle rectangle and made the exit pill flash after zoom.
+        int composeState = SaveDC(g_paintBufferDc);
+        IntersectClipRect(g_paintBufferDc, g_stage.left, g_stage.top,
+            g_stage.right, g_stage.bottom);
+        BitBlt(g_paintBufferDc, g_stage.left, g_stage.top,
             g_stage.right - g_stage.left, g_stage.bottom - g_stage.top,
             g_stageFrameDc, g_stage.left, g_stage.top, SRCCOPY);
+        PaintMainScrollBar(g_paintBufferDc, client, g_stage);
+
+        RECT toggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
+        if (!IsRectEmpty(&toggle) && Intersects(toggle, g_stage))
+            PaintSidebarPanelToggle(g_paintBufferDc, client);
+        if (g_immersive)
+        {
+            RECT exit = ImmersiveExitPanelPaintRectForClient(client);
+            if (!IsRectEmpty(&exit) && Intersects(exit, g_stage))
+            {
+                int exitState = SaveDC(g_paintBufferDc);
+                IntersectClipRect(g_paintBufferDc, exit.left, exit.top,
+                    exit.right, exit.bottom);
+                PaintStatus(g_paintBufferDc, client);
+                RestoreDC(g_paintBufferDc, exitState);
+            }
+        }
+        RestoreDC(g_paintBufferDc, composeState);
+
+        int windowState = SaveDC(windowDc);
+        BitBlt(windowDc, g_stage.left, g_stage.top,
+            g_stage.right - g_stage.left, g_stage.bottom - g_stage.top,
+            g_paintBufferDc, g_stage.left, g_stage.top, SRCCOPY);
         RestoreDC(windowDc, windowState);
-        // The transformed copy also covers the transparent scrollbar strips.
-        // Repaint the current thumb immediately on top of that same frame;
-        // waiting for a later scrollbar-only WM_PAINT leaves the old thumb or
-        // its old underlay visible for one zoom sample.
-        PaintMainScrollBar(windowDc, client, g_stage);
+        // The normal-layout rail toggle is outside the reader and remains
+        // protected by the page copy. The immersive toggle was composed in
+        // the same off-screen frame above, so neither path needs a second
+        // window submission.
         ReleaseDC(hwnd, windowDc);
         g_stageFrameOffsetX = 0;
         g_stageFrameOffsetY = 0;
@@ -14535,6 +15076,8 @@ namespace
             tab->selectedOutlineRow = -1;
             ClearOutlineNavigationOverride();
         }
+
+        InvalidateSidebarChrome(hwnd);
     }
 
     void SwitchSidebarMode(HWND hwnd, int mode)
@@ -15365,6 +15908,8 @@ namespace
         HFONT searchFont = Font(11);
         HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
         std::wstring shown = g_homeSearchQuery.empty() ? L"\u641c\u7d22\u6587\u6863" : g_homeSearchQuery;
+        PaintEditorSelection(dc, g_homeSearchQuery, inputText, g_homeSearchCaretIndex,
+            g_homeSearchSelectionAnchor, false);
         Text(dc, shown, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             g_homeSearchQuery.empty() ? MixColor(T().muted, T().paper, 0.16) : T().text);
         if (g_homeSearchFocused && g_homeSearchCaretVisible)
@@ -15427,8 +15972,9 @@ namespace
         int columns = std::max<int>(1, (availableW + gapX) / (tileW + gapX));
         int gridW = columns * tileW + std::max(0, columns - 1) * gapX;
         int startX = gridLeft + std::max(0, (availableW - gridW) / 2);
+        bool emptySearch = !g_homeSearchQuery.empty() && g_homeRecentIds.empty();
         int x = startX;
-        int y = viewport.top + S(16) - g_homeScrollY;
+        int y = viewport.top + (emptySearch ? S(102) : S(16)) - g_homeScrollY;
         int lastBottom = y;
         int maxRight = startX + gridW;
         auto advance = [&]()
@@ -15443,7 +15989,7 @@ namespace
         auto drawCoverFrame = [&](RECT cover, bool active)
         {
             DrawContactShadow(dc, cover, active ? 30 : 22);
-            DrawRoundedShadow(dc, cover, S(5.0f), S(1), S(2), S(3), active ? 22 : 14);
+            DrawRoundedShadow(dc, cover, S(5.0f), S(1), S(2), S(4), active ? 22 : 14);
             RoundFill(dc, cover, S(5), T().paper, active ? T().accent : T().line);
         };
 
@@ -15543,9 +16089,12 @@ namespace
             lastBottom = std::max(lastBottom, static_cast<int>(tile.bottom));
             advance();
         }
-        if (!g_homeSearchQuery.empty() && g_homeRecentIds.empty())
+        if (emptySearch)
         {
-            RECT empty{ S(58), viewport.top + S(32) - g_homeScrollY, client.right - S(58), viewport.top + S(90) - g_homeScrollY };
+            // Align the empty state with the same content column as the
+            // opening tile instead of anchoring it to the window edge.
+            RECT empty{ startX, viewport.top + S(16) - g_homeScrollY,
+                client.right - S(42), viewport.top + S(82) - g_homeScrollY };
             Text(dc, L"\u6ca1\u6709\u627e\u5230\u5339\u914d\u7684\u6587\u6863", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             lastBottom = std::max(lastBottom, static_cast<int>(empty.bottom));
         }
@@ -15751,6 +16300,8 @@ namespace
         HFONT inputFont = Font(13, FW_SEMIBOLD);
         oldFont = SelectObject(dc, inputFont);
         std::wstring inputText = g_customZoomText.empty() ? L"" : g_customZoomText;
+        PaintEditorSelection(dc, inputText, inputTextRect,
+            static_cast<int>(g_customZoomCaretIndex), g_customZoomSelectionAnchor, false);
         Text(dc, inputText, inputTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         if (g_customZoomFocused)
         {
@@ -16026,8 +16577,12 @@ namespace
                 if (visible(item))
                 {
                     PageImage& thumb = EnsureThumb(tab, i);
-                    thumbW = thumb.width;
-                    thumbH = thumb.height;
+                    // Layout follows the requested slider size. The cached
+                    // bitmap may still be from the previous size and is
+                    // deliberately stretched into this stable target rect
+                    // until the replacement render arrives.
+                    thumbW = g_thumbSize;
+                    thumbH = std::max<int>(S(56), static_cast<int>(thumbW * ratioH + 0.5));
                     boxW = std::max(thumbW + S(36), S(160));
                     boxH = thumbH + S(58);
                     item = RECT{ g_sidebar.left + (g_sidebar.right - g_sidebar.left - boxW) / 2, y, g_sidebar.left + (g_sidebar.right - g_sidebar.left + boxW) / 2, y + boxH };
@@ -16067,6 +16622,8 @@ namespace
             RECT inputText{ g_searchInputRect.left + S(43), g_searchInputRect.top, searchClearRight - S(30), g_searchInputRect.bottom };
             HFONT searchFont = Font(9);
             HGDIOBJ oldSearchFont = SelectObject(dc, searchFont);
+            PaintEditorSelection(dc, g_searchQuery, inputText, g_searchCaretIndex,
+                g_searchSelectionAnchor, false);
             Text(dc, g_searchQuery.empty() ? L"\u8f93\u5165\u5173\u952e\u8bcd" : g_searchQuery, inputText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, g_searchQuery.empty() ? T().muted : T().text);
             if (g_searchInputFocused && g_searchCaretVisible)
             {
@@ -16392,6 +16949,8 @@ namespace
                     : g_outlineSearchClearRect.left - S(2),
                 g_outlineSearchRect.bottom };
             std::wstring searchShown = g_outlineSearchQuery.empty() ? L"\u641c\u7d22\u4e66\u7b7e" : g_outlineSearchQuery;
+            PaintEditorSelection(dc, g_outlineSearchQuery, searchText, g_outlineSearchCaretIndex,
+                g_outlineSearchSelectionAnchor, false);
             Text(dc, searchShown, searchText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 g_outlineSearchQuery.empty() ? T().muted : T().text);
             if (g_outlineSearchFocused && g_outlineSearchCaretVisible)
@@ -16450,15 +17009,10 @@ namespace
             int clipDc = SaveDC(dc);
             RECT scrollArea = SidebarScrollRect();
             IntersectClipRect(dc, scrollArea.left, scrollArea.top, scrollArea.right, scrollArea.bottom);
-            int rows = static_cast<int>(tab.outline.size());
-            bool compactOutline = rows > 512;
             HPEN treePen = CreatePen(PS_DOT, 1, SidebarTreeColor());
             HGDIOBJ oldPen = SelectObject(dc, treePen);
-            int sampleDepth = rows > 0 ? tab.outline[0].depth : 0;
-            int sampleLineX = g_sidebar.left + S(10 + sampleDepth * 18);
-            int sampleIconLeft = sampleLineX + S(12);
-            int sampleTextWidth = std::max<int>(24, static_cast<int>((g_sidebar.right - S(30)) - (sampleIconLeft + S(10) + S(5)) - S(4)));
             EnsureOutlineLayout(dc, tab, g_sidebar.right - g_sidebar.left);
+            int pageColumnWidth = OutlinePageColumnWidth(dc, tab);
             auto firstVisible = std::lower_bound(
                 tab.outlineLayout.begin(),
                 tab.outlineLayout.end(),
@@ -16476,13 +17030,11 @@ namespace
                 int iconH = S(14);
                 int iconW = S(10);
                 int iconLeft = lineX + S(12);
-                int pageLeft = g_sidebar.right - S(30);
+                int pageRight = g_sidebar.right - S(6);
+                int pageLeft = pageRight - pageColumnWidth;
                 int textLeft = iconLeft + iconW + S(5);
-                int textWidth = std::max(24, pageLeft - textLeft - S(4));
                 std::wstring label = tab.outline[static_cast<size_t>(i)].title;
-                int textH = compactOutline
-                    ? S(16)
-                    : (textWidth == sampleTextWidth ? it->textHeight : MeasureTextHeight(dc, label, textWidth, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX));
+                int textH = it->textHeight;
                 int rowH = it->height;
                 int y = scrollArea.top + it->top - g_sidebarScrollY;
                 RECT row{ g_sidebar.left + S(3), y, g_sidebar.right - S(3), y + rowH };
@@ -16533,7 +17085,7 @@ namespace
                         DeleteObject(togglePen);
                     }
 
-                    RECT pageRect{ pageLeft, row.top, row.right - S(3), row.bottom };
+                    RECT pageRect{ pageLeft, row.top, pageRight, row.bottom };
                     RECT tx{ textLeft, textTop, pageRect.left - S(4), textTop + textH };
                     COLORREF rowText = (selected && (IsGlassTheme() || IsWarmMistTheme())) ? RGB(255, 255, 255) : T().text;
                     COLORREF rowAux = selected ? rowText : T().muted;
@@ -16541,12 +17093,11 @@ namespace
 
                     RECT mark{ iconLeft, firstLineCenterY - iconH / 2, iconLeft + iconW, firstLineCenterY + (iconH + 1) / 2 };
                     DrawBookmarkIcon(dc, mark, markColor, false);
-                    if (!g_outlineSearchQuery.empty() && !compactOutline)
+                    if (!g_outlineSearchQuery.empty())
                         DrawHighlightedOutlineText(dc, label, tx, rowText, selected);
                     else
                         Text(dc, label, tx,
-                            compactOutline ? (DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX)
-                                           : (DT_LEFT | DT_WORDBREAK | DT_NOPREFIX),
+                            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
                             rowText);
                     Text(dc, std::to_wstring(page + 1), pageRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, rowAux);
                 }
@@ -17079,16 +17630,14 @@ namespace
     {
         if (!hwnd || tab.pageCount <= 0 || IsRectEmpty(&g_stage)) return false;
 
-        // The custom scrollbars are transparent overlays. Their track area
-        // still needs the same target-generation page underlay as the rest
-        // of the stage; composing only MainReaderPixelClip() leaves the
-        // previous zoom's pixels under the track and creates a thin, shifted
-        // strip along the right/bottom edge.
-        RECT reader = g_stage;
-        if (IsRectEmpty(&reader)) return false;
-
         RECT client{};
         GetClientRect(hwnd, &client);
+        UpdateMainScrollRects(client);
+        // The fixed scrollbar slots are outside the PDF presentation surface.
+        // The fallback frame is therefore composed only for the reader clip;
+        // its track pixels are filled separately below.
+        RECT reader = MainReaderPixelClip();
+        if (IsRectEmpty(&reader)) return false;
         HDC windowDc = GetDC(hwnd);
         if (!windowDc) return false;
         bool buffersReady = EnsurePaintBuffer(windowDc,
@@ -17150,6 +17699,10 @@ namespace
 
                 if (IsDarkTheme())
                     AlphaFill(dc, visible, PdfOverlayColor(), PdfOverlayAlpha());
+                // The zoom handoff uses raw page images, so compose the
+                // application-owned annotation overlay on this frame too.
+                // Otherwise marks disappear until the target zoom is ready.
+                PaintPageAnnotations(dc, tab, page, pageRect);
             }
         }
 
@@ -17173,11 +17726,35 @@ namespace
         g_stageFrameOffsetY = 0;
         g_stageFrameMotionX = 0;
         g_stageFrameMotionY = 0;
-        int windowState = SaveDC(windowDc);
-        ExcludeSidebarPanelToggle(windowDc, client);
+        // The frame never owns the fixed track surface. Normalize it here so
+        // a later scrollbar drag cannot restore page pixels into the slots.
+        PaintMainScrollTrackBackground(g_stageFrameDc, g_stage);
+
+        // Compose controls that lie inside the reader together with the
+        // fallback page before the single reader BitBlt. Controls outside the
+        // reader (the normal-layout rail button) are left on the existing
+        // rail surface and presented once below. This avoids the old sequence
+        // of page copy -> control copy -> stage invalidation, which produced a
+        // visible one-frame flash on every zoom step.
+        bool toggleInReader = SidebarTotalWidth() <= 0;
+        int overlayState = SaveDC(g_paintBufferDc);
+        IntersectClipRect(g_paintBufferDc, reader.left, reader.top,
+            reader.right, reader.bottom);
+        if (toggleInReader)
+            PaintSidebarPanelToggle(g_paintBufferDc, client);
+        if (g_immersive)
+            PaintStatus(g_paintBufferDc, client);
+        RestoreDC(g_paintBufferDc, overlayState);
+
         BitBlt(windowDc, reader.left, reader.top, width, height,
-            g_stageFrameDc, reader.left, reader.top, SRCCOPY);
-        RestoreDC(windowDc, windowState);
+            g_paintBufferDc, reader.left, reader.top, SRCCOPY);
+        PaintMainScrollBar(windowDc, client, g_stage);
+        // The rail button is outside the reader copy in the normal layout and
+        // must remain on the rail surface that was already committed by the
+        // normal paint pass. Do not redraw it directly on the window for each
+        // zoom sample: its translucent shadow would be composited over the
+        // previous shadow and grow on every zoom step. The immersive toggle
+        // is already included in the reader transaction above.
         ReleaseDC(hwnd, windowDc);
         return true;
     }
@@ -17527,11 +18104,17 @@ namespace
     }
 
     bool RectContains(RECT outer, RECT inner);
+    RECT MainReaderPixelClip();
 
     bool PaintPages(HDC dc, PdfTab& tab, RECT paintClip)
     {
         RECT stageDirty{};
         if (!IntersectRect(&stageDirty, &g_stage, &paintClip)) return true;
+        // The scrollbar slots are reserved surface, not part of the PDF
+        // viewport. Keep every page/cache paint out of them, including
+        // partial paints caused by scrolling and zoom completion.
+        RECT readerClip = MainReaderPixelClip();
+        if (!IntersectRect(&stageDirty, &stageDirty, &readerClip)) return true;
         if (tab.zoomPresentationPending && !ZoomRenderDeferred() &&
             CurrentZoomVisibleContentReady(tab))
         {
@@ -17833,55 +18416,12 @@ namespace
                             }
                         }
                     }
-                    if (!zoomPresentationPending) for (PdfAnnotation const& annotation : tab.annotations)
-                    {
-                        if (annotation.page != i) continue;
-                        COLORREF annotationColor = AnnotationColor(annotation);
-                        auto drawSegment = [&](RECT mark)
-                        {
-                            RECT visibleMark{};
-                            if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
-                            if (annotation.kind == AnnotationKind::Highlight)
-                            {
-                                RECT fillMark{
-                                    visibleMark.left,
-                                    std::max(pageRect.top, visibleMark.top - S(1)),
-                                    visibleMark.right,
-                                    std::min(pageRect.bottom, visibleMark.bottom + S(1))
-                                };
-                                MultiplyHighlightFill(dc, fillMark, annotationColor, IsDarkTheme() ? 88 : 122);
-                            }
-                            else
-                            {
-                                float markHeight = static_cast<float>(std::max<LONG>(1, mark.bottom - mark.top));
-                                float bottom = static_cast<float>(mark.bottom);
-                                float lineWidth = std::max(1.0f, markHeight / 16.0f);
-                                float lineY = annotation.kind == AnnotationKind::Underline
-                                    ? bottom + std::max(S(1.0f), lineWidth * 0.65f)
-                                    : bottom - markHeight * (3.0f / 7.0f);
-                                float halfWidth = lineWidth * 0.5f;
-                                lineY = std::clamp(lineY,
-                                    static_cast<float>(pageRect.top) + halfWidth,
-                                    static_cast<float>(pageRect.bottom) - halfWidth);
-
-                                Gdiplus::Graphics markGraphics(dc);
-                                markGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-                                markGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-                                Gdiplus::Pen markPen(GdiColor(annotationColor), lineWidth);
-                                markPen.SetStartCap(Gdiplus::LineCapFlat);
-                                markPen.SetEndCap(Gdiplus::LineCapFlat);
-                                markGraphics.DrawLine(&markPen,
-                                    static_cast<float>(visibleMark.left), lineY,
-                                    static_cast<float>(visibleMark.right), lineY);
-                            }
-                        };
-                        if (!annotation.segments.empty())
-                        {
-                            for (auto const& segment : annotation.segments)
-                                drawSegment(DenormalizeAnnotationSegment(segment, pageRect));
-                        }
-                        else drawSegment(DenormalizeAnnotationRect(annotation, pageRect));
-                    }
+                    // Annotations are an overlay above both current pages and
+                    // their complete zoom handoff frames. Keep them in the
+                    // shared helper so a fallback frame cannot hide marks
+                    // until the target-resolution render finishes.
+                    if (!zoomPresentationPending)
+                        PaintPageAnnotations(dc, tab, i, pageRect);
                     if (!zoomPresentationPending && (g_hasContentSelection || g_selectingContent))
                     {
                         auto selectedSegment = std::find_if(
@@ -17934,6 +18474,15 @@ namespace
         // worker supplies the missing image/tile, preventing white blocks
         // during a fast scroll.
         if (missingVisiblePage && g_stageFrameValid &&
+            !g_allowIncompletePageNavigationFrame)
+        {
+            return false;
+        }
+        // There is no safe underlay during the first paint of a document or
+        // after a viewport reset. Keep partial tile coverage off the window;
+        // the render completion path invalidates the full stage when all
+        // visible tiles are ready.
+        if (missingVisiblePage && !g_stageFrameValid &&
             !g_allowIncompletePageNavigationFrame)
         {
             return false;
@@ -18369,9 +18918,18 @@ namespace
 
     RECT SidebarPanelToggleRectForClient(RECT client)
     {
+        // This geometry is queried from several direct-present paths before
+        // the normal WM_PAINT pass runs. Refresh the track rectangles here so
+        // the toggle responds to the current content width, not the previous
+        // zoom sample's scrollbar state.
+        if (g_active >= 0 && !IsRectEmpty(&g_stage))
+            UpdateMainScrollRects(client);
         int bottomInset = (!g_immersive && g_statusPinned) ? S(34) : 0;
         int size = S(24);
-        int bottom = g_immersive ? client.bottom - S(21) : client.bottom - bottomInset - S(8);
+        // Both expanded and collapsed states use the same fixed position,
+        // aligned to the top edge of the reserved 12px bottom track slot.
+        int bottom = g_immersive ? client.bottom - S(21)
+            : client.bottom - bottomInset - S(12);
         int railRight = S(44);
         int left = std::max<int>(S(7), (railRight - size) / 2);
         return RECT{ left, bottom - size, left + size, bottom };
@@ -18402,98 +18960,32 @@ namespace
             fill = MixColor(fill, T().accent, 0.10);
             line = MixColor(line, T().accent, 0.30);
         }
-        DrawRoundedShadow(dc, r, S(8.0f), S(1), S(3), S(3), IsDarkTheme() ? 20 : 12);
-        RoundFill(dc, r, S(8), fill, line);
+        // This rail control sits against the fixed scrollbar/rail boundary.
+        // Do not add a translucent shadow around it: the shadow extends past
+        // the top/right edges and can be composited again during a zoom,
+        // producing the dirty border seen around the button.
+        RoundFillAA(dc, r, S(8), fill, line);
         DrawSidebarPanelToggleGlyph(dc, r, open, glyph);
-    }
-
-    void PaintSidebarPanelToggleUnderlay(HDC dc, RECT client, RECT paintRect)
-    {
-        if (!dc || IsRectEmpty(&paintRect)) return;
-        int top = g_immersive ? 0 : S(76);
-        int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
-        int side = SidebarTotalWidth();
-        if (side <= 0) return;
-
-        RECT sidebarFull{ 0, top, side, client.bottom - bottom };
-        RECT rail{ 0, top, std::min<int>(S(44), sidebarFull.right), sidebarFull.bottom };
-        int state = SaveDC(dc);
-        IntersectClipRect(dc, paintRect.left, paintRect.top,
-            paintRect.right, paintRect.bottom);
-        if (IsGraphiteTheme())
-        {
-            Fill(dc, paintRect, RGB(34, 37, 41));
-        }
-        else if (IsGlassTheme())
-        {
-            // Reproduce the same base -> sidebar glass -> rail order used by
-            // Paint(), so clearing a stale toggle never creates a small
-            // rectangular patch with a different backdrop.
-            PaintGlassBackdrop(dc, paintRect, false);
-            GlassSurface(dc, sidebarFull, 128);
-            AlphaFill(dc, rail, RGB(247, 250, 253), 116);
-        }
-        else
-        {
-            Fill(dc, paintRect, T().panel);
-        }
-        RestoreDC(dc, state);
     }
 
     void PaintSidebarPanelToggleAtomic(HDC dc, RECT client)
     {
         if (!dc || !Active()) return;
-        RECT paintRect = SidebarPanelTogglePaintRectForClient(client);
-        if (IsRectEmpty(&paintRect)) return;
-
-        // The shadow is translucent. Compose it on a clean underlay first,
-        // then copy the complete overlay once; painting it repeatedly onto
-        // the window DC would accumulate alpha in the rounded corners.
-        if (!g_paintBufferDc || !g_paintBufferBitmap)
-        {
-            PaintSidebarPanelToggleUnderlay(dc, client, paintRect);
-            PaintSidebarPanelToggle(dc, client);
-            g_sidebarPanelTogglePresented = true;
-            return;
-        }
-
-        int state = SaveDC(g_paintBufferDc);
-        IntersectClipRect(g_paintBufferDc, paintRect.left, paintRect.top,
-            paintRect.right, paintRect.bottom);
-        if (!SidebarRailVisible())
-        {
-            // Rebuild the small underlay from the same stage/page path used
-            // by the reader. A raw retained-frame copy can contain undefined
-            // pixels outside its last committed dirty edge, which shows up as
-            // a rectangular patch around the translucent shadow.
-            Fill(g_paintBufferDc, paintRect, T().stage);
-            PdfTab* tab = Active();
-            if (tab && !tab->zoomPresentationPending && !ZoomRenderDeferred())
-                PaintPages(g_paintBufferDc, *tab, paintRect);
-            else if (g_stageFrameValid && g_stageFrameDc)
-                RestoreStageFrame(g_paintBufferDc, paintRect);
-        }
-        else
-        {
-            // The expanded rail already has its authoritative GlassSurface
-            // on the window. Rebuilding only this small rectangle produces a
-            // visible rectangular patch at the panel's bottom edge. Keep the
-            // existing panel pixels and draw the overlay in place instead.
-            PaintSidebarPanelToggleUnderlay(dc, client, paintRect);
-            PaintSidebarPanelToggle(dc, client);
-            RestoreDC(g_paintBufferDc, state);
-            g_sidebarPanelTogglePresented = true;
-            return;
-        }
-        PaintSidebarPanelToggle(g_paintBufferDc, client);
-        RestoreDC(g_paintBufferDc, state);
-
-        int targetState = SaveDC(dc);
-        BitBlt(dc, paintRect.left, paintRect.top,
-            paintRect.right - paintRect.left, paintRect.bottom - paintRect.top,
-            g_paintBufferDc, paintRect.left, paintRect.top, SRCCOPY);
-        RestoreDC(dc, targetState);
+        // The page/background underneath this control is owned by the current
+        // paint transaction. Draw the control directly on that surface; never
+        // copy a padded rectangle from the shared page buffer. A shaped copy
+        // still carries whatever stale pixels are inside its bounding box.
+        PaintSidebarPanelToggle(dc, client);
         g_sidebarPanelTogglePresented = true;
+    }
+
+    void PaintImmersiveExitAtomic(HDC dc, RECT client)
+    {
+        if (!dc || !g_immersive || !Active()) return;
+        // PaintStatus draws only the pill/text. Its background is blended
+        // directly over the already-presented reader surface, so no padded
+        // rectangle or stale page pixels can be submitted with it.
+        PaintStatus(dc, client);
     }
     void PaintStatus(HDC dc, RECT client)
     {
@@ -18501,7 +18993,10 @@ namespace
         if (!tab && !g_immersive) return;
         if (g_immersive)
         {
-            RECT panel{ client.right - S(154), client.bottom - S(48), client.right - S(18), client.bottom - S(21) };
+            RECT panel = ImmersiveExitPanelRectForClient(client);
+            g_buttons.erase(std::remove_if(g_buttons.begin(), g_buttons.end(),
+                [](Button const& button) { return button.id == CmdImmersive; }),
+                g_buttons.end());
             bool hovered = g_hasHoverButton && EqualRect(&g_hoverButtonRect, &panel);
             bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &panel);
             PaintImmersiveFrostedPill(dc, panel, hovered, pressed);
@@ -18565,6 +19060,8 @@ namespace
         HGDIOBJ oldPageFont = SelectObject(dc, pageFont);
         std::wstring pageText = g_pageInputFocused ? g_pageInputText : currentPageText;
         RECT pageTextBox{ pageBox.left + S(8), pageBox.top, pageBox.right - S(8), pageBox.bottom };
+        PaintEditorSelection(dc, pageText, pageTextBox, g_pageCaretIndex,
+            g_pageSelectionAnchor, true);
         Text(dc, pageText, pageTextBox, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().muted);
         if (g_pageInputFocused && g_pageCaretVisible)
         {
@@ -18678,6 +19175,16 @@ namespace
         g_sidebar = RECT{ rail, top, side, client.bottom - bottom };
         int splitW = side ? std::max(1, S(1)) : 0;
         g_stage = RECT{ side + splitW, top, client.right, client.bottom - bottom };
+        // Sidebar animation changes the reader width every frame. Rebase the
+        // content extent on that new stage before deciding whether a fixed
+        // horizontal track exists; using the previous frame's stage width
+        // creates a one-frame false overflow rail while the panel opens.
+        g_contentHeight = g_continuousRead
+            ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+        g_contentWidth = ReadingContentWidth(*tab);
+        // Recompute the fixed scrollbar slots after the stage geometry is
+        // established. PaintPages then uses the same slots for its clip.
+        UpdateMainScrollRects(client);
         bool stageChanged = !EqualRect(&oldStage, &g_stage);
         if (stageChanged && g_viewMode != 0)
             g_scrollX = PreferredFacingScrollX(*tab);
@@ -18706,7 +19213,11 @@ namespace
         }
         bool paintedPages = false;
         bool canFlush = true;
-        RECT sidebarPaint{ 0, top, side, client.bottom - bottom };
+        // Include the splitter in the same first-paint band as the sidebar.
+        // Otherwise the update region can stop at `side`, leaving the one
+        // pixel boundary at the window's default white background until a
+        // later repaint.
+        RECT sidebarPaint{ 0, top, side + splitW, client.bottom - bottom };
         bool sidebarNeedsPaint = Intersects(paintClip, sidebarPaint) ||
             (g_favoriteListOpen && !IsRectEmpty(&g_favoriteListRect) &&
                 Intersects(paintClip, g_favoriteListRect));
@@ -18714,11 +19225,14 @@ namespace
         {
             PaintSidebar(dc, *tab, paintClip);
         }
-        if (side)
+        if (side && sidebarNeedsPaint)
         {
             int lineW = std::max(1, S(1));
             RECT splitter{ side, top, side + lineW, client.bottom - bottom };
-            if (Intersects(paintClip, splitter)) GlassDivider(dc, splitter);
+            // The sidebar paint band includes this boundary. Paint it whenever
+            // that band is being submitted, even when the native update
+            // region stops one pixel before the splitter itself.
+            GlassDivider(dc, splitter);
         }
         if (Intersects(paintClip, g_stage))
         {
@@ -18751,6 +19265,10 @@ namespace
         int side = SidebarTotalWidth();
         int splitW = side ? std::max(1, S(1)) : 0;
         g_stage = RECT{ side + splitW, top, client.right, client.bottom - bottom };
+        g_contentHeight = g_continuousRead
+            ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+        g_contentWidth = ReadingContentWidth(*tab);
+        UpdateMainScrollRects(client);
         if (g_viewMode != 0)
             g_scrollX = PreferredFacingScrollX(*tab);
         RECT stage = g_stage;
@@ -18800,6 +19318,7 @@ namespace
             }
             if (g_favoriteListOpen && !IsRectEmpty(&g_favoriteListRect))
                 PaintFavoriteList(dc);
+            PaintMainScrollBar(dc, client, stage);
         }
         ReleaseDC(hwnd, dc);
         return presented;
@@ -18824,6 +19343,9 @@ namespace
             ? RECT{ side - S(31), top + S(3), side - S(1), top + S(33) }
             : RECT{};
         g_stage = RECT{ side + (side ? std::max(1, S(1)) : 0), top, client.right, client.bottom - bottom };
+        g_contentHeight = g_continuousRead
+            ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
+        g_contentWidth = ReadingContentWidth(*tab);
 
         // This is intentionally a small direct presentation. A full-window
         // invalidation would make PaintReader walk every visible layout page
@@ -18841,14 +19363,15 @@ namespace
             GlassDivider(dc, splitter);
         }
         PaintSidebarPanelToggleAtomic(dc, client);
-        PaintStatus(dc, client);
+        if (g_immersive) PaintImmersiveExitAtomic(dc, client);
+        else PaintStatus(dc, client);
         ReleaseDC(hwnd, dc);
 
         // Let the normal paint pass refresh the directory in its own narrow
         // update region. It must not be drawn synchronously during a Tab
         // click because outline layout can be expensive for large files.
         if (side > 0)
-            InvalidateRect(hwnd, &g_sidebar, FALSE);
+            InvalidateSidebarChrome(hwnd);
     }
 
     COLORREF MenuPopupFill()
@@ -20384,6 +20907,14 @@ namespace
     {
         PdfTab* tab = Active();
         if (!tab || !g_hasContentSelection || g_selectionPage < 0 || g_selectionQuads.empty()) return;
+
+        // Do not save only the newly-created marks when the asynchronous
+        // startup scan has not reached annotations yet. Load the existing
+        // PDF marks before the first edit so a later save is a full replace,
+        // not an accidental deletion of older annotations.
+        if (!tab->annotationsMetadataLoaded && !LoadAnnotationsFromPdf(*tab))
+            return;
+
         int firstAnnotation = -1;
         for (TextSelectionSegment const& selected : g_selectionSegments)
         {
@@ -20439,18 +20970,54 @@ namespace
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    void LoadAnnotationsFromPdf(PdfTab& tab)
+    std::wstring ExtractAnnotationTextForRect(
+        PdfTab& tab, int page, double x0, double y0, double x1, double y1)
     {
-        tab.annotations.clear();
-        if (!g_pdf.loadAnnotations || !tab.ctx || !tab.doc || tab.pageCount <= 0) return;
+        if (!g_pdf.selectTextWithMargins || page < 0 || page >= tab.pageCount)
+            return {};
+
+        // The caller already owns PdfDocumentLock. Reading the text here keeps
+        // persisted underline annotations as accurate as newly-created ones;
+        // the PDF annotation payload itself stores geometry and note text, not
+        // the original selected characters.
+        std::vector<fz_quad> quads(256);
+        std::string text(4096, '\0');
+        try
+        {
+            int count = g_pdf.selectTextWithMargins(
+                tab.ctx, tab.doc, page,
+                static_cast<float>(std::clamp(x0, 0.0, 1.0)),
+                static_cast<float>(std::clamp(y0, 0.0, 1.0)),
+                static_cast<float>(std::clamp(x1, 0.0, 1.0)),
+                static_cast<float>(std::clamp(y1, 0.0, 1.0)),
+                0, 0, quads.data(), static_cast<int>(quads.size()),
+                text.data(), static_cast<int>(text.size()));
+            if (count > 0 && !text.empty())
+                return FromUtf8(text.c_str());
+        }
+        catch (...)
+        {
+            // A malformed or image-only annotation has no selectable text.
+        }
+        return {};
+    }
+
+    bool LoadAnnotationsFromPdf(PdfTab& tab)
+    {
+        if (!g_pdf.loadAnnotations || !tab.ctx || !tab.doc || tab.pageCount <= 0)
+            return false;
 
         PdfDocumentLock pdfLock(tab);
         constexpr int MaxPdfAnnotations = 4096;
         std::vector<QuietPdfAnnotationInfo> items(MaxPdfAnnotations);
         int count = g_pdf.loadAnnotations(tab.ctx, tab.doc, items.data(), static_cast<int>(items.size()));
-        if (count <= 0) return;
+        if (count < 0) return false;
+        if (count == 0 && g_pdf.lastError && g_pdf.lastError()[0] != '\0')
+            return false;
+
+        std::vector<PdfAnnotation> loaded;
         count = std::min<int>(count, static_cast<int>(items.size()));
-        tab.annotations.reserve(static_cast<size_t>(count));
+        loaded.reserve(static_cast<size_t>(count));
         for (int i = 0; i < count; ++i)
         {
             QuietPdfAnnotationInfo const& item = items[static_cast<size_t>(i)];
@@ -20476,8 +21043,16 @@ namespace
             if (annotation.author.empty()) annotation.author = L"10726";
             annotation.note = FromUtf8(item.contents);
             annotation.text = annotation.note;
+            if (annotation.kind == AnnotationKind::Underline)
+            {
+                std::wstring selectedText = ExtractAnnotationTextForRect(
+                    tab, annotation.page, annotation.x0, annotation.y0,
+                    annotation.x1, annotation.y1);
+                if (!selectedText.empty())
+                    annotation.text = std::move(selectedText);
+            }
             bool merged = false;
-            for (auto& existing : tab.annotations)
+            for (auto& existing : loaded)
             {
                 if (CanMergeLoadedAnnotation(existing, annotation))
                 {
@@ -20492,10 +21067,13 @@ namespace
             }
             if (merged)
                 continue;
-            tab.annotations.push_back(std::move(annotation));
+            loaded.push_back(std::move(annotation));
         }
-        for (PdfAnnotation& annotation : tab.annotations)
+        for (PdfAnnotation& annotation : loaded)
             MergeAnnotationSegments(annotation.segments);
+        tab.annotations = std::move(loaded);
+        tab.annotationsMetadataLoaded = true;
+        return true;
     }
 
     bool ReopenPdfHandlesPreservingView(PdfTab& tab, const std::wstring& path)
@@ -20522,6 +21100,8 @@ namespace
             tab.path = path;
             tab.name = std::filesystem::path(path).filename().wstring();
             UpdateTabFileStamp(tab);
+            if (!LoadAnnotationsFromPdf(tab))
+                return false;
             return true;
         }
         catch (...)
@@ -20573,7 +21153,8 @@ namespace
             // directory after an external PDF edit.
             replacement.outlineMetadataRequested = true;
             replacement.outlineMetadataLoaded = true;
-            LoadAnnotationsFromPdf(replacement);
+            if (!LoadAnnotationsFromPdf(replacement))
+                throw std::runtime_error("PDF annotations could not be read.");
         }
         catch (...)
         {
@@ -20680,11 +21261,21 @@ namespace
             PdfDocumentLock pdfLock(tab);
             saved = g_pdf.saveAnnotations(tab.ctx, tab.doc, tempUtf8.c_str(), annotations.empty() ? nullptr : annotations.data(), static_cast<int>(annotations.size()));
         }
-        if (!saved || !std::filesystem::exists(temp))
+        std::error_code tempSizeError;
+        auto tempSize = std::filesystem::file_size(temp, tempSizeError);
+        if (!saved || tempSizeError || tempSize == 0)
         {
             try { std::filesystem::remove(temp); } catch (...) {}
             finishSaveStatus();
-            MessageBoxW(hwnd, L"PDF \u6807\u6ce8\u5199\u5165\u5931\u8d25\uff0c\u539f\u6587\u4ef6\u672a\u4fee\u6539\u3002", L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
+            std::wstring reason;
+            if (g_pdf.lastError)
+            {
+                const char* error = g_pdf.lastError();
+                if (error && *error) reason = FromUtf8(error);
+            }
+            std::wstring message = L"PDF \u6807\u6ce8\u5199\u5165\u5931\u8d25，\u539f\u6587\u4ef6\u672a\u4fee\u6539。";
+            if (!reason.empty()) message += L"\n\n\u539f\u56e0：" + reason;
+            MessageBoxW(hwnd, message.c_str(), L"\u4fdd\u5b58", MB_OK | MB_ICONWARNING);
             return;
         }
 
@@ -21444,7 +22035,18 @@ namespace
 
         if (id == 2501)
         {
-            CopyCurrentSelectionToClipboard(hwnd);
+            if (g_contextImageTab)
+            {
+                CopyContextImageToClipboard(hwnd);
+                g_contextImageTab = nullptr;
+                g_contextImagePage = -1;
+                g_contextImagePageRect = {};
+                g_contextImageNorm = {};
+            }
+            else
+            {
+                CopyCurrentSelectionToClipboard(hwnd);
+            }
             return;
         }
         if (id == 2520)
@@ -21621,6 +22223,7 @@ namespace
             SwitchSidebarMode(hwnd, 2);
             g_searchInputFocused = true;
             g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
+            g_searchSelectionAnchor = -1;
             g_searchCaretVisible = true;
             SetTimer(hwnd, 12, 500, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -21683,6 +22286,7 @@ namespace
             g_searchLastQuery.clear();
             g_searchInputFocused = true;
             g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
+            g_searchSelectionAnchor = -1;
             g_searchCaretVisible = true;
             SetTimer(hwnd, 12, 500, nullptr);
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -21914,6 +22518,10 @@ namespace
             stage.right - stage.left, stage.bottom - stage.top,
             paintDc, stage.left, stage.top, SRCCOPY))
         {
+            // Keep fixed scrollbar slots out of the retained PDF frame. A
+            // later drag/hover restore must see the track color, never the
+            // page pixels that happened to be underneath it.
+            PaintMainScrollTrackBackground(g_stageFrameDc, stage);
             if (completeFrame)
             {
                 g_stageFrameValid = true;
@@ -21925,29 +22533,51 @@ namespace
         }
     }
 
-    bool PresentMainScrollBarNow(HWND hwnd, RECT oldThumb)
+    bool PresentMainScrollBarNow(HWND hwnd, RECT oldVerticalOverlay, RECT oldHorizontalOverlay)
     {
-        if (!hwnd || IsRectEmpty(&g_mainScrollTrackRect)) return false;
-        RECT dirty = oldThumb;
-        UnionRect(&dirty, &dirty, &g_mainScrollThumbRect);
-        UnionRect(&dirty, &dirty, &g_mainScrollTrackRect);
-        InflateRect(&dirty, S(2), S(2));
+        if (!hwnd) return false;
         RECT client{};
         GetClientRect(hwnd, &client);
+        UpdateMainScrollRects(client);
+        if (IsRectEmpty(&g_mainScrollTrackRect) &&
+            IsRectEmpty(&g_mainHScrollTrackRect)) return false;
+
+        // Both old overlays live entirely inside their opaque fixed tracks.
+        // Clearing each complete track once removes the old thumb regardless
+        // of its previous position, so no per-rectangle repaint is needed.
+        (void)oldVerticalOverlay;
+        (void)oldHorizontalOverlay;
         HDC dc = GetDC(hwnd);
-        if (dc && g_stageFrameValid && RestoreStageFrame(dc, dirty))
+        if (dc)
         {
-            // Hover and drag feedback is a small overlay transaction. Restore
-            // the clean page underlay first, then draw exactly one current
-            // thumb. This removes the previous black/green thumb instead of
-            // painting the new state on top of stale screen pixels.
-            PaintMainScrollBar(dc, client, dirty);
+            // Compose the complete fixed tracks off-screen. Even one clear
+            // followed by one thumb draw is visibly two window updates in
+            // immersive mode; a single BitBlt per disjoint track keeps every
+            // pointer sample atomic without touching the PDF surface.
+            bool bufferReady = EnsurePaintBuffer(dc,
+                std::max<int>(1, client.right), std::max<int>(1, client.bottom));
+            if (bufferReady)
+            {
+                PaintMainScrollTrackBackground(g_paintBufferDc, g_mainScrollTrackRect);
+                PaintMainScrollTrackBackground(g_paintBufferDc, g_mainHScrollTrackRect);
+                PaintMainScrollThumbs(g_paintBufferDc, g_stage);
+                auto presentTrack = [&](RECT track)
+                {
+                    if (IsRectEmpty(&track)) return;
+                    BitBlt(dc, track.left, track.top,
+                        track.right - track.left, track.bottom - track.top,
+                        g_paintBufferDc, track.left, track.top, SRCCOPY);
+                };
+                presentTrack(g_mainScrollTrackRect);
+                presentTrack(g_mainHScrollTrackRect);
+            }
             ReleaseDC(hwnd, dc);
-            return true;
+            if (bufferReady) return true;
         }
-        if (dc) ReleaseDC(hwnd, dc);
-        InvalidateRect(hwnd, &dirty, FALSE);
-        RedrawWindow(hwnd, &dirty, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        if (!IsRectEmpty(&g_mainScrollTrackRect))
+            InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
+        if (!IsRectEmpty(&g_mainHScrollTrackRect))
+            InvalidateRect(hwnd, &g_mainHScrollTrackRect, FALSE);
         return false;
     }
 
@@ -22093,7 +22723,6 @@ namespace
         IntersectClipRect(dc, reader.left, reader.top, reader.right, reader.bottom);
         RECT client{};
         GetClientRect(hwnd, &client);
-        ExcludeSidebarPanelToggle(dc, client);
         // The drag path must not share the WM_PAINT back buffer. A paint can
         // clear or partially redraw that buffer immediately after the input
         // sample; copying from it here was the source of transient black
@@ -22113,6 +22742,8 @@ namespace
             // complete frame stable until the target spread is ready.
             Fill(dc, reader, T().stage);
             presented = RestoreStableStageFrame(dc, reader);
+            PaintSidebarPanelToggle(dc, client);
+            if (g_immersive) PaintStatus(dc, client);
             RestoreDC(dc, state);
             ReleaseDC(hwnd, dc);
             return presented;
@@ -22158,6 +22789,8 @@ namespace
             paintExposed(RECT{ covered.right, reader.top, reader.right, covered.bottom });
         if (covered.left > reader.left)
             paintExposed(RECT{ reader.left, covered.top, covered.left, covered.bottom });
+        PaintSidebarPanelToggle(dc, client);
+        if (g_immersive) PaintStatus(dc, client);
         RestoreDC(dc, state);
         ReleaseDC(hwnd, dc);
         return presented;
@@ -22185,6 +22818,24 @@ namespace
         RECT box{};
         int complexity = GetRgnBox(region, &box);
         return complexity == SIMPLEREGION && EqualRect(&box, &expected);
+    }
+
+    bool PaintClipIntersectsRect(HRGN region, RECT rect)
+    {
+        if (!region || IsRectEmpty(&rect)) return false;
+        HRGN probe = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
+        HRGN intersection = CreateRectRgn(0, 0, 0, 0);
+        if (!probe || !intersection)
+        {
+            if (probe) DeleteObject(probe);
+            if (intersection) DeleteObject(intersection);
+            return false;
+        }
+        int complexity = CombineRgn(intersection, region, probe, RGN_AND);
+        bool intersects = complexity != NULLREGION && complexity != ERROR;
+        DeleteObject(probe);
+        DeleteObject(intersection);
+        return intersects;
     }
 
     void ReleasePaintBuffer()
@@ -22227,9 +22878,10 @@ namespace
         }
     }
 
-    void PresentForegroundChrome(HWND hwnd, bool presentToggle, bool presentTip)
+    void PresentForegroundChrome(HWND hwnd, bool presentToggle, bool presentTip,
+        bool presentImmersiveExit, bool presentDivider)
     {
-        if (!hwnd || (!presentToggle && !presentTip)) return;
+        if (!hwnd || (!presentToggle && !presentTip && !presentImmersiveExit && !presentDivider)) return;
         RECT client{};
         GetClientRect(hwnd, &client);
         HDC dc = GetDC(hwnd);
@@ -22242,6 +22894,24 @@ namespace
         // EndPaint, when no update-region clip can truncate it.
         if (presentToggle && !g_favoriteListOpen && !g_tabListOpen)
             PaintSidebarPanelToggleAtomic(dc, client);
+
+        if (presentImmersiveExit)
+            PaintImmersiveExitAtomic(dc, client);
+
+        // The divider is persistent chrome, not PDF content. Submit it after
+        // EndPaint as a complete physical strip so a high-DPI first paint
+        // cannot leave its one-pixel boundary behind the window background.
+        if (presentDivider && Active() && SidebarRailVisible())
+        {
+            int top = g_immersive ? 0 : S(76);
+            int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
+            int side = SidebarTotalWidth();
+            if (side > 0)
+            {
+                RECT splitter{ side, top, side + std::max(1, S(1)), client.bottom - bottom };
+                GlassDivider(dc, splitter);
+            }
+        }
 
         bool zoomPresentationPending = Active() && Active()->zoomPresentationPending;
         if (presentTip && !g_customZoomOpen && !zoomPresentationPending && !ZoomRenderDeferred())
@@ -22257,7 +22927,6 @@ namespace
         GetClientRect(hwnd, &client);
         RECT dirty = ps.rcPaint;
         if (IsRectEmpty(&dirty)) dirty = client;
-        RECT protectedToggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
         int dirtyW = std::max<int>(1, dirty.right - dirty.left);
         int dirtyH = std::max<int>(1, dirty.bottom - dirty.top);
         if (!EnsurePaintBuffer(dc, std::max<int>(1, client.right), std::max<int>(1, client.bottom)))
@@ -22287,24 +22956,13 @@ namespace
             dirty.left >= g_mainHScrollTrackRect.left && dirty.right <= g_mainHScrollTrackRect.right &&
             dirty.top >= g_mainHScrollTrackRect.top && dirty.bottom <= g_mainHScrollTrackRect.bottom;
         bool scrollBarOnly = verticalScrollOnly || horizontalScrollOnly;
-        if (scrollBarOnly && !RestoreStageFrame(mem, dirty))
+        if (scrollBarOnly)
         {
-            // Never copy the window back into the paint buffer here. The
-            // screen may still contain the previous thumb, so that fallback
-            // would turn the old overlay into the new underlay and produce a
-            // black/green double thumb. Repaint the small underlay from the
-            // current reader cache instead; if it is not available, the
-            // reader surface is the only honest fallback for a transparent
-            // scrollbar track.
-            if (PdfTab* tab = Active())
-            {
-                Fill(mem, dirty, T().stage);
-                PaintPages(mem, *tab, dirty);
-            }
-            else if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty, g_homeScrollLightPaint);
-            else Fill(mem, dirty, T().bg);
+            // A fixed track owns these pixels. Never restore the retained PDF
+            // frame here: doing so can bring back an old page or old thumb.
+            PaintMainScrollTrackBackground(mem, dirty);
         }
-        else if (!scrollBarOnly)
+        else
         {
             if (UsesBackdropTheme()) PaintGlassBackdrop(mem, dirty, g_homeScrollLightPaint);
             else Fill(mem, dirty, T().bg);
@@ -22332,9 +22990,9 @@ namespace
             // so an old thumb can never be copied into the next clean frame.
             RECT underlay{};
             if (IntersectRect(&underlay, &dirty, &g_mainScrollTrackRect))
-                RestoreStageFrame(mem, underlay);
+                PaintMainScrollTrackBackground(mem, underlay);
             if (IntersectRect(&underlay, &dirty, &g_mainHScrollTrackRect))
-                RestoreStageFrame(mem, underlay);
+                PaintMainScrollTrackBackground(mem, underlay);
         }
         if (!scrollBarOnly && g_stageFrameValid && !IsRectEmpty(&g_favoriteListStaleRect))
         {
@@ -22378,8 +23036,11 @@ namespace
         if (g_stageFrameValid && (g_facingScrollPending || g_pageNavigationPending))
             shouldFlush = false;
         bool fullStageDirty = completePaintRect && RectContains(dirty, g_stage);
+        bool completeFacingDragFrame = g_draggingMainScroll &&
+            UseFacingContinuousPresentation() && fullStageDirty &&
+            !g_facingScrollPending && !g_pageNavigationPending;
         if (readerPainted && shouldFlush && !g_pageNavigationPending &&
-            !g_draggingMainScroll)
+            (!g_draggingMainScroll || completeFacingDragFrame))
         {
             RECT committedStage{};
             if (IntersectRect(&committedStage, &g_stage, &dirty))
@@ -22399,10 +23060,31 @@ namespace
         if (!scrollBarOnly)
             PaintMainScrollBar(mem, client, dirty);
         if (repaintUi) PaintStatus(mem, client);
+        // Foreground controls are composited into the same clipped frame as
+        // the page. The window DC is therefore always repainted underneath
+        // them before they are drawn; no protected rectangle or second copy
+        // can leave stale page-colored pixels around their shapes.
+        if (!g_favoriteListOpen && !g_tabListOpen)
+        {
+            PaintSidebarPanelToggle(mem, client);
+            g_sidebarPanelTogglePresented = true;
+        }
+        if (g_immersive)
+            PaintStatus(mem, client);
         PaintTabListOverlay(mem, client);
         PaintClearRecentDialog(mem, client);
         PaintCustomZoomDialog(mem, client);
         PaintTabDragOverlay(mem);
+        bool paintZoomPending = Active() && Active()->zoomPresentationPending;
+        // Compose the tooltip into the same back buffer as the button state.
+        // The previous GetDC-after-EndPaint path exposed one blank frame when
+        // a toolbar click invalidated the window underneath a still-hovered
+        // button.
+        bool tooltipDirty = g_hasHoverTip && !g_customZoomOpen &&
+            !paintZoomPending && !ZoomRenderDeferred() &&
+            (Intersects(dirty, g_hoverTipRect) || Intersects(dirty, g_hoverTipPaintRect));
+        if (tooltipDirty)
+            PaintHoverTip(mem, client);
         // A zoom transaction is still showing the last committed frame. A
         // tooltip painted on top of that frame can appear for one WM_PAINT and
         // disappear on the atomic target-frame swap, which looks like a flash
@@ -22416,9 +23098,6 @@ namespace
             if (w > 0 && h > 0)
             {
                 int state = SaveDC(dc);
-                if (!IsRectEmpty(&protectedToggle))
-                    ExcludeClipRect(dc, protectedToggle.left, protectedToggle.top,
-                        protectedToggle.right, protectedToggle.bottom);
                 BitBlt(dc, clipped.left, clipped.top, w, h, mem, clipped.left, clipped.top, SRCCOPY);
                 RestoreDC(dc, state);
             }
@@ -22426,9 +23105,6 @@ namespace
         if (shouldFlush)
         {
             int state = SaveDC(dc);
-            if (!IsRectEmpty(&protectedToggle))
-                ExcludeClipRect(dc, protectedToggle.left, protectedToggle.top,
-                    protectedToggle.right, protectedToggle.bottom);
             BitBlt(dc, dirty.left, dirty.top, dirtyW, dirtyH, mem, dirty.left, dirty.top, SRCCOPY);
             RestoreDC(dc, state);
             // The page frame is the authoritative surface for facing views.
@@ -22439,7 +23115,7 @@ namespace
             // popups that intentionally overlap the reader.
             if (readerPainted && g_stageFrameValid &&
                 !g_facingScrollPending && !g_pageNavigationPending &&
-                !g_draggingMainScroll &&
+                (!g_draggingMainScroll || completeFacingDragFrame) &&
                 !g_favoriteListOpen && !g_annotationToolbarOpen &&
                 !g_annotationNoteOpen)
             {
@@ -22458,9 +23134,17 @@ namespace
                     ExcludeClipRect(dc, g_mainHScrollTrackRect.left,
                         g_mainHScrollTrackRect.top, g_mainHScrollTrackRect.right,
                         g_mainHScrollTrackRect.bottom);
-                    if (!IsRectEmpty(&protectedToggle))
-                        ExcludeClipRect(dc, protectedToggle.left, protectedToggle.top,
-                            protectedToggle.right, protectedToggle.bottom);
+                    // The committed stage frame intentionally contains only
+                    // page pixels. Keep the already-composited controls in
+                    // place when this final authoritative page copy runs;
+                    // otherwise it overwrites them immediately after the
+                    // normal paint copy and they flash away after zoom.
+                    RECT toggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
+                    RECT exit = ImmersiveExitPanelPaintRectForClient(client);
+                    if (!IsRectEmpty(&toggle))
+                        ExcludeClipRect(dc, toggle.left, toggle.top, toggle.right, toggle.bottom);
+                    if (!IsRectEmpty(&exit))
+                        ExcludeClipRect(dc, exit.left, exit.top, exit.right, exit.bottom);
                     BitBlt(dc, readerDirty.left, readerDirty.top,
                         readerDirty.right - readerDirty.left,
                         readerDirty.bottom - readerDirty.top,
@@ -22509,24 +23193,29 @@ namespace
             g_favoriteListStaleRect = {};
         RestoreDC(mem, paintState);
 
-        if (nativePaintClip)
-            DeleteObject(nativePaintClip);
-        RECT toggleRect = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
-        bool broadStageDirty = !IsRectEmpty(&g_stage) && RectContains(dirty, g_stage);
-        bool presentToggle = !IsRectEmpty(&toggleRect) &&
-            (!g_sidebarPanelTogglePresented ||
-                (Intersects(dirty, toggleRect) && !broadStageDirty));
         // The paint rectangle is only known after PaintHoverTip calculates
         // the current box. A newly entered tooltip therefore cannot be
         // gated by the old rectangle; use the state flag for its first
         // presentation, while the old rectangle still handles cleanup.
-        bool presentTip = Intersects(dirty, g_hoverTipPaintRect) ||
-            Intersects(dirty, g_hoverTipRect);
+        bool paintTouchesTip = hasNativePaintClip
+            ? PaintClipIntersectsRect(nativePaintClip, g_hoverTipPaintRect) ||
+              PaintClipIntersectsRect(nativePaintClip, g_hoverTipRect)
+            : Intersects(dirty, g_hoverTipPaintRect) ||
+              Intersects(dirty, g_hoverTipRect);
+        // The tooltip belongs to the pointer, not to the page frame. A page
+        // navigation repaint may cover the status bar without intersecting
+        // the old tooltip rectangle, so gating it by the dirty rectangle
+        // makes a rapidly clicked Prev/Next button blink. Re-submit the
+        // current tooltip whenever it still has a live hover owner; WM_MOUSEMOVE
+        // remains the sole authority that removes it.
+        bool presentTip = !tooltipDirty && (g_hasHoverTip || paintTouchesTip);
+        if (nativePaintClip)
+            DeleteObject(nativePaintClip);
         EndPaint(hwnd, &ps);
-        // These are foreground chrome overlays, not part of the retained PDF
-        // frame. Submit them after EndPaint so a scrollbar-only clip cannot
-        // truncate the rail toggle or the tooltip.
-        PresentForegroundChrome(hwnd, presentToggle, presentTip);
+        // The toggle and immersive exit are already part of the clipped
+        // transaction above. The divider is submitted as persistent chrome;
+        // only the tooltip remains transient.
+        PresentForegroundChrome(hwnd, false, presentTip, false, true);
     }
 
     bool HandleDocumentArrowKey(HWND hwnd, WPARAM key)
@@ -22649,11 +23338,9 @@ namespace
         // one current scrollbar image immediately whenever hover changes.
         if (oldVertical != g_mainScrollHover || oldHorizontal != g_mainHScrollHover)
         {
-            RECT oldOverlay{};
-            if (oldVertical != g_mainScrollHover) oldOverlay = oldVerticalRect;
-            if (oldHorizontal != g_mainHScrollHover)
-                oldOverlay = UnionRectSafe(oldOverlay, oldHorizontalRect);
-            if (!PresentMainScrollBarNow(hwnd, oldOverlay))
+            RECT oldVerticalOverlay = oldVertical != g_mainScrollHover ? oldVerticalRect : RECT{};
+            RECT oldHorizontalOverlay = oldHorizontal != g_mainHScrollHover ? oldHorizontalRect : RECT{};
+            if (!PresentMainScrollBarNow(hwnd, oldVerticalOverlay, oldHorizontalOverlay))
             {
                 if (oldVertical != g_mainScrollHover)
                     InvalidateRect(hwnd, &g_mainScrollTrackRect, FALSE);
@@ -22721,6 +23408,12 @@ namespace
                 RequestOutlineMetadata(hwnd, *tab);
             return 0;
         }
+        case WM_QUIETPDF_RETRY_ANNOTATIONS:
+        {
+            if (PdfTab* tab = Active(); tab && !tab->annotationsMetadataLoaded && !tab->annotationsMetadataRequested)
+                RequestAnnotationsMetadata(hwnd, *tab);
+            return 0;
+        }
         case WM_QUIETPDF_PAGE_RENDERED:
         {
             std::unique_ptr<PageRenderResult> result(reinterpret_cast<PageRenderResult*>(lParam));
@@ -22739,7 +23432,29 @@ namespace
                 {
                     if (request.metadataPageCount != tab.pageCount)
                         break;
-                    if (request.metadataPhase == 0)
+                    if (request.annotationsMetadata)
+                    {
+                        tab.annotationsMetadataRequested = false;
+                        if (!result->metadataAnnotationsRead)
+                        {
+                            if (i == g_active)
+                                SetTimer(hwnd, 26, 500, nullptr);
+                        }
+                        else if (!tab.dirty)
+                        {
+                            tab.annotations = std::move(result->metadataAnnotations);
+                            tab.annotationsMetadataLoaded = true;
+                            if (i == g_active)
+                            {
+                                KillTimer(hwnd, 26);
+                                g_stageFrameValid = false;
+                                g_mainScrollPresentationValid = false;
+                                InvalidateRect(hwnd, &g_stage, FALSE);
+                                UpdateWindow(hwnd);
+                            }
+                        }
+                    }
+                    else if (request.metadataPhase == 0)
                     {
                         int start = std::clamp(request.metadataPageStart, 0, tab.pageCount);
                         if (start + static_cast<int>(result->metadataPages.size()) > tab.pageCount)
@@ -22807,15 +23522,11 @@ namespace
                                 // so a real outline can take its reserved width.
                                 InvalidateRect(hwnd, nullptr, FALSE);
                             }
+                            QueuePageMetadata(hwnd, tab, tab.pageCount, 2);
                         }
-                        QueuePageMetadata(hwnd, tab, tab.pageCount, 2);
-                    }
-                    else
-                    {
-                        tab.annotations = std::move(result->metadataAnnotations);
                     }
 
-                    bool metadataFinished = request.metadataPhase == 2;
+                    bool metadataFinished = !request.annotationsMetadata && request.metadataPhase == 2;
                     if (metadataFinished)
                     {
                         tab.layoutCacheViewMode = -1;
@@ -22866,12 +23577,20 @@ namespace
                 // marker is cleared and the cached thumbnail can be reused.
                 if (request.thumbnail)
                 {
-                    tab.thumbRenderPending.erase(request.page);
                     auto found = tab.thumbCache.find(request.page);
-                    if (found != tab.thumbCache.end())
+                    bool currentAppearance = request.dpi == g_dpi &&
+                        request.theme == PdfRenderTheme();
+                    // Slider movement does not create a new render generation.
+                    // Accept the fixed-quality source bitmap whenever the
+                    // document appearance is still current; only theme/DPI
+                    // changes make a completed thumbnail stale.
+                    if (currentAppearance)
                     {
-                        found->second = std::move(result->image);
-                        if ((found->second.dib || !found->second.bgra.empty()) && i == g_active)
+                        tab.thumbRenderPending.erase(request.page);
+                        if (found != tab.thumbCache.end())
+                            found->second = std::move(result->image);
+                        if (found != tab.thumbCache.end() &&
+                            (found->second.dib || !found->second.bgra.empty()) && i == g_active)
                             InvalidateRect(hwnd, &g_sidebar, FALSE);
                     }
                     break;
@@ -22885,6 +23604,8 @@ namespace
                 // completion, without adding a timer or another worker.
                 if (i == g_active && !tab.outlineMetadataLoaded && !tab.outlineMetadataRequested)
                     RequestOutlineMetadata(hwnd, tab);
+                if (i == g_active && !tab.annotationsMetadataLoaded && !tab.annotationsMetadataRequested)
+                    RequestAnnotationsMetadata(hwnd, tab);
 
                 PreparePageCache(tab);
                 bool inserted = false;
@@ -22961,6 +23682,14 @@ namespace
                 }
                 if (inserted && i == g_active)
                 {
+                    // On the first viewport of a document there is no
+                    // committed frame to cover the not-yet-rendered tiles.
+                    // Do not present one completed tile by itself. Once the
+                    // visible coverage is complete, repaint the whole stage
+                    // in one transaction and establish the retained frame
+                    // used by later partial updates.
+                    if (!g_stageFrameValid && CurrentZoomVisibleContentReady(tab))
+                        InvalidateRect(hwnd, &g_stage, FALSE);
                     if (g_facingScrollPending)
                     {
                         // Scroll presentation is allowed to settle on a
@@ -23096,11 +23825,22 @@ namespace
                 g_annotationNoteEditFont = nullptr;
             }
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
+            InvalidateSidebarChrome(hwnd);
             return 0;
         case WM_SIZE:
+        {
+            // A maximized window can enter a monitor at a different scale
+            // without a separate DPI notification on some Windows builds.
+            // Refresh the scale from the actual HWND before rebuilding the
+            // sidebar and its one-pixel divider geometry.
+            UINT windowDpi = GetDpiForWindow(hwnd);
+            if (windowDpi != 0 && windowDpi != g_dpi)
+                g_dpi = windowDpi;
             DisableNativeScrollbars(hwnd);
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
+            InvalidateSidebarChrome(hwnd);
             return 0;
+        }
         case WM_GETTEXTLENGTH:
             if (HasUiaTextSelection()) return static_cast<LRESULT>(g_selectionText.size());
             break;
@@ -23201,6 +23941,33 @@ namespace
                 ScreenToClient(hwnd, &pt);
                 if (Active())
                     RefreshMainScrollHover(hwnd, pt);
+                // Scrollbars are transparent overlays on top of the PDF. If
+                // cursor selection falls through to the page hit-test below,
+                // text under the rail changes the cursor to an I-beam after a
+                // drag/re-entry, especially in immersive mode. Resolve every
+                // scrollbar hot area before any page/text hit-test so the
+                // pointer cursor is stable whenever the rail owns the point.
+                bool favoriteOverlayHit = g_favoriteListOpen &&
+                    !IsRectEmpty(&g_favoriteListRect) &&
+                    Hit(g_favoriteListRect, pt.x, pt.y);
+                auto hitScrollHotArea = [&](RECT rect, int inflateX, int inflateY)
+                {
+                    if (IsRectEmpty(&rect)) return false;
+                    InflateRect(&rect, S(inflateX), S(inflateY));
+                    return Hit(rect, pt.x, pt.y);
+                };
+                bool onScrollbar = !favoriteOverlayHit &&
+                    (hitScrollHotArea(g_mainScrollTrackRect, 8, 2) ||
+                        hitScrollHotArea(g_mainHScrollTrackRect, 2, 8) ||
+                        hitScrollHotArea(g_homeScrollTrackRect, 2, 2) ||
+                        hitScrollHotArea(g_sidebarScrollTrackRect, 2, 2) ||
+                        hitScrollHotArea(g_tabListScrollTrackRect, 2, 2) ||
+                        hitScrollHotArea(g_favoriteListScrollTrackRect, 2, 2));
+                if (onScrollbar)
+                {
+                    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                    return TRUE;
+                }
                 if (Active())
                 {
                     RECT client{};
@@ -23426,6 +24193,7 @@ namespace
                 if (Hit(g_zoomDialogInputRect, x, y))
                 {
                     g_customZoomFocused = true;
+                    g_customZoomSelectionAnchor = -1;
                     g_customZoomCaretIndex = CustomZoomCaretIndexAtX(hwnd, x);
                     UpdateCustomZoomCaret(hwnd);
                     return 0;
@@ -23462,8 +24230,18 @@ namespace
                     if (g_confirmDeleteAllAnnotations)
                     {
                         g_confirmDeleteAllAnnotations = false;
-                        if (PdfTab* tab = Active(); tab && !tab->annotations.empty())
+                        if (PdfTab* tab = Active())
                         {
+                            if (!tab->annotationsMetadataLoaded && !LoadAnnotationsFromPdf(*tab))
+                            {
+                                InvalidateRect(hwnd, nullptr, FALSE);
+                                return 0;
+                            }
+                            if (tab->annotations.empty())
+                            {
+                                InvalidateRect(hwnd, nullptr, FALSE);
+                                return 0;
+                            }
                             tab->annotations.clear();
                             tab->dirty = true;
                             ClearAnnotationFocus();
@@ -23533,6 +24311,7 @@ namespace
                 {
                     g_homeSearchQuery.clear();
                     g_homeSearchCaretIndex = 0;
+                    g_homeSearchSelectionAnchor = -1;
                     g_homeSearchFocused = true;
                     g_homeSearchCaretVisible = true;
                     SetTimer(hwnd, 15, 500, nullptr);
@@ -23543,6 +24322,7 @@ namespace
                 {
                     RECT inputText{ g_homeSearchRect.left + S(40), g_homeSearchRect.top, g_homeSearchRect.right - (g_homeSearchQuery.empty() ? S(14) : S(42)), g_homeSearchRect.bottom };
                     g_homeSearchCaretIndex = CaretIndexFromPoint(hwnd, g_homeSearchQuery, inputText, 11, x, false);
+                    g_homeSearchSelectionAnchor = -1;
                     g_homeSearchFocused = true;
                     g_homeSearchCaretVisible = true;
                     SetTimer(hwnd, 15, 500, nullptr);
@@ -23737,6 +24517,7 @@ namespace
                 {
                     g_outlineSearchQuery.clear();
                     g_outlineSearchCaretIndex = 0;
+                    g_outlineSearchSelectionAnchor = -1;
                     g_outlineSearchCaretVisible = true;
                     RefreshOutlineSearchLayout(hwnd, true);
                     return 0;
@@ -23750,6 +24531,7 @@ namespace
                     g_outlineSearchRect.bottom };
                 g_outlineSearchExpanded = true;
                 g_outlineSearchFocused = true;
+                g_outlineSearchSelectionAnchor = -1;
                 g_outlineSearchCaretIndex = CaretIndexFromPoint(
                     hwnd, g_outlineSearchQuery, inputText,
                     g_outlineSearchQuery.empty() ? 9 : 10, x, false);
@@ -23780,7 +24562,10 @@ namespace
                 SetCapture(hwnd);
                 int width = std::max<int>(1, g_thumbSliderRect.right - g_thumbSliderRect.left);
                 g_thumbSize = std::clamp<int>(ThumbSizeMin + (x - g_thumbSliderRect.left) * (ThumbSizeMax - ThumbSizeMin) / width, ThumbSizeMin, ThumbSizeMax);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                // The slider only changes the thumbnail panel. Keeping the
+                // invalidation local prevents the reader and its scrollbars
+                // from repainting on every mouse sample.
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
                 return 0;
             }
             if (g_sideMode == 2 && Hit(g_searchInputRect, x, y))
@@ -23815,6 +24600,7 @@ namespace
                     g_searchCaretIndex = CaretIndexFromPoint(hwnd, g_searchQuery, inputText, 9, x, false);
                 }
                 g_searchInputFocused = true;
+                g_searchSelectionAnchor = -1;
                 g_searchCaretVisible = true;
                 SetTimer(hwnd, 12, 500, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -24066,6 +24852,10 @@ namespace
             }
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            g_contextImageTab = nullptr;
+            g_contextImagePage = -1;
+            g_contextImagePageRect = {};
+            g_contextImageNorm = {};
             for (size_t i = 0; i < g_tabRects.size(); ++i)
             {
                 if (Hit(g_tabRects[i], x, y))
@@ -24125,6 +24915,27 @@ namespace
                         ShowFavoriteOnlyMenu(hwnd, pt.x, pt.y);
                         return 0;
                     }
+                }
+            }
+            // Match SumatraPDF's image context-menu behavior: a right click
+            // directly on an image creates only a temporary copy target. It
+            // must not replace or paint the user's existing selection.
+            if (PdfTab* tab = Active())
+            {
+                int page = -1;
+                RECT pageRect{};
+                fz_rect imageRect{};
+                if (PageRectAtPoint(*tab, x, y, page, pageRect) &&
+                    FindImageRectAtPoint(*tab, page, pageRect, POINT{ x, y }, imageRect))
+                {
+                    g_contextImageTab = tab;
+                    g_contextImagePage = page;
+                    g_contextImagePageRect = pageRect;
+                    g_contextImageNorm = imageRect;
+                    POINT pt{ x, y };
+                    ClientToScreen(hwnd, &pt);
+                    ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y, true);
+                    return 0;
                 }
             }
             if (g_hasContentSelection && Hit(g_stage, x, y))
@@ -24661,7 +25472,7 @@ namespace
                 int x = mx;
                 int width = std::max<int>(1, g_thumbSliderRect.right - g_thumbSliderRect.left);
                 g_thumbSize = std::clamp<int>(ThumbSizeMin + (x - g_thumbSliderRect.left) * (ThumbSizeMax - ThumbSizeMin) / width, ThumbSizeMin, ThumbSizeMax);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                InvalidateRect(hwnd, &g_sidebar, FALSE);
                 return 0;
             }
             break;
@@ -25182,6 +25993,16 @@ namespace
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
             }
+            if (wParam == 26)
+            {
+                KillTimer(hwnd, 26);
+                if (PdfTab* tab = Active(); tab &&
+                    !tab->annotationsMetadataLoaded && !tab->annotationsMetadataRequested)
+                {
+                    RequestAnnotationsMetadata(hwnd, *tab);
+                }
+                return 0;
+            }
             break;
         case WM_MOUSEWHEEL:
         {
@@ -25396,6 +26217,32 @@ namespace
             if (wParam == VK_ESCAPE && g_autoScrollActive) { StopAutoScroll(hwnd); return 0; }
             if (g_customZoomOpen)
             {
+                int customCaret = static_cast<int>(g_customZoomCaretIndex);
+                if (((GetKeyState(VK_CONTROL) & 0x8000) != 0) && wParam == 'A')
+                {
+                    EditorSelectAll(g_customZoomText, customCaret, g_customZoomSelectionAnchor);
+                    g_customZoomCaretIndex = static_cast<size_t>(customCaret);
+                    UpdateCustomZoomCaret(hwnd);
+                    InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_HOME || wParam == VK_END)
+                {
+                    EditorMove(g_customZoomText, customCaret, g_customZoomSelectionAnchor,
+                        static_cast<UINT>(wParam), ((GetKeyState(VK_SHIFT) & 0x8000) != 0));
+                    g_customZoomCaretIndex = static_cast<size_t>(customCaret);
+                    UpdateCustomZoomCaret(hwnd);
+                    InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_DELETE)
+                {
+                    EditorDeleteForward(g_customZoomText, customCaret, g_customZoomSelectionAnchor);
+                    g_customZoomCaretIndex = static_cast<size_t>(customCaret);
+                    UpdateCustomZoomCaret(hwnd);
+                    InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
+                    return 0;
+                }
                 if (wParam == VK_LEFT)
                 {
                     if (g_customZoomCaretIndex > 0) --g_customZoomCaretIndex;
@@ -25446,6 +26293,16 @@ namespace
                 CopyCurrentSelectionToClipboard(hwnd);
                 return 0;
             }
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && wParam == 'A' && Active() &&
+                !g_customZoomOpen && !g_pageInputFocused && !g_homeSearchFocused &&
+                !g_searchInputFocused && !g_outlineSearchFocused && !g_annotationNoteFocused)
+            {
+                if (PdfTab* tab = Active(); tab && SelectAllDocumentText(*tab))
+                {
+                    InvalidateRect(hwnd, &g_stage, FALSE);
+                    return 0;
+                }
+            }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && (g_hasContentSelection || HasCopyableTextSelection()))
             {
                 if (wParam == 'C' || wParam == VK_INSERT)
@@ -25486,9 +26343,10 @@ namespace
                 g_sidebarRailOpen = true;
                 g_sidebarOpen = true;
                 SwitchSidebarMode(hwnd, 2);
-                g_searchInputFocused = true;
-                g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
-                g_searchCaretVisible = true;
+            g_searchInputFocused = true;
+            g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
+            g_searchSelectionAnchor = -1;
+            g_searchCaretVisible = true;
                 SetTimer(hwnd, 12, 500, nullptr);
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -25507,13 +26365,24 @@ namespace
             }
             if (g_pageInputFocused)
             {
-                if (wParam == VK_LEFT) { g_pageCaretIndex = std::max(0, g_pageCaretIndex - 1); g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_RIGHT) { g_pageCaretIndex = std::min(static_cast<int>(g_pageInputText.size()), g_pageCaretIndex + 1); g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_HOME) { g_pageCaretIndex = 0; g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_END) { g_pageCaretIndex = static_cast<int>(g_pageInputText.size()); g_pageCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_DELETE && g_pageCaretIndex < static_cast<int>(g_pageInputText.size()))
+                if (((GetKeyState(VK_CONTROL) & 0x8000) != 0) && wParam == 'A')
                 {
-                    g_pageInputText.erase(static_cast<size_t>(g_pageCaretIndex), 1);
+                    EditorSelectAll(g_pageInputText, g_pageCaretIndex, g_pageSelectionAnchor);
+                    g_pageCaretVisible = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_HOME || wParam == VK_END)
+                {
+                    EditorMove(g_pageInputText, g_pageCaretIndex, g_pageSelectionAnchor,
+                        static_cast<UINT>(wParam), ((GetKeyState(VK_SHIFT) & 0x8000) != 0));
+                    g_pageCaretVisible = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_DELETE)
+                {
+                    EditorDeleteForward(g_pageInputText, g_pageCaretIndex, g_pageSelectionAnchor);
                     g_pageCaretVisible = true;
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
@@ -25521,57 +26390,61 @@ namespace
             }
             if (g_searchInputFocused && g_sideMode == 2)
             {
-                if (wParam == VK_LEFT) { g_searchCaretIndex = std::max(0, g_searchCaretIndex - 1); g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_RIGHT) { g_searchCaretIndex = std::min(static_cast<int>(g_searchQuery.size()), g_searchCaretIndex + 1); g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_HOME) { g_searchCaretIndex = 0; g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_END) { g_searchCaretIndex = static_cast<int>(g_searchQuery.size()); g_searchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_DELETE && g_searchCaretIndex < static_cast<int>(g_searchQuery.size()))
+                if (((GetKeyState(VK_CONTROL) & 0x8000) != 0) && wParam == 'A')
                 {
-                    g_searchQuery.erase(static_cast<size_t>(g_searchCaretIndex), 1);
+                    EditorSelectAll(g_searchQuery, g_searchCaretIndex, g_searchSelectionAnchor);
                     g_searchResults.clear();
                     g_searchCurrent = 0;
                     g_searchHasRun = false;
                     g_searchLastQuery.clear();
                     g_searchCaretVisible = true;
-                    SetTimer(hwnd, 12, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_HOME || wParam == VK_END)
+                {
+                    EditorMove(g_searchQuery, g_searchCaretIndex, g_searchSelectionAnchor,
+                        static_cast<UINT>(wParam), ((GetKeyState(VK_SHIFT) & 0x8000) != 0));
+                    g_searchCaretVisible = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_DELETE)
+                {
+                    if (EditorDeleteForward(g_searchQuery, g_searchCaretIndex, g_searchSelectionAnchor))
+                    {
+                        g_searchResults.clear();
+                        g_searchCurrent = 0;
+                        g_searchHasRun = false;
+                        g_searchLastQuery.clear();
+                        SetTimer(hwnd, 12, 500, nullptr);
+                    }
+                    g_searchCaretVisible = true;
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
             }
             if (g_outlineSearchFocused && g_sideMode == 0)
             {
-                if (wParam == VK_LEFT)
+                if (((GetKeyState(VK_CONTROL) & 0x8000) != 0) && wParam == 'A')
                 {
-                    g_outlineSearchCaretIndex = std::max(0, g_outlineSearchCaretIndex - 1);
+                    EditorSelectAll(g_outlineSearchQuery, g_outlineSearchCaretIndex, g_outlineSearchSelectionAnchor);
                     g_outlineSearchCaretVisible = true;
                     InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
                     return 0;
                 }
-                if (wParam == VK_RIGHT)
+                if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_HOME || wParam == VK_END)
                 {
-                    g_outlineSearchCaretIndex = std::min(
-                        static_cast<int>(g_outlineSearchQuery.size()), g_outlineSearchCaretIndex + 1);
+                    EditorMove(g_outlineSearchQuery, g_outlineSearchCaretIndex,
+                        g_outlineSearchSelectionAnchor, static_cast<UINT>(wParam), ((GetKeyState(VK_SHIFT) & 0x8000) != 0));
                     g_outlineSearchCaretVisible = true;
                     InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
                     return 0;
                 }
-                if (wParam == VK_HOME)
+                if (wParam == VK_DELETE)
                 {
-                    g_outlineSearchCaretIndex = 0;
-                    g_outlineSearchCaretVisible = true;
-                    InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
-                    return 0;
-                }
-                if (wParam == VK_END)
-                {
-                    g_outlineSearchCaretIndex = static_cast<int>(g_outlineSearchQuery.size());
-                    g_outlineSearchCaretVisible = true;
-                    InvalidateRect(hwnd, &g_outlineSearchRect, FALSE);
-                    return 0;
-                }
-                if (wParam == VK_DELETE && g_outlineSearchCaretIndex < static_cast<int>(g_outlineSearchQuery.size()))
-                {
-                    g_outlineSearchQuery.erase(static_cast<size_t>(g_outlineSearchCaretIndex), 1);
+                    EditorDeleteForward(g_outlineSearchQuery, g_outlineSearchCaretIndex,
+                        g_outlineSearchSelectionAnchor);
                     g_outlineSearchCaretVisible = true;
                     SetTimer(hwnd, 13, 500, nullptr);
                     RefreshOutlineSearchLayout(hwnd, true);
@@ -25580,15 +26453,26 @@ namespace
             }
             if (g_homeSearchFocused && !Active())
             {
-                if (wParam == VK_LEFT) { g_homeSearchCaretIndex = std::max(0, g_homeSearchCaretIndex - 1); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_RIGHT) { g_homeSearchCaretIndex = std::min(static_cast<int>(g_homeSearchQuery.size()), g_homeSearchCaretIndex + 1); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_HOME) { g_homeSearchCaretIndex = 0; g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_END) { g_homeSearchCaretIndex = static_cast<int>(g_homeSearchQuery.size()); g_homeSearchCaretVisible = true; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-                if (wParam == VK_DELETE && g_homeSearchCaretIndex < static_cast<int>(g_homeSearchQuery.size()))
+                if (((GetKeyState(VK_CONTROL) & 0x8000) != 0) && wParam == 'A')
                 {
-                    g_homeSearchQuery.erase(static_cast<size_t>(g_homeSearchCaretIndex), 1);
+                    EditorSelectAll(g_homeSearchQuery, g_homeSearchCaretIndex, g_homeSearchSelectionAnchor);
                     g_homeSearchCaretVisible = true;
-                    SetTimer(hwnd, 15, 500, nullptr);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_HOME || wParam == VK_END)
+                {
+                    EditorMove(g_homeSearchQuery, g_homeSearchCaretIndex,
+                        g_homeSearchSelectionAnchor, static_cast<UINT>(wParam), ((GetKeyState(VK_SHIFT) & 0x8000) != 0));
+                    g_homeSearchCaretVisible = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+                if (wParam == VK_DELETE)
+                {
+                    if (EditorDeleteForward(g_homeSearchQuery, g_homeSearchCaretIndex, g_homeSearchSelectionAnchor))
+                        SetTimer(hwnd, 15, 500, nullptr);
+                    g_homeSearchCaretVisible = true;
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -25651,11 +26535,9 @@ namespace
             {
                 if (wParam == VK_BACK)
                 {
-                    if (g_customZoomCaretIndex > 0)
-                    {
-                        g_customZoomText.erase(g_customZoomCaretIndex - 1, 1);
-                        --g_customZoomCaretIndex;
-                    }
+                    int caret = static_cast<int>(g_customZoomCaretIndex);
+                    EditorBackspace(g_customZoomText, caret, g_customZoomSelectionAnchor);
+                    g_customZoomCaretIndex = static_cast<size_t>(caret);
                 }
                 else if (wParam == VK_RETURN)
                 {
@@ -25664,18 +26546,20 @@ namespace
                 }
                 else if ((wParam >= L'0' && wParam <= L'9') && g_customZoomText.size() < 7)
                 {
-                    if (g_customZoomText == L"0")
+                    if (g_customZoomText == L"0" && !EditorHasSelection(static_cast<int>(g_customZoomCaretIndex), g_customZoomSelectionAnchor))
                     {
                         g_customZoomText.clear();
                         g_customZoomCaretIndex = 0;
                     }
-                    g_customZoomText.insert(g_customZoomCaretIndex, 1, static_cast<wchar_t>(wParam));
-                    ++g_customZoomCaretIndex;
+                    int caret = static_cast<int>(g_customZoomCaretIndex);
+                    EditorInsert(g_customZoomText, caret, g_customZoomSelectionAnchor, static_cast<wchar_t>(wParam), 7);
+                    g_customZoomCaretIndex = static_cast<size_t>(caret);
                 }
                 else if (wParam == L'.' && g_customZoomText.find(L'.') == std::wstring::npos && !g_customZoomText.empty() && g_customZoomText.size() < 7)
                 {
-                    g_customZoomText.insert(g_customZoomCaretIndex, 1, L'.');
-                    ++g_customZoomCaretIndex;
+                    int caret = static_cast<int>(g_customZoomCaretIndex);
+                    EditorInsert(g_customZoomText, caret, g_customZoomSelectionAnchor, L'.', 7);
+                    g_customZoomCaretIndex = static_cast<size_t>(caret);
                 }
                 UpdateCustomZoomCaret(hwnd);
                 InvalidateRect(hwnd, &g_zoomDialogInputRect, FALSE);
@@ -25686,11 +26570,7 @@ namespace
                 g_pageCaretIndex = std::clamp(g_pageCaretIndex, 0, static_cast<int>(g_pageInputText.size()));
                 if (wParam == VK_BACK)
                 {
-                    if (g_pageCaretIndex > 0)
-                    {
-                        g_pageInputText.erase(static_cast<size_t>(g_pageCaretIndex - 1), 1);
-                        --g_pageCaretIndex;
-                    }
+                    EditorBackspace(g_pageInputText, g_pageCaretIndex, g_pageSelectionAnchor);
                 }
                 else if (wParam == VK_RETURN)
                 {
@@ -25699,13 +26579,12 @@ namespace
                 }
                 else if (wParam >= L'0' && wParam <= L'9' && g_pageInputText.size() < 6)
                 {
-                    if (g_pageInputText == L"0")
+                    if (g_pageInputText == L"0" && !EditorHasSelection(g_pageCaretIndex, g_pageSelectionAnchor))
                     {
                         g_pageInputText.clear();
                         g_pageCaretIndex = 0;
                     }
-                    g_pageInputText.insert(g_pageInputText.begin() + g_pageCaretIndex, static_cast<wchar_t>(wParam));
-                    ++g_pageCaretIndex;
+                    EditorInsert(g_pageInputText, g_pageCaretIndex, g_pageSelectionAnchor, static_cast<wchar_t>(wParam), 6);
                 }
                 g_pageCaretVisible = true;
                 RECT client{};
@@ -25720,12 +26599,7 @@ namespace
                 g_homeSearchCaretIndex = std::clamp(g_homeSearchCaretIndex, 0, static_cast<int>(g_homeSearchQuery.size()));
                 if (wParam == VK_BACK)
                 {
-                    if (g_homeSearchCaretIndex > 0)
-                    {
-                        g_homeSearchQuery.erase(static_cast<size_t>(g_homeSearchCaretIndex - 1), 1);
-                        --g_homeSearchCaretIndex;
-                        changed = true;
-                    }
+                    changed = EditorBackspace(g_homeSearchQuery, g_homeSearchCaretIndex, g_homeSearchSelectionAnchor);
                 }
                 else if (wParam == VK_RETURN)
                 {
@@ -25733,9 +26607,8 @@ namespace
                 }
                 else if (wParam >= 32 && g_homeSearchQuery.size() < 120)
                 {
-                    g_homeSearchQuery.insert(g_homeSearchQuery.begin() + g_homeSearchCaretIndex, static_cast<wchar_t>(wParam));
-                    ++g_homeSearchCaretIndex;
-                    changed = true;
+                    changed = EditorInsert(g_homeSearchQuery, g_homeSearchCaretIndex,
+                        g_homeSearchSelectionAnchor, static_cast<wchar_t>(wParam), 120);
                 }
                 if (changed)
                 {
@@ -25752,20 +26625,13 @@ namespace
                 bool changed = false;
                 if (wParam == VK_BACK)
                 {
-                    if (g_outlineSearchCaretIndex > 0)
-                    {
-                        g_outlineSearchQuery.erase(static_cast<size_t>(g_outlineSearchCaretIndex - 1), 1);
-                        --g_outlineSearchCaretIndex;
-                        changed = true;
-                    }
+                    changed = EditorBackspace(g_outlineSearchQuery, g_outlineSearchCaretIndex,
+                        g_outlineSearchSelectionAnchor);
                 }
                 else if (wParam >= 32 && g_outlineSearchQuery.size() < 120)
                 {
-                    g_outlineSearchQuery.insert(
-                        g_outlineSearchQuery.begin() + g_outlineSearchCaretIndex,
-                        static_cast<wchar_t>(wParam));
-                    ++g_outlineSearchCaretIndex;
-                    changed = true;
+                    changed = EditorInsert(g_outlineSearchQuery, g_outlineSearchCaretIndex,
+                        g_outlineSearchSelectionAnchor, static_cast<wchar_t>(wParam), 120);
                 }
                 if (changed)
                 {
@@ -25781,12 +26647,7 @@ namespace
                 g_searchCaretIndex = std::clamp(g_searchCaretIndex, 0, static_cast<int>(g_searchQuery.size()));
                 if (wParam == VK_BACK)
                 {
-                    if (g_searchCaretIndex > 0)
-                    {
-                        g_searchQuery.erase(static_cast<size_t>(g_searchCaretIndex - 1), 1);
-                        --g_searchCaretIndex;
-                        changed = true;
-                    }
+                    changed = EditorBackspace(g_searchQuery, g_searchCaretIndex, g_searchSelectionAnchor);
                 }
                 else if (wParam == VK_RETURN)
                 {
@@ -25794,9 +26655,8 @@ namespace
                 }
                 else if (wParam >= 32)
                 {
-                    g_searchQuery.insert(g_searchQuery.begin() + g_searchCaretIndex, static_cast<wchar_t>(wParam));
-                    ++g_searchCaretIndex;
-                    changed = true;
+                    changed = EditorInsert(g_searchQuery, g_searchCaretIndex,
+                        g_searchSelectionAnchor, static_cast<wchar_t>(wParam), 120);
                 }
                 if (changed)
                 {
