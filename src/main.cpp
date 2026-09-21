@@ -12511,8 +12511,33 @@ namespace
         }
         else if (g_sideMode == 1)
         {
+            // Start the thumbnail request before the selected card is moved
+            // into view. The worker stays asynchronous, but the new card no
+            // longer has to appear first as an empty placeholder.
+            int page = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
+            if (tab.pageCount > 0)
+                (void)EnsureThumb(tab, page);
             RequestSidebarRepaint(hwnd);
         }
+    }
+
+    RECT ThumbnailItemRect(PdfTab const& tab, int page)
+    {
+        if (tab.pageCount <= 0 || g_sidebar.right <= g_sidebar.left ||
+            page < 0 || page >= tab.pageCount)
+            return RECT{};
+
+        int y = g_sidebar.top + S(80) - g_sidebarScrollY;
+        for (int i = 0; i < page; ++i)
+            y += ThumbnailBoxHeight(tab, i) + S(22);
+        int boxH = ThumbnailBoxHeight(tab, page);
+        int boxW = std::max(g_thumbSize + S(36), S(160));
+        return RECT{
+            g_sidebar.left + (g_sidebar.right - g_sidebar.left - boxW) / 2,
+            y,
+            g_sidebar.left + (g_sidebar.right - g_sidebar.left + boxW) / 2,
+            y + boxH
+        };
     }
 
     void FocusPageInput(HWND hwnd)
@@ -23859,7 +23884,15 @@ namespace
                             found->second = std::move(result->image);
                         if (found != tab.thumbCache.end() &&
                             (found->second.dib || !found->second.bgra.empty()) && i == g_active)
-                            InvalidateRect(hwnd, &g_sidebar, FALSE);
+                        {
+                            // The sidebar position and selected card are
+                            // already stable. Repaint only this thumbnail so
+                            // an async image completion cannot flash the
+                            // entire sidebar while the reader is scrolling.
+                            RECT dirty = ThumbnailItemRect(tab, request.page);
+                            if (!IsRectEmpty(&dirty))
+                                InvalidateRect(hwnd, &dirty, FALSE);
+                        }
                     }
                     break;
                 }
