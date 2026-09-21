@@ -2048,6 +2048,9 @@ namespace
     std::wstring g_customZoomText;
     size_t g_customZoomCaretIndex{};
     int g_customZoomSelectionAnchor{ -1 };
+    bool g_keyboardShortcutsOpen{};
+    RECT g_keyboardShortcutsRect{};
+    RECT g_keyboardShortcutsCloseRect{};
     struct ThemedMenuItem
     {
         std::wstring text;
@@ -2433,6 +2436,7 @@ namespace
     bool Intersects(RECT a, RECT b);
     void RoundFill(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
     void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
+    void DrawScrollThumbAA(HDC dc, RECT r, int radius, COLORREF color);
 
     void ApplyPdfThemeFor(int theme, std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
@@ -2987,7 +2991,7 @@ namespace
             int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
             int trackW = active ? S(7) : std::max(2, S(3));
             RECT visualThumb{ centerX - trackW / 2, g_mainScrollThumbRect.top, centerX + (trackW + 1) / 2, g_mainScrollThumbRect.bottom };
-            RoundFill(dc, visualThumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+            DrawScrollThumbAA(dc, visualThumb, S(5), ScrollThumbColor(active));
         }
         if (!IsRectEmpty(&g_mainHScrollTrackRect) && (Intersects(paintClip, g_mainHScrollTrackRect) || Intersects(paintClip, g_mainHScrollThumbRect)))
         {
@@ -2995,7 +2999,7 @@ namespace
             int centerY = (g_mainHScrollTrackRect.top + g_mainHScrollTrackRect.bottom) / 2;
             int h = hActive ? S(7) : std::max(2, S(3));
             RECT visualH{ g_mainHScrollThumbRect.left, centerY - h / 2, g_mainHScrollThumbRect.right, centerY + (h + 1) / 2 };
-            RoundFill(dc, visualH, S(5), ScrollThumbColor(hActive), ScrollThumbColor(hActive));
+            DrawScrollThumbAA(dc, visualH, S(5), ScrollThumbColor(hActive));
         }
     }
 
@@ -3050,7 +3054,7 @@ namespace
             int centerX = (g_homeScrollTrackRect.left + g_homeScrollTrackRect.right) / 2;
             int trackW = active ? S(7) : std::max(2, S(3));
             RECT visualThumb{ centerX - trackW / 2, g_homeScrollThumbRect.top, centerX + (trackW + 1) / 2, g_homeScrollThumbRect.bottom };
-            RoundFill(dc, visualThumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+            DrawScrollThumbAA(dc, visualThumb, S(5), ScrollThumbColor(active));
         }
     }
 
@@ -3129,6 +3133,16 @@ namespace
         Gdiplus::Pen pen(GdiColor(line), 1.0f);
         FillGdiRoundRect(g, brush, bounds, cornerRadius);
         DrawGdiRoundRect(g, pen, bounds, cornerRadius);
+    }
+
+    void DrawScrollThumbAA(HDC dc, RECT r, int radius, COLORREF color)
+    {
+        if (IsRectEmpty(&r)) return;
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::SolidBrush brush(GdiColor(color));
+        FillGdiRoundRect(g, brush, Rf(r), std::max(1.0f, static_cast<float>(radius)));
     }
 
     void DrawRoundedShadow(HDC dc, RECT r, float radius, int offsetX, int offsetY, int spread, BYTE alpha)
@@ -4324,8 +4338,7 @@ namespace
                 centerX - visualW / 2, g_favoriteListScrollThumbRect.top,
                 centerX + (visualW + 1) / 2,
                 g_favoriteListScrollThumbRect.bottom };
-            RoundFill(dc, thumb, S(5), ScrollThumbColor(active),
-                ScrollThumbColor(active));
+            DrawScrollThumbAA(dc, thumb, S(5), ScrollThumbColor(active));
         }
     }
 
@@ -13200,27 +13213,7 @@ namespace
             centerX + (trackW + 1) / 2,
             g_sidebarScrollThumbRect.bottom
         };
-        Gdiplus::Graphics g(dc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        BYTE alpha = active ? 136 : 92;
-        Gdiplus::SolidBrush brush(GdiColor(ScrollThumbColor(active), alpha));
-        Gdiplus::RectF thumb = Rf(visualThumb);
-        float cap = std::max(1.0f, thumb.Width * 0.5f);
-        if (thumb.Height <= thumb.Width)
-        {
-            g.FillEllipse(&brush, thumb);
-        }
-        else
-        {
-            Gdiplus::GraphicsPath path;
-            path.AddArc(thumb.X, thumb.Y, thumb.Width, thumb.Width, 180.0f, 180.0f);
-            path.AddLine(thumb.X + thumb.Width, thumb.Y + cap, thumb.X + thumb.Width, thumb.Y + thumb.Height - cap);
-            path.AddArc(thumb.X, thumb.Y + thumb.Height - thumb.Width, thumb.Width, thumb.Width, 0.0f, 180.0f);
-            path.AddLine(thumb.X, thumb.Y + thumb.Height - cap, thumb.X, thumb.Y + cap);
-            path.CloseFigure();
-            g.FillPath(&brush, &path);
-        }
+        DrawScrollThumbAA(dc, visualThumb, S(5), ScrollThumbColor(active));
     }
 
     bool ZoomRenderDeferred()
@@ -15708,7 +15701,7 @@ namespace
                 {
                     COLORREF utilFill = active ? MixColor(T().panel2, T().accent, 0.06) : (hover ? SidebarHoverFill() : T().panel);
                     COLORREF utilLine = active ? MixColor(T().line, T().accent, 0.20) : MixColor(T().line, T().panel, 0.22);
-                    RoundFill(dc, r, S(9), utilFill, utilLine);
+                    RoundFillAA(dc, r, S(9), utilFill, utilLine);
                 }
                 else
                 {
@@ -15717,7 +15710,7 @@ namespace
                         : (active ? RGB(247, 250, 253) : (hover ? RGB(255, 255, 255) : tabBarFill));
                     COLORREF utilLine = pressed ? RGB(202, 210, 220)
                         : (active ? RGB(208, 218, 228) : (hover ? RGB(228, 234, 241) : (showIdleBorder ? T().line : tabBarFill)));
-                    RoundFill(dc, r, S(9), utilFill, utilLine);
+                    RoundFillAA(dc, r, S(9), utilFill, utilLine);
                 }
             }
             else
@@ -15725,10 +15718,10 @@ namespace
                 if (IsGraphiteTheme())
                 {
                     COLORREF utilityFill = pressed ? RGB(77, 83, 91) : (active ? RGB(44, 48, 54) : (hover ? RGB(44, 48, 53) : RGB(35, 39, 44)));
-                    RoundFill(dc, r, S(9), utilityFill, RGB(48, 52, 58));
+                    RoundFillAA(dc, r, S(9), utilityFill, RGB(48, 52, 58));
                 }
                 else
-                    RoundFill(dc, r, S(9), pressed ? T().panel2 : (hover ? T().panel2 : fill), hover ? MixColor(line, T().text, 0.08) : line);
+                    RoundFillAA(dc, r, S(9), pressed ? T().panel2 : (hover ? T().panel2 : fill), hover ? MixColor(line, T().text, 0.08) : line);
             }
         };
 
@@ -15868,7 +15861,7 @@ namespace
             int centerX = (g_tabListScrollTrackRect.left + g_tabListScrollTrackRect.right) / 2;
             int visualW = active ? S(4) : std::max(2, S(2));
             RECT thumb{ centerX - visualW / 2, g_tabListScrollThumbRect.top, centerX + (visualW + 1) / 2, g_tabListScrollThumbRect.bottom };
-            RoundFill(dc, thumb, S(5), ScrollThumbColor(active), ScrollThumbColor(active));
+            DrawScrollThumbAA(dc, thumb, S(5), ScrollThumbColor(active));
         }
     }
 
@@ -19428,6 +19421,12 @@ namespace
                         bool ignoredMissing = false;
                         presented |= DrawTileLevel(dc, *tab, page, pageRect, drawRect, 0, false, ignoredMissing);
                     }
+                    // Cached transition frames use the raw PDF palette just
+                    // like the normal reader pass. Apply the dark-theme mask
+                    // before presenting the tab switch so a white page can
+                    // never flash through for one frame.
+                    if (IsDarkTheme())
+                        AlphaFill(dc, drawRect, PdfOverlayColor(), PdfOverlayAlpha());
                 }
             }
             if (g_favoriteListOpen && !IsRectEmpty(&g_favoriteListRect))
@@ -20714,27 +20713,139 @@ namespace
 
     void ShowKeyboardShortcutsDialog(HWND hwnd)
     {
-        std::wstring shortcuts =
-            L"\u6807\u7b7e\u9875\n"
-            L"Ctrl + Tab    \u5207\u6362\u5230\u4e0b\u4e00\u4e2a\u6807\u7b7e\u9875\n"
-            L"Ctrl + Shift + Tab    \u5207\u6362\u5230\u4e0a\u4e00\u4e2a\u6807\u7b7e\u9875\n"
-            L"Ctrl + W    \u5173\u95ed\u5f53\u524d\u6807\u7b7e\u9875\n"
-            L"\n\u6587\u6863\n"
-            L"Ctrl + O    \u6253\u5f00 PDF \u6587\u4ef6\n"
-            L"Ctrl + S    \u4fdd\u5b58\u6807\u6ce8\n"
-            L"Ctrl + P    \u6253\u5370\u5f53\u524d\u6587\u6863\n"
-            L"Ctrl + A    \u5168\u9009\u6587\u6863\u6587\u672c\n"
-            L"Ctrl + C / Ctrl + Insert    \u590d\u5236\u9009\u4e2d\u5185\u5bb9\n"
-            L"Page Up / Page Down    \u4e0a\u4e00\u9875 / \u4e0b\u4e00\u9875\n"
-            L"\u65b9\u5411\u952e    \u6eda\u52a8\u6587\u6863\n"
-            L"F11    \u5207\u6362\u6c89\u6d78\u6a21\u5f0f\n"
-            L"Esc    \u53d6\u6d88\u5f53\u524d\u64cd\u4f5c / \u9000\u51fa\u6c89\u6d78\u6a21\u5f0f\n"
-            L"\n\u641c\u7d22\u4e0e\u6807\u6ce8\n"
-            L"Ctrl + F    \u6253\u5f00\u641c\u7d22\n"
-            L"Ctrl + H    \u4e3a\u9009\u4e2d\u6587\u672c\u6dfb\u52a0\u9ad8\u4eae\n"
-            L"Ctrl + U    \u4e3a\u9009\u4e2d\u6587\u672c\u6dfb\u52a0\u4e0b\u5212\u7ebf\n"
-            L"Ctrl + K    \u4e3a\u9009\u4e2d\u6587\u672c\u6dfb\u52a0\u5220\u9664\u7ebf";
-        MessageBoxW(hwnd, shortcuts.c_str(), L"\u5feb\u6377\u952e", MB_OK | MB_ICONINFORMATION);
+        g_keyboardShortcutsOpen = true;
+        g_keyboardShortcutsRect = {};
+        g_keyboardShortcutsCloseRect = {};
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+
+    bool HandleKeyboardShortcutsClick(HWND hwnd, int x, int y)
+    {
+        if (!g_keyboardShortcutsOpen) return false;
+        if (Hit(g_keyboardShortcutsCloseRect, x, y) ||
+            !Hit(g_keyboardShortcutsRect, x, y))
+        {
+            g_keyboardShortcutsOpen = false;
+            g_keyboardShortcutsRect = {};
+            g_keyboardShortcutsCloseRect = {};
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return true;
+    }
+
+    void PaintKeyboardShortcutsDialog(HDC dc, RECT client)
+    {
+        g_keyboardShortcutsRect = {};
+        g_keyboardShortcutsCloseRect = {};
+        if (!g_keyboardShortcutsOpen) return;
+
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush scrim(GdiColor(RGB(18, 22, 28), IsDarkTheme() ? 142 : 76));
+        g.FillRectangle(&scrim, Rf(client));
+
+        int availableW = std::max<int>(S(420), static_cast<int>(client.right) - S(40));
+        int availableH = std::max<int>(S(420), static_cast<int>(client.bottom) - S(40));
+        int panelW = std::clamp<int>(S(620), S(420), availableW);
+        int panelH = std::min<int>(S(520), availableH);
+        RECT panel{ (client.right - panelW) / 2, (client.bottom - panelH) / 2,
+            (client.right + panelW) / 2, (client.bottom + panelH) / 2 };
+        g_keyboardShortcutsRect = panel;
+        DrawRoundedShadow(dc, panel, S(16), S(1), S(3), S(8), IsDarkTheme() ? 42 : 30);
+        GlassRoundedSurface(dc, panel, IsDarkTheme() ? 244 : 250, S(16), true);
+
+        g_keyboardShortcutsCloseRect = RECT{ panel.right - S(46), panel.top + S(14), panel.right - S(14), panel.top + S(46) };
+        bool closeHover = Hit(g_keyboardShortcutsCloseRect, g_mousePos.x, g_mousePos.y);
+        if (closeHover)
+            RoundFillAA(dc, g_keyboardShortcutsCloseRect, S(8), SidebarHoverFill(), SidebarHoverFill());
+        DrawCloseGlyph(dc, g_keyboardShortcutsCloseRect, closeHover ? T().text : T().muted);
+
+        HFONT titleFont = SystemUiFont(13, FW_SEMIBOLD);
+        HGDIOBJ oldFont = SelectObject(dc, titleFont);
+        Text(dc, L"快捷键", RECT{ panel.left + S(26), panel.top + S(22), panel.right - S(70), panel.top + S(52) },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
+        SelectObject(dc, oldFont);
+        DeleteObject(titleFont);
+        HFONT hintFont = SystemUiFont(8);
+        oldFont = SelectObject(dc, hintFont);
+        Text(dc, L"轻阅 PDF 的常用操作", RECT{ panel.left + S(27), panel.top + S(51), panel.right - S(70), panel.top + S(72) },
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
+        SelectObject(dc, oldFont);
+        DeleteObject(hintFont);
+
+        struct ShortcutRow { const wchar_t* key; const wchar_t* text; };
+        struct ShortcutGroup { const wchar_t* title; const ShortcutRow* rows; int count; };
+        static const ShortcutRow tabs[] = {
+            { L"Ctrl + Tab", L"切换到下一个标签页" },
+            { L"Ctrl + Shift + Tab", L"切换到上一个标签页" },
+            { L"Ctrl + W", L"关闭当前标签页" }
+        };
+        static const ShortcutRow document[] = {
+            { L"Ctrl + O", L"打开 PDF 文件" },
+            { L"Ctrl + S", L"保存标注" },
+            { L"Ctrl + P", L"打印当前文档" },
+            { L"Ctrl + A", L"全选文档文本" },
+            { L"Ctrl + C", L"复制选中内容" },
+            { L"Page Up / Page Down", L"上一页 / 下一页" },
+            { L"方向键", L"滚动文档" },
+            { L"F11", L"切换沉浸模式" },
+            { L"Esc", L"取消当前操作或退出沉浸模式" }
+        };
+        static const ShortcutRow search[] = {
+            { L"Ctrl + F", L"打开搜索" },
+            { L"Ctrl + H", L"为选中文本添加高亮" },
+            { L"Ctrl + U", L"为选中文本添加下划线" },
+            { L"Ctrl + K", L"为选中文本添加删除线" }
+        };
+        ShortcutGroup groups[] = {
+            { L"标签页", tabs, static_cast<int>(std::size(tabs)) },
+            { L"文档", document, static_cast<int>(std::size(document)) },
+            { L"搜索与标注", search, static_cast<int>(std::size(search)) }
+        };
+
+        int contentTop = panel.top + S(90);
+        int contentBottom = panel.bottom - S(22);
+        int contentLeft = panel.left + S(26);
+        int contentRight = panel.right - S(26);
+        int columnGap = S(24);
+        int columnW = std::max(S(120), (contentRight - contentLeft - columnGap) / 2);
+        int columnX[] = { contentLeft, contentLeft + columnW + columnGap };
+        HFONT groupFont = SystemUiFont(8, FW_SEMIBOLD);
+        HFONT rowFont = SystemUiFont(9);
+        auto paintGroup = [&](ShortcutGroup const& group, int column, int& y)
+        {
+            int x = columnX[column];
+            int right = column == 0 ? columnX[1] - columnGap / 2 : contentRight;
+            if (y + S(30) > contentBottom) return;
+            oldFont = SelectObject(dc, groupFont);
+            Text(dc, group.title, RECT{ x, y, right, y + S(22) },
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().accent);
+            SelectObject(dc, oldFont);
+            y += S(24);
+            for (int i = 0; i < group.count; ++i)
+            {
+                if (y + S(30) > contentBottom) break;
+                int keyW = std::clamp(S(16) + static_cast<int>(wcslen(group.rows[i].key)) * S(7), S(66),
+                    std::max(S(66), columnW - S(92)));
+                RECT keyRect{ x, y + S(2), x + keyW, y + S(27) };
+                RoundFillAA(dc, keyRect, S(6), MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.16 : 0.07),
+                    MixColor(T().line, T().accent, IsDarkTheme() ? 0.30 : 0.18));
+                oldFont = SelectObject(dc, rowFont);
+                Text(dc, group.rows[i].key, keyRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
+                Text(dc, group.rows[i].text, RECT{ keyRect.right + S(10), y, right, y + S(29) },
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
+                SelectObject(dc, oldFont);
+                y += S(31);
+            }
+            y += S(7);
+        };
+        int leftY = contentTop;
+        int rightY = contentTop;
+        paintGroup(groups[0], 0, leftY);
+        paintGroup(groups[1], 1, rightY);
+        paintGroup(groups[2], 0, leftY);
+        DeleteObject(groupFont);
+        DeleteObject(rowFont);
     }
 
     bool LaunchOpenWithForDefaultPdf(HWND hwnd)
@@ -23223,6 +23334,7 @@ namespace
         PaintTabListOverlay(mem, client);
         PaintClearRecentDialog(mem, client);
         PaintCustomZoomDialog(mem, client);
+        PaintKeyboardShortcutsDialog(mem, client);
         PaintTabDragOverlay(mem);
         // Compose the tooltip into the same back buffer as the button state.
         // The previous GetDC-after-EndPaint path exposed one blank frame when
@@ -24241,6 +24353,8 @@ namespace
         {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            if (HandleKeyboardShortcutsClick(hwnd, x, y))
+                return 0;
             if (g_customZoomOpen || ConfirmationDialogOpen())
                 return 0;
             if (HandleSidebarControlClick(hwnd, x, y))
@@ -24275,6 +24389,8 @@ namespace
         }
         case WM_LBUTTONDOWN:
         {
+            if (HandleKeyboardShortcutsClick(hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)))
+                return 0;
             if (::GetFocus() != hwnd)
             {
                 ::SetFocus(hwnd);
@@ -24773,10 +24889,13 @@ namespace
                 if (Hit(close, x, y)) { CloseTab(tabId); return 0; }
                 if (Hit(g_tabRects[i], x, y))
                 {
-                    g_pressedButtonRect = g_tabRects[i];
-                    g_hasPressedButton = true;
-                    SetTimer(hwnd, 2, 90, nullptr);
-                    InvalidateRect(hwnd, &g_tabRects[i], FALSE);
+                    // Selecting a tab is a navigation transaction, not a
+                    // toolbar press. Avoid submitting a transient pressed
+                    // frame immediately before ActivateTab repaints the
+                    // active tab; that one-frame handoff made the tab labels
+                    // appear to flash during rapid switching.
+                    g_hasPressedButton = false;
+                    g_pressedButtonRect = RECT{};
                     ActivateTab(hwnd, tabId);
                     // A normal Tab click must not enter mouse-capture mode.
                     // Defer drag activation until the pointer actually moves
@@ -24981,6 +25100,8 @@ namespace
         }
         case WM_RBUTTONDOWN:
         {
+            if (HandleKeyboardShortcutsClick(hwnd, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)))
+                return 0;
             if (ConfirmationDialogOpen()) return 0;
             if (::GetFocus() != hwnd)
             {
@@ -25184,6 +25305,15 @@ namespace
             TrackMouseEvent(&trackMouse);
             POINT oldMousePos = g_mousePos;
             POINT newMousePos{ mx, my };
+            if (g_keyboardShortcutsOpen)
+            {
+                bool oldCloseHover = Hit(g_keyboardShortcutsCloseRect, oldMousePos.x, oldMousePos.y);
+                bool newCloseHover = Hit(g_keyboardShortcutsCloseRect, newMousePos.x, newMousePos.y);
+                g_mousePos = newMousePos;
+                if (oldCloseHover != newCloseHover)
+                    InvalidateRect(hwnd, &g_keyboardShortcutsCloseRect, FALSE);
+                return 0;
+            }
             bool oldAnnotationToolHover = AnnotationToolbarClickableAt(oldMousePos);
             bool newAnnotationToolHover = AnnotationToolbarClickableAt(newMousePos);
             RECT oldToggleRect{};
@@ -26345,6 +26475,17 @@ namespace
             return 0;
         }
         case WM_KEYDOWN:
+            if (g_keyboardShortcutsOpen)
+            {
+                if (wParam == VK_ESCAPE)
+                {
+                    g_keyboardShortcutsOpen = false;
+                    g_keyboardShortcutsRect = {};
+                    g_keyboardShortcutsCloseRect = {};
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
             if (wParam == VK_ESCAPE && (g_confirmClearRecent || g_confirmDeleteAllAnnotations))
             {
                 g_confirmClearRecent = false;
