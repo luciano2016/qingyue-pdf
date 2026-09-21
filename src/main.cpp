@@ -14499,8 +14499,6 @@ namespace
         }
         else if (!UseTiledPageRendering(tab))
             WarmZoomPreviewPagesForCurrentView(tab, anchorPage);
-        RECT oldVerticalScroll = g_mainScrollTrackRect;
-        RECT oldHorizontalScroll = g_mainHScrollTrackRect;
         UpdateVertScrollBar(hwnd);
 
         // Compose the new facing layout only from complete page-level sources.
@@ -14514,10 +14512,9 @@ namespace
         // and book layouts and keeps the layout's own centering rules.
         PresentZoomFallbackLayout(hwnd, tab);
 
-        RECT verticalScrollDirty = UnionRectSafe(oldVerticalScroll, g_mainScrollTrackRect);
-        RECT horizontalScrollDirty = UnionRectSafe(oldHorizontalScroll, g_mainHScrollTrackRect);
-        if (!IsRectEmpty(&verticalScrollDirty)) InvalidateRect(hwnd, &verticalScrollDirty, FALSE);
-        if (!IsRectEmpty(&horizontalScrollDirty)) InvalidateRect(hwnd, &horizontalScrollDirty, FALSE);
+        // The reader, fixed tracks and foreground chrome are one zoom frame.
+        // Invalidating the old/new tracks separately queued extra paints that
+        // alternated with the complete frame and made the thumb blink.
         InvalidateRect(hwnd, &g_stage, FALSE);
         RECT client{};
         GetClientRect(hwnd, &client);
@@ -15603,25 +15600,23 @@ namespace
             g_tabRectIds.push_back(actualIndex);
             bool active = actualIndex == g_active;
             bool hovered = actualIndex == g_hoverTab;
-            bool pressed = g_hasPressedButton && EqualRect(&g_pressedButtonRect, &r);
             if (IsGlassTheme() || IsAuroraTheme())
             {
-                if (active || hovered || pressed)
+                if (active || hovered)
                 {
                     if (IsAuroraTheme())
                     {
-                        COLORREF tabFill = pressed ? MixColor(T().panel2, T().accent, 0.075) : (active ? MixColor(T().panel2, T().accent, 0.055) : SidebarHoverFill());
-                        COLORREF tabLine = pressed ? MixColor(T().line, T().accent, 0.26) : (active ? MixColor(T().line, T().accent, 0.18) : MixColor(T().line, T().panel, 0.22));
+                        COLORREF tabFill = active ? MixColor(T().panel2, T().accent, 0.055) : SidebarHoverFill();
+                        COLORREF tabLine = active ? MixColor(T().line, T().accent, 0.18) : MixColor(T().line, T().panel, 0.22);
                         RoundFillAA(dc, r, S(9), tabFill, tabLine);
-                        UNREFERENCED_PARAMETER(pressed);
                     }
                     else
                     {
-                        AlphaFill(dc, r, RGB(255, 255, 255), pressed ? 196 : (active ? 132 : 112));
+                        AlphaFill(dc, r, RGB(255, 255, 255), active ? 132 : 112);
                         RoundFillAA(dc, r, S(9),
-                            pressed ? RGB(245, 249, 252) : (active ? RGB(239, 246, 251) : RGB(255, 255, 255)),
-                            pressed ? RGB(198, 208, 220) : (active ? RGB(198, 211, 224) : RGB(230, 235, 241)));
-                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), pressed ? 48 : 36);
+                            active ? RGB(239, 246, 251) : RGB(255, 255, 255),
+                            active ? RGB(198, 211, 224) : RGB(230, 235, 241));
+                        AlphaFill(dc, RECT{ r.left + S(1), r.top + S(1), r.right - S(1), r.top + S(8) }, RGB(255, 255, 255), 36);
                     }
                 }
                 else
@@ -15643,25 +15638,20 @@ namespace
                 COLORREF line{};
                 if (IsGraphiteTheme())
                 {
-                    fill = pressed ? RGB(77, 83, 91) : (active ? RGB(44, 48, 54) : (hovered ? RGB(44, 48, 53) : RGB(35, 39, 44)));
+                    fill = active ? RGB(44, 48, 54) : (hovered ? RGB(44, 48, 53) : RGB(35, 39, 44));
                     line = RGB(48, 52, 58);
                 }
                 else
                 {
-                    fill = pressed
-                        ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.24 : 0.10)
-                        : ((active || hovered) ? T().panel2 : T().panel);
-                    line = pressed
-                        ? MixColor(T().line, T().accent, 0.34)
-                        : ((active || hovered) ? T().line : MixColor(T().line, T().panel, IsDarkTheme() ? 0.20 : 0.14));
+                    fill = (active || hovered) ? T().panel2 : T().panel;
+                    line = (active || hovered) ? T().line : MixColor(T().line, T().panel, IsDarkTheme() ? 0.20 : 0.14);
                 }
                 RoundFillAA(dc, r, S(9), fill, line);
             }
             PdfTab const& tab = *g_tabs[static_cast<size_t>(actualIndex)];
             bool dirty = tab.dirty;
             RECT text{ r.left + S(11), r.top, r.right - S(dirty ? 42 : 28), r.bottom };
-            Text(dc, tab.name, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                pressed ? MixColor(T().text, T().accent, 0.12) : T().text);
+            Text(dc, tab.name, text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, T().text);
             SIZE nameSize{};
             GetTextExtentPoint32W(dc, tab.name.c_str(), static_cast<int>(tab.name.size()), &nameSize);
             g_tabTitleTruncated.push_back(nameSize.cx > std::max<int>(0, static_cast<int>(text.right - text.left)));
@@ -17836,31 +17826,28 @@ namespace
         // a later scrollbar drag cannot restore page pixels into the slots.
         PaintMainScrollTrackBackground(g_stageFrameDc, g_stage);
 
-        // Compose controls that lie inside the reader together with the
-        // fallback page before the single reader BitBlt. Controls outside the
-        // reader (the normal-layout rail button) are left on the existing
-        // rail surface and presented once below. This avoids the old sequence
-        // of page copy -> control copy -> stage invalidation, which produced a
-        // visible one-frame flash on every zoom step.
+        // Compose the complete zoom frame off-screen: page pixels, fixed
+        // scrollbar tracks/thumbs, and foreground overlays. The previous path
+        // copied the page first and then painted the scrollbar and tooltip
+        // directly to the HWND, exposing those intermediate states as flashes.
         bool toggleInReader = SidebarTotalWidth() <= 0;
         int overlayState = SaveDC(g_paintBufferDc);
-        IntersectClipRect(g_paintBufferDc, reader.left, reader.top,
-            reader.right, reader.bottom);
+        IntersectClipRect(g_paintBufferDc, g_stage.left, g_stage.top,
+            g_stage.right, g_stage.bottom);
+        PaintMainScrollBar(g_paintBufferDc, client, g_stage);
         if (toggleInReader)
             PaintSidebarPanelToggle(g_paintBufferDc, client);
         if (g_immersive)
             PaintStatus(g_paintBufferDc, client);
+        if (g_tabListOpen)
+            PaintTabListOverlay(g_paintBufferDc, client);
+        if (g_hasHoverTip && !g_customZoomOpen)
+            PaintHoverTip(g_paintBufferDc, client);
         RestoreDC(g_paintBufferDc, overlayState);
 
-        BitBlt(windowDc, reader.left, reader.top, width, height,
-            g_paintBufferDc, reader.left, reader.top, SRCCOPY);
-        PaintMainScrollBar(windowDc, client, g_stage);
-        // The fallback frame is submitted directly, outside WM_PAINT. A
-        // toolbar tooltip can sit immediately above the bottom toolbar and
-        // therefore overlap the reader rectangle; paint it after the frame
-        // and scrollbar so this direct zoom handoff cannot cover it.
-        if (g_hasHoverTip && !g_customZoomOpen)
-            PaintHoverTip(windowDc, client);
+        BitBlt(windowDc, g_stage.left, g_stage.top,
+            g_stage.right - g_stage.left, g_stage.bottom - g_stage.top,
+            g_paintBufferDc, g_stage.left, g_stage.top, SRCCOPY);
         // The rail button is outside the reader copy in the normal layout and
         // must remain on the rail surface that was already committed by the
         // normal paint pass. Do not redraw it directly on the window for each
@@ -23384,7 +23371,7 @@ namespace
             if (readerPainted && g_stageFrameValid &&
                 !g_facingScrollPending && !g_pageNavigationPending &&
                 (!g_draggingMainScroll || completeFacingDragFrame) &&
-                !g_favoriteListOpen && !g_annotationToolbarOpen &&
+                !g_favoriteListOpen && !g_tabListOpen && !g_annotationToolbarOpen &&
                 !g_annotationNoteOpen)
             {
                 RECT readerDirty{};
@@ -23466,17 +23453,13 @@ namespace
             g_favoriteListStaleRect = {};
         RestoreDC(mem, paintState);
 
-        // Tooltip chrome is independent of the retained reader frame. Submit
-        // the current box after every paint transaction so a zoom handoff can
-        // never leave it partially covered or wait for another mouse move.
-        bool presentTip = g_hasHoverTip && !g_customZoomOpen;
         if (nativePaintClip)
             DeleteObject(nativePaintClip);
         EndPaint(hwnd, &ps);
-        // The toggle and immersive exit are already part of the clipped
-        // transaction above. The divider is submitted as persistent chrome;
-        // only the tooltip remains transient.
-        PresentForegroundChrome(hwnd, false, presentTip, false, true);
+        // The tooltip is composed in the same back-buffer transaction whenever
+        // its pixels are dirty. Re-submitting it through GetDC after EndPaint
+        // caused a second visible draw on every zoom frame.
+        PresentForegroundChrome(hwnd, false, false, false, true);
     }
 
     bool HandleDocumentArrowKey(HWND hwnd, WPARAM key)
