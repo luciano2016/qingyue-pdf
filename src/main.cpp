@@ -9315,6 +9315,7 @@ namespace
         {
             tab.thumbCache.clear();
             tab.thumbRenderPending.clear();
+            tab.thumbnailSelectionPage = -1;
             tab.cachedThumbTheme = PdfRenderTheme();
         }
         // The slider changes presentation size only. Do not invalidate the
@@ -9336,7 +9337,9 @@ namespace
                 int worstDistance = -1;
                 for (auto candidate = tab.thumbCache.begin(); candidate != tab.thumbCache.end(); ++candidate)
                 {
-                    if (candidate->first == index) continue;
+                    if (candidate->first == index || candidate->first == tab.currentPage ||
+                        candidate->first == tab.thumbnailSelectionPage)
+                        continue;
                     // A completed worker result is committed back into this
                     // entry. Evicting it while it is pending loses the
                     // result and leaves a permanent blank placeholder.
@@ -12561,6 +12564,13 @@ namespace
     {
         if (tab.pageCount <= 0) return;
         int nextPage = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+        auto found = tab.thumbCache.find(nextPage);
+        bool ready = found != tab.thumbCache.end() &&
+            (found->second.dib || !found->second.bgra.empty());
+        // A new reader page can become current before its thumbnail finishes.
+        // Keep the previous stable frame until the bitmap is ready, otherwise
+        // the green selection frame appears before the card and blinks.
+        if (!ready) return;
         int previousPage = tab.thumbnailSelectionPage;
         if (previousPage == nextPage) return;
         tab.thumbnailSelectionPage = nextPage;
@@ -16754,7 +16764,13 @@ namespace
             int y = g_sidebar.top + S(80) - g_sidebarScrollY;
             int content = S(80);
             if (tab.thumbnailSelectionPage < 0 || tab.thumbnailSelectionPage >= tab.pageCount)
-                tab.thumbnailSelectionPage = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+            {
+                int initialPage = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+                auto cached = tab.thumbCache.find(initialPage);
+                bool ready = cached != tab.thumbCache.end() &&
+                    (cached->second.dib || !cached->second.bgra.empty());
+                tab.thumbnailSelectionPage = ready ? initialPage : -1;
+            }
             for (int i = 0; i < tab.pageCount; ++i)
             {
                 double pageWidthPixelsAtZoom1 = tab.pages[static_cast<size_t>(i)].widthPt * static_cast<double>(g_dpi) / 72.0;
@@ -23978,6 +23994,8 @@ namespace
                             RECT dirty = ThumbnailImageRect(tab, request.page);
                             if (!IsRectEmpty(&dirty))
                                 InvalidateRect(hwnd, &dirty, FALSE);
+                            if (g_sideMode == 1 && request.page == tab.currentPage)
+                                RequestThumbnailSelectionRepaint(hwnd, tab);
                         }
                     }
                     break;
