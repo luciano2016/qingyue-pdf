@@ -370,6 +370,11 @@ namespace
         fz_document* doc{};
         int pageCount{};
         int currentPage{};
+        // The thumbnail highlight is a presentation state of the sidebar,
+        // separate from the reader's continuously changing page position.
+        // Keeping the last painted page lets scroll updates invalidate only
+        // the old and new cards instead of repainting the whole list.
+        int thumbnailSelectionPage{ -1 };
         int savedScrollY{};
         int sidebarScrollY[4]{};
         int selectedOutlineRow{ -1 };
@@ -12410,9 +12415,13 @@ namespace
         return thumbH + S(58);
     }
 
-    void KeepThumbnailSelectionVisible(HWND hwnd, PdfTab const& tab)
+    RECT ThumbnailItemRect(PdfTab const& tab, int page);
+    void RequestThumbnailSelectionRepaint(HWND hwnd, PdfTab& tab);
+
+    void KeepThumbnailSelectionVisible(HWND hwnd, PdfTab& tab)
     {
         if (!SidebarVisible() || g_sideMode != 1 || tab.pageCount <= 0) return;
+        RequestThumbnailSelectionRepaint(hwnd, tab);
         int page = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
         int itemTop = S(80);
         for (int i = 0; i < page; ++i)
@@ -12517,7 +12526,7 @@ namespace
             int page = std::clamp(tab.currentPage, 0, std::max(0, tab.pageCount - 1));
             if (tab.pageCount > 0)
                 (void)EnsureThumb(tab, page);
-            RequestSidebarRepaint(hwnd);
+            RequestThumbnailSelectionRepaint(hwnd, tab);
         }
     }
 
@@ -12538,6 +12547,30 @@ namespace
             g_sidebar.left + (g_sidebar.right - g_sidebar.left + boxW) / 2,
             y + boxH
         };
+    }
+
+    void RequestThumbnailSelectionRepaint(HWND hwnd, PdfTab& tab)
+    {
+        if (tab.pageCount <= 0) return;
+        int nextPage = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
+        int previousPage = tab.thumbnailSelectionPage;
+        if (previousPage == nextPage) return;
+        tab.thumbnailSelectionPage = nextPage;
+
+        if (!hwnd || !SidebarVisible() || g_sideMode != 1)
+            return;
+
+        RECT dirty{};
+        auto include = [&](RECT rect)
+        {
+            if (IsRectEmpty(&rect)) return;
+            if (IsRectEmpty(&dirty)) dirty = rect;
+            else UnionRect(&dirty, &dirty, &rect);
+        };
+        include(ThumbnailItemRect(tab, previousPage));
+        include(ThumbnailItemRect(tab, nextPage));
+        if (!IsRectEmpty(&dirty))
+            InvalidateRect(hwnd, &dirty, FALSE);
     }
 
     RECT ThumbnailImageRect(PdfTab const& tab, int page)
@@ -13349,6 +13382,8 @@ namespace
             ? ContinuousContentHeight(tab)
             : SinglePageContentHeight(tab);
         g_contentWidth = ReadingContentWidth(tab);
+        if (g_sideMode == 1)
+            RequestThumbnailSelectionRepaint(hwnd, tab);
         // A navigation transaction keeps the last complete viewport on screen
         // until every visible target page pixel is ready.
         g_pageNavigationPending = waitForComplete;
@@ -16710,6 +16745,8 @@ namespace
             IntersectClipRect(dc, g_sidebar.left, g_sidebar.top + S(72), g_sidebar.right, g_sidebar.bottom);
             int y = g_sidebar.top + S(80) - g_sidebarScrollY;
             int content = S(80);
+            if (tab.thumbnailSelectionPage < 0 || tab.thumbnailSelectionPage >= tab.pageCount)
+                tab.thumbnailSelectionPage = std::clamp(tab.currentPage, 0, tab.pageCount - 1);
             for (int i = 0; i < tab.pageCount; ++i)
             {
                 double pageWidthPixelsAtZoom1 = tab.pages[static_cast<size_t>(i)].widthPt * static_cast<double>(g_dpi) / 72.0;
@@ -16735,7 +16772,7 @@ namespace
                     g_sidebarRowPages.push_back(i);
                     g_sidebarRowRects.push_back(item);
                     g_sidebarRowIds.push_back(-1);
-                    if (i == tab.currentPage)
+                    if (i == tab.thumbnailSelectionPage)
                     {
                         const double selectedTint = IsDarkTheme() ? 0.08 : 0.035;
                         COLORREF selectedFill = MixColor(T().panel, T().accent, selectedTint);
