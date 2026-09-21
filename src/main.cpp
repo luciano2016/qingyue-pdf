@@ -20906,7 +20906,10 @@ namespace
             (client.right + panelW) / 2, (client.bottom + panelH) / 2 };
         g_keyboardShortcutsRect = panel;
         DrawRoundedShadow(dc, panel, S(16), S(1), S(3), S(8), IsDarkTheme() ? 42 : 30);
-        GlassRoundedSurface(dc, panel, IsDarkTheme() ? 244 : 250, S(16), true);
+        // Dark shortcut dialogs should use one consistent surface. The
+        // translucent top wash reads as a separate gray half in dark themes;
+        // keep it for light themes where it provides the intended glass lift.
+        GlassRoundedSurface(dc, panel, IsDarkTheme() ? 244 : 250, S(16), !IsDarkTheme());
 
         g_keyboardShortcutsCloseRect = RECT{ panel.right - S(46), panel.top + S(14), panel.right - S(14), panel.top + S(46) };
         bool closeHover = Hit(g_keyboardShortcutsCloseRect, g_mousePos.x, g_mousePos.y);
