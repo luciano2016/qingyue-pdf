@@ -3099,7 +3099,17 @@ namespace
 
     void FillGdiRoundRect(Gdiplus::Graphics& g, Gdiplus::Brush& brush, Gdiplus::RectF r, float radius)
     {
-        float d = radius * 2.0f;
+        if (r.Width <= 0.0f || r.Height <= 0.0f) return;
+        // Narrow scrollbar thumbs need a diameter that fits both dimensions.
+        // Without this clamp, the far arcs receive negative coordinates and
+        // GDI+ paints small square caps outside the thumb bounds.
+        float clampedRadius = std::clamp(radius, 0.0f, std::min(r.Width, r.Height) * 0.5f);
+        float d = clampedRadius * 2.0f;
+        if (d <= 0.01f)
+        {
+            g.FillRectangle(&brush, r);
+            return;
+        }
         Gdiplus::GraphicsPath path;
         path.AddArc(r.X, r.Y, d, d, 180, 90);
         path.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
@@ -3142,7 +3152,10 @@ namespace
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         Gdiplus::SolidBrush brush(GdiColor(color));
-        FillGdiRoundRect(g, brush, Rf(r), std::max(1.0f, static_cast<float>(radius)));
+        Gdiplus::RectF bounds = Rf(r);
+        float maxRadius = std::min(bounds.Width, bounds.Height) * 0.5f;
+        FillGdiRoundRect(g, brush, bounds,
+            std::min(maxRadius, std::max(1.0f, static_cast<float>(radius))));
     }
 
     void DrawRoundedShadow(HDC dc, RECT r, float radius, int offsetX, int offsetY, int spread, BYTE alpha)
@@ -15360,6 +15373,13 @@ namespace
             return;
         }
         SaveActiveTabProgress();
+        // A page-number editor belongs to the old Tab. Clear it before the
+        // status bar is rebuilt so old and new page indicators cannot overlap.
+        g_pageInputFocused = false;
+        g_pageInputText.clear();
+        g_pageCaretIndex = 0;
+        g_pageSelectionAnchor = -1;
+        KillTimer(hwnd, 10);
         g_active = index;
         g_tabs[static_cast<size_t>(index)]->lastActivatedSerial = ++g_tabActivationSerial;
         g_sidebarKeyboardFocus = false;
@@ -19443,9 +19463,7 @@ namespace
         if (!hwnd || !tab) return;
 
         RECT client{};
-        GetClientRect(hwnd, &client);
-        HDC dc = GetDC(hwnd);
-        if (!dc) return;
+        if (!GetClientRect(hwnd, &client)) return;
 
         int top = g_immersive ? 0 : S(76);
         int bottom = (g_immersive || !g_statusPinned) ? 0 : S(34);
@@ -19460,29 +19478,20 @@ namespace
             ? ContinuousContentHeight(*tab) : SinglePageContentHeight(*tab);
         g_contentWidth = ReadingContentWidth(*tab);
 
-        // This is intentionally a small direct presentation. A full-window
-        // invalidation would make PaintReader walk every visible layout page
-        // before the next input message, which is especially costly for a
-        // 1400-page document.
-        if (!g_immersive)
+        // Never paint translucent chrome directly over the previous Tab.
+        // Queue it for the normal double-buffered Paint pass, which clears
+        // the old glyphs before compositing the new toolbar and status bar.
+        if (g_immersive)
         {
-            g_buttons.clear();
-            PaintToolbar(dc, client);
-            PaintTabs(dc, client);
+            InvalidateRect(hwnd, &g_stage, FALSE);
         }
-        if (side > 0)
+        else
         {
-            RECT splitter{ side, top, side + std::max(1, S(1)), client.bottom - bottom };
-            GlassDivider(dc, splitter);
+            RECT chromeTop{ 0, 0, client.right, S(76) };
+            RECT chromeBottom{ 0, client.bottom - S(34), client.right, client.bottom };
+            InvalidateRect(hwnd, &chromeTop, FALSE);
+            InvalidateRect(hwnd, &chromeBottom, FALSE);
         }
-        PaintSidebarPanelToggleAtomic(dc, client);
-        if (g_immersive) PaintImmersiveExitAtomic(dc, client);
-        else PaintStatus(dc, client);
-        ReleaseDC(hwnd, dc);
-
-        // Let the normal paint pass refresh the directory in its own narrow
-        // update region. It must not be drawn synchronously during a Tab
-        // click because outline layout can be expensive for large files.
         if (side > 0)
             InvalidateSidebarChrome(hwnd);
     }
