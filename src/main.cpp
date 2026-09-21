@@ -2436,7 +2436,7 @@ namespace
     bool Intersects(RECT a, RECT b);
     void RoundFill(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
     void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
-    void DrawScrollThumbAA(HDC dc, RECT r, int radius, COLORREF color);
+    void DrawScrollThumbAA(HDC dc, RECT r, int radius, COLORREF color, BYTE alpha = 255);
 
     void ApplyPdfThemeFor(int theme, std::uint8_t& b, std::uint8_t& g, std::uint8_t& r)
     {
@@ -3145,13 +3145,13 @@ namespace
         DrawGdiRoundRect(g, pen, bounds, cornerRadius);
     }
 
-    void DrawScrollThumbAA(HDC dc, RECT r, int radius, COLORREF color)
+    void DrawScrollThumbAA(HDC dc, RECT r, int radius, COLORREF color, BYTE alpha)
     {
         if (IsRectEmpty(&r)) return;
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-        Gdiplus::SolidBrush brush(GdiColor(color));
+        Gdiplus::SolidBrush brush(GdiColor(color, alpha));
         Gdiplus::RectF bounds = Rf(r);
         float maxRadius = std::min(bounds.Width, bounds.Height) * 0.5f;
         FillGdiRoundRect(g, brush, bounds,
@@ -13170,7 +13170,7 @@ namespace
     bool SidebarContentNeedsScroll()
     {
         if (!SidebarVisible() || g_sidebarWidth <= 0) return false;
-        if (g_sideMode != 0 && g_sideMode != 1) return false;
+        if (g_sideMode < 0 || g_sideMode > 3) return false;
         RECT area = SidebarScrollRect();
         int visible = std::max<int>(1, area.bottom - area.top);
         return g_sidebarContentHeight > visible + S(1);
@@ -13219,14 +13219,20 @@ namespace
 
         bool active = g_draggingSidebarScroll || Hit(g_sidebarScrollTrackRect, g_mousePos.x, g_mousePos.y);
         int centerX = (g_sidebarScrollTrackRect.left + g_sidebarScrollTrackRect.right) / 2;
-        int trackW = active ? S(6) : std::max(2, S(3));
+        int trackW = active
+            ? std::max(1, (S(6) * 9) / 10)
+            : std::max(2, S(3));
         RECT visualThumb{
             centerX - trackW / 2,
             g_sidebarScrollThumbRect.top,
             centerX + (trackW + 1) / 2,
             g_sidebarScrollThumbRect.bottom
         };
-        DrawScrollThumbAA(dc, visualThumb, S(5), ScrollThumbColor(active));
+        // The sidebar thumb is an overlay on top of its content. Keep it
+        // green in both states, but translucent, so inactive content-area
+        // hover never falls back to the dark document scrollbar color.
+        BYTE alpha = active ? 188 : 156;
+        DrawScrollThumbAA(dc, visualThumb, S(5), T().accent, alpha);
     }
 
     bool ZoomRenderDeferred()
@@ -16796,7 +16802,21 @@ namespace
                 content += S(44);
             }
             RestoreDC(dc, clipDc);
-            g_sidebarContentHeight = std::max(0, content - S(146));
+            if (!g_searchHasRun || g_searchResults.empty())
+            {
+                g_sidebarContentHeight = 0;
+            }
+            else
+            {
+                // Measure the actual bottom of the last result from the
+                // scrolling viewport, rather than subtracting a fixed header
+                // value. This keeps the thumb and drag range correct for the
+                // search panel's taller top chrome.
+                int contentEnd = resultsTop - g_sidebar.top + S(4) +
+                    static_cast<int>(g_searchResults.size()) * S(44) + S(42);
+                int viewportTop = SidebarScrollRect().top - g_sidebar.top;
+                g_sidebarContentHeight = std::max(0, contentEnd - viewportTop);
+            }
         }
         else if (g_sideMode == 3)
         {
@@ -16935,7 +16955,8 @@ namespace
                 Text(dc, L"\u6682\u65e0\u6ce8\u91ca", empty, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().muted);
             }
             RestoreDC(dc, clipDc);
-            g_sidebarContentHeight = std::max(0, content - S(94));
+            int viewportTop = SidebarScrollRect().top - g_sidebar.top;
+            g_sidebarContentHeight = std::max(0, content - viewportTop);
         }
         else
         {
@@ -24737,7 +24758,7 @@ namespace
                 ScrollStageXTo(hwnd, newScroll);
                 return 0;
             }
-            if (Active() && (g_sideMode == 0 || g_sideMode == 1))
+            if (Active() && SidebarContentNeedsScroll())
             {
                 UpdateSidebarScrollRects();
                 if (Hit(g_sidebarScrollThumbRect, x, y))
@@ -25400,8 +25421,11 @@ namespace
                 !IsRectEmpty(&g_favoriteListRect) &&
                 Hit(g_favoriteListRect, mx, my);
             g_homeScrollHover = Hit(g_homeScrollTrackRect, mx, my);
-            g_sidebarScrollHover = !favoriteOverlayHit && SidebarVisible() && (g_sideMode == 0 || g_sideMode == 1) &&
-                Hit(g_sidebarScrollTrackRect, mx, my);
+            // The sidebar scrollbar is intentionally shown while the pointer
+            // is anywhere in the scrollable content area. The thumb itself
+            // still gets the wider active treatment only on track hover.
+            g_sidebarScrollHover = !favoriteOverlayHit && SidebarVisible() &&
+                Hit(SidebarScrollRect(), mx, my);
             g_sidebarPanelToggleHover = !favoriteOverlayHit && Hit(g_sidebarPanelToggleRect, mx, my);
             if (oldSidebarPanelToggleHover != g_sidebarPanelToggleHover)
             {
@@ -25413,8 +25437,7 @@ namespace
             }
             if (oldSidebarScrollHover != g_sidebarScrollHover)
             {
-                RECT area = SidebarScrollRect();
-                InvalidateRect(hwnd, &area, FALSE);
+                InvalidateRect(hwnd, &g_sidebarScrollTrackRect, FALSE);
             }
             if (g_draggingMainScroll)
             {
