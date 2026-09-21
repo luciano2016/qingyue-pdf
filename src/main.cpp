@@ -12608,6 +12608,22 @@ namespace
         };
     }
 
+    RECT ThumbnailPaintRect(PdfTab const& tab, int page)
+    {
+        RECT image = ThumbnailImageRect(tab, page);
+        if (IsRectEmpty(&image)) return RECT{};
+
+        // The page shadow is intentionally outside imageRect. Async thumbnail
+        // completion must repaint that whole footprint in one transaction;
+        // invalidating only the bitmap leaves a stale pale page edge behind
+        // for one frame while the sidebar back buffer is partially rebuilt.
+        RECT painted = image;
+        InflateRect(&painted, S(2), S(2));
+        painted.right += S(10);
+        painted.bottom += S(4);
+        return painted;
+    }
+
     void FocusPageInput(HWND hwnd)
     {
         PdfTab* tab = Active();
@@ -16803,8 +16819,10 @@ namespace
                         RoundFill(dc, item, S(6), selectedFill, T().accent);
                     }
                     RECT imageRect{ item.left + (boxW - thumbW) / 2, item.top + S(14), item.left + (boxW + thumbW) / 2, item.top + S(14) + thumbH };
-                    DrawContactShadow(dc, imageRect, 16);
-                    DrawRoundedShadow(dc, imageRect, S(3.0f), S(1), S(2), S(2), 12);
+                    // Keep the page plate as one stable surface. Two
+                    // independent shadows create a second pale page edge
+                    // when only the bitmap region is invalidated asynchronously.
+                    DrawRoundedShadow(dc, imageRect, S(3.0f), S(1), S(2), S(3), 18);
                     bool thumbnailReady = thumb.dib || !thumb.bgra.empty();
                     if (thumbnailReady)
                     {
@@ -23991,7 +24009,7 @@ namespace
                             // already stable. Repaint only this thumbnail so
                             // an async image completion cannot flash the
                             // entire sidebar while the reader is scrolling.
-                            RECT dirty = ThumbnailImageRect(tab, request.page);
+                            RECT dirty = ThumbnailPaintRect(tab, request.page);
                             if (!IsRectEmpty(&dirty))
                                 InvalidateRect(hwnd, &dirty, FALSE);
                             if (g_sideMode == 1 && request.page == tab.currentPage)
