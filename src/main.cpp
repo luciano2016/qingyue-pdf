@@ -9232,7 +9232,10 @@ namespace
         request.viewportGeneration = g_viewportGeneration;
         request.dpi = g_dpi;
         request.theme = PdfRenderTheme();
-        request.priority = 24;
+        // Thumbnails are the visible sidebar payload. Keep them ahead of
+        // predictive reader work so a newly exposed card does not remain a
+        // blank placeholder while the main-page queue is busy.
+        request.priority = 40;
         {
             std::lock_guard<std::mutex> lock(g_pageRenderMutex);
             if (g_pageRenderActive && SamePageRenderRequest(g_pageRenderActiveRequest, request)) return;
@@ -9247,7 +9250,7 @@ namespace
                 [&](PageRenderRequest const& queued) { return queued.priority > request.priority; });
             g_pageRenderQueue.insert(insertAt, std::move(request));
 
-            constexpr size_t maxQueuedThumbRenders = 2;
+            constexpr size_t maxQueuedThumbRenders = 8;
             size_t queuedThumbs = static_cast<size_t>(std::count_if(
                 g_pageRenderQueue.begin(), g_pageRenderQueue.end(),
                 [](PageRenderRequest const& queued) { return queued.thumbnail; }));
@@ -9327,13 +9330,18 @@ namespace
             placeholder.width = std::max(1, g_thumbSize);
             placeholder.height = std::max<int>(S(56), static_cast<int>(placeholder.width * ratioH + 0.5));
             it = tab.thumbCache.emplace(index, std::move(placeholder)).first;
-            while (tab.thumbCache.size() > 12)
+            while (tab.thumbCache.size() > 16)
             {
                 auto victim = tab.thumbCache.end();
                 int worstDistance = -1;
                 for (auto candidate = tab.thumbCache.begin(); candidate != tab.thumbCache.end(); ++candidate)
                 {
                     if (candidate->first == index) continue;
+                    // A completed worker result is committed back into this
+                    // entry. Evicting it while it is pending loses the
+                    // result and leaves a permanent blank placeholder.
+                    if (tab.thumbRenderPending.find(candidate->first) != tab.thumbRenderPending.end())
+                        continue;
                     int distance = std::abs(candidate->first - index);
                     if (distance > worstDistance)
                     {
@@ -23948,9 +23956,19 @@ namespace
                     if (currentAppearance)
                     {
                         tab.thumbRenderPending.erase(request.page);
-                        if (found != tab.thumbCache.end())
-                            found->second = std::move(result->image);
-                        if (found != tab.thumbCache.end() &&
+                        bool rendered = result->image.dib || !result->image.bgra.empty();
+                        if (rendered)
+                        {
+                            // Keep a completed result even if a stale paint
+                            // removed its placeholder before the worker
+                            // returned. Dropping it here creates a blank card
+                            // that only repairs itself after another scroll.
+                            if (found == tab.thumbCache.end())
+                                found = tab.thumbCache.emplace(request.page, std::move(result->image)).first;
+                            else
+                                found->second = std::move(result->image);
+                        }
+                        if (rendered && found != tab.thumbCache.end() &&
                             (found->second.dib || !found->second.bgra.empty()) && i == g_active)
                         {
                             // The sidebar position and selected card are
