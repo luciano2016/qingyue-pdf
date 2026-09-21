@@ -12540,6 +12540,23 @@ namespace
         };
     }
 
+    RECT ThumbnailImageRect(PdfTab const& tab, int page)
+    {
+        RECT item = ThumbnailItemRect(tab, page);
+        if (IsRectEmpty(&item)) return RECT{};
+        double ratioH = tab.pages[static_cast<size_t>(page)].heightPt /
+            std::max(1.0, tab.pages[static_cast<size_t>(page)].widthPt);
+        int thumbW = g_thumbSize;
+        int thumbH = std::max<int>(S(56), static_cast<int>(thumbW * ratioH + 0.5));
+        int boxW = std::max(thumbW + S(36), S(160));
+        return RECT{
+            item.left + (boxW - thumbW) / 2,
+            item.top + S(14),
+            item.left + (boxW + thumbW) / 2,
+            item.top + S(14) + thumbH
+        };
+    }
+
     void FocusPageInput(HWND hwnd)
     {
         PdfTab* tab = Active();
@@ -16727,7 +16744,21 @@ namespace
                     RECT imageRect{ item.left + (boxW - thumbW) / 2, item.top + S(14), item.left + (boxW + thumbW) / 2, item.top + S(14) + thumbH };
                     DrawContactShadow(dc, imageRect, 16);
                     DrawRoundedShadow(dc, imageRect, S(3.0f), S(1), S(2), S(2), 12);
-                    DrawCachedImage(dc, thumb, imageRect);
+                    bool thumbnailReady = thumb.dib || !thumb.bgra.empty();
+                    if (thumbnailReady)
+                    {
+                        DrawCachedImage(dc, thumb, imageRect);
+                    }
+                    else
+                    {
+                        // Keep the page slot visually stable while the
+                        // asynchronous thumbnail render is pending. Without
+                        // this, the card briefly exposes the panel surface
+                        // before the bitmap arrives and looks like a blink.
+                        COLORREF placeholder = MixColor(
+                            T().paper, T().panel, IsDarkTheme() ? 0.16 : 0.06);
+                        RoundFillAA(dc, imageRect, S(3), placeholder, placeholder);
+                    }
                     RECT pageLabel{ item.left, imageRect.bottom + S(8), item.right, item.bottom };
                     Text(dc, std::to_wstring(i + 1), pageLabel, DT_CENTER | DT_VCENTER | DT_SINGLELINE, T().text);
                 }
@@ -23889,7 +23920,7 @@ namespace
                             // already stable. Repaint only this thumbnail so
                             // an async image completion cannot flash the
                             // entire sidebar while the reader is scrolling.
-                            RECT dirty = ThumbnailItemRect(tab, request.page);
+                            RECT dirty = ThumbnailImageRect(tab, request.page);
                             if (!IsRectEmpty(&dirty))
                                 InvalidateRect(hwnd, &dirty, FALSE);
                         }
