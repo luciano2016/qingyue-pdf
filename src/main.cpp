@@ -2989,7 +2989,9 @@ namespace
             // message coordinates, which makes the thumb appear to jump.
             bool active = g_draggingMainScroll || g_mainScrollHover;
             int centerX = (g_mainScrollTrackRect.left + g_mainScrollTrackRect.right) / 2;
-            int trackW = active ? S(7) : std::max(2, S(3));
+            int trackW = active
+                ? std::max(1, (S(7) * 8) / 10)
+                : std::max(2, S(3));
             RECT visualThumb{ centerX - trackW / 2, g_mainScrollThumbRect.top, centerX + (trackW + 1) / 2, g_mainScrollThumbRect.bottom };
             DrawScrollThumbAA(dc, visualThumb, S(5), ScrollThumbColor(active));
         }
@@ -25411,11 +25413,12 @@ namespace
             bool oldSidebarPanelToggleHover = g_sidebarPanelToggleHover;
             bool oldHomeScrollHover = g_homeScrollHover;
             bool oldSidebarScrollHover = g_sidebarScrollHover;
-            // The sidebar hover state is used to invalidate the scrollbar
-            // when entering or leaving it. Track the actual scrollbar track,
-            // not the whole scrollable content area; otherwise moving from a
-            // directory row to the scrollbar produces no state transition.
+            // Keep the broad content-area visibility state separate from the
+            // track-hover width state. Both can change while moving within
+            // the sidebar, so either transition must repaint the thumb.
             UpdateSidebarScrollRects();
+            bool oldSidebarScrollActive = g_draggingSidebarScroll ||
+                Hit(g_sidebarScrollTrackRect, oldMousePos.x, oldMousePos.y);
             if (Active()) RefreshMainScrollHover(hwnd, newMousePos);
             bool favoriteOverlayHit = g_favoriteListOpen &&
                 !IsRectEmpty(&g_favoriteListRect) &&
@@ -25426,6 +25429,8 @@ namespace
             // still gets the wider active treatment only on track hover.
             g_sidebarScrollHover = !favoriteOverlayHit && SidebarVisible() &&
                 Hit(SidebarScrollRect(), mx, my);
+            bool newSidebarScrollActive = g_draggingSidebarScroll ||
+                Hit(g_sidebarScrollTrackRect, mx, my);
             g_sidebarPanelToggleHover = !favoriteOverlayHit && Hit(g_sidebarPanelToggleRect, mx, my);
             if (oldSidebarPanelToggleHover != g_sidebarPanelToggleHover)
             {
@@ -25435,7 +25440,8 @@ namespace
             {
                 InvalidateRect(hwnd, &g_homeScrollTrackRect, FALSE);
             }
-            if (oldSidebarScrollHover != g_sidebarScrollHover)
+            if (oldSidebarScrollHover != g_sidebarScrollHover ||
+                oldSidebarScrollActive != newSidebarScrollActive)
             {
                 InvalidateRect(hwnd, &g_sidebarScrollTrackRect, FALSE);
             }
