@@ -382,12 +382,25 @@ namespace
         // Zero means an older state file has no per-Tab width yet.
         int sidebarWidth{};
         bool sidebarStateExplicit{};
+        // Keep the selected sidebar surface with the document. The old
+        // implementation kept this only in the window-global g_sideMode, so
+        // switching tabs made every document inherit the last tab's panel.
+        int sidebarMode{};
+        std::wstring searchQuery;
+        std::wstring searchLastQuery;
+        std::vector<SearchResult> searchResults;
+        int searchCurrent{};
+        bool searchHasRun{};
+        bool searchMatchCase{};
         double zoom{ 1.0 };
         // Every zoom transition keeps the previous complete page generation
         // visible until the new viewport coverage is ready. The raster
         // strategy may be a whole page or tiles, but presentation never mixes
         // generations.
         bool zoomPresentationPending{};
+        bool zoomPresentationAnchorValid{};
+        int zoomPresentationScrollX{};
+        int zoomPresentationScrollY{};
         double cachedZoom{};
         unsigned cachedDpi{};
         std::wstring path;
@@ -13013,6 +13026,11 @@ namespace
         }
         int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
         int maxScrollX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
+        if (tab && tab->zoomPresentationPending && tab->zoomPresentationAnchorValid)
+        {
+            g_scrollX = std::clamp(tab->zoomPresentationScrollX, 0, maxScrollX);
+            g_scrollY = std::clamp(tab->zoomPresentationScrollY, 0, maxScroll);
+        }
         // During a thumb drag the mapping was captured at button-down. An
         // asynchronous layout/render completion must not clamp the live
         // position against a newer extent and move the thumb backwards.
@@ -13310,6 +13328,7 @@ namespace
         // remains owned by the tab and supplies a complete page until the
         // target generation is ready.
         tab.zoomPresentationPending = false;
+        tab.zoomPresentationAnchorValid = false;
         g_zoomRenderDeferUntil = 0;
         KillTimer(hwnd, 21);
         if (tab.zoomFallbackZoom > 0.0)
@@ -14355,12 +14374,12 @@ namespace
         // The old complete result remains the presentation frame; the new
         // result is committed only after the visible viewport is complete.
         tab.zoomPresentationPending = true;
-        // Keep the pointer's tooltip state, but repaint its old rectangle
-        // without the tooltip while the zoom transaction is in flight. This
-        // prevents a one-frame flash without losing the tooltip forever when
-        // the pointer remains over the same toolbar button.
-        if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
-            InvalidateRect(hwnd, &g_hoverTipPaintRect, FALSE);
+        tab.zoomPresentationAnchorValid = false;
+        // A toolbar tooltip is independent foreground chrome. Do not erase it
+        // when the reader starts a zoom transaction: the stage can be replaced
+        // several times while the pointer remains over the same button, and
+        // erasing/repainting the tooltip here makes it flash or clip at every
+        // zoom step. Paint's normal foreground pass will keep it on top.
         g_pageNavigationPending = false;
         // Zoom supersedes an in-flight facing scroll. If this flag survives
         // the zoom change, a later partial paint can restore the pre-zoom
@@ -14373,7 +14392,29 @@ namespace
 
         auto restoreHorizontalAnchor = [&]()
         {
-            if (UseFacingContinuousPresentation()) return;
+            if (UseFacingContinuousPresentation())
+            {
+                // Match Sumatra's SetZoomVirtual(fixPt): after relayout,
+                // preserve the page-space point under the pointer only when
+                // the spread is wider than the reader. A spread that fits is
+                // centered by SpreadX(), so its scroll offset must stay zero.
+                int start = FirstPageInSpread(anchorPage);
+                int stageW = std::max<int>(1, g_stage.right - g_stage.left);
+                int spreadW = SpreadWidth(tab, start);
+                if (spreadW + S(56) <= stageW)
+                {
+                    g_scrollX = 0;
+                    return;
+                }
+
+                int pageOffsetX = PageOffsetXInSpread(tab, start, anchorPage);
+                int pageW = std::max<int>(1, PageW(tab, anchorPage));
+                int desiredX = g_stage.left + S(28) + pageOffsetX +
+                    static_cast<int>(anchorX * pageW + 0.5) - clientPt.x;
+                int spreadMaxScroll = std::max<int>(0, spreadW + S(56) - stageW);
+                g_scrollX = std::clamp(desiredX, 0, spreadMaxScroll);
+                return;
+            }
             int savedScrollX = g_scrollX;
             g_scrollX = 0;
             RECT newPageRect{};
@@ -14393,33 +14434,51 @@ namespace
         };
         if (g_continuousRead)
         {
-            int pageTop = PageTopScroll(tab, anchorPage);
-            int pageH = PageH(tab, anchorPage);
-            int desiredScroll = g_stage.top + pageTop + static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
             g_contentHeight = ContinuousContentHeight(tab);
             g_contentWidth = ReadingContentWidth(tab);
             restoreHorizontalAnchor();
+            int start = FirstPageInSpread(anchorPage);
+            int spreadTop = SpreadTopScroll(tab, start);
+            RECT targetPageRect{};
+            int targetPageBaseY = g_stage.top + spreadTop;
+            if (!BuildSpreadPageRect(tab, start, targetPageBaseY, anchorPage, targetPageRect))
+                targetPageRect = RECT{ g_stage.left, targetPageBaseY,
+                    g_stage.left + PageW(tab, anchorPage),
+                    targetPageBaseY + PageH(tab, anchorPage) };
+            int pageH = std::max<int>(1, targetPageRect.bottom - targetPageRect.top);
+            int desiredScroll = targetPageRect.top +
+                static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
             int maxScroll = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
             g_scrollY = std::clamp(desiredScroll, 0, maxScroll);
             tab.currentPage = PageFromScroll(tab, g_scrollY);
-            if (UseFacingContinuousPresentation())
-                g_scrollX = PreferredFacingScrollX(tab);
             TouchRecentProgress(tab, false);
             SyncSidebarProgressFromScroll(hwnd, tab);
         }
         else
         {
-            int pageH = PageH(tab, anchorPage);
-            int desiredScroll = g_stage.top + S(28) + static_cast<int>(anchorY * pageH + 0.5) - clientPt.y;
             g_contentHeight = SinglePageContentHeight(tab);
             g_contentWidth = ReadingContentWidth(tab);
             restoreHorizontalAnchor();
+            RECT targetPageRect{};
+            int start = FirstPageInSpread(anchorPage);
+            int targetPageBaseY = g_stage.top + S(28);
+            int desiredScroll = targetPageBaseY +
+                static_cast<int>(anchorY * std::max<int>(1, PageH(tab, anchorPage)) + 0.5) - clientPt.y;
+            if (BuildSpreadPageRect(tab, start, targetPageBaseY, anchorPage, targetPageRect))
+                desiredScroll = targetPageRect.top +
+                    static_cast<int>(anchorY * (targetPageRect.bottom - targetPageRect.top) + 0.5) - clientPt.y;
             g_scrollY = std::clamp(desiredScroll, 0, SinglePageMaxScroll(tab));
-            if (UseFacingContinuousPresentation())
-                g_scrollX = PreferredFacingScrollX(tab);
             TouchRecentProgress(tab, false);
             KeepThumbnailSelectionVisible(hwnd, tab);
         }
+
+        // The target viewport is now fully determined. Keep this exact scroll
+        // position for the lifetime of the zoom handoff. Render completion is
+        // asynchronous, and a late layout/clamp pass must not reinterpret the
+        // new page geometry and move the document under the pointer.
+        tab.zoomPresentationScrollX = g_scrollX;
+        tab.zoomPresentationScrollY = g_scrollY;
+        tab.zoomPresentationAnchorValid = true;
 
         if (g_viewMode != 0 && UseTiledPageRendering(tab))
         {
@@ -14985,6 +15044,33 @@ namespace
         return std::clamp(g_sideMode, 0, 3);
     }
 
+    void SaveActiveTabSearchState(PdfTab& tab)
+    {
+        tab.searchQuery = g_searchQuery;
+        tab.searchLastQuery = g_searchLastQuery;
+        tab.searchResults = g_searchResults;
+        tab.searchCurrent = g_searchCurrent;
+        tab.searchHasRun = g_searchHasRun;
+        tab.searchMatchCase = g_searchMatchCase;
+    }
+
+    void RestoreActiveTabSearchState(PdfTab& tab)
+    {
+        g_searchQuery = tab.searchQuery;
+        g_searchLastQuery = tab.searchLastQuery;
+        g_searchResults = tab.searchResults;
+        g_searchCurrent = std::clamp(tab.searchCurrent, 0,
+            std::max(0, static_cast<int>(g_searchResults.size()) - 1));
+        g_searchHasRun = tab.searchHasRun;
+        g_searchMatchCase = tab.searchMatchCase;
+        g_searchInputFocused = false;
+        g_searchCaretIndex = static_cast<int>(g_searchQuery.size());
+        g_searchSelectionAnchor = -1;
+        g_searchCaretVisible = true;
+        g_searchResultRects.clear();
+        g_searchResultIds.clear();
+    }
+
     void SaveActiveTabSidebarState(PdfTab& tab)
     {
         tab.sidebarScrollY[ActiveSidebarModeIndex()] = std::max(0, g_sidebarScrollY);
@@ -14992,10 +15078,12 @@ namespace
         tab.collapsedOutlineRows = g_collapsedOutlineRows;
         tab.sidebarRailOpen = g_sidebarRailOpen;
         tab.sidebarContentOpen = g_sidebarOpen;
+        tab.sidebarMode = ActiveSidebarModeIndex();
         tab.sidebarWidth = std::clamp(
             std::max(g_sidebarExpandedWidth, g_sidebarWidth),
             SidebarMinimumWidth(), S(520));
         tab.sidebarStateExplicit = true;
+        SaveActiveTabSearchState(tab);
     }
 
     void SaveActiveTabProgress()
@@ -15023,6 +15111,7 @@ namespace
         PdfTab* tab = Active();
         if (!tab)
         {
+            g_sideMode = 0;
             g_sidebarRailOpen = true;
             g_sidebarOpen = true;
             g_sidebarScrollY = 0;
@@ -15031,6 +15120,9 @@ namespace
             g_collapsedOutlineRows.clear();
             return;
         }
+
+        g_sideMode = std::clamp(tab->sidebarMode, 0, 3);
+        RestoreActiveTabSearchState(*tab);
 
         int restoredWidth = tab->sidebarWidth > 0
             ? tab->sidebarWidth
@@ -15098,6 +15190,7 @@ namespace
             KillTimer(hwnd, 13);
         }
         g_sideMode = mode;
+        if (PdfTab* tab = Active()) tab->sidebarMode = mode;
         RestoreActiveTabSidebarState(hwnd);
     }
 
@@ -17749,6 +17842,12 @@ namespace
         BitBlt(windowDc, reader.left, reader.top, width, height,
             g_paintBufferDc, reader.left, reader.top, SRCCOPY);
         PaintMainScrollBar(windowDc, client, g_stage);
+        // The fallback frame is submitted directly, outside WM_PAINT. A
+        // toolbar tooltip can sit immediately above the bottom toolbar and
+        // therefore overlap the reader rectangle; paint it after the frame
+        // and scrollbar so this direct zoom handoff cannot cover it.
+        if (g_hasHoverTip && !g_customZoomOpen)
+            PaintHoverTip(windowDc, client);
         // The rail button is outside the reader copy in the normal layout and
         // must remain on the rail surface that was already committed by the
         // normal paint pass. Do not redraw it directly on the window for each
@@ -18128,6 +18227,7 @@ namespace
                 return false;
             }
             tab.zoomPresentationPending = false;
+            tab.zoomPresentationAnchorValid = false;
             ReleaseZoomFallback(tab);
         }
         bool zoomPresentationPending = tab.zoomPresentationPending;
@@ -19186,7 +19286,11 @@ namespace
         // established. PaintPages then uses the same slots for its clip.
         UpdateMainScrollRects(client);
         bool stageChanged = !EqualRect(&oldStage, &g_stage);
-        if (stageChanged && g_viewMode != 0)
+        // A zoom transaction already owns the viewport anchor. A sidebar or
+        // scrollbar geometry pass can change the stage rectangle while the
+        // target tiles are rendering, but must not replace the mouse-anchored
+        // offset with the default facing center position.
+        if (stageChanged && g_viewMode != 0 && !tab->zoomPresentationPending)
             g_scrollX = PreferredFacingScrollX(*tab);
         if (stageChanged)
         {
@@ -19202,6 +19306,16 @@ namespace
             // A first layout or sidebar transition therefore needs one fresh
             // foreground submission even when the update region is stage-only.
             g_sidebarPanelTogglePresented = false;
+        }
+        if (tab->zoomPresentationPending && tab->zoomPresentationAnchorValid)
+        {
+            // Keep the zoom transaction's viewport authoritative while target
+            // tiles arrive. This prevents an async completion from producing a
+            // small vertical jump between fallback and final pixels.
+            int maxY = std::max<int>(0, g_contentHeight - (g_stage.bottom - g_stage.top));
+            int maxX = std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left));
+            g_scrollX = std::clamp(tab->zoomPresentationScrollX, 0, maxX);
+            g_scrollY = std::clamp(tab->zoomPresentationScrollY, 0, maxY);
         }
         if (!side)
         {
@@ -20590,11 +20704,37 @@ namespace
         ClientToScreen(hwnd, &pt);
         HMENU menu = CreatePopupMenu();
         AppendThemedMenuItem(menu, 2601, L"\u6253\u5370", false, !Active());
+        AppendThemedMenuItem(menu, 2603, L"\u5feb\u6377\u952e");
         AppendThemedMenuSeparator(menu);
         AppendThemedMenuItem(menu, 2600, L"\u8bbe\u7f6e\u4e3a\u9ed8\u8ba4 PDF \u9605\u8bfb\u5668");
         AppendThemedMenuSeparator(menu);
         AppendThemedMenuItem(menu, 2602, L"\u7248\u672c " QINGYUE_VERSION_STRING_W, false, true);
         ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
+    }
+
+    void ShowKeyboardShortcutsDialog(HWND hwnd)
+    {
+        std::wstring shortcuts =
+            L"\u6807\u7b7e\u9875\n"
+            L"Ctrl + Tab    \u5207\u6362\u5230\u4e0b\u4e00\u4e2a\u6807\u7b7e\u9875\n"
+            L"Ctrl + Shift + Tab    \u5207\u6362\u5230\u4e0a\u4e00\u4e2a\u6807\u7b7e\u9875\n"
+            L"Ctrl + W    \u5173\u95ed\u5f53\u524d\u6807\u7b7e\u9875\n"
+            L"\n\u6587\u6863\n"
+            L"Ctrl + O    \u6253\u5f00 PDF \u6587\u4ef6\n"
+            L"Ctrl + S    \u4fdd\u5b58\u6807\u6ce8\n"
+            L"Ctrl + P    \u6253\u5370\u5f53\u524d\u6587\u6863\n"
+            L"Ctrl + A    \u5168\u9009\u6587\u6863\u6587\u672c\n"
+            L"Ctrl + C / Ctrl + Insert    \u590d\u5236\u9009\u4e2d\u5185\u5bb9\n"
+            L"Page Up / Page Down    \u4e0a\u4e00\u9875 / \u4e0b\u4e00\u9875\n"
+            L"\u65b9\u5411\u952e    \u6eda\u52a8\u6587\u6863\n"
+            L"F11    \u5207\u6362\u6c89\u6d78\u6a21\u5f0f\n"
+            L"Esc    \u53d6\u6d88\u5f53\u524d\u64cd\u4f5c / \u9000\u51fa\u6c89\u6d78\u6a21\u5f0f\n"
+            L"\n\u641c\u7d22\u4e0e\u6807\u6ce8\n"
+            L"Ctrl + F    \u6253\u5f00\u641c\u7d22\n"
+            L"Ctrl + H    \u4e3a\u9009\u4e2d\u6587\u672c\u6dfb\u52a0\u9ad8\u4eae\n"
+            L"Ctrl + U    \u4e3a\u9009\u4e2d\u6587\u672c\u6dfb\u52a0\u4e0b\u5212\u7ebf\n"
+            L"Ctrl + K    \u4e3a\u9009\u4e2d\u6587\u672c\u6dfb\u52a0\u5220\u9664\u7ebf";
+        MessageBoxW(hwnd, shortcuts.c_str(), L"\u5feb\u6377\u952e", MB_OK | MB_ICONINFORMATION);
     }
 
     bool LaunchOpenWithForDefaultPdf(HWND hwnd)
@@ -21121,6 +21261,13 @@ namespace
         replacement.sidebarScrollY[3] = tab.sidebarScrollY[3];
         replacement.selectedOutlineRow = tab.selectedOutlineRow;
         replacement.collapsedOutlineRows = tab.collapsedOutlineRows;
+        replacement.sidebarMode = tab.sidebarMode;
+        replacement.searchQuery = tab.searchQuery;
+        replacement.searchLastQuery = tab.searchLastQuery;
+        replacement.searchResults = tab.searchResults;
+        replacement.searchCurrent = tab.searchCurrent;
+        replacement.searchHasRun = tab.searchHasRun;
+        replacement.searchMatchCase = tab.searchMatchCase;
         replacement.savedScrollY = tab.savedScrollY;
         replacement.sidebarRailOpen = tab.sidebarRailOpen;
         replacement.sidebarContentOpen = tab.sidebarContentOpen;
@@ -21359,10 +21506,9 @@ namespace
                 tab->dirty = true;
             }
             g_scrollY = oldScroll;
-            g_searchResults.clear();
-            g_searchCurrent = 0;
-            g_searchHasRun = false;
-            g_searchLastQuery.clear();
+            // ReloadPdfTab preserves the document-local search state. Restore
+            // it into the window globals because this tab remains active.
+            RestoreActiveTabSidebarState(hwnd);
             ClearAnnotationFocus();
             ClearTextSelection();
             SetTitle();
@@ -21897,6 +22043,7 @@ namespace
                 if (tab)
                 {
                     tab->zoomPresentationPending = false;
+                    tab->zoomPresentationAnchorValid = false;
                     ReleaseZoomFallback(*tab);
                 }
                 // A committed frame belongs to the previous page geometry.
@@ -22155,6 +22302,9 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             g_tabListOpen = false;
+            break;
+        case 2603:
+            ShowKeyboardShortcutsDialog(hwnd);
             break;
         case CmdSidebarPanelToggle:
             g_sidebarPanelTogglePresented = false;
@@ -22913,8 +23063,7 @@ namespace
             }
         }
 
-        bool zoomPresentationPending = Active() && Active()->zoomPresentationPending;
-        if (presentTip && !g_customZoomOpen && !zoomPresentationPending && !ZoomRenderDeferred())
+        if (presentTip && !g_customZoomOpen)
             PaintHoverTip(dc, client);
         ReleaseDC(hwnd, dc);
     }
@@ -23075,20 +23224,18 @@ namespace
         PaintClearRecentDialog(mem, client);
         PaintCustomZoomDialog(mem, client);
         PaintTabDragOverlay(mem);
-        bool paintZoomPending = Active() && Active()->zoomPresentationPending;
         // Compose the tooltip into the same back buffer as the button state.
         // The previous GetDC-after-EndPaint path exposed one blank frame when
         // a toolbar click invalidated the window underneath a still-hovered
         // button.
         bool tooltipDirty = g_hasHoverTip && !g_customZoomOpen &&
-            !paintZoomPending && !ZoomRenderDeferred() &&
             (Intersects(dirty, g_hoverTipRect) || Intersects(dirty, g_hoverTipPaintRect));
         if (tooltipDirty)
             PaintHoverTip(mem, client);
-        // A zoom transaction is still showing the last committed frame. A
-        // tooltip painted on top of that frame can appear for one WM_PAINT and
-        // disappear on the atomic target-frame swap, which looks like a flash
-        // after every zoom step.
+        // Tooltip pixels are foreground chrome. They are allowed to be
+        // presented while the reader is waiting for a complete zoom frame;
+        // otherwise a status-bar repaint during zoom erases a still-valid
+        // tooltip and makes it flash under a stationary pointer.
         auto flushRect = [&](RECT r)
         {
             RECT clipped{};
@@ -23145,6 +23292,17 @@ namespace
                         ExcludeClipRect(dc, toggle.left, toggle.top, toggle.right, toggle.bottom);
                     if (!IsRectEmpty(&exit))
                         ExcludeClipRect(dc, exit.left, exit.top, exit.right, exit.bottom);
+                    // The retained reader frame is submitted after the
+                    // tooltip has already been composited into the paint
+                    // buffer. Keep the current tooltip out of this final
+                    // page-only copy, otherwise every zoom frame briefly
+                    // erases the tooltip before the foreground pass restores
+                    // it.
+                    if (g_hasHoverTip && !g_customZoomOpen &&
+                        !IsRectEmpty(&g_hoverTipPaintRect))
+                        ExcludeClipRect(dc, g_hoverTipPaintRect.left,
+                            g_hoverTipPaintRect.top, g_hoverTipPaintRect.right,
+                            g_hoverTipPaintRect.bottom);
                     BitBlt(dc, readerDirty.left, readerDirty.top,
                         readerDirty.right - readerDirty.left,
                         readerDirty.bottom - readerDirty.top,
@@ -23176,12 +23334,6 @@ namespace
             // Keep the previous page frame until the next complete commit.
             flushRect(g_tabListRect);
             flushRect(g_favoriteListStaleRect);
-            // During a zoom transaction the tooltip state is retained but
-            // its old pixels must still be erased from the screen. The next
-            // timer tick invalidates this same rect and draws it again after
-            // the target frame is committed.
-            if (!IsRectEmpty(&g_hoverTipPaintRect))
-                flushRect(g_hoverTipPaintRect);
             // Scrollbars are independent transparent overlays. A deferred
             // reader paint must not defer their current thumb as well, or a
             // zoom transaction makes them disappear until the next gesture.
@@ -23193,22 +23345,10 @@ namespace
             g_favoriteListStaleRect = {};
         RestoreDC(mem, paintState);
 
-        // The paint rectangle is only known after PaintHoverTip calculates
-        // the current box. A newly entered tooltip therefore cannot be
-        // gated by the old rectangle; use the state flag for its first
-        // presentation, while the old rectangle still handles cleanup.
-        bool paintTouchesTip = hasNativePaintClip
-            ? PaintClipIntersectsRect(nativePaintClip, g_hoverTipPaintRect) ||
-              PaintClipIntersectsRect(nativePaintClip, g_hoverTipRect)
-            : Intersects(dirty, g_hoverTipPaintRect) ||
-              Intersects(dirty, g_hoverTipRect);
-        // The tooltip belongs to the pointer, not to the page frame. A page
-        // navigation repaint may cover the status bar without intersecting
-        // the old tooltip rectangle, so gating it by the dirty rectangle
-        // makes a rapidly clicked Prev/Next button blink. Re-submit the
-        // current tooltip whenever it still has a live hover owner; WM_MOUSEMOVE
-        // remains the sole authority that removes it.
-        bool presentTip = !tooltipDirty && (g_hasHoverTip || paintTouchesTip);
+        // Tooltip chrome is independent of the retained reader frame. Submit
+        // the current box after every paint transaction so a zoom handoff can
+        // never leave it partially covered or wait for another mouse move.
+        bool presentTip = g_hasHoverTip && !g_customZoomOpen;
         if (nativePaintClip)
             DeleteObject(nativePaintClip);
         EndPaint(hwnd, &ps);
@@ -23563,7 +23703,8 @@ namespace
                             {
                                 g_scrollY = std::clamp(g_scrollY, 0, SinglePageMaxScroll(tab));
                             }
-                            if (g_viewMode != 0 && !g_draggingMainScroll)
+                            if (g_viewMode != 0 && !g_draggingMainScroll &&
+                                !tab.zoomPresentationPending)
                                 g_scrollX = PreferredFacingScrollX(tab);
                             UpdateVertScrollBar(hwnd);
                             InvalidateRect(hwnd, nullptr, FALSE);
@@ -23738,6 +23879,7 @@ namespace
                             // level 0 continues rendering and replaces it as
                             // one complete visible region.
                             tab.zoomPresentationPending = false;
+                            tab.zoomPresentationAnchorValid = false;
                             ReleaseZoomFallback(tab);
                             InvalidateRect(hwnd, &g_stage, FALSE);
                         }
@@ -25936,8 +26078,6 @@ namespace
                 KillTimer(hwnd, 21);
                 g_zoomRenderDeferUntil = 0;
                 InvalidateRect(hwnd, &g_stage, FALSE);
-                if (g_hasHoverTip && !IsRectEmpty(&g_hoverTipPaintRect))
-                    InvalidateRect(hwnd, &g_hoverTipPaintRect, FALSE);
                 SchedulePagePrefetch(hwnd);
                 ScheduleIdleCacheTrim(hwnd);
                 return 0;
@@ -26215,6 +26355,15 @@ namespace
             if (ConfirmationDialogOpen()) return 0;
             if (wParam == VK_F11) { ApplyImmersiveWindow(hwnd, !g_immersive); return 0; }
             if (wParam == VK_ESCAPE && g_autoScrollActive) { StopAutoScroll(hwnd); return 0; }
+            if (wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
+                !g_tabs.empty() && !g_customZoomOpen)
+            {
+                int count = static_cast<int>(g_tabs.size());
+                int direction = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+                int next = g_active < 0 ? 0 : (g_active + direction + count) % count;
+                ActivateTab(hwnd, next);
+                return 0;
+            }
             if (g_customZoomOpen)
             {
                 int customCaret = static_cast<int>(g_customZoomCaretIndex);
