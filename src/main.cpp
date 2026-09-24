@@ -2339,8 +2339,10 @@ namespace
 
     constexpr COLORREF AnnotationPalette[] = {
         RGB(255, 236, 0), RGB(49, 211, 68), RGB(82, 174, 232),
-        RGB(244, 97, 142), RGB(156, 120, 229), RGB(255, 157, 50)
+        RGB(255, 0, 0), RGB(156, 120, 229), RGB(255, 157, 50)
     };
+
+    constexpr int AnnotationPaletteDisplayOrder[] = { 3, 0, 1, 2, 4, 5 };
 
     COLORREF AnnotationColor(PdfAnnotation const& annotation)
     {
@@ -3278,6 +3280,58 @@ namespace
             FillGdiRoundRect(g, wash, Rf(top), std::max(1.0f, radius - S(1.0f)));
         }
         DrawGdiRoundRect(g, border, Rf(r), radius);
+    }
+
+    void BlurRoundedBackdrop(HDC dc, RECT r, float radius)
+    {
+        int width = r.right - r.left;
+        int height = r.bottom - r.top;
+        if (width <= 3 || height <= 3) return;
+
+        constexpr int scale = 4;
+        int smallWidth = std::max(1, width / scale);
+        int smallHeight = std::max(1, height / scale);
+        HDC sourceDc = CreateCompatibleDC(dc);
+        HDC smallDc = CreateCompatibleDC(dc);
+        HBITMAP sourceBitmap = CreateCompatibleBitmap(dc, width, height);
+        HBITMAP smallBitmap = CreateCompatibleBitmap(dc, smallWidth, smallHeight);
+        if (!sourceDc || !smallDc || !sourceBitmap || !smallBitmap)
+        {
+            if (sourceBitmap) DeleteObject(sourceBitmap);
+            if (smallBitmap) DeleteObject(smallBitmap);
+            if (sourceDc) DeleteDC(sourceDc);
+            if (smallDc) DeleteDC(smallDc);
+            return;
+        }
+
+        HGDIOBJ oldSource = SelectObject(sourceDc, sourceBitmap);
+        HGDIOBJ oldSmall = SelectObject(smallDc, smallBitmap);
+        BitBlt(sourceDc, 0, 0, width, height, dc, r.left, r.top, SRCCOPY);
+        SetStretchBltMode(smallDc, HALFTONE);
+        SetBrushOrgEx(smallDc, 0, 0, nullptr);
+        StretchBlt(smallDc, 0, 0, smallWidth, smallHeight,
+            sourceDc, 0, 0, width, height, SRCCOPY);
+
+        int state = SaveDC(dc);
+        int diameter = std::max(2, static_cast<int>(std::ceil(radius * 2.0f)));
+        HRGN clip = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, diameter, diameter);
+        if (clip)
+        {
+            ExtSelectClipRgn(dc, clip, RGN_AND);
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            StretchBlt(dc, r.left, r.top, width, height,
+                smallDc, 0, 0, smallWidth, smallHeight, SRCCOPY);
+            DeleteObject(clip);
+        }
+        RestoreDC(dc, state);
+
+        SelectObject(sourceDc, oldSource);
+        SelectObject(smallDc, oldSmall);
+        DeleteObject(sourceBitmap);
+        DeleteObject(smallBitmap);
+        DeleteDC(sourceDc);
+        DeleteDC(smallDc);
     }
 
     void FlatRoundedSurface(HDC dc, RECT r, float radius)
@@ -19017,8 +19071,9 @@ namespace
         if (top < g_stage.top + S(8)) top = std::min(mark.bottom + S(10), g_stage.bottom - height - S(8));
         g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
 
+        BlurRoundedBackdrop(dc, g_annotationToolbarRect, S(11.0f));
         DrawRoundedShadow(dc, g_annotationToolbarRect, S(11.0f), S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
-        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() ? 214 : 236, S(11.0f), false);
+        GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() ? 208 : 226, S(11.0f), false);
 
         HFONT f = Font(9);
         HGDIOBJ oldFont = SelectObject(dc, f);
@@ -19060,14 +19115,15 @@ namespace
         Gdiplus::Graphics colorGraphics(dc);
         colorGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         colorGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        for (int i = 0; i < static_cast<int>(std::size(AnnotationPalette)); ++i)
+        for (int displayIndex = 0; displayIndex < static_cast<int>(std::size(AnnotationPaletteDisplayOrder)); ++displayIndex)
         {
+            int paletteIndex = AnnotationPaletteDisplayOrder[displayIndex];
             RECT swatch{ x, y + S(6), x + S(16), y + S(22) };
             g_annotationColorRects.push_back(swatch);
-            bool selected = !annotation->hasCustomColor && i == annotation->colorIndex;
+            bool selected = !annotation->hasCustomColor && paletteIndex == annotation->colorIndex;
             bool hovered = Hit(swatch, g_mousePos.x, g_mousePos.y);
             drawColorRing(colorGraphics, swatch, selected, hovered);
-            Gdiplus::SolidBrush brush(GdiColor(AnnotationPalette[i]));
+            Gdiplus::SolidBrush brush(GdiColor(AnnotationPalette[paletteIndex]));
             colorGraphics.FillEllipse(&brush, Rf(swatch));
             x += S(22);
         }
@@ -24789,7 +24845,7 @@ namespace
                     {
                         if (Hit(g_annotationColorRects[i], x, y))
                         {
-                            annotation->colorIndex = static_cast<int>(i);
+                            annotation->colorIndex = AnnotationPaletteDisplayOrder[i];
                             annotation->hasCustomColor = false;
                             tab->dirty = true;
                             SetTitle();
