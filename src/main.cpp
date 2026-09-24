@@ -2439,6 +2439,14 @@ namespace
         return MixColor(T().muted, T().text, 0.14);
     }
 
+    COLORREF MainScrollThumbColor(bool active)
+    {
+        if (active) return ScrollThumbColor(true);
+        if (IsGraphiteTheme()) return RGB(135, 141, 149);
+        if (IsDarkTheme()) return MixColor(T().muted, T().text, 0.10);
+        return MixColor(T().muted, T().panel, 0.28);
+    }
+
     bool Hit(RECT r, int x, int y);
     bool Intersects(RECT a, RECT b);
     void RoundFill(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line);
@@ -3000,7 +3008,7 @@ namespace
                 ? std::max(1, (S(7) * 8) / 10)
                 : std::max(2, S(3));
             RECT visualThumb{ centerX - trackW / 2, g_mainScrollThumbRect.top, centerX + (trackW + 1) / 2, g_mainScrollThumbRect.bottom };
-            DrawScrollThumbAA(dc, visualThumb, S(5), ScrollThumbColor(active));
+            DrawScrollThumbAA(dc, visualThumb, S(5), MainScrollThumbColor(active));
         }
         if (!IsRectEmpty(&g_mainHScrollTrackRect) && (Intersects(paintClip, g_mainHScrollTrackRect) || Intersects(paintClip, g_mainHScrollThumbRect)))
         {
@@ -3008,7 +3016,7 @@ namespace
             int centerY = (g_mainHScrollTrackRect.top + g_mainHScrollTrackRect.bottom) / 2;
             int h = hActive ? S(7) : std::max(2, S(3));
             RECT visualH{ g_mainHScrollThumbRect.left, centerY - h / 2, g_mainHScrollThumbRect.right, centerY + (h + 1) / 2 };
-            DrawScrollThumbAA(dc, visualH, S(5), ScrollThumbColor(hActive));
+            DrawScrollThumbAA(dc, visualH, S(5), MainScrollThumbColor(hActive));
         }
     }
 
@@ -13393,11 +13401,11 @@ namespace
             centerX + (trackW + 1) / 2,
             g_sidebarScrollThumbRect.bottom
         };
+        OffsetRect(&visualThumb, S(2), 0);
         // The sidebar thumb is an overlay on top of its content. Keep it
         // green in both states, but translucent, so inactive content-area
         // hover never falls back to the dark document scrollbar color.
-        BYTE alpha = active ? 188 : 156;
-        DrawScrollThumbAA(dc, visualThumb, S(5), T().accent, alpha);
+        DrawScrollThumbAA(dc, visualThumb, S(5), T().accent, 128);
     }
 
     bool ZoomRenderDeferred()
@@ -17121,7 +17129,7 @@ namespace
                     {
                         COLORREF fill = selected ? MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.22 : 0.12) : T().panel2;
                         COLORREF line = selected ? T().accent : T().line;
-                        RoundFill(dc, row, S(8), fill, line);
+                        RoundFillAA(dc, row, S(8), fill, line);
                     }
                     COLORREF markColor = AnnotationColor(annotation);
                     RECT swatch{ row.left + S(10), row.top + S(12), row.left + S(22), row.top + S(24) };
@@ -21030,6 +21038,13 @@ namespace
         {
             int x = columnX[column];
             int right = column == 0 ? columnX[1] - columnGap / 2 : contentRight;
+            int keyW = S(66);
+            for (int i = 0; i < group.count; ++i)
+            {
+                keyW = std::max(keyW,
+                    S(16) + static_cast<int>(wcslen(group.rows[i].key)) * S(7));
+            }
+            keyW = std::min(keyW, std::max(S(66), columnW - S(92)));
             if (y + S(30) > contentBottom) return;
             oldFont = SelectObject(dc, groupFont);
             Text(dc, group.title, RECT{ x, y, right, y + S(22) },
@@ -21039,8 +21054,6 @@ namespace
             for (int i = 0; i < group.count; ++i)
             {
                 if (y + S(30) > contentBottom) break;
-                int keyW = std::clamp(S(16) + static_cast<int>(wcslen(group.rows[i].key)) * S(7), S(66),
-                    std::max(S(66), columnW - S(92)));
                 RECT keyRect{ x, y + S(2), x + keyW, y + S(27) };
                 RoundFillAA(dc, keyRect, S(6), MixColor(T().panel2, T().accent, IsDarkTheme() ? 0.16 : 0.07),
                     MixColor(T().line, T().accent, IsDarkTheme() ? 0.30 : 0.18));
