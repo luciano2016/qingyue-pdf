@@ -19100,16 +19100,17 @@ namespace
         auto drawColorRing = [&](Gdiplus::Graphics& graphics, RECT swatch, bool selected, bool hovered)
         {
             if (!selected && !hovered) return;
+            int ringInset = S(2);
             Gdiplus::RectF ring{
-                static_cast<Gdiplus::REAL>(swatch.left - S(4)),
-                static_cast<Gdiplus::REAL>(swatch.top - S(4)),
-                static_cast<Gdiplus::REAL>(swatch.right - swatch.left + S(8)),
-                static_cast<Gdiplus::REAL>(swatch.bottom - swatch.top + S(8))
+                static_cast<Gdiplus::REAL>(swatch.left - ringInset),
+                static_cast<Gdiplus::REAL>(swatch.top - ringInset),
+                static_cast<Gdiplus::REAL>(swatch.right - swatch.left + ringInset * 2),
+                static_cast<Gdiplus::REAL>(swatch.bottom - swatch.top + ringInset * 2)
             };
             Gdiplus::SolidBrush ringFill(GdiColor(selected ? MixColor(T().panel2, T().accent, 0.18) : T().panel2));
             Gdiplus::Pen ringLine(GdiColor(selected ? T().accent : T().line), std::max<Gdiplus::REAL>(1.0f, S(1.0f)));
-            FillGdiRoundRect(graphics, ringFill, ring, S(10.0f));
-            DrawGdiRoundRect(graphics, ringLine, ring, S(10.0f));
+            FillGdiRoundRect(graphics, ringFill, ring, S(8.0f));
+            DrawGdiRoundRect(graphics, ringLine, ring, S(8.0f));
         };
 
         Gdiplus::Graphics colorGraphics(dc);
