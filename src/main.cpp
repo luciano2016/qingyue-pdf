@@ -3296,31 +3296,77 @@ namespace
         int height = r.bottom - r.top;
         if (width <= 3 || height <= 3) return;
 
-        // A smaller backdrop buffer produces a stronger, still inexpensive
-        // blur while keeping the popup geometry and text crisp.
-        constexpr int scale = 6;
+        // Keep the blur transient and small, but smooth the reduced image
+        // before enlarging it so fine text becomes a soft Mica-like haze
+        // instead of a blocky, low-resolution pattern.
+        constexpr int scale = 5;
         int smallWidth = std::max(1, width / scale);
         int smallHeight = std::max(1, height / scale);
-        HDC sourceDc = CreateCompatibleDC(dc);
         HDC smallDc = CreateCompatibleDC(dc);
-        HBITMAP sourceBitmap = CreateCompatibleBitmap(dc, width, height);
-        HBITMAP smallBitmap = CreateCompatibleBitmap(dc, smallWidth, smallHeight);
-        if (!sourceDc || !smallDc || !sourceBitmap || !smallBitmap)
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = smallWidth;
+        bitmapInfo.bmiHeader.biHeight = -smallHeight;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        void* bitmapBits = nullptr;
+        HBITMAP smallBitmap = CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS, &bitmapBits, nullptr, 0);
+        if (!smallDc || !smallBitmap || !bitmapBits)
         {
-            if (sourceBitmap) DeleteObject(sourceBitmap);
             if (smallBitmap) DeleteObject(smallBitmap);
-            if (sourceDc) DeleteDC(sourceDc);
             if (smallDc) DeleteDC(smallDc);
             return;
         }
 
-        HGDIOBJ oldSource = SelectObject(sourceDc, sourceBitmap);
         HGDIOBJ oldSmall = SelectObject(smallDc, smallBitmap);
-        BitBlt(sourceDc, 0, 0, width, height, dc, r.left, r.top, SRCCOPY);
         SetStretchBltMode(smallDc, HALFTONE);
         SetBrushOrgEx(smallDc, 0, 0, nullptr);
         StretchBlt(smallDc, 0, 0, smallWidth, smallHeight,
-            sourceDc, 0, 0, width, height, SRCCOPY);
+            dc, r.left, r.top, width, height, SRCCOPY);
+
+        auto* pixels = static_cast<std::uint32_t*>(bitmapBits);
+        std::vector<std::uint32_t> scratch(static_cast<size_t>(smallWidth) * static_cast<size_t>(smallHeight));
+        auto average3 = [](std::uint32_t first, std::uint32_t second, std::uint32_t third)
+        {
+            std::uint32_t blue = ((first & 0xFFu) + (second & 0xFFu) + (third & 0xFFu)) / 3u;
+            std::uint32_t green = (((first >> 8) & 0xFFu) + ((second >> 8) & 0xFFu) + ((third >> 8) & 0xFFu)) / 3u;
+            std::uint32_t red = (((first >> 16) & 0xFFu) + ((second >> 16) & 0xFFu) + ((third >> 16) & 0xFFu)) / 3u;
+            return blue | (green << 8) | (red << 16);
+        };
+        auto smoothPass = [&]()
+        {
+            for (int y = 0; y < smallHeight; ++y)
+            {
+                size_t row = static_cast<size_t>(y) * static_cast<size_t>(smallWidth);
+                for (int x = 0; x < smallWidth; ++x)
+                {
+                    int left = std::max(0, x - 1);
+                    int right = std::min(smallWidth - 1, x + 1);
+                    scratch[row + static_cast<size_t>(x)] = average3(
+                        pixels[row + static_cast<size_t>(left)],
+                        pixels[row + static_cast<size_t>(x)],
+                        pixels[row + static_cast<size_t>(right)]);
+                }
+            }
+            for (int y = 0; y < smallHeight; ++y)
+            {
+                size_t row = static_cast<size_t>(y) * static_cast<size_t>(smallWidth);
+                int top = std::max(0, y - 1);
+                int bottom = std::min(smallHeight - 1, y + 1);
+                size_t topRow = static_cast<size_t>(top) * static_cast<size_t>(smallWidth);
+                size_t bottomRow = static_cast<size_t>(bottom) * static_cast<size_t>(smallWidth);
+                for (int x = 0; x < smallWidth; ++x)
+                {
+                    pixels[row + static_cast<size_t>(x)] = average3(
+                        scratch[topRow + static_cast<size_t>(x)],
+                        scratch[row + static_cast<size_t>(x)],
+                        scratch[bottomRow + static_cast<size_t>(x)]);
+                }
+            }
+        };
+        smoothPass();
+        smoothPass();
 
         int state = SaveDC(dc);
         int diameter = std::max(2, static_cast<int>(std::ceil(radius * 2.0f)));
@@ -3336,11 +3382,8 @@ namespace
         }
         RestoreDC(dc, state);
 
-        SelectObject(sourceDc, oldSource);
         SelectObject(smallDc, oldSmall);
-        DeleteObject(sourceBitmap);
         DeleteObject(smallBitmap);
-        DeleteDC(sourceDc);
         DeleteDC(smallDc);
     }
 
