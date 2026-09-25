@@ -3296,7 +3296,9 @@ namespace
         int height = r.bottom - r.top;
         if (width <= 3 || height <= 3) return;
 
-        constexpr int scale = 4;
+        // A smaller backdrop buffer produces a stronger, still inexpensive
+        // blur while keeping the popup geometry and text crisp.
+        constexpr int scale = 6;
         int smallWidth = std::max(1, width / scale);
         int smallHeight = std::max(1, height / scale);
         HDC sourceDc = CreateCompatibleDC(dc);
@@ -19190,6 +19192,7 @@ namespace
         int panelTop = std::min<int>(static_cast<int>(g_annotationToolbarRect.bottom) + S(8), static_cast<int>(client.bottom) - panelH - S(46));
         panelTop = std::max<int>(static_cast<int>(g_stage.top) + S(14), panelTop);
         g_annotationNotePanelRect = RECT{ panelLeft, panelTop, panelLeft + panelW, panelTop + panelH };
+        BlurRoundedBackdrop(dc, g_annotationNotePanelRect, S(12.0f));
         DrawRoundedShadow(dc, g_annotationNotePanelRect, S(12.0f), S(2), S(3), S(5), IsDarkTheme() ? 42 : 30);
         GlassRoundedSurface(dc, g_annotationNotePanelRect, IsDarkTheme() ? 224 : 242, S(12.0f), false);
 
@@ -21417,7 +21420,7 @@ namespace
             annotation.x1 = std::max(r.x0, r.x1);
             annotation.y1 = std::max(r.y0, r.y1);
             annotation.kind = kind;
-            annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : (kind == AnnotationKind::Underline ? 1 : 3);
+            annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : 3;
             annotation.createdAt = NowMs();
             annotation.author = L"10726";
             annotation.text = selected.text;
