@@ -1649,6 +1649,8 @@ namespace
     RECT g_hoverButtonRect{};
     RECT g_hoverTipRect{};
     RECT g_hoverTipPaintRect{};
+    POINT g_hoverTipAnchor{};
+    bool g_hoverTipAnchorValid{};
     RECT g_pageInputRect{};
     RECT g_homeSearchRect{};
     RECT g_homeSearchClearRect{};
@@ -1912,6 +1914,8 @@ namespace
     bool g_syncingAnnotationNoteEdit{};
     int g_annotationNoteEditAnnotation{ -1 };
     RECT g_annotationHitRect{};
+    POINT g_annotationPopupAnchor{};
+    bool g_annotationPopupAnchorValid{};
     RECT g_annotationToolbarRect{};
     RECT g_annotationCopyRect{};
     RECT g_annotationNoteRect{};
@@ -5709,11 +5713,18 @@ namespace
         int maxW = std::max<int>(S(80), static_cast<int>(client.right) - S(16));
         int w = std::min<int>(static_cast<int>(sz.cx) + S(20), maxW);
         int h = S(28);
-        int x = (g_hoverTipRect.left + g_hoverTipRect.right - w) / 2;
+        int anchorX = g_hoverTipAnchorValid
+            ? g_hoverTipAnchor.x
+            : (g_hoverTipRect.left + g_hoverTipRect.right) / 2;
+        int x = anchorX - w / 2;
         x = std::clamp<int>(x, S(8), std::max<int>(S(8), static_cast<int>(client.right) - w - S(8)));
-        int y = g_hoverTipIsPdfLink ? g_hoverTipRect.bottom + S(6) : g_hoverTipRect.top - h - S(9);
+        int y = g_hoverTipIsPdfLink && g_hoverTipAnchorValid
+            ? g_hoverTipAnchor.y + S(14)
+            : (g_hoverTipIsPdfLink ? g_hoverTipRect.bottom + S(6) : g_hoverTipRect.top - h - S(9));
         if (g_hoverTipIsPdfLink && y + h > client.bottom - S(8))
-            y = g_hoverTipRect.top - h - S(6);
+            y = g_hoverTipAnchorValid
+                ? g_hoverTipAnchor.y - h - S(14)
+                : g_hoverTipRect.top - h - S(6);
         else if (!g_hoverTipIsPdfLink && y < S(8))
             y = g_hoverTipRect.bottom + S(9);
         y = std::clamp<int>(y, S(8), static_cast<int>(client.bottom) - h - S(8));
@@ -12111,6 +12122,8 @@ namespace
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
         g_annotationNoteEditAnnotation = -1;
+        g_annotationPopupAnchor = POINT{};
+        g_annotationPopupAnchorValid = false;
         if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
         g_annotationHitRect = RECT{};
         g_annotationToolbarRect = RECT{};
@@ -12227,6 +12240,8 @@ namespace
         g_annotationToolbarOpen = false;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
+        g_annotationPopupAnchor = POINT{};
+        g_annotationPopupAnchorValid = false;
         if (jump) JumpToAnnotation(hwnd, tab, tab.annotations[static_cast<size_t>(index)]);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -19119,9 +19134,15 @@ namespace
 
         int width = S(312);
         int height = S(42);
-        int left = std::clamp(mark.left, g_stage.left + S(10), std::max(g_stage.left + S(10), g_stage.right - width - S(10)));
-        int top = mark.top - height - S(10);
-        if (top < g_stage.top + S(8)) top = std::min(mark.bottom + S(10), g_stage.bottom - height - S(8));
+        int anchorX = g_annotationPopupAnchorValid ? g_annotationPopupAnchor.x : static_cast<int>(mark.left);
+        int anchorY = g_annotationPopupAnchorValid ? g_annotationPopupAnchor.y : static_cast<int>(mark.top);
+        int left = g_annotationPopupAnchorValid ? anchorX - width / 2 : static_cast<int>(mark.left);
+        left = std::clamp<int>(left, static_cast<int>(g_stage.left + S(10)),
+            std::max<int>(static_cast<int>(g_stage.left + S(10)), static_cast<int>(g_stage.right - width - S(10))));
+        int top = anchorY - height - S(10);
+        if (top < g_stage.top + S(8)) top = anchorY + S(10);
+        top = std::clamp<int>(top, static_cast<int>(g_stage.top + S(8)),
+            std::max<int>(static_cast<int>(g_stage.top + S(8)), static_cast<int>(g_stage.bottom - height - S(8))));
         g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
 
         BlurRoundedBackdrop(dc, g_annotationToolbarRect, S(11.0f));
@@ -21488,8 +21509,12 @@ namespace
         g_annotationToolbarOpen = true;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
+        g_annotationPopupAnchor = POINT{};
+        g_annotationPopupAnchorValid = false;
         g_hasHoverTip = false;
         g_hoverTipIsPdfLink = false;
+        g_hoverTipAnchor = POINT{};
+        g_hoverTipAnchorValid = false;
         g_hoverTip.clear();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -25279,7 +25304,15 @@ namespace
                         g_pdfLinkPressUri = std::move(uri);
                     }
                     g_selectingContent = true;
-                    if(g_hoverTipIsPdfLink) { g_hasHoverTip=false; g_hoverTipIsPdfLink=false; g_hoverTip.clear(); InvalidateRect(hwnd,nullptr,FALSE); }
+                    if (g_hoverTipIsPdfLink)
+                    {
+                        g_hasHoverTip = false;
+                        g_hoverTipIsPdfLink = false;
+                        g_hoverTipAnchor = POINT{};
+                        g_hoverTipAnchorValid = false;
+                        g_hoverTip.clear();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
                     g_hasContentSelection = false;
                     g_selectionIsImage = false;
                     g_selectionPage = page;
@@ -25917,9 +25950,13 @@ namespace
             bool hadTip = g_hasHoverTip;
             std::wstring oldTip = g_hoverTip;
             RECT oldTipRect = g_hoverTipRect;
+            POINT oldTipAnchor = g_hoverTipAnchor;
+            bool oldTipAnchorValid = g_hoverTipAnchorValid;
             bool oldTipIsPdfLink = g_hoverTipIsPdfLink;
             g_hasHoverTip = false;
             g_hoverTipIsPdfLink = false;
+            g_hoverTipAnchor = POINT{};
+            g_hoverTipAnchorValid = false;
             g_hoverTip.clear();
             if (!favoriteOverlayHit && g_hoverTab >= 0)
             {
@@ -25949,6 +25986,8 @@ namespace
                         g_hoverTipIsPdfLink = true;
                         g_hoverTip = uri;
                         g_hoverTipRect = linkRect;
+                        g_hoverTipAnchor = POINT{ mx, my };
+                        g_hoverTipAnchorValid = true;
                     }
                 }
             }
@@ -25994,6 +26033,8 @@ namespace
             }
             if (hadTip != g_hasHoverTip || oldTip != g_hoverTip ||
                 oldTipIsPdfLink != g_hoverTipIsPdfLink || !EqualRect(&oldTipRect, &g_hoverTipRect) ||
+                oldTipAnchorValid != g_hoverTipAnchorValid ||
+                (oldTipAnchorValid && (oldTipAnchor.x != g_hoverTipAnchor.x || oldTipAnchor.y != g_hoverTipAnchor.y)) ||
                 oldHoverTabClose != g_hoverTabClose || oldHoverTab != g_hoverTab ||
                 oldHoverHomeHit != g_hoverHomeHit || oldHoverRecentRect != g_hoverRecentRect)
             {
@@ -26141,6 +26182,8 @@ namespace
                     ClearTextSelection();
                     g_activeAnnotation = activateAnnotation;
                     g_annotationHitRect = annotationHitRect;
+                    g_annotationPopupAnchor = releasePoint;
+                    g_annotationPopupAnchorValid = true;
                     g_annotationToolbarOpen = true;
                     g_annotationNoteOpen = false;
                     g_annotationNoteFocused = false;
@@ -26193,6 +26236,8 @@ namespace
                             {
                                 g_activeAnnotation = annotationIndex;
                                 g_annotationHitRect = hitRect;
+                                g_annotationPopupAnchor = g_selectionEnd;
+                                g_annotationPopupAnchorValid = true;
                                 g_annotationToolbarOpen = true;
                                 g_annotationNoteOpen = false;
                                 g_annotationNoteFocused = false;
