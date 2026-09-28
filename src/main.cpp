@@ -18942,6 +18942,11 @@ namespace
     {
         if (message == WM_ERASEBKGND)
             return 1;
+        if (message == WM_KEYDOWN && wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000))
+        {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
         if (message == WM_KEYDOWN && wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000))
         {
             HWND owner = GetParent(hwnd);
@@ -18962,7 +18967,8 @@ namespace
                 0,
                 L"EDIT",
                 L"",
-                WS_CHILD | WS_TABSTOP | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
+                WS_CHILD | WS_TABSTOP | WS_VSCROLL |
+                    ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
                 0, 0, 0, 0,
                 hwnd,
                 reinterpret_cast<HMENU>(static_cast<INT_PTR>(0x7F10)),
@@ -18979,7 +18985,7 @@ namespace
         }
         if (!g_annotationNoteEditFont)
         {
-            g_annotationNoteEditFont = SystemUiFont(11);
+            g_annotationNoteEditFont = SystemUiFont(10);
             fontCreated = true;
         }
         if (fontCreated)
@@ -19291,7 +19297,22 @@ namespace
         RECT title{ panelLeft + S(14), panelTop + S(10), panelLeft + S(160), panelTop + S(34) };
         Text(dc, L"\u4fbf\u7b7e", title, DT_LEFT | DT_VCENTER | DT_SINGLELINE, T().text);
         g_annotationNoteCloseRect = RECT{ panelLeft + panelW - S(34), panelTop + S(8), panelLeft + panelW - S(10), panelTop + S(32) };
-        drawTool(g_annotationNoteCloseRect, L"x");
+        bool closeHover = Hit(g_annotationNoteCloseRect, g_mousePos.x, g_mousePos.y);
+        if (closeHover)
+            RoundFill(dc, g_annotationNoteCloseRect, S(7), T().panel2, T().line);
+        Gdiplus::Graphics closeGraphics(dc);
+        closeGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        closeGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::Pen closePen(GdiColor(closeHover ? T().text : T().muted), std::max<Gdiplus::REAL>(1.45f, S(1.25f)));
+        closePen.SetStartCap(Gdiplus::LineCapRound);
+        closePen.SetEndCap(Gdiplus::LineCapRound);
+        float closeInset = S(8.0f);
+        float closeLeft = static_cast<float>(g_annotationNoteCloseRect.left) + closeInset;
+        float closeRight = static_cast<float>(g_annotationNoteCloseRect.right) - closeInset;
+        float closeTop = static_cast<float>(g_annotationNoteCloseRect.top) + closeInset;
+        float closeBottom = static_cast<float>(g_annotationNoteCloseRect.bottom) - closeInset;
+        closeGraphics.DrawLine(&closePen, closeLeft, closeTop, closeRight, closeBottom);
+        closeGraphics.DrawLine(&closePen, closeRight, closeTop, closeLeft, closeBottom);
         SelectObject(dc, oldFont);
         DeleteObject(titleFont);
 
