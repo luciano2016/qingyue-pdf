@@ -18951,6 +18951,7 @@ namespace
 
     void EnsureAnnotationNoteEdit(HWND hwnd)
     {
+        bool fontCreated = false;
         if (!g_annotationNoteEdit)
         {
             g_annotationNoteEdit = CreateWindowExW(
@@ -18973,8 +18974,12 @@ namespace
             SendMessageW(g_annotationNoteEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"点击输入注释..."));
         }
         if (!g_annotationNoteEditFont)
+        {
             g_annotationNoteEditFont = SystemUiFont(11);
-        SendMessageW(g_annotationNoteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_annotationNoteEditFont), TRUE);
+            fontCreated = true;
+        }
+        if (fontCreated)
+            SendMessageW(g_annotationNoteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_annotationNoteEditFont), FALSE);
     }
 
     void SyncAnnotationNoteEdit(HWND hwnd, PdfAnnotation const& annotation)
@@ -19002,13 +19007,19 @@ namespace
         MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&currentRect), 2);
         if (!EqualRect(&currentRect, &editRect))
         {
-            MoveWindow(
+            SetWindowPos(
                 g_annotationNoteEdit,
+                nullptr,
                 editRect.left,
                 editRect.top,
                 std::max(1L, editRect.right - editRect.left),
                 std::max(1L, editRect.bottom - editRect.top),
-                TRUE);
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+            RedrawWindow(
+                g_annotationNoteEdit,
+                nullptr,
+                nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
         }
         if (!IsWindowVisible(g_annotationNoteEdit))
             ShowWindow(g_annotationNoteEdit, SW_SHOW);
