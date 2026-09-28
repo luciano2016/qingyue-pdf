@@ -1499,6 +1499,7 @@ namespace
     constexpr UINT WM_QUIETPDF_REFRESH_FILE_WATCH = WM_APP + 46;
     constexpr UINT WM_QUIETPDF_RETRY_OUTLINE = WM_APP + 47;
     constexpr UINT WM_QUIETPDF_RETRY_ANNOTATIONS = WM_APP + 48;
+    constexpr UINT WM_QUIETPDF_SYNC_ANNOTATION_NOTE = WM_APP + 49;
 
     struct PageRenderRequest
     {
@@ -1912,6 +1913,7 @@ namespace
     COLORREF g_annotationNoteEditBrushColor{ CLR_INVALID };
     WNDPROC g_annotationNoteEditProc{};
     bool g_syncingAnnotationNoteEdit{};
+    bool g_annotationNoteEditSyncPosted{};
     int g_annotationNoteEditAnnotation{ -1 };
     RECT g_annotationHitRect{};
     POINT g_annotationPopupAnchor{};
@@ -18938,6 +18940,8 @@ namespace
 
     LRESULT CALLBACK AnnotationNoteEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
+        if (message == WM_ERASEBKGND)
+            return 1;
         if (message == WM_KEYDOWN && wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000))
         {
             HWND owner = GetParent(hwnd);
@@ -18987,13 +18991,17 @@ namespace
         EnsureAnnotationNoteEdit(hwnd);
         if (!g_annotationNoteEdit) return;
 
+        bool needsRefresh = false;
         if (g_annotationNoteEditAnnotation != g_activeAnnotation)
         {
             g_syncingAnnotationNoteEdit = true;
+            SendMessageW(g_annotationNoteEdit, WM_SETREDRAW, FALSE, 0);
             SetWindowTextW(g_annotationNoteEdit, annotation.note.c_str());
+            SendMessageW(g_annotationNoteEdit, WM_SETREDRAW, TRUE, 0);
             g_syncingAnnotationNoteEdit = false;
             g_annotationNoteEditAnnotation = g_activeAnnotation;
             SendMessageW(g_annotationNoteEdit, EM_SETSEL, annotation.note.size(), annotation.note.size());
+            needsRefresh = true;
         }
 
         RECT editRect{
@@ -19007,6 +19015,7 @@ namespace
         MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&currentRect), 2);
         if (!EqualRect(&currentRect, &editRect))
         {
+            RECT oldEditRect = currentRect;
             SetWindowPos(
                 g_annotationNoteEdit,
                 nullptr,
@@ -19015,16 +19024,22 @@ namespace
                 std::max(1L, editRect.right - editRect.left),
                 std::max(1L, editRect.bottom - editRect.top),
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
-            RedrawWindow(
-                g_annotationNoteEdit,
-                nullptr,
-                nullptr,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            // The main window clips its child controls. Repaint the former
+            // edit location so a moved note cannot leave its old pixels in
+            // the parent's retained frame.
+            if (!IsRectEmpty(&oldEditRect))
+                InvalidateRect(hwnd, &oldEditRect, FALSE);
+            needsRefresh = true;
         }
         if (!IsWindowVisible(g_annotationNoteEdit))
-            ShowWindow(g_annotationNoteEdit, SW_SHOW);
+            needsRefresh = true;
         if (g_annotationNoteFocused && GetFocus() != g_annotationNoteEdit)
-            SetFocus(g_annotationNoteEdit);
+            needsRefresh = true;
+        if (needsRefresh && !g_annotationNoteEditSyncPosted)
+        {
+            g_annotationNoteEditSyncPosted = true;
+            PostMessageW(hwnd, WM_QUIETPDF_SYNC_ANNOTATION_NOTE, 0, 0);
+        }
     }
 
     UINT_PTR CALLBACK AnnotationColorDialogHook(HWND dialog, UINT message, WPARAM, LPARAM)
@@ -23952,6 +23967,30 @@ namespace
         case WM_QUIETPDF_REFRESH_FILE_WATCH:
             StartActiveFileWatcher(hwnd);
             return 0;
+        case WM_QUIETPDF_SYNC_ANNOTATION_NOTE:
+        {
+            g_annotationNoteEditSyncPosted = false;
+            if (!g_annotationNoteEdit) return 0;
+
+            PdfAnnotation* annotation = nullptr;
+            PdfTab* tab = Active();
+            bool shouldShow = g_annotationToolbarOpen && g_annotationNoteOpen &&
+                tab && ActiveAnnotation(*tab, annotation);
+            if (!shouldShow)
+            {
+                if (IsWindowVisible(g_annotationNoteEdit))
+                    ShowWindow(g_annotationNoteEdit, SW_HIDE);
+                return 0;
+            }
+
+            if (!IsWindowVisible(g_annotationNoteEdit))
+                ShowWindow(g_annotationNoteEdit, SW_SHOWNOACTIVATE);
+            RedrawWindow(g_annotationNoteEdit, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+            if (g_annotationNoteFocused && GetFocus() != g_annotationNoteEdit)
+                SetFocus(g_annotationNoteEdit);
+            return 0;
+        }
         case WM_QUIETPDF_HOME_SCROLL_FRAME:
             g_homeScrollFramePosted = false;
             PresentHomeScrollFrame(hwnd);
@@ -27412,7 +27451,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         wc.hbrBackground = nullptr;
         wc.lpszClassName = L"XiaoYuePDFWindow";
         RegisterClassW(&wc);
-        g_hwnd = CreateWindowExW(0, wc.lpszClassName, AppName, WS_OVERLAPPEDWINDOW,
+        g_hwnd = CreateWindowExW(0, wc.lpszClassName, AppName,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT, CW_USEDEFAULT, 1180, 840, nullptr, nullptr, instance, nullptr);
         if (!g_hwnd) return 1;
         ApplyWindowChrome();
