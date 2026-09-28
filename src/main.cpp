@@ -18938,10 +18938,79 @@ namespace
         return text.substr(0, maxChars - 1) + L"...";
     }
 
+    void UpdateAnnotationNoteEditScrollbar()
+    {
+        if (!g_annotationNoteEdit || !IsWindow(g_annotationNoteEdit)) return;
+
+        RECT formatRect{};
+        SendMessageW(g_annotationNoteEdit, EM_GETRECT, 0,
+            reinterpret_cast<LPARAM>(&formatRect));
+        int formatHeight = std::max(1L, formatRect.bottom - formatRect.top);
+
+        HDC dc = GetDC(g_annotationNoteEdit);
+        int lineHeight = S(13);
+        if (dc)
+        {
+            HFONT font = reinterpret_cast<HFONT>(SendMessageW(
+                g_annotationNoteEdit, WM_GETFONT, 0, 0));
+            HGDIOBJ old = font ? SelectObject(dc, font) : nullptr;
+            TEXTMETRICW metrics{};
+            if (GetTextMetricsW(dc, &metrics) && metrics.tmHeight > 0)
+                lineHeight = metrics.tmHeight;
+            if (old) SelectObject(dc, old);
+            ReleaseDC(g_annotationNoteEdit, dc);
+        }
+
+        int visibleLines = std::max(1, formatHeight / std::max(1, lineHeight));
+        int lineCount = static_cast<int>(SendMessageW(
+            g_annotationNoteEdit, EM_GETLINECOUNT, 0, 0));
+        bool overflow = lineCount > visibleLines;
+        ShowScrollBar(g_annotationNoteEdit, SB_VERT, overflow ? TRUE : FALSE);
+    }
+
     LRESULT CALLBACK AnnotationNoteEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
+        if (message == WM_PAINT)
+        {
+            PAINTSTRUCT ps{};
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (dc)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                HBRUSH brush = CreateSolidBrush(T().paper);
+                if (brush)
+                {
+                    FillRect(dc, &client, brush);
+                    DeleteObject(brush);
+                }
+                // The native EDIT still owns text layout, caret, selection,
+                // and IME rendering. Ask it to paint its client contents only
+                // after this control has been made fully opaque, so no pixels
+                // from the PDF frame beneath a newly shown note can survive.
+                if (g_annotationNoteEditProc)
+                    CallWindowProcW(g_annotationNoteEditProc, hwnd,
+                        WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+                EndPaint(hwnd, &ps);
+            }
+            return 0;
+        }
         if (message == WM_ERASEBKGND)
+        {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            if (dc)
+            {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                HBRUSH brush = CreateSolidBrush(T().paper);
+                if (brush)
+                {
+                    FillRect(dc, &client, brush);
+                    DeleteObject(brush);
+                }
+            }
             return 1;
+        }
         if (message == WM_KEYDOWN && wParam == 'A' && (GetKeyState(VK_CONTROL) & 0x8000))
         {
             SendMessageW(hwnd, EM_SETSEL, 0, -1);
@@ -18953,9 +19022,12 @@ namespace
             if (owner) PostMessageW(owner, WM_COMMAND, MAKEWPARAM(CmdSave, 0), 0);
             return 0;
         }
-        return g_annotationNoteEditProc
+        LRESULT result = g_annotationNoteEditProc
             ? CallWindowProcW(g_annotationNoteEditProc, hwnd, message, wParam, lParam)
             : DefWindowProcW(hwnd, message, wParam, lParam);
+        if (message == WM_SIZE || message == WM_SETTEXT || message == WM_FONTCHANGE)
+            UpdateAnnotationNoteEditScrollbar();
+        return result;
     }
 
     void EnsureAnnotationNoteEdit(HWND hwnd)
@@ -18990,6 +19062,7 @@ namespace
         }
         if (fontCreated)
             SendMessageW(g_annotationNoteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_annotationNoteEditFont), FALSE);
+        UpdateAnnotationNoteEditScrollbar();
     }
 
     void SyncAnnotationNoteEdit(HWND hwnd, PdfAnnotation const& annotation)
@@ -19009,6 +19082,8 @@ namespace
             SendMessageW(g_annotationNoteEdit, EM_SETSEL, annotation.note.size(), annotation.note.size());
             needsRefresh = true;
         }
+
+        UpdateAnnotationNoteEditScrollbar();
 
         RECT editRect{
             g_annotationNoteInputRect.left + S(8),
@@ -24007,7 +24082,7 @@ namespace
             if (!IsWindowVisible(g_annotationNoteEdit))
                 ShowWindow(g_annotationNoteEdit, SW_SHOWNOACTIVATE);
             RedrawWindow(g_annotationNoteEdit, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_NOCHILDREN);
             if (g_annotationNoteFocused && GetFocus() != g_annotationNoteEdit)
                 SetFocus(g_annotationNoteEdit);
             return 0;
@@ -24531,6 +24606,7 @@ namespace
                             InvalidateRect(hwnd, &g_sidebar, FALSE);
                             SetTitle();
                         }
+                        UpdateAnnotationNoteEditScrollbar();
                     }
                     return 0;
                 }
