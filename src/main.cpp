@@ -2099,6 +2099,7 @@ namespace
     int g_themedSearchMenuWidth{};
     int g_themedSearchMenuHeight{};
     std::vector<std::unique_ptr<ThemedMenuItem>> g_themedSearchMenuItems;
+    std::vector<std::unique_ptr<ThemedMenuItem>> g_themedAnnotationMenuItems;
     HWND g_themedSearchMenuPopup{};
     std::vector<RECT> g_themedSearchMenuItemRects;
     int g_themedSearchMenuHover{ -1 };
@@ -20164,6 +20165,14 @@ namespace
         AppendMenuW(menu, flags, id, reinterpret_cast<LPCWSTR>(item));
     }
 
+    void AppendThemedAnnotationSubmenuItem(UINT id, const wchar_t* text)
+    {
+        auto item = std::make_unique<ThemedMenuItem>();
+        item->text = text ? text : L"";
+        item->id = id;
+        g_themedAnnotationMenuItems.push_back(std::move(item));
+    }
+
     void AppendThemedMenuSeparator(HMENU menu)
     {
         ThemedMenuItem* item = AddThemedMenuStorage(L"", true);
@@ -20174,7 +20183,7 @@ namespace
     void AddSearchMenuItem(std::wstring text, UINT id);
     void CloseThemedPopupMenu();
     void CloseSearchEngineSubmenu(bool restoreParentCapture);
-    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect);
+    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect, bool annotationSubmenu = false);
 
     void ShowThemedPopupMenu(HWND hwnd, HMENU menu, int x, int y)
     {
@@ -20398,7 +20407,7 @@ namespace
 
         HFONT font = Font(ThemedMenuFontPt(&item));
         HGDIOBJ old = SelectObject(dc, font);
-        int rightInset = item.id == 2511 ? S(22) : S(10);
+        int rightInset = (item.id == 2511 || item.id == 2529) ? S(22) : S(10);
         RECT textRect{ r.left + ThemedMenuTextLeft(&item), r.top, r.right - rightInset, r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
         UINT mainTextFlags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
@@ -20479,7 +20488,8 @@ namespace
                 RECT row = boxRects[static_cast<size_t>(i)];
                 OffsetRect(&row, box.left, box.top);
                 DrawThemedMenuEntry(mem, *boxItems[static_cast<size_t>(i)], row, i == boxHover, i == boxPressed);
-                if (boxItems[static_cast<size_t>(i)]->id == 2511)
+                if (boxItems[static_cast<size_t>(i)]->id == 2511 ||
+                    boxItems[static_cast<size_t>(i)]->id == 2529)
                 {
                     float cx = static_cast<float>(row.right - S(13));
                     float cy = static_cast<float>((row.top + row.bottom) / 2);
@@ -20531,6 +20541,7 @@ namespace
         g_themedMenuOwner = nullptr;
         g_themedMenuItemRects.clear();
         g_themedMenuItems.clear();
+        g_themedAnnotationMenuItems.clear();
         g_themedMenuHover = -1;
         g_themedMenuPressed = -1;
     }
@@ -20594,7 +20605,8 @@ namespace
         if (!GetWindowRect(g_themedMenuPopup, &parentRect)) return false;
         for (size_t i = 0; i < g_themedMenuItems.size() && i < g_themedMenuItemRects.size(); ++i)
         {
-            if (!g_themedMenuItems[i] || g_themedMenuItems[i]->id != 2511) continue;
+            if (!g_themedMenuItems[i] ||
+                (g_themedMenuItems[i]->id != 2511 && g_themedMenuItems[i]->id != 2529)) continue;
             RECT itemRect = g_themedMenuItemRects[i];
             OffsetRect(&itemRect, parentRect.left, parentRect.top);
             return PtInRect(&itemRect, screenPt);
@@ -20705,10 +20717,14 @@ namespace
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             if (hover >= 0 && hover < static_cast<int>(g_themedMenuItems.size()) &&
-                g_themedMenuItems[static_cast<size_t>(hover)]->id == 2511)
+                (g_themedMenuItems[static_cast<size_t>(hover)]->id == 2511 ||
+                 g_themedMenuItems[static_cast<size_t>(hover)]->id == 2529))
             {
                 if (!g_themedSearchMenuPopup)
-                    ShowSearchEngineSubmenu(g_themedMenuOwner, g_themedMenuItemRects[static_cast<size_t>(hover)]);
+                    ShowSearchEngineSubmenu(
+                        g_themedMenuOwner,
+                        g_themedMenuItemRects[static_cast<size_t>(hover)],
+                        g_themedMenuItems[static_cast<size_t>(hover)]->id == 2529);
             }
             else if (g_themedSearchMenuPopup)
             {
@@ -21094,7 +21110,7 @@ namespace
             SetCapture(g_themedMenuPopup);
     }
 
-    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect)
+    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect, bool annotationSubmenu)
     {
         if (!hwnd || !g_themedMenuPopup || g_themedSearchMenuPopup)
             return;
@@ -21103,8 +21119,19 @@ namespace
         g_themedSearchMenuItemRects.clear();
         g_themedSearchMenuHover = -1;
         g_themedSearchMenuPressed = -1;
-        AddSearchMenuItem(L"\u8c37\u6b4c\u641c\u7d22", 2512);
-        AddSearchMenuItem(L"\u767e\u5ea6\u641c\u7d22", 2513);
+        if (annotationSubmenu)
+        {
+            for (auto const& source : g_themedAnnotationMenuItems)
+            {
+                auto item = std::make_unique<ThemedMenuItem>(*source);
+                g_themedSearchMenuItems.push_back(std::move(item));
+            }
+        }
+        else
+        {
+            AddSearchMenuItem(L"\u8c37\u6b4c\u641c\u7d22", 2512);
+            AddSearchMenuItem(L"\u767e\u5ea6\u641c\u7d22", 2513);
+        }
 
         HDC dc = GetDC(hwnd);
         HFONT font = Font(9);
@@ -21660,18 +21687,15 @@ namespace
             AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
             AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u7ebf");
             AppendThemedMenuSeparator(menu);
-            HMENU createMenu = CreatePopupMenu();
-            if (createMenu)
-            {
-                AppendThemedMenuItem(createMenu, 2530, L"\u6587\u672c\uff08T\uff09");
-                AppendThemedMenuItem(createMenu, 2531, L"\u81ea\u7531\u6587\u672c");
-                AppendThemedMenuItem(createMenu, 2532, L"\u56fe\u7ae0\uff08S\uff09");
-                AppendThemedMenuItem(createMenu, 2533, L"\u63d2\u5165\u7b26\uff08C\uff09");
-                AppendThemedMenuItem(createMenu, 2534, L"\u7ebf\u6bb5");
-                AppendThemedMenuItem(createMenu, 2535, L"\u77e9\u5f62");
-                AppendThemedMenuItem(createMenu, 2536, L"\u5706\u5708");
-                AppendThemedMenuSubmenu(menu, createMenu, 2529, L"\u5728\u5149\u6807\u4f4d\u7f6e\u521b\u5efa\u6807\u6ce8");
-            }
+            g_themedAnnotationMenuItems.clear();
+            AppendThemedAnnotationSubmenuItem(2530, L"\u6587\u672c\uff08T\uff09");
+            AppendThemedAnnotationSubmenuItem(2531, L"\u81ea\u7531\u6587\u672c");
+            AppendThemedAnnotationSubmenuItem(2532, L"\u56fe\u7ae0\uff08S\uff09");
+            AppendThemedAnnotationSubmenuItem(2533, L"\u63d2\u5165\u7b26\uff08C\uff09");
+            AppendThemedAnnotationSubmenuItem(2534, L"\u7ebf\u6bb5");
+            AppendThemedAnnotationSubmenuItem(2535, L"\u77e9\u5f62");
+            AppendThemedAnnotationSubmenuItem(2536, L"\u5706\u5708");
+            AppendThemedMenuItem(menu, 2529, L"\u5728\u5149\u6807\u4f4d\u7f6e\u521b\u5efa\u6807\u6ce8");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
             AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22");
@@ -21714,7 +21738,7 @@ namespace
         g_themedSearchMenuItems.push_back(std::move(item));
     }
 
-    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect);
+    void ShowSearchEngineSubmenu(HWND hwnd, RECT parentItemRect, bool annotationSubmenu);
 
     std::string UrlEncodeUtf8(std::wstring const& text)
     {
