@@ -10844,6 +10844,15 @@ namespace
         return g_hasContentSelection && g_selectionIsImage;
     }
 
+    bool PointInsideActiveSelection(int x, int y)
+    {
+        if (!g_hasContentSelection || !Hit(g_stage, x, y)) return false;
+        RECT selection = CurrentSelectionRect();
+        if (g_selectionIsImage)
+            return !IsRectEmpty(&g_selectionPageRect) && Hit(g_selectionPageRect, x, y);
+        return !IsRectEmpty(&selection) && Hit(selection, x, y);
+    }
+
     bool CurrentSelectionPageRect(RECT& out)
     {
         RECT selection = CurrentSelectionRect();
@@ -21671,6 +21680,8 @@ namespace
         AppendMenuW(menu, MF_OWNERDRAW | MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), reinterpret_cast<LPCWSTR>(item));
     }
 
+    void PopulateThemedAnnotationMenuItems();
+
     void ShowSelectionNativeMenu(HWND hwnd, int x, int y, bool imageOnly, bool withShortcuts)
     {
         CloseThemedPopupMenu();
@@ -21687,19 +21698,34 @@ namespace
             AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
             AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u7ebf");
             AppendThemedMenuSeparator(menu);
-            g_themedAnnotationMenuItems.clear();
-            AppendThemedAnnotationSubmenuItem(2530, L"\u6587\u672c\uff08T\uff09");
-            AppendThemedAnnotationSubmenuItem(2531, L"\u81ea\u7531\u6587\u672c");
-            AppendThemedAnnotationSubmenuItem(2532, L"\u56fe\u7ae0\uff08S\uff09");
-            AppendThemedAnnotationSubmenuItem(2533, L"\u63d2\u5165\u7b26\uff08C\uff09");
-            AppendThemedAnnotationSubmenuItem(2534, L"\u7ebf\u6bb5");
-            AppendThemedAnnotationSubmenuItem(2535, L"\u77e9\u5f62");
-            AppendThemedAnnotationSubmenuItem(2536, L"\u5706\u5708");
+            PopulateThemedAnnotationMenuItems();
             AppendThemedMenuItem(menu, 2529, L"\u5728\u5149\u6807\u4f4d\u7f6e\u521b\u5efa\u6807\u6ce8");
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2510, L"\u5fc5\u5e94\u641c\u7d22");
             AppendThemedMenuItem(menu, 2511, L"\u4f7f\u7528\u5176\u4ed6\u641c\u7d22\u5f15\u64ce\u641c\u7d22");
         }
+        ShowThemedPopupMenu(hwnd, menu, x, y);
+    }
+
+    void PopulateThemedAnnotationMenuItems()
+    {
+        g_themedAnnotationMenuItems.clear();
+        AppendThemedAnnotationSubmenuItem(2530, L"\u6587\u672c\uff08T\uff09");
+        AppendThemedAnnotationSubmenuItem(2531, L"\u81ea\u7531\u6587\u672c");
+        AppendThemedAnnotationSubmenuItem(2532, L"\u56fe\u7ae0\uff08S\uff09");
+        AppendThemedAnnotationSubmenuItem(2533, L"\u63d2\u5165\u7b26\uff08C\uff09");
+        AppendThemedAnnotationSubmenuItem(2534, L"\u7ebf\u6bb5");
+        AppendThemedAnnotationSubmenuItem(2535, L"\u77e9\u5f62");
+        AppendThemedAnnotationSubmenuItem(2536, L"\u5706\u5708");
+    }
+
+    void ShowAnnotationCreationMenu(HWND hwnd, int x, int y)
+    {
+        CloseThemedPopupMenu();
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        PopulateThemedAnnotationMenuItems();
+        AppendThemedMenuItem(menu, 2529, L"\u5728\u5149\u6807\u4f4d\u7f6e\u521b\u5efa\u6807\u6ce8");
         ShowThemedPopupMenu(hwnd, menu, x, y);
     }
 
@@ -26027,7 +26053,7 @@ namespace
                     return 0;
                 }
             }
-            if (g_hasContentSelection && Hit(g_stage, x, y))
+            if (PointInsideActiveSelection(x, y))
             {
                 if (PdfTab* tab = Active()) CaptureAnnotationCreateContext(*tab, x, y);
                 POINT pt{ x, y };
@@ -26040,7 +26066,7 @@ namespace
                 CaptureAnnotationCreateContext(*tab, x, y);
                 POINT pt{ x, y };
                 ClientToScreen(hwnd, &pt);
-                ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y, false);
+                ShowAnnotationCreationMenu(hwnd, pt.x, pt.y);
                 return 0;
             }
             return 0;

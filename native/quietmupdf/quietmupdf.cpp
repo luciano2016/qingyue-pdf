@@ -1053,7 +1053,9 @@ extern "C" int quiet_pdf_load_annotations(
                             pdf_annot_line(ctx, annot, &a, &b);
                             append_item(a.x, a.y, b.x, b.y);
                         }
-                        else
+                        else if (type == PDF_ANNOT_HIGHLIGHT ||
+                            type == PDF_ANNOT_UNDERLINE ||
+                            type == PDF_ANNOT_STRIKE_OUT)
                         {
                             int quad_count = pdf_annot_quad_point_count(ctx, annot);
                             if (quad_count > 0)
@@ -1061,11 +1063,9 @@ extern "C" int quiet_pdf_load_annotations(
                                 for (int q = 0; q < quad_count && count < max_annotations; ++q)
                                     append_rect(fz_rect_from_quad(pdf_annot_quad_point(ctx, annot, q)));
                             }
-                            else
-                            {
-                                append_rect(pdf_annot_rect(ctx, annot));
-                            }
+                            else append_rect(pdf_annot_rect(ctx, annot));
                         }
+                        else append_rect(pdf_annot_rect(ctx, annot));
                     }
                 }
             }
