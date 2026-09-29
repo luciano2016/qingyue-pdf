@@ -312,7 +312,14 @@ static bool quiet_page_has_supported_markup(fz_context* ctx, pdf_document* doc, 
         if (pdf_name_eq(ctx, subtype, PDF_NAME(Highlight)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(Underline)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(StrikeOut)) ||
-            pdf_name_eq(ctx, subtype, PDF_NAME(Ink)))
+            pdf_name_eq(ctx, subtype, PDF_NAME(Ink)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Text)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(FreeText)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Stamp)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Caret)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Line)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Square)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Circle)))
             return true;
     }
     return false;
@@ -622,7 +629,14 @@ static bool quiet_is_supported_markup(enum pdf_annot_type type)
 {
     return type == PDF_ANNOT_HIGHLIGHT ||
         type == PDF_ANNOT_UNDERLINE ||
-        type == PDF_ANNOT_STRIKE_OUT;
+        type == PDF_ANNOT_STRIKE_OUT ||
+        type == PDF_ANNOT_TEXT ||
+        type == PDF_ANNOT_FREE_TEXT ||
+        type == PDF_ANNOT_STAMP ||
+        type == PDF_ANNOT_CARET ||
+        type == PDF_ANNOT_LINE ||
+        type == PDF_ANNOT_SQUARE ||
+        type == PDF_ANNOT_CIRCLE;
 }
 
 static bool quiet_is_user_comment_annot(enum pdf_annot_type type)
@@ -775,6 +789,13 @@ extern "C" int quiet_pdf_save_annotations(
             enum pdf_annot_type type = PDF_ANNOT_HIGHLIGHT;
             if (input.kind == 1) type = PDF_ANNOT_UNDERLINE;
             else if (input.kind == 2) type = PDF_ANNOT_STRIKE_OUT;
+            else if (input.kind == 4) type = PDF_ANNOT_TEXT;
+            else if (input.kind == 5) type = PDF_ANNOT_FREE_TEXT;
+            else if (input.kind == 6) type = PDF_ANNOT_STAMP;
+            else if (input.kind == 7) type = PDF_ANNOT_CARET;
+            else if (input.kind == 8) type = PDF_ANNOT_LINE;
+            else if (input.kind == 9) type = PDF_ANNOT_SQUARE;
+            else if (input.kind == 10) type = PDF_ANNOT_CIRCLE;
 
             pdf_page* page = nullptr;
             pdf_annot* annot = nullptr;
@@ -788,11 +809,13 @@ extern "C" int quiet_pdf_save_annotations(
                 float bottom = bounds.y0 + fz_clamp(input.y1, 0.0f, 1.0f) * (bounds.y1 - bounds.y0);
                 if (right < left) { float t = left; left = right; right = t; }
                 if (bottom < top) { float t = top; top = bottom; bottom = t; }
-                if (right - left >= 0.5f && bottom - top >= 0.5f)
+                bool isLine = type == PDF_ANNOT_LINE;
+                bool hasGeometry = isLine
+                    ? (std::abs(right - left) >= 0.5f || std::abs(bottom - top) >= 0.5f)
+                    : (right - left >= 0.5f && bottom - top >= 0.5f);
+                if (hasGeometry)
                 {
                     annot = pdf_create_annot(ctx, page, type);
-                    fz_quad quad = fz_make_quad(left, top, right, top, left, bottom, right, bottom);
-                    pdf_set_annot_quad_points(ctx, annot, 1, &quad);
                     int64_t date = input.created_at_ms > 0 ? input.created_at_ms / 1000 : static_cast<int64_t>(time(nullptr));
                     pdf_set_annot_creation_date(ctx, annot, date);
                     pdf_set_annot_modification_date(ctx, annot, date);
@@ -800,21 +823,43 @@ extern "C" int quiet_pdf_save_annotations(
                     if (input.contents && input.contents[0])
                         pdf_set_annot_contents(ctx, annot, input.contents);
 
-                    if (type == PDF_ANNOT_HIGHLIGHT)
+                    float color[3] = { input.color_r, input.color_g, input.color_b };
+                    pdf_set_annot_color(ctx, annot, 3, color);
+                    if (type == PDF_ANNOT_HIGHLIGHT || type == PDF_ANNOT_UNDERLINE ||
+                        type == PDF_ANNOT_STRIKE_OUT)
                     {
-                        float color[3] = { input.color_r, input.color_g, input.color_b };
-                        pdf_set_annot_color(ctx, annot, 3, color);
-                        pdf_set_annot_opacity(ctx, annot, fz_clamp(input.opacity, 0.12f, 1.0f));
+                        fz_quad quad = fz_make_quad(left, top, right, top, left, bottom, right, bottom);
+                        pdf_set_annot_quad_points(ctx, annot, 1, &quad);
+                        if (type == PDF_ANNOT_HIGHLIGHT)
+                            pdf_set_annot_opacity(ctx, annot, fz_clamp(input.opacity, 0.12f, 1.0f));
                     }
-                    else if (type == PDF_ANNOT_UNDERLINE)
+                    else if (type == PDF_ANNOT_LINE)
                     {
-                        float color[3] = { input.color_r, input.color_g, input.color_b };
-                        pdf_set_annot_color(ctx, annot, 3, color);
+                        pdf_set_annot_line(ctx, annot, fz_make_point(left, top), fz_make_point(right, bottom));
+                        pdf_set_annot_border_width(ctx, annot, 1.0f);
                     }
                     else
                     {
-                        float color[3] = { input.color_r, input.color_g, input.color_b };
-                        pdf_set_annot_color(ctx, annot, 3, color);
+                        pdf_set_annot_rect(ctx, annot, fz_make_rect(left, top, right, bottom));
+                        if (type == PDF_ANNOT_FREE_TEXT)
+                        {
+                            pdf_set_annot_border_width(ctx, annot, 0.0f);
+                            pdf_set_annot_default_appearance(ctx, annot, "Helv", 12, 3, color);
+                        }
+                        else if (type == PDF_ANNOT_TEXT)
+                        {
+                            pdf_set_annot_icon_name(ctx, annot, "Comment");
+                            pdf_set_annot_popup(ctx, annot, fz_make_rect(right + 8, top, right + 208, top + 100));
+                        }
+                        else if (type == PDF_ANNOT_STAMP)
+                        {
+                            pdf_set_annot_icon_name(ctx, annot, "Draft");
+                            pdf_set_annot_border_width(ctx, annot, 1.0f);
+                        }
+                        else if (type == PDF_ANNOT_CARET || type == PDF_ANNOT_SQUARE || type == PDF_ANNOT_CIRCLE)
+                        {
+                            pdf_set_annot_border_width(ctx, annot, 1.0f);
+                        }
                     }
 
                     pdf_update_annot(ctx, annot);
@@ -896,6 +941,13 @@ extern "C" int quiet_pdf_load_annotations(
                         else if (type == PDF_ANNOT_UNDERLINE) kind = 1;
                         else if (type == PDF_ANNOT_STRIKE_OUT) kind = 2;
                         else if (type == PDF_ANNOT_INK) kind = 3;
+                        else if (type == PDF_ANNOT_TEXT) kind = 4;
+                        else if (type == PDF_ANNOT_FREE_TEXT) kind = 5;
+                        else if (type == PDF_ANNOT_STAMP) kind = 6;
+                        else if (type == PDF_ANNOT_CARET) kind = 7;
+                        else if (type == PDF_ANNOT_LINE) kind = 8;
+                        else if (type == PDF_ANNOT_SQUARE) kind = 9;
+                        else if (type == PDF_ANNOT_CIRCLE) kind = 10;
                         if (kind < 0)
                             continue;
 
@@ -950,6 +1002,12 @@ extern "C" int quiet_pdf_load_annotations(
                                         append_item(a.x, a.y, b.x, b.y);
                                 }
                             }
+                        }
+                        else if (type == PDF_ANNOT_LINE)
+                        {
+                            fz_point a{}, b{};
+                            pdf_annot_line(ctx, annot, &a, &b);
+                            append_item(a.x, a.y, b.x, b.y);
                         }
                         else
                         {
