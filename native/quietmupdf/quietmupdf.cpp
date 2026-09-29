@@ -311,7 +311,8 @@ static bool quiet_page_has_supported_markup(fz_context* ctx, pdf_document* doc, 
         pdf_obj* subtype = pdf_dict_get(ctx, annot, PDF_NAME(Subtype));
         if (pdf_name_eq(ctx, subtype, PDF_NAME(Highlight)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(Underline)) ||
-            pdf_name_eq(ctx, subtype, PDF_NAME(StrikeOut)))
+            pdf_name_eq(ctx, subtype, PDF_NAME(StrikeOut)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Ink)))
             return true;
     }
     return false;
@@ -642,7 +643,6 @@ static bool quiet_is_user_comment_annot(enum pdf_annot_type type)
     case PDF_ANNOT_REDACT:
     case PDF_ANNOT_STAMP:
     case PDF_ANNOT_CARET:
-    case PDF_ANNOT_INK:
     case PDF_ANNOT_FILE_ATTACHMENT:
     case PDF_ANNOT_SOUND:
         return true;
@@ -895,6 +895,7 @@ extern "C" int quiet_pdf_load_annotations(
                         if (type == PDF_ANNOT_HIGHLIGHT) kind = 0;
                         else if (type == PDF_ANNOT_UNDERLINE) kind = 1;
                         else if (type == PDF_ANNOT_STRIKE_OUT) kind = 2;
+                        else if (type == PDF_ANNOT_INK) kind = 3;
                         if (kind < 0)
                             continue;
 
@@ -906,18 +907,18 @@ extern "C" int quiet_pdf_load_annotations(
                         const char* author = pdf_annot_author(ctx, annot);
                         const char* contents = pdf_annot_contents(ctx, annot);
 
-                        auto append_rect = [&](fz_rect rect)
+                        auto append_item = [&](float x0, float y0, float x1, float y1)
                         {
-                            if (count >= max_annotations || rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                            if (count >= max_annotations)
                                 return;
                             quiet_pdf_annotation_info& item = out[count];
                             std::memset(&item, 0, sizeof(item));
                             item.page = page_index;
                             item.kind = kind;
-                            item.x0 = fz_clamp((rect.x0 - bounds.x0) / page_w, 0.0f, 1.0f);
-                            item.y0 = fz_clamp((rect.y0 - bounds.y0) / page_h, 0.0f, 1.0f);
-                            item.x1 = fz_clamp((rect.x1 - bounds.x0) / page_w, 0.0f, 1.0f);
-                            item.y1 = fz_clamp((rect.y1 - bounds.y0) / page_h, 0.0f, 1.0f);
+                            item.x0 = fz_clamp((x0 - bounds.x0) / page_w, 0.0f, 1.0f);
+                            item.y0 = fz_clamp((y0 - bounds.y0) / page_h, 0.0f, 1.0f);
+                            item.x1 = fz_clamp((x1 - bounds.x0) / page_w, 0.0f, 1.0f);
+                            item.y1 = fz_clamp((y1 - bounds.y0) / page_h, 0.0f, 1.0f);
                             item.color_r = n > 0 ? color[0] : 1.0f;
                             item.color_g = n > 1 ? color[1] : 0.82f;
                             item.color_b = n > 2 ? color[2] : 0.0f;
@@ -928,15 +929,40 @@ extern "C" int quiet_pdf_load_annotations(
                             ++count;
                         };
 
-                        int quad_count = pdf_annot_quad_point_count(ctx, annot);
-                        if (quad_count > 0)
+                        auto append_rect = [&](fz_rect rect)
                         {
-                            for (int q = 0; q < quad_count && count < max_annotations; ++q)
-                                append_rect(fz_rect_from_quad(pdf_annot_quad_point(ctx, annot, q)));
+                            if (rect.x1 <= rect.x0 || rect.y1 <= rect.y0)
+                                return;
+                            append_item(rect.x0, rect.y0, rect.x1, rect.y1);
+                        };
+
+                        if (type == PDF_ANNOT_INK)
+                        {
+                            int stroke_count = pdf_annot_ink_list_count(ctx, annot);
+                            for (int stroke = 0; stroke < stroke_count && count < max_annotations; ++stroke)
+                            {
+                                int vertex_count = pdf_annot_ink_list_stroke_count(ctx, annot, stroke);
+                                for (int vertex = 1; vertex < vertex_count && count < max_annotations; ++vertex)
+                                {
+                                    fz_point a = pdf_annot_ink_list_stroke_vertex(ctx, annot, stroke, vertex - 1);
+                                    fz_point b = pdf_annot_ink_list_stroke_vertex(ctx, annot, stroke, vertex);
+                                    if (a.x != b.x || a.y != b.y)
+                                        append_item(a.x, a.y, b.x, b.y);
+                                }
+                            }
                         }
                         else
                         {
-                            append_rect(pdf_annot_rect(ctx, annot));
+                            int quad_count = pdf_annot_quad_point_count(ctx, annot);
+                            if (quad_count > 0)
+                            {
+                                for (int q = 0; q < quad_count && count < max_annotations; ++q)
+                                    append_rect(fz_rect_from_quad(pdf_annot_quad_point(ctx, annot, q)));
+                            }
+                            else
+                            {
+                                append_rect(pdf_annot_rect(ctx, annot));
+                            }
                         }
                     }
                 }

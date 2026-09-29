@@ -265,7 +265,8 @@ namespace
     {
         Highlight = 0,
         Underline = 1,
-        Strikeout = 2
+        Strikeout = 2,
+        Ink = 3
     };
 
     struct AnnotationSegment
@@ -2401,6 +2402,7 @@ namespace
     {
         if (kind == AnnotationKind::Underline) return L"\u4e0b\u5212\u7ebf";
         if (kind == AnnotationKind::Strikeout) return L"\u5220\u9664\u7ebf";
+        if (kind == AnnotationKind::Ink) return L"Ink\u6807\u6ce8";
         return L"\u9ad8\u4eae";
     }
 
@@ -10356,6 +10358,25 @@ namespace
             bool cjkOnlyText = hasCjkText && !hasLatinOrDigitText;
             auto drawSegment = [&](RECT mark)
             {
+                if (annotation.kind == AnnotationKind::Ink)
+                {
+                    RECT inkBounds{
+                        std::min(mark.left, mark.right), std::min(mark.top, mark.bottom),
+                        std::max(mark.left, mark.right), std::max(mark.top, mark.bottom) };
+                    RECT visibleInk{};
+                    if (!IntersectRect(&visibleInk, &inkBounds, &pageRect)) return;
+                    Gdiplus::Graphics inkGraphics(dc);
+                    inkGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                    inkGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+                    Gdiplus::Pen inkPen(GdiColor(annotationColor), std::max<Gdiplus::REAL>(S(2.0f), 1.5f));
+                    inkPen.SetStartCap(Gdiplus::LineCapRound);
+                    inkPen.SetEndCap(Gdiplus::LineCapRound);
+                    inkPen.SetLineJoin(Gdiplus::LineJoinRound);
+                    inkGraphics.DrawLine(&inkPen,
+                        static_cast<float>(mark.left), static_cast<float>(mark.top),
+                        static_cast<float>(mark.right), static_cast<float>(mark.bottom));
+                    return;
+                }
                 RECT visibleMark{};
                 if (!IntersectRect(&visibleMark, &mark, &pageRect)) return;
                 if (annotation.kind == AnnotationKind::Highlight)
@@ -10417,7 +10438,7 @@ namespace
 
     bool AppendUniqueSegment(std::vector<AnnotationSegment>& segments, AnnotationSegment segment)
     {
-        if (segment.x1 - segment.x0 < 0.002 || segment.y1 - segment.y0 < 0.002)
+        if (std::hypot(segment.x1 - segment.x0, segment.y1 - segment.y0) < 0.002)
             return false;
         for (auto const& existing : segments)
         {
@@ -12259,6 +12280,18 @@ namespace
             if (annotation.page != page) continue;
             auto hitMark = [&](RECT mark)
             {
+                if (annotation.kind == AnnotationKind::Ink)
+                {
+                    RECT inkBounds{
+                        std::min(mark.left, mark.right), std::min(mark.top, mark.bottom),
+                        std::max(mark.left, mark.right), std::max(mark.top, mark.bottom) };
+                    RECT clippedInk{};
+                    if (!IntersectRect(&clippedInk, &inkBounds, &pageRect)) return false;
+                    InflateRect(&clippedInk, S(3), S(3));
+                    if (!Hit(clippedInk, x, y)) return false;
+                    if (hitRect) *hitRect = clippedInk;
+                    return true;
+                }
                 RECT clipped{};
                 if (!IntersectRect(&clipped, &mark, &pageRect)) return false;
                 InflateRect(&clipped, S(1), S(1));
@@ -21698,7 +21731,9 @@ namespace
             annotation.y0 = std::clamp<double>(item.y0, 0.0, 1.0);
             annotation.x1 = std::clamp<double>(item.x1, 0.0, 1.0);
             annotation.y1 = std::clamp<double>(item.y1, 0.0, 1.0);
-            annotation.kind = item.kind == 1 ? AnnotationKind::Underline : (item.kind == 2 ? AnnotationKind::Strikeout : AnnotationKind::Highlight);
+            annotation.kind = item.kind == 1 ? AnnotationKind::Underline :
+                (item.kind == 2 ? AnnotationKind::Strikeout :
+                    (item.kind == 3 ? AnnotationKind::Ink : AnnotationKind::Highlight));
             annotation.colorIndex = AnnotationColorIndexFromRgb(item.colorR, item.colorG, item.colorB);
             int exactColorIndex = annotation.colorIndex;
             annotation.hasCustomColor = !ExactAnnotationPaletteColor(item.colorR, item.colorG, item.colorB, exactColorIndex);
@@ -21741,7 +21776,10 @@ namespace
             loaded.push_back(std::move(annotation));
         }
         for (PdfAnnotation& annotation : loaded)
-            MergeAnnotationSegments(annotation.segments);
+        {
+            if (annotation.kind != AnnotationKind::Ink)
+                MergeAnnotationSegments(annotation.segments);
+        }
         tab.annotations = std::move(loaded);
         tab.annotationsMetadataLoaded = true;
         return true;
@@ -21899,6 +21937,11 @@ namespace
         annotations.reserve(tab.annotations.size());
         for (auto const& item : tab.annotations)
         {
+            // Foreign PDF Ink annotations are rendered from their original
+            // InkList and are intentionally left in the source document.
+            // Do not serialize them as highlight rectangles on the next save.
+            if (item.kind == AnnotationKind::Ink && item.persisted)
+                continue;
             notes.push_back(ToUtf8(item.note));
             authors.push_back(ToUtf8(item.author.empty() ? L"10726" : item.author));
             COLORREF color = AnnotationColor(item);
@@ -21926,7 +21969,8 @@ namespace
                 uniqueSegments.reserve(item.segments.size());
                 for (auto const& segment : item.segments)
                     AppendUniqueSegment(uniqueSegments, segment);
-                MergeAnnotationSegments(uniqueSegments);
+                if (item.kind != AnnotationKind::Ink)
+                    MergeAnnotationSegments(uniqueSegments);
                 for (auto const& segment : uniqueSegments)
                     pushAnnotation(segment.x0, segment.y0, segment.x1, segment.y1);
             }
