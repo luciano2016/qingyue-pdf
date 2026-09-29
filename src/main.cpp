@@ -7196,7 +7196,19 @@ namespace
                 g_pdf.dropPage(tab.ctx, page);
                 int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
                 int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
-                fz_display_list* list = CachedPageDisplayListLocked(tab, index, renderCookie);
+                // A display list intentionally contains page contents only.
+                // Use the page renderer for pages with persisted Ink so the
+                // native MuPDF annotation appearance is painted as well.
+                bool hasPersistedInk = false;
+                for (PdfAnnotation const& annotation : tab.annotations)
+                {
+                    if (annotation.page == index && annotation.kind == AnnotationKind::Ink && annotation.persisted)
+                    {
+                        hasPersistedInk = true;
+                        break;
+                    }
+                }
+                fz_display_list* list = hasPersistedInk ? nullptr : CachedPageDisplayListLocked(tab, index, renderCookie);
                 if (renderToDib && (g_pdf.renderDisplayListClipToBuffer || g_pdf.renderPageNumberClipToBuffer))
                 {
                     image.width = widthPx;
@@ -10363,6 +10375,11 @@ namespace
         for (PdfAnnotation const& annotation : tab.annotations)
         {
             if (annotation.page != page) continue;
+            // Persisted Ink is already painted by MuPDF from the original
+            // multi-stroke InkList while the page bitmap is rendered. Drawing
+            // the flattened UI segments again would create a duplicate,
+            // incomplete-looking stroke on top of the native appearance.
+            if (annotation.kind == AnnotationKind::Ink && annotation.persisted) continue;
             COLORREF annotationColor = AnnotationColor(annotation);
             bool hasCjkText = false;
             bool hasLatinOrDigitText = false;
@@ -21643,7 +21660,6 @@ namespace
             AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
             AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u7ebf");
             AppendThemedMenuSeparator(menu);
-            AppendThemedMenuItem(menu, 2505, L"\u6dfb\u52a0\u4fbf\u7b7e");
             HMENU createMenu = CreatePopupMenu();
             if (createMenu)
             {
