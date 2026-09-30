@@ -202,6 +202,15 @@ struct quiet_pdf_annotation
     int64_t created_at_ms;
     const char* author;
     const char* contents;
+    struct quiet_pdf_ink_point const* ink_points;
+    int ink_point_count;
+};
+
+struct quiet_pdf_ink_point
+{
+    float x;
+    float y;
+    int stroke_start;
 };
 
 struct quiet_pdf_annotation_info
@@ -219,6 +228,7 @@ struct quiet_pdf_annotation_info
     int64_t created_at_ms;
     char author[128];
     char contents[512];
+    int stroke_start;
 };
 
 static char quiet_last_error[512] = "";
@@ -678,6 +688,7 @@ static bool quiet_is_supported_markup(enum pdf_annot_type type)
         type == PDF_ANNOT_FREE_TEXT ||
         type == PDF_ANNOT_STAMP ||
         type == PDF_ANNOT_CARET ||
+        type == PDF_ANNOT_INK ||
         type == PDF_ANNOT_LINE ||
         type == PDF_ANNOT_SQUARE ||
         type == PDF_ANNOT_CIRCLE;
@@ -701,6 +712,7 @@ static bool quiet_is_user_comment_annot(enum pdf_annot_type type)
     case PDF_ANNOT_REDACT:
     case PDF_ANNOT_STAMP:
     case PDF_ANNOT_CARET:
+    case PDF_ANNOT_INK:
     case PDF_ANNOT_FILE_ATTACHMENT:
     case PDF_ANNOT_SOUND:
         return true;
@@ -772,6 +784,21 @@ static void quiet_set_rectangular_highlight_appearance(
         fz_rethrow(ctx);
     }
 }
+
+// MuPDF's appearance synthesizer reads /BS for Stamp and Caret annotations,
+// although those subtypes are not accepted by pdf_set_annot_border_width().
+// Sumatra creates these annotations through pdf_create_annot(), which leaves
+// the type-specific defaults in place. Keep the same valid border dictionary
+// when annotations are reconstructed from the compact application format.
+static void quiet_set_annot_border_dictionary(fz_context* ctx, pdf_annot* annot, float width)
+{
+    pdf_obj* annotObj = pdf_annot_obj(ctx, annot);
+    pdf_obj* border = pdf_dict_put_dict(ctx, annotObj, PDF_NAME(BS), 4);
+    pdf_dict_put(ctx, border, PDF_NAME(Type), PDF_NAME(Border));
+    pdf_dict_put(ctx, border, PDF_NAME(S), PDF_NAME(S));
+    pdf_dict_put_real(ctx, border, PDF_NAME(W), width);
+}
+
 extern "C" int quiet_pdf_save_annotations(
     fz_context* ctx,
     fz_document* fzdoc,
@@ -833,6 +860,7 @@ extern "C" int quiet_pdf_save_annotations(
             enum pdf_annot_type type = PDF_ANNOT_HIGHLIGHT;
             if (input.kind == 1) type = PDF_ANNOT_UNDERLINE;
             else if (input.kind == 2) type = PDF_ANNOT_STRIKE_OUT;
+            else if (input.kind == 3) type = PDF_ANNOT_INK;
             else if (input.kind == 4) type = PDF_ANNOT_TEXT;
             else if (input.kind == 5) type = PDF_ANNOT_FREE_TEXT;
             else if (input.kind == 6) type = PDF_ANNOT_STAMP;
@@ -851,10 +879,34 @@ extern "C" int quiet_pdf_save_annotations(
                 float top = bounds.y0 + fz_clamp(input.y0, 0.0f, 1.0f) * (bounds.y1 - bounds.y0);
                 float right = bounds.x0 + fz_clamp(input.x1, 0.0f, 1.0f) * (bounds.x1 - bounds.x0);
                 float bottom = bounds.y0 + fz_clamp(input.y1, 0.0f, 1.0f) * (bounds.y1 - bounds.y0);
+                std::vector<fz_point> inkPoints;
+                if (type == PDF_ANNOT_INK && input.ink_points && input.ink_point_count >= 2)
+                {
+                    inkPoints.reserve(static_cast<size_t>(input.ink_point_count));
+                    for (int pointIndex = 0; pointIndex < input.ink_point_count; ++pointIndex)
+                    {
+                        quiet_pdf_ink_point const& point = input.ink_points[pointIndex];
+                        inkPoints.push_back(fz_make_point(
+                            bounds.x0 + fz_clamp(point.x, 0.0f, 1.0f) * (bounds.x1 - bounds.x0),
+                            bounds.y0 + fz_clamp(point.y, 0.0f, 1.0f) * (bounds.y1 - bounds.y0)));
+                    }
+                    left = right = inkPoints.front().x;
+                    top = bottom = inkPoints.front().y;
+                    for (fz_point const& point : inkPoints)
+                    {
+                        left = std::min(left, point.x);
+                        top = std::min(top, point.y);
+                        right = std::max(right, point.x);
+                        bottom = std::max(bottom, point.y);
+                    }
+                }
                 if (right < left) { float t = left; left = right; right = t; }
                 if (bottom < top) { float t = top; top = bottom; bottom = t; }
                 bool isLine = type == PDF_ANNOT_LINE;
-                bool hasGeometry = isLine
+                bool isInk = type == PDF_ANNOT_INK;
+                bool hasGeometry = isInk
+                    ? inkPoints.size() >= 2
+                    : isLine
                     ? (std::abs(right - left) >= 0.5f || std::abs(bottom - top) >= 0.5f)
                     : (right - left >= 0.5f && bottom - top >= 0.5f);
                 if (hasGeometry)
@@ -877,6 +929,32 @@ extern "C" int quiet_pdf_save_annotations(
                         if (type == PDF_ANNOT_HIGHLIGHT)
                             pdf_set_annot_opacity(ctx, annot, fz_clamp(input.opacity, 0.12f, 1.0f));
                     }
+                    else if (type == PDF_ANNOT_INK)
+                    {
+                        // MuPDF intentionally does not expose Rect through
+                        // pdf_set_annot_rect for Ink annotations. Ink still
+                        // needs a bounding Rect for appearance generation,
+                        // so write that dictionary entry directly.
+                        pdf_dict_put_rect(ctx, pdf_annot_obj(ctx, annot), PDF_NAME(Rect),
+                            fz_make_rect(left, top, right, bottom));
+                        quiet_set_annot_border_dictionary(ctx, annot, 1.0f);
+                        int strokeCount = 1;
+                        for (size_t pointIndex = 1; pointIndex < inkPoints.size(); ++pointIndex)
+                            if (input.ink_points[pointIndex].stroke_start)
+                                ++strokeCount;
+                        std::vector<int> strokeSizes(static_cast<size_t>(strokeCount), 0);
+                        std::vector<fz_point> strokeVertices;
+                        strokeVertices.reserve(inkPoints.size());
+                        int strokeIndex = 0;
+                        for (size_t pointIndex = 0; pointIndex < inkPoints.size(); ++pointIndex)
+                        {
+                            if (pointIndex > 0 && input.ink_points[pointIndex].stroke_start)
+                                ++strokeIndex;
+                            ++strokeSizes[static_cast<size_t>(strokeIndex)];
+                            strokeVertices.push_back(inkPoints[pointIndex]);
+                        }
+                        pdf_set_annot_ink_list(ctx, annot, strokeCount, strokeSizes.data(), strokeVertices.data());
+                    }
                     else if (type == PDF_ANNOT_LINE)
                     {
                         pdf_set_annot_line(ctx, annot, fz_make_point(left, top), fz_make_point(right, bottom));
@@ -898,11 +976,14 @@ extern "C" int quiet_pdf_save_annotations(
                         else if (type == PDF_ANNOT_STAMP)
                         {
                             pdf_set_annot_icon_name(ctx, annot, "Draft");
-                            pdf_set_annot_border_width(ctx, annot, 1.0f);
+                            quiet_set_annot_border_dictionary(ctx, annot, 1.0f);
                         }
                         else if (type == PDF_ANNOT_CARET || type == PDF_ANNOT_SQUARE || type == PDF_ANNOT_CIRCLE)
                         {
-                            pdf_set_annot_border_width(ctx, annot, 1.0f);
+                            if (type == PDF_ANNOT_CARET)
+                                quiet_set_annot_border_dictionary(ctx, annot, 1.0f);
+                            else
+                                pdf_set_annot_border_width(ctx, annot, 1.0f);
                         }
                     }
 
@@ -1003,7 +1084,7 @@ extern "C" int quiet_pdf_load_annotations(
                         const char* author = pdf_annot_author(ctx, annot);
                         const char* contents = pdf_annot_contents(ctx, annot);
 
-                        auto append_item = [&](float x0, float y0, float x1, float y1)
+                        auto append_item = [&](float x0, float y0, float x1, float y1, int stroke_start = 0)
                         {
                             if (count >= max_annotations)
                                 return;
@@ -1022,6 +1103,7 @@ extern "C" int quiet_pdf_load_annotations(
                             item.created_at_ms = date > 0 ? date * 1000 : 0;
                             quiet_copy_text(item.author, sizeof(item.author), author);
                             quiet_copy_text(item.contents, sizeof(item.contents), contents);
+                            item.stroke_start = stroke_start;
                             ++count;
                         };
 
@@ -1043,7 +1125,7 @@ extern "C" int quiet_pdf_load_annotations(
                                     fz_point a = pdf_annot_ink_list_stroke_vertex(ctx, annot, stroke, vertex - 1);
                                     fz_point b = pdf_annot_ink_list_stroke_vertex(ctx, annot, stroke, vertex);
                                     if (a.x != b.x || a.y != b.y)
-                                        append_item(a.x, a.y, b.x, b.y);
+                                        append_item(a.x, a.y, b.x, b.y, vertex == 1 ? 1 : 0);
                                 }
                             }
                         }

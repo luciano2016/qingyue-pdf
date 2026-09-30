@@ -282,6 +282,7 @@ namespace
         double y0{};
         double x1{};
         double y1{};
+        int strokeStart{};
     };
 
     struct PdfAnnotation
@@ -310,6 +311,13 @@ namespace
         std::wstring text;
     };
 
+    struct QuietPdfInkPoint
+    {
+        float x{};
+        float y{};
+        int strokeStart{};
+    };
+
     struct QuietPdfAnnotation
     {
         int page{};
@@ -325,6 +333,8 @@ namespace
         long long createdAtMs{};
         const char* author{};
         const char* contents{};
+        const QuietPdfInkPoint* inkPoints{};
+        int inkPointCount{};
     };
 
     struct QuietPdfAnnotationInfo
@@ -342,6 +352,7 @@ namespace
         long long createdAtMs{};
         char author[128]{};
         char contents[512]{};
+        int strokeStart{};
     };
 
     struct QuietPdfLinkInfo
@@ -1914,6 +1925,7 @@ namespace
     bool g_annotationToolbarOpen{};
     bool g_annotationNoteOpen{};
     bool g_annotationNoteFocused{};
+    bool g_annotationInlineFreeText{};
     bool g_annotationSaveInProgress{};
     HWND g_annotationNoteEdit{};
     HFONT g_annotationNoteEditFont{};
@@ -6228,6 +6240,31 @@ namespace
         }
     }
 
+    void InvalidateTabRenderCaches(PdfTab& tab)
+    {
+        // A PDF rewrite changes page contents even when page count, zoom and
+        // geometry stay the same. Do not let a bitmap from before the rewrite
+        // survive the new document session; it may not contain newly saved
+        // annotations such as Line or Ink.
+        tab.cache.clear();
+        tab.tileCache.clear();
+        tab.zoomFallbackCache.clear();
+        tab.facingPreviewCache.clear();
+        tab.thumbCache.clear();
+        tab.thumbRenderPending.clear();
+        tab.cachedZoom = 0.0;
+        tab.cachedDpi = 0;
+        tab.cachedTheme = -1;
+        tab.zoomFallbackDpi = 0;
+        tab.zoomFallbackTheme = -1;
+        tab.zoomFallbackZoom = 0.0;
+        tab.zoomFallbackUntil = 0;
+        tab.facingPreviewDpi = 0;
+        tab.facingPreviewTheme = -1;
+        tab.zoomPresentationPending = false;
+        tab.zoomPresentationAnchorValid = false;
+    }
+
     void DropTab(PdfTab& tab)
     {
         tab.textBoxes.clear();
@@ -10373,9 +10410,14 @@ namespace
 
     void PaintPageAnnotations(HDC dc, PdfTab const& tab, int page, RECT pageRect)
     {
-        for (PdfAnnotation const& annotation : tab.annotations)
+        for (size_t annotationIndex = 0; annotationIndex < tab.annotations.size(); ++annotationIndex)
         {
+            PdfAnnotation const& annotation = tab.annotations[annotationIndex];
             if (annotation.page != page) continue;
+            if (g_annotationInlineFreeText && g_annotationNoteOpen &&
+                static_cast<int>(annotationIndex) == g_activeAnnotation &&
+                annotation.kind == AnnotationKind::FreeText)
+                continue;
             // Persisted Ink is already painted by MuPDF from the original
             // multi-stroke InkList while the page bitmap is rendered. Drawing
             // the flattened UI segments again would create a duplicate,
@@ -10434,6 +10476,8 @@ namespace
                     RECT visibleShape{};
                     RECT shapeBounds = mark;
                     if (annotation.kind == AnnotationKind::Text || annotation.kind == AnnotationKind::Caret)
+                        InflateRect(&shapeBounds, std::max(1, S(2)), std::max(1, S(2)));
+                    else if (annotation.kind == AnnotationKind::Line)
                         InflateRect(&shapeBounds, std::max(1, S(2)), std::max(1, S(2)));
                     if (!IntersectRect(&visibleShape, &shapeBounds, &pageRect)) return;
 
@@ -10566,7 +10610,16 @@ namespace
             Gdiplus::Graphics previewGraphics(dc);
             previewGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
             Gdiplus::Pen previewPen(GdiColor(RGB(220, 55, 45), 190), std::max<Gdiplus::REAL>(S(1.0f), 1.4f));
-            if (g_annotationDrawKind == AnnotationKind::Line)
+            if (g_annotationDrawKind == AnnotationKind::Ink)
+            {
+                std::vector<Gdiplus::PointF> points;
+                points.reserve(g_annotationInkPoints.size());
+                for (POINT point : g_annotationInkPoints)
+                    points.emplace_back(static_cast<float>(point.x), static_cast<float>(point.y));
+                if (points.size() >= 2)
+                    previewGraphics.DrawLines(&previewPen, points.data(), static_cast<INT>(points.size()));
+            }
+            else if (g_annotationDrawKind == AnnotationKind::Line)
                 previewGraphics.DrawLine(&previewPen, static_cast<float>(g_annotationDrawStart.x), static_cast<float>(g_annotationDrawStart.y),
                     static_cast<float>(g_annotationDrawCurrent.x), static_cast<float>(g_annotationDrawCurrent.y));
             else if (g_annotationDrawKind == AnnotationKind::Circle)
@@ -12304,6 +12357,7 @@ namespace
         g_annotationToolbarOpen = false;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
+        g_annotationInlineFreeText = false;
         g_annotationNoteEditAnnotation = -1;
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
@@ -12423,6 +12477,7 @@ namespace
         g_annotationToolbarOpen = false;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
+        g_annotationInlineFreeText = false;
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
         if (jump) JumpToAnnotation(hwnd, tab, tab.annotations[static_cast<size_t>(index)]);
@@ -19172,16 +19227,19 @@ namespace
             {
                 RECT client{};
                 GetClientRect(hwnd, &client);
-                HBRUSH brush = CreateSolidBrush(T().paper);
-                if (brush)
+                HBRUSH brush = nullptr;
+                if (!g_annotationInlineFreeText)
                 {
-                    FillRect(dc, &client, brush);
-                    DeleteObject(brush);
+                    brush = CreateSolidBrush(T().paper);
+                    if (brush)
+                    {
+                        FillRect(dc, &client, brush);
+                        DeleteObject(brush);
+                    }
                 }
                 // The native EDIT still owns text layout, caret, selection,
-                // and IME rendering. Ask it to paint its client contents only
-                // after this control has been made fully opaque, so no pixels
-                // from the PDF frame beneath a newly shown note can survive.
+                // and IME rendering. FreeText leaves the PDF page visible
+                // beneath the control through WM_CTLCOLOREDIT.
                 if (g_annotationNoteEditProc)
                     CallWindowProcW(g_annotationNoteEditProc, hwnd,
                         WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
@@ -19191,6 +19249,8 @@ namespace
         }
         if (message == WM_ERASEBKGND)
         {
+            if (g_annotationInlineFreeText)
+                return 1;
             HDC dc = reinterpret_cast<HDC>(wParam);
             if (dc)
             {
@@ -19317,6 +19377,45 @@ namespace
         }
     }
 
+    void SyncInlineFreeTextEdit(HWND hwnd, PdfAnnotation const& annotation, RECT mark)
+    {
+        EnsureAnnotationNoteEdit(hwnd);
+        if (!g_annotationNoteEdit) return;
+
+        if (g_annotationNoteEditAnnotation != g_activeAnnotation)
+        {
+            g_syncingAnnotationNoteEdit = true;
+            SendMessageW(g_annotationNoteEdit, WM_SETREDRAW, FALSE, 0);
+            SetWindowTextW(g_annotationNoteEdit, annotation.note.c_str());
+            SendMessageW(g_annotationNoteEdit, WM_SETREDRAW, TRUE, 0);
+            g_syncingAnnotationNoteEdit = false;
+            g_annotationNoteEditAnnotation = g_activeAnnotation;
+            SendMessageW(g_annotationNoteEdit, EM_SETSEL, annotation.note.size(), annotation.note.size());
+        }
+
+        UpdateAnnotationNoteEditScrollbar();
+        InflateRect(&mark, -S(2), -S(2));
+        if (mark.right <= mark.left) mark.right = mark.left + S(8);
+        if (mark.bottom <= mark.top) mark.bottom = mark.top + S(8);
+
+        RECT currentRect{};
+        GetWindowRect(g_annotationNoteEdit, &currentRect);
+        MapWindowPoints(nullptr, hwnd, reinterpret_cast<POINT*>(&currentRect), 2);
+        if (!EqualRect(&currentRect, &mark))
+        {
+            SetWindowPos(g_annotationNoteEdit, nullptr,
+                mark.left, mark.top,
+                mark.right - mark.left, mark.bottom - mark.top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+        }
+        if (!IsWindowVisible(g_annotationNoteEdit))
+            ShowWindow(g_annotationNoteEdit, SW_SHOWNOACTIVATE);
+        RedrawWindow(g_annotationNoteEdit, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE | RDW_NOCHILDREN);
+        if (g_annotationNoteFocused && GetFocus() != g_annotationNoteEdit)
+            SetFocus(g_annotationNoteEdit);
+    }
+
     UINT_PTR CALLBACK AnnotationColorDialogHook(HWND dialog, UINT message, WPARAM, LPARAM)
     {
         if (message != WM_INITDIALOG || IsRectEmpty(&g_annotationColorDialogAnchor))
@@ -19417,6 +19516,20 @@ namespace
         g_annotationColorRects.clear();
         if (!g_annotationToolbarOpen)
         {
+            PdfAnnotation* inlineAnnotation = nullptr;
+            if (g_annotationInlineFreeText && g_annotationNoteOpen &&
+                ActiveAnnotation(tab, inlineAnnotation) &&
+                inlineAnnotation->kind == AnnotationKind::FreeText)
+            {
+                RECT pageRect{};
+                if (PageRectForPage(tab, inlineAnnotation->page, pageRect))
+                {
+                    RECT mark = DenormalizeAnnotationRect(*inlineAnnotation, pageRect);
+                    g_annotationHitRect = mark;
+                    SyncInlineFreeTextEdit(g_hwnd, *inlineAnnotation, mark);
+                    return;
+                }
+            }
             if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
             return;
         }
@@ -19442,6 +19555,27 @@ namespace
             std::max<int>(static_cast<int>(g_stage.left + S(10)), static_cast<int>(g_stage.right - width - S(10))));
         int top = anchorY - height - S(10);
         if (top < g_stage.top + S(8)) top = anchorY + S(10);
+        // Keep the glass toolbar out of the selected geometry. This matters
+        // most for horizontal line annotations: the backdrop is painted over
+        // the page after the page pass, so a toolbar touching the line can
+        // make the line appear to disappear beneath the blur surface.
+        if (annotation->kind == AnnotationKind::Line)
+        {
+            RECT toolbarCandidate{ left, top, left + width, top + height };
+            RECT lineBounds = mark;
+            InflateRect(&lineBounds, S(6), S(6));
+            RECT overlap{};
+            if (IntersectRect(&overlap, &toolbarCandidate, &lineBounds))
+            {
+                int below = anchorY + S(10);
+                int above = anchorY - height - S(10);
+                RECT belowRect{ left, below, left + width, below + height };
+                if (!IntersectRect(&overlap, &belowRect, &lineBounds))
+                    top = below;
+                else
+                    top = above;
+            }
+        }
         top = std::clamp<int>(top, static_cast<int>(g_stage.top + S(8)),
             std::max<int>(static_cast<int>(g_stage.top + S(8)), static_cast<int>(g_stage.bottom - height - S(8))));
         g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
@@ -21710,13 +21844,13 @@ namespace
     void PopulateThemedAnnotationMenuItems()
     {
         g_themedAnnotationMenuItems.clear();
-        AppendThemedAnnotationSubmenuItem(2530, L"\u6587\u672c\uff08T\uff09");
         AppendThemedAnnotationSubmenuItem(2531, L"\u81ea\u7531\u6587\u672c");
         AppendThemedAnnotationSubmenuItem(2532, L"\u56fe\u7ae0\uff08S\uff09");
         AppendThemedAnnotationSubmenuItem(2533, L"\u63d2\u5165\u7b26\uff08C\uff09");
         AppendThemedAnnotationSubmenuItem(2534, L"\u7ebf\u6bb5");
         AppendThemedAnnotationSubmenuItem(2535, L"\u77e9\u5f62");
         AppendThemedAnnotationSubmenuItem(2536, L"\u5706\u5708");
+        AppendThemedAnnotationSubmenuItem(2537, L"\u58a8\u8ff9");
     }
 
     void ShowAnnotationCreationMenu(HWND hwnd, int x, int y)
@@ -21873,6 +22007,7 @@ namespace
         tab->dirty = true;
         ClearTextSelection();
         g_activeAnnotation = firstAnnotation;
+        g_annotationInlineFreeText = false;
         g_annotationToolbarOpen = true;
         g_annotationNoteOpen = false;
         g_annotationNoteFocused = false;
@@ -21886,7 +22021,8 @@ namespace
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
-    void FinishCreatedAnnotation(HWND hwnd, AnnotationKind kind, int page, RECT pageRect, POINT a, POINT b)
+    void FinishCreatedAnnotation(HWND hwnd, AnnotationKind kind, int page, RECT pageRect, POINT a, POINT b,
+        std::vector<POINT> const* inkPoints = nullptr)
     {
         PdfTab* tab = Active();
         if (!tab || page < 0 || page >= tab->pageCount || IsRectEmpty(&pageRect)) return;
@@ -21916,13 +22052,40 @@ namespace
             annotation.y1 = std::clamp((b.y - pageRect.top) / pageH, 0.0, 1.0);
             annotation.segments.push_back(AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
         }
+        if (kind == AnnotationKind::Ink && inkPoints && inkPoints->size() >= 2)
+        {
+            annotation.segments.clear();
+            for (size_t i = 1; i < inkPoints->size(); ++i)
+            {
+                POINT const previous = (*inkPoints)[i - 1];
+                POINT const current = (*inkPoints)[i];
+                AppendUniqueSegment(annotation.segments, AnnotationSegment{
+                    std::clamp((previous.x - pageRect.left) / pageW, 0.0, 1.0),
+                    std::clamp((previous.y - pageRect.top) / pageH, 0.0, 1.0),
+                    std::clamp((current.x - pageRect.left) / pageW, 0.0, 1.0),
+                    std::clamp((current.y - pageRect.top) / pageH, 0.0, 1.0), 0 });
+            }
+            if (!annotation.segments.empty())
+            {
+                annotation.x0 = annotation.x1 = annotation.segments.front().x0;
+                annotation.y0 = annotation.y1 = annotation.segments.front().y0;
+                for (auto const& segment : annotation.segments)
+                {
+                    annotation.x0 = std::min({ annotation.x0, segment.x0, segment.x1 });
+                    annotation.y0 = std::min({ annotation.y0, segment.y0, segment.y1 });
+                    annotation.x1 = std::max({ annotation.x1, segment.x0, segment.x1 });
+                    annotation.y1 = std::max({ annotation.y1, segment.y0, segment.y1 });
+                }
+            }
+        }
         if (kind == AnnotationKind::Stamp)
             annotation.note = L"DRAFT";
         annotation.text = annotation.note;
         tab->annotations.push_back(std::move(annotation));
         tab->dirty = true;
         g_activeAnnotation = static_cast<int>(tab->annotations.size()) - 1;
-        g_annotationToolbarOpen = true;
+        g_annotationInlineFreeText = kind == AnnotationKind::FreeText;
+        g_annotationToolbarOpen = !g_annotationInlineFreeText;
         g_annotationNoteOpen = kind == AnnotationKind::Text || kind == AnnotationKind::FreeText;
         g_annotationNoteFocused = g_annotationNoteOpen;
         g_annotationNoteEditAnnotation = -1;
@@ -21951,6 +22114,24 @@ namespace
         {
             FinishCreatedAnnotation(hwnd, kind, g_annotationCreatePage, r,
                 POINT{ p.x - S(9), p.y - S(8) }, POINT{ p.x + S(9), p.y + S(8) });
+        }
+        else if (kind == AnnotationKind::FreeText)
+        {
+            int width = S(220);
+            int height = S(42);
+            POINT a{ p.x, p.y };
+            POINT b{ p.x + width, p.y + height };
+            if (b.x > r.right)
+            {
+                a.x = std::max(r.left, r.right - width);
+                b.x = r.right;
+            }
+            if (b.y > r.bottom)
+            {
+                a.y = std::max(r.top, r.bottom - height);
+                b.y = r.bottom;
+            }
+            FinishCreatedAnnotation(hwnd, kind, g_annotationCreatePage, r, a, b);
         }
         else
         {
@@ -22054,7 +22235,8 @@ namespace
                 std::clamp<int>(static_cast<int>(item.colorB * 255.0f + 0.5f), 0, 255));
             annotation.createdAt = item.createdAtMs;
             annotation.persisted = true;
-            AppendUniqueSegment(annotation.segments, AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
+            AppendUniqueSegment(annotation.segments, AnnotationSegment{
+                annotation.x0, annotation.y0, annotation.x1, annotation.y1, item.strokeStart });
             annotation.author = FromUtf8(item.author);
             if (annotation.author.empty()) annotation.author = L"10726";
             annotation.note = FromUtf8(item.contents);
@@ -22073,7 +22255,8 @@ namespace
                 if (annotation.kind == AnnotationKind::Ink &&
                     CanMergeLoadedAnnotation(existing, annotation))
                 {
-                    AppendUniqueSegment(existing.segments, AnnotationSegment{ annotation.x0, annotation.y0, annotation.x1, annotation.y1 });
+                    AppendUniqueSegment(existing.segments, AnnotationSegment{
+                        annotation.x0, annotation.y0, annotation.x1, annotation.y1, item.strokeStart });
                     existing.x0 = std::min(existing.x0, annotation.x0);
                     existing.y0 = std::min(existing.y0, annotation.y0);
                     existing.x1 = std::max(existing.x1, annotation.x1);
@@ -22101,6 +22284,7 @@ namespace
         unsigned long oldVersion = tab.renderVersion;
         int oldPageCount = tab.pageCount;
         tab.renderVersion = ++g_nextRenderVersion;
+        InvalidateTabRenderCaches(tab);
         DropTab(tab);
 
         try
@@ -22243,22 +22427,18 @@ namespace
         std::vector<std::string> notes;
         std::vector<std::string> authors;
         std::vector<QuietPdfAnnotation> annotations;
+        std::vector<std::vector<QuietPdfInkPoint>> inkPointStorage;
         notes.reserve(tab.annotations.size());
         authors.reserve(tab.annotations.size());
         annotations.reserve(tab.annotations.size());
+        inkPointStorage.reserve(tab.annotations.size());
         for (auto const& item : tab.annotations)
         {
-            // Foreign PDF Ink annotations are rendered from their original
-            // InkList and are intentionally left in the source document.
-            // Do not serialize them as highlight rectangles on the next save.
-            // Ink keeps its original multi-stroke geometry in the source PDF;
-            // the compact save ABI intentionally does not flatten it.
-            if (item.kind == AnnotationKind::Ink && item.persisted)
-                continue;
             notes.push_back(ToUtf8(item.note));
             authors.push_back(ToUtf8(item.author.empty() ? L"10726" : item.author));
             COLORREF color = AnnotationColor(item);
-            auto pushAnnotation = [&](double x0, double y0, double x1, double y1)
+            auto pushAnnotation = [&](double x0, double y0, double x1, double y1,
+                std::vector<QuietPdfInkPoint> const* inkPoints = nullptr)
             {
                 QuietPdfAnnotation out;
                 out.page = item.page;
@@ -22274,8 +22454,44 @@ namespace
                 out.createdAtMs = item.createdAt > 0 ? item.createdAt : NowMs();
                 out.author = authors.back().empty() ? "10726" : authors.back().c_str();
                 out.contents = notes.back().empty() ? nullptr : notes.back().c_str();
+                if (inkPoints && !inkPoints->empty())
+                {
+                    out.inkPoints = inkPoints->data();
+                    out.inkPointCount = static_cast<int>(inkPoints->size());
+                }
                 annotations.push_back(out);
             };
+            if (item.kind == AnnotationKind::Ink)
+            {
+                inkPointStorage.emplace_back();
+                auto& points = inkPointStorage.back();
+                if (!item.segments.empty())
+                {
+                    points.reserve(item.segments.size() * 2);
+                    for (auto const& segment : item.segments)
+                    {
+                        if (points.empty() ||
+                            segment.strokeStart ||
+                            std::abs(points.back().x - static_cast<float>(segment.x0)) > 0.0001f ||
+                            std::abs(points.back().y - static_cast<float>(segment.y0)) > 0.0001f)
+                        {
+                            points.push_back(QuietPdfInkPoint{
+                                static_cast<float>(segment.x0), static_cast<float>(segment.y0),
+                                points.empty() ? 1 : segment.strokeStart });
+                        }
+                        points.push_back(QuietPdfInkPoint{
+                            static_cast<float>(segment.x1), static_cast<float>(segment.y1), 0 });
+                    }
+                }
+                else
+                {
+                    points.push_back(QuietPdfInkPoint{ static_cast<float>(item.x0), static_cast<float>(item.y0), 1 });
+                    points.push_back(QuietPdfInkPoint{ static_cast<float>(item.x1), static_cast<float>(item.y1), 0 });
+                }
+                if (points.size() >= 2)
+                    pushAnnotation(item.x0, item.y0, item.x1, item.y1, &points);
+                continue;
+            }
             if (!item.segments.empty())
             {
                 std::vector<AnnotationSegment> uniqueSegments;
@@ -22370,6 +22586,15 @@ namespace
         GetClientRect(hwnd, &client);
         RECT chrome{ 0, 0, client.right, g_stage.top };
         InvalidateRect(hwnd, &chrome, FALSE);
+        // Reopen loads a fresh annotation list and invalidates the page
+        // render generation. Present the reader frame as one unit so newly
+        // saved Line and Ink annotations cannot be hidden by the old page
+        // bitmap that was committed before the PDF rewrite.
+        g_stageFrameValid = false;
+        g_stageFrameOffsetX = 0;
+        g_stageFrameOffsetY = 0;
+        InvalidateRect(hwnd, &g_stage, FALSE);
+        SchedulePagePrefetch(hwnd);
         if (SidebarVisible()) InvalidateRect(hwnd, &g_sidebar, FALSE);
     }
 
@@ -23140,13 +23365,13 @@ namespace
         if (id == 2502) { AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight); return; }
         if (id == 2503) { AddAnnotationFromSelection(hwnd, AnnotationKind::Underline); return; }
         if (id == 2504) { AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout); return; }
-        if (id == 2530) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Text); return; }
         if (id == 2531) { CreateAnnotationAtCursor(hwnd, AnnotationKind::FreeText); return; }
         if (id == 2532) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Stamp); return; }
         if (id == 2533) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Caret); return; }
         if (id == 2534) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Line); return; }
         if (id == 2535) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Square); return; }
         if (id == 2536) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Circle); return; }
+        if (id == 2537) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Ink); return; }
         if (id == 2505)
         {
             size_t annotationCount = tab ? tab->annotations.size() : 0;
@@ -24434,12 +24659,24 @@ namespace
 
             PdfAnnotation* annotation = nullptr;
             PdfTab* tab = Active();
-            bool shouldShow = g_annotationToolbarOpen && g_annotationNoteOpen &&
-                tab && ActiveAnnotation(*tab, annotation);
+            bool hasAnnotation = tab && ActiveAnnotation(*tab, annotation);
+            bool inlineFreeText = hasAnnotation && g_annotationInlineFreeText &&
+                g_annotationNoteOpen && annotation->kind == AnnotationKind::FreeText;
+            bool shouldShow = hasAnnotation && g_annotationNoteOpen &&
+                (g_annotationToolbarOpen || inlineFreeText);
             if (!shouldShow)
             {
                 if (IsWindowVisible(g_annotationNoteEdit))
                     ShowWindow(g_annotationNoteEdit, SW_HIDE);
+                return 0;
+            }
+
+            if (inlineFreeText)
+            {
+                RECT pageRect{};
+                if (PageRectForPage(*tab, annotation->page, pageRect))
+                    SyncInlineFreeTextEdit(hwnd, *annotation,
+                        DenormalizeAnnotationRect(*annotation, pageRect));
                 return 0;
             }
 
@@ -24986,6 +25223,12 @@ namespace
             if (reinterpret_cast<HWND>(lParam) == g_annotationNoteEdit)
             {
                 HDC editDc = reinterpret_cast<HDC>(wParam);
+                if (g_annotationInlineFreeText)
+                {
+                    SetTextColor(editDc, T().text);
+                    SetBkMode(editDc, TRANSPARENT);
+                    return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+                }
                 COLORREF background = T().paper;
                 SetTextColor(editDc, T().text);
                 SetBkColor(editDc, background);
@@ -25223,6 +25466,16 @@ namespace
             }
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+            if (g_annotationInlineFreeText && g_annotationNoteOpen &&
+                !Hit(g_annotationHitRect, x, y))
+            {
+                g_annotationInlineFreeText = false;
+                g_annotationNoteOpen = false;
+                g_annotationNoteFocused = false;
+                if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
+                SetFocus(hwnd);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             g_outlineClickHandledOnDown = false;
             if (Active()) RefreshReaderHitGeometry(hwnd);
             // The favorite popup is a foreground overlay. Resolve it before
@@ -25359,6 +25612,9 @@ namespace
                     g_annotationCreatePageRect = drawPageRect;
                     g_annotationDrawStart = POINT{ x, y };
                     g_annotationDrawCurrent = g_annotationDrawStart;
+                    g_annotationInkPoints.clear();
+                    if (g_annotationDrawKind == AnnotationKind::Ink)
+                        g_annotationInkPoints.push_back(g_annotationDrawStart);
                     g_annotationDrawing = true;
                     SetCapture(hwnd);
                     InvalidateRect(hwnd, &g_stage, FALSE);
@@ -26376,6 +26632,13 @@ namespace
             if (g_annotationDrawing)
             {
                 g_annotationDrawCurrent = POINT{ mx, my };
+                if (g_annotationDrawKind == AnnotationKind::Ink)
+                {
+                    POINT const last = g_annotationInkPoints.empty()
+                        ? g_annotationDrawStart : g_annotationInkPoints.back();
+                    if (std::abs(mx - last.x) + std::abs(my - last.y) >= std::max(1, S(2)))
+                        g_annotationInkPoints.push_back(g_annotationDrawCurrent);
+                }
                 InvalidateRect(hwnd, &g_stage, FALSE);
                 return 0;
             }
@@ -26692,11 +26955,18 @@ namespace
                 RECT pageRect = g_annotationCreatePageRect;
                 g_annotationDrawing = false;
                 g_annotationDrawMode = false;
+                std::vector<POINT> inkPoints = g_annotationInkPoints;
                 g_annotationInkPoints.clear();
                 ReleaseCapture();
                 if (page >= 0 && !IsRectEmpty(&pageRect))
                 {
-                    if (g_annotationDrawKind == AnnotationKind::Line ||
+                    if (g_annotationDrawKind == AnnotationKind::Ink)
+                    {
+                        if (inkPoints.size() >= 2)
+                            FinishCreatedAnnotation(hwnd, g_annotationDrawKind, page, pageRect,
+                                inkPoints.front(), inkPoints.back(), &inkPoints);
+                    }
+                    else if (g_annotationDrawKind == AnnotationKind::Line ||
                         std::abs(releasePoint.x - start.x) >= S(4) ||
                         std::abs(releasePoint.y - start.y) >= S(4))
                     {
@@ -26751,6 +27021,7 @@ namespace
                     g_annotationHitRect = annotationHitRect;
                     g_annotationPopupAnchor = releasePoint;
                     g_annotationPopupAnchorValid = true;
+                    g_annotationInlineFreeText = false;
                     g_annotationToolbarOpen = true;
                     g_annotationNoteOpen = false;
                     g_annotationNoteFocused = false;
@@ -26805,6 +27076,7 @@ namespace
                                 g_annotationHitRect = hitRect;
                                 g_annotationPopupAnchor = g_selectionEnd;
                                 g_annotationPopupAnchorValid = true;
+                                g_annotationInlineFreeText = false;
                                 g_annotationToolbarOpen = true;
                                 g_annotationNoteOpen = false;
                                 g_annotationNoteFocused = false;
