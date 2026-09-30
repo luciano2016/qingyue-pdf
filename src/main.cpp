@@ -7234,19 +7234,10 @@ namespace
                 g_pdf.dropPage(tab.ctx, page);
                 int widthPx = std::max(1, static_cast<int>(std::ceil((bounds.x1 - bounds.x0) * renderScale)));
                 int heightPx = std::max(1, static_cast<int>(std::ceil((bounds.y1 - bounds.y0) * renderScale)));
-                // A display list intentionally contains page contents only.
-                // Use the page renderer for pages with persisted Ink so the
-                // native MuPDF annotation appearance is painted as well.
-                bool hasPersistedInk = false;
-                for (PdfAnnotation const& annotation : tab.annotations)
-                {
-                    if (annotation.page == index && annotation.kind == AnnotationKind::Ink && annotation.persisted)
-                    {
-                        hasPersistedInk = true;
-                        break;
-                    }
-                }
-                fz_display_list* list = hasPersistedInk ? nullptr : CachedPageDisplayListLocked(tab, index, renderCookie);
+                // Page bitmaps contain PDF page contents only. Editable
+                // annotations, including persisted Ink, are composed by the
+                // Win32 overlay so an in-memory delete is visible immediately.
+                fz_display_list* list = CachedPageDisplayListLocked(tab, index, renderCookie);
                 if (renderToDib && (g_pdf.renderDisplayListClipToBuffer || g_pdf.renderPageNumberClipToBuffer))
                 {
                     image.width = widthPx;
@@ -10418,11 +10409,6 @@ namespace
                 static_cast<int>(annotationIndex) == g_activeAnnotation &&
                 annotation.kind == AnnotationKind::FreeText)
                 continue;
-            // Persisted Ink is already painted by MuPDF from the original
-            // multi-stroke InkList while the page bitmap is rendered. Drawing
-            // the flattened UI segments again would create a duplicate,
-            // incomplete-looking stroke on top of the native appearance.
-            if (annotation.kind == AnnotationKind::Ink && annotation.persisted) continue;
             COLORREF annotationColor = AnnotationColor(annotation);
             bool hasCjkText = false;
             bool hasLatinOrDigitText = false;
@@ -10439,6 +10425,38 @@ namespace
                     hasLatinOrDigitText = true;
             }
             bool cjkOnlyText = hasCjkText && !hasLatinOrDigitText;
+            if (annotation.kind == AnnotationKind::Ink && !annotation.segments.empty())
+            {
+                Gdiplus::Graphics inkGraphics(dc);
+                inkGraphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                inkGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+                Gdiplus::Pen inkPen(GdiColor(annotationColor), std::max<Gdiplus::REAL>(S(2.0f), 1.5f));
+                inkPen.SetStartCap(Gdiplus::LineCapRound);
+                inkPen.SetEndCap(Gdiplus::LineCapRound);
+                inkPen.SetLineJoin(Gdiplus::LineJoinRound);
+
+                Gdiplus::GraphicsPath inkPath;
+                bool hasVisibleStroke = false;
+                for (AnnotationSegment const& segment : annotation.segments)
+                {
+                    RECT mark = DenormalizeAnnotationSegment(segment, pageRect);
+                    RECT inkBounds{
+                        std::min(mark.left, mark.right), std::min(mark.top, mark.bottom),
+                        std::max(mark.left, mark.right), std::max(mark.top, mark.bottom) };
+                    InflateRect(&inkBounds, std::max(1, S(2)), std::max(1, S(2)));
+                    RECT visibleInk{};
+                    if (!IntersectRect(&visibleInk, &inkBounds, &pageRect)) continue;
+                    if (!hasVisibleStroke || segment.strokeStart)
+                        inkPath.StartFigure();
+                    inkPath.AddLine(
+                        static_cast<float>(mark.left), static_cast<float>(mark.top),
+                        static_cast<float>(mark.right), static_cast<float>(mark.bottom));
+                    hasVisibleStroke = true;
+                }
+                if (hasVisibleStroke)
+                    inkGraphics.DrawPath(&inkPen, &inkPath);
+                continue;
+            }
             auto drawSegment = [&](RECT mark)
             {
                 if (annotation.kind == AnnotationKind::Ink)
@@ -12467,6 +12485,7 @@ namespace
         tab.annotations.erase(tab.annotations.begin() + index);
         tab.dirty = true;
         ClearAnnotationFocus();
+        g_stageFrameValid = false;
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 
@@ -20344,6 +20363,11 @@ namespace
         return id == 2441;
     }
 
+    bool IsThemedSubmenuItem(UINT id)
+    {
+        return id == 2511 || id == 2529;
+    }
+
     int ThemedMenuRowHeight(ThemedMenuItem const* item)
     {
         if (!item || item->separator) return S(6);
@@ -20386,6 +20410,7 @@ namespace
         ReleaseDC(g_hwnd, dc);
 
         int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
+        if (IsThemedSubmenuItem(item->id)) textW += S(18);
         measure->itemWidth = IsCheckboxMenuItem(item->id) ? std::max(S(96), textW + S(54)) : std::max(S(112), textW + (shortcut.empty() ? S(54) : S(62)));
         measure->itemHeight = ThemedMenuRowHeight(item);
         return true;
@@ -20488,7 +20513,8 @@ namespace
         RECT textRect{ r.left + ThemedMenuTextLeft(item), r.top, r.right - S(10), r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
         UINT mainTextFlags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-        if (!IsCheckboxMenuItem(item->id)) mainTextFlags |= DT_END_ELLIPSIS;
+        if (!IsCheckboxMenuItem(item->id) && !IsThemedSubmenuItem(item->id))
+            mainTextFlags |= DT_END_ELLIPSIS;
         Text(draw->hDC, mainText, textRect, mainTextFlags, MenuPopupText(disabled));
         if (!shortcut.empty())
         {
@@ -20550,11 +20576,12 @@ namespace
 
         HFONT font = Font(ThemedMenuFontPt(&item));
         HGDIOBJ old = SelectObject(dc, font);
-        int rightInset = (item.id == 2511 || item.id == 2529) ? S(22) : S(10);
+        int rightInset = IsThemedSubmenuItem(item.id) ? S(22) : S(10);
         RECT textRect{ r.left + ThemedMenuTextLeft(&item), r.top, r.right - rightInset, r.bottom };
         if (!shortcut.empty()) textRect.right -= S(76);
         UINT mainTextFlags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-        if (!IsCheckboxMenuItem(item.id)) mainTextFlags |= DT_END_ELLIPSIS;
+        if (!IsCheckboxMenuItem(item.id) && !IsThemedSubmenuItem(item.id))
+            mainTextFlags |= DT_END_ELLIPSIS;
         Text(dc, mainText, textRect, mainTextFlags, MenuPopupText(item.disabled));
         if (!shortcut.empty())
         {
@@ -21159,6 +21186,7 @@ namespace
                 SelectObject(dc, oldRowFont);
                 DeleteObject(rowFont);
                 int textW = mainSize.cx + (shortcut.empty() ? 0 : shortcutSize.cx + S(30));
+                if (IsThemedSubmenuItem(item->id)) textW += S(18);
                 width = std::max(width, IsCheckboxMenuItem(item->id) ? textW + S(54) : textW + (shortcut.empty() ? S(54) : S(62)));
             }
             height += rowH;
@@ -21848,9 +21876,9 @@ namespace
         AppendThemedAnnotationSubmenuItem(2532, L"\u56fe\u7ae0\uff08S\uff09");
         AppendThemedAnnotationSubmenuItem(2533, L"\u63d2\u5165\u7b26\uff08C\uff09");
         AppendThemedAnnotationSubmenuItem(2534, L"\u7ebf\u6bb5");
+        AppendThemedAnnotationSubmenuItem(2537, L"\u58a8\u8ff9");
         AppendThemedAnnotationSubmenuItem(2535, L"\u77e9\u5f62");
         AppendThemedAnnotationSubmenuItem(2536, L"\u5706\u5708");
-        AppendThemedAnnotationSubmenuItem(2537, L"\u58a8\u8ff9");
     }
 
     void ShowAnnotationCreationMenu(HWND hwnd, int x, int y)
@@ -22271,7 +22299,7 @@ namespace
         }
         for (PdfAnnotation& annotation : loaded)
         {
-            if (annotation.kind != AnnotationKind::Ink)
+            if (annotation.kind != AnnotationKind::Ink && annotation.kind != AnnotationKind::Line)
                 MergeAnnotationSegments(annotation.segments);
         }
         tab.annotations = std::move(loaded);
@@ -22498,7 +22526,7 @@ namespace
                 uniqueSegments.reserve(item.segments.size());
                 for (auto const& segment : item.segments)
                     AppendUniqueSegment(uniqueSegments, segment);
-                if (item.kind != AnnotationKind::Ink)
+                if (item.kind != AnnotationKind::Ink && item.kind != AnnotationKind::Line)
                     MergeAnnotationSegments(uniqueSegments);
                 for (auto const& segment : uniqueSegments)
                     pushAnnotation(segment.x0, segment.y0, segment.x1, segment.y1);

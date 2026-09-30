@@ -369,28 +369,6 @@ extern "C" void quiet_set_render_theme(int theme)
     quiet_render_theme = theme;
 }
 
-// The Win32 layer renders ordinary annotations as a separate UI overlay, but
-// PDF Ink annotations must be rendered from their original InkList.  Flattening
-// the list into independent line segments loses stroke joins, caps, and the
-// annotation appearance stream.  Let MuPDF paint Ink itself, exactly as the
-// native PDF viewer path does.
-static void quiet_run_ink_annotations(
-    fz_context* ctx,
-    pdf_document* doc,
-    pdf_page* page,
-    fz_device* dev,
-    fz_cookie* cookie)
-{
-    (void)doc;
-    for (pdf_annot* annot = pdf_first_annot(ctx, page); annot; annot = pdf_next_annot(ctx, annot))
-    {
-        if (pdf_annot_type(ctx, annot) == PDF_ANNOT_INK)
-            pdf_run_annot(ctx, annot, dev, fz_identity, cookie);
-        if (cookie && cookie->abort)
-            break;
-    }
-}
-
 static fz_pixmap* quiet_new_pixmap_from_page_number_clip_impl(
     fz_context* ctx,
     fz_document* doc,
@@ -405,7 +383,6 @@ static fz_pixmap* quiet_new_pixmap_from_page_number_clip_impl(
     fz_cookie* cookie)
 {
     fz_page* page = nullptr;
-    pdf_page* pdf_page = nullptr;
     fz_pixmap* pix = nullptr;
     fz_device* dev = nullptr;
     fz_irect bbox{ x0, y0, x1, y1 };
@@ -413,21 +390,15 @@ static fz_pixmap* quiet_new_pixmap_from_page_number_clip_impl(
     fz_try(ctx)
     {
         page = fz_load_page(ctx, doc, number);
-        pdf_document* pdf_doc = pdf_specifics(ctx, doc);
-        if (pdf_doc)
-            pdf_page = pdf_load_page(ctx, pdf_doc, number);
         pix = fz_new_pixmap_with_bbox(ctx, cs, bbox, nullptr, alpha);
         quiet_clear_theme_pixmap(ctx, pix, quiet_render_theme);
         dev = quiet_wrap_theme_device(ctx, fz_new_draw_device(ctx, ctm, pix), quiet_render_theme);
         fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
-        if (pdf_page && (!cookie || !cookie->abort))
-            quiet_run_ink_annotations(ctx, pdf_doc, pdf_page, dev, cookie);
         fz_close_device(ctx, dev);
     }
     fz_always(ctx)
     {
         if (dev) fz_drop_device(ctx, dev);
-        if (pdf_page) pdf_drop_page(ctx, pdf_page);
         if (page) fz_drop_page(ctx, page);
     }
     fz_catch(ctx)
@@ -445,7 +416,6 @@ extern "C" fz_display_list* quiet_new_page_contents_display_list_cookie(
     fz_cookie* cookie)
 {
     fz_page* page = nullptr;
-    pdf_page* pdfPage = nullptr;
     fz_display_list* list = nullptr;
     fz_device* dev = nullptr;
 
@@ -455,18 +425,11 @@ extern "C" fz_display_list* quiet_new_page_contents_display_list_cookie(
         list = fz_new_display_list(ctx, fz_bound_page(ctx, page));
         dev = fz_new_list_device(ctx, list);
         fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
-        pdf_document* pdfDoc = pdf_specifics(ctx, doc);
-        if (pdfDoc && (!cookie || !cookie->abort))
-        {
-            pdfPage = pdf_load_page(ctx, pdfDoc, number);
-            quiet_run_ink_annotations(ctx, pdfDoc, pdfPage, dev, cookie);
-        }
         fz_close_device(ctx, dev);
     }
     fz_always(ctx)
     {
         if (dev) fz_drop_device(ctx, dev);
-        if (pdfPage) pdf_drop_page(ctx, pdfPage);
         if (page) fz_drop_page(ctx, page);
     }
     fz_catch(ctx)
@@ -596,7 +559,6 @@ extern "C" int quiet_render_page_number_clip_to_buffer(
 {
     if (!ctx || !doc || !samples || x1 <= x0 || y1 <= y0) return 0;
     fz_page* page = nullptr;
-    pdf_page* pdf_page = nullptr;
     fz_pixmap* pix = nullptr;
     fz_device* dev = nullptr;
     int ok = 0;
@@ -604,24 +566,18 @@ extern "C" int quiet_render_page_number_clip_to_buffer(
     fz_try(ctx)
     {
         page = fz_load_page(ctx, doc, number);
-        pdf_document* pdf_doc = pdf_specifics(ctx, doc);
-        if (pdf_doc)
-            pdf_page = pdf_load_page(ctx, pdf_doc, number);
         pix = fz_new_pixmap_with_data(ctx, cs, x1 - x0, y1 - y0, nullptr, alpha, stride, samples);
         pix->x = x0;
         pix->y = y0;
         quiet_clear_theme_pixmap(ctx, pix, quiet_render_theme);
         dev = quiet_wrap_theme_device(ctx, fz_new_draw_device(ctx, ctm, pix), quiet_render_theme);
         fz_run_page_contents(ctx, page, dev, fz_identity, cookie);
-        if (pdf_page && (!cookie || !cookie->abort))
-            quiet_run_ink_annotations(ctx, pdf_doc, pdf_page, dev, cookie);
         fz_close_device(ctx, dev);
         ok = !cookie || !cookie->abort;
     }
     fz_always(ctx)
     {
         if (dev) fz_drop_device(ctx, dev);
-        if (pdf_page) pdf_drop_page(ctx, pdf_page);
         if (pix) fz_drop_pixmap(ctx, pix);
         if (page) fz_drop_page(ctx, page);
     }
