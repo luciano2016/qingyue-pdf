@@ -10915,13 +10915,56 @@ namespace
         return g_hasContentSelection && g_selectionIsImage;
     }
 
-    bool PointInsideActiveSelection(int x, int y)
+    bool PointInsideActiveSelection(PdfTab const& tab, int x, int y)
     {
         if (!g_hasContentSelection || !Hit(g_stage, x, y)) return false;
-        RECT selection = CurrentSelectionRect();
         if (g_selectionIsImage)
             return !IsRectEmpty(&g_selectionPageRect) && Hit(g_selectionPageRect, x, y);
-        return !IsRectEmpty(&selection) && Hit(selection, x, y);
+
+        int page = -1;
+        RECT pageRect{};
+        if (!PageRectAtPoint(tab, x, y, page, pageRect)) return false;
+
+        // The selection is painted from native text quads. The drag endpoints
+        // are only anchors and can be separated from the painted range by
+        // word spacing, line wrapping, zoom, or a scroll-frame handoff. Use
+        // the same quads for the context-menu hit test so the visible
+        // selection and the menu choice cannot disagree.
+        RECT selectedPageBounds{};
+        bool haveSelectedPageBounds = false;
+        for (TextSelectionSegment const& segment : g_selectionSegments)
+        {
+            if (segment.page != page) continue;
+            for (fz_quad const& quad : segment.quads)
+            {
+                RECT quadRect = QuadToRect(quad, pageRect);
+                RECT clipped{};
+                if (!IntersectRect(&clipped, &quadRect, &pageRect)) continue;
+                if (!haveSelectedPageBounds)
+                {
+                    selectedPageBounds = clipped;
+                    haveSelectedPageBounds = true;
+                }
+                else
+                    UnionRect(&selectedPageBounds, &selectedPageBounds, &clipped);
+            }
+        }
+        if (haveSelectedPageBounds)
+        {
+            RECT hitBounds = selectedPageBounds;
+            InflateRect(&hitBounds, S(4), S(3));
+            if (Hit(hitBounds, x, y)) return true;
+        }
+
+        // Keep the endpoint range as a narrow fallback for transient frames
+        // where the text quads have not caught up with the visible selection.
+        RECT selection = CurrentSelectionRect();
+        if (!IsRectEmpty(&selection))
+        {
+            InflateRect(&selection, S(2), S(2));
+            if (Hit(selection, x, y)) return true;
+        }
+        return false;
     }
 
     bool CurrentSelectionPageRect(RECT& out)
@@ -26337,9 +26380,9 @@ namespace
                     return 0;
                 }
             }
-            if (PointInsideActiveSelection(x, y))
+            if (PdfTab* tab = Active(); tab && PointInsideActiveSelection(*tab, x, y))
             {
-                if (PdfTab* tab = Active()) CaptureAnnotationCreateContext(*tab, x, y);
+                CaptureAnnotationCreateContext(*tab, x, y);
                 POINT pt{ x, y };
                 ClientToScreen(hwnd, &pt);
                 ShowSelectionMenuWithShortcuts(hwnd, pt.x, pt.y, HasImageSelection());
