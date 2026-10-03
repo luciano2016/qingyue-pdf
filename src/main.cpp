@@ -26351,9 +26351,7 @@ namespace
                         if (i == 0)
                         {
                             CopyCurrentSelectionToClipboard(hwnd);
-                            g_selectionToolbarOpen = false;
-                            g_selectionToolbarRect = {};
-                            g_selectionToolbarActionRects.clear();
+                            ClearTextSelection();
                             g_hasHoverTip = false;
                             g_hoverTip.clear();
                             g_hoverTipRect = {};
