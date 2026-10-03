@@ -1942,6 +1942,8 @@ namespace
     RECT g_annotationHitRect{};
     POINT g_annotationPopupAnchor{};
     bool g_annotationPopupAnchorValid{};
+    POINT g_annotationPopupAnchorOffset{};
+    bool g_annotationPopupAnchorOffsetValid{};
     AnnotationKind g_annotationDrawKind{ AnnotationKind::Highlight };
     bool g_annotationDrawMode{};
     bool g_annotationDrawing{};
@@ -12901,6 +12903,8 @@ namespace
         g_annotationNoteEditAnnotation = -1;
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
+        g_annotationPopupAnchorOffset = POINT{};
+        g_annotationPopupAnchorOffsetValid = false;
         if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
         g_annotationHitRect = RECT{};
         g_annotationToolbarRect = RECT{};
@@ -13022,6 +13026,8 @@ namespace
         g_annotationInlineFreeText = false;
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
+        g_annotationPopupAnchorOffset = POINT{};
+        g_annotationPopupAnchorOffsetValid = false;
         if (jump) JumpToAnnotation(hwnd, tab, tab.annotations[static_cast<size_t>(index)]);
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -14813,6 +14819,19 @@ namespace
             : std::max<int>(0, g_contentHeight - std::max<int>(1, g_stage.bottom - g_stage.top));
         g_scrollX = std::clamp(g_scrollX, 0, std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left)));
         int old = g_scrollY;
+        if (g_annotationToolbarOpen && g_annotationPopupAnchorValid &&
+            !g_annotationPopupAnchorOffsetValid && !IsRectEmpty(&g_annotationHitRect))
+        {
+            // Convert the one-time click anchor before changing the viewport,
+            // so the first scroll frame uses the same relative position.
+            g_annotationPopupAnchorOffset = POINT{
+                g_annotationPopupAnchor.x - g_annotationHitRect.left,
+                g_annotationPopupAnchor.y - g_annotationHitRect.top
+            };
+            g_annotationPopupAnchorOffsetValid = true;
+            g_annotationPopupAnchor = POINT{};
+            g_annotationPopupAnchorValid = false;
+        }
         g_scrollY = std::clamp(newScrollY, 0, maxScroll);
         if (tab && g_continuousRead)
         {
@@ -14879,7 +14898,9 @@ namespace
         // Prime a complete coarse representation first, then move the frame
         // immediately when that representation covers the new viewport.
         // Single-page reading retains the 2.5.9 path below.
-        bool facingFrameShift = facingContinuous && tab;
+        bool floatingToolbarOpen = g_annotationToolbarOpen || g_annotationNoteOpen ||
+            g_selectionToolbarOpen;
+        bool facingFrameShift = facingContinuous && tab && !floatingToolbarOpen;
         if (facingFrameShift)
             PrimeFacingScrollCoverage(hwnd, *tab);
         bool facingCoverageReady = facingFrameShift && !tab->zoomPresentationPending &&
@@ -14887,10 +14908,10 @@ namespace
         bool targetReady = tab && !tab->zoomPresentationPending &&
             CurrentZoomVisibleContentReady(*tab);
         bool canShiftFacingFrame = facingFrameShift && facingCoverageReady && g_stageFrameValid &&
-            !g_annotationToolbarOpen && !g_annotationNoteOpen &&
+            !g_annotationToolbarOpen && !g_annotationNoteOpen && !g_selectionToolbarOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         bool canPreserveFrame = !facingFrameShift && (targetReady || dragFrame) && g_stageFrameValid &&
-            !g_annotationToolbarOpen && !g_annotationNoteOpen &&
+            !g_annotationToolbarOpen && !g_annotationNoteOpen && !g_selectionToolbarOpen &&
             std::abs(dy) < std::max<int>(1, g_stage.bottom - g_stage.top) * 3 / 4;
         if (facingFrameShift)
         {
@@ -15013,7 +15034,9 @@ namespace
         if (facingContinuous && tab && tab->zoomPresentationPending)
             FinishZoomPresentationForScroll(hwnd, *tab);
         UpdateVertScrollBar(hwnd);
-        bool facingFrameShift = facingContinuous && tab;
+        bool floatingToolbarOpen = g_annotationToolbarOpen || g_annotationNoteOpen ||
+            g_selectionToolbarOpen;
+        bool facingFrameShift = facingContinuous && tab && !floatingToolbarOpen;
         if (facingFrameShift)
             PrimeFacingScrollCoverage(hwnd, *tab);
         bool facingCoverageReady = facingFrameShift && !tab->zoomPresentationPending &&
@@ -15023,10 +15046,10 @@ namespace
         // Horizontal facing movement uses the same complete-coverage rule as
         // vertical scrolling; the scrollbar never exposes a background strip.
         bool canShiftFacingFrame = facingFrameShift && facingCoverageReady && g_stageFrameValid &&
-            !g_annotationToolbarOpen && !g_annotationNoteOpen &&
+            !g_annotationToolbarOpen && !g_annotationNoteOpen && !g_selectionToolbarOpen &&
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         bool canPreserveFrame = !facingFrameShift && targetReady && g_stageFrameValid &&
-            !g_annotationToolbarOpen && !g_annotationNoteOpen &&
+            !g_annotationToolbarOpen && !g_annotationNoteOpen && !g_selectionToolbarOpen &&
             std::abs(old - g_scrollX) < std::max<int>(1, g_stage.right - g_stage.left) * 3 / 4;
         if (facingFrameShift)
         {
@@ -20193,15 +20216,34 @@ namespace
             g_annotationNoteFocused = false;
             g_annotationPopupAnchor = POINT{};
             g_annotationPopupAnchorValid = false;
+            g_annotationPopupAnchorOffset = POINT{};
+            g_annotationPopupAnchorOffsetValid = false;
             if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
             return;
         }
 
         int width = S(312);
         int height = S(42);
-        bool usePopupAnchor = g_annotationPopupAnchorValid;
-        int anchorX = usePopupAnchor ? g_annotationPopupAnchor.x : static_cast<int>(mark.left);
-        int anchorY = usePopupAnchor ? g_annotationPopupAnchor.y : static_cast<int>(mark.top);
+        // Preserve the click position relative to the annotation. The first
+        // paint receives a client-space click point; after that point has been
+        // converted to an annotation-relative offset, every repaint follows
+        // the mark as the document scrolls instead of snapping once to the
+        // mark's top-left corner.
+        if (g_annotationPopupAnchorValid && !g_annotationPopupAnchorOffsetValid)
+        {
+            g_annotationPopupAnchorOffset = POINT{
+                g_annotationPopupAnchor.x - mark.left,
+                g_annotationPopupAnchor.y - mark.top
+            };
+            g_annotationPopupAnchorOffsetValid = true;
+        }
+        bool usePopupAnchor = g_annotationPopupAnchorOffsetValid;
+        int anchorX = usePopupAnchor
+            ? mark.left + g_annotationPopupAnchorOffset.x
+            : static_cast<int>(mark.left);
+        int anchorY = usePopupAnchor
+            ? mark.top + g_annotationPopupAnchorOffset.y
+            : static_cast<int>(mark.top);
         int left = usePopupAnchor ? anchorX - width / 2 : static_cast<int>(mark.left);
         left = std::clamp<int>(left, static_cast<int>(g_stage.left + S(10)),
             std::max<int>(static_cast<int>(g_stage.left + S(10)), static_cast<int>(g_stage.right - width - S(10))));
@@ -22685,6 +22727,8 @@ namespace
         g_annotationNoteFocused = false;
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
+        g_annotationPopupAnchorOffset = POINT{};
+        g_annotationPopupAnchorOffsetValid = false;
         g_hasHoverTip = false;
         g_hoverTipIsPdfLink = false;
         g_hoverTipAnchor = POINT{};
@@ -22763,6 +22807,8 @@ namespace
         g_annotationNoteEditAnnotation = -1;
         g_annotationPopupAnchor = POINT{ (a.x + b.x) / 2, (a.y + b.y) / 2 };
         g_annotationPopupAnchorValid = true;
+        g_annotationPopupAnchorOffset = POINT{};
+        g_annotationPopupAnchorOffsetValid = false;
         SetTitle();
         InvalidateRect(hwnd, nullptr, FALSE);
     }
@@ -23255,6 +23301,8 @@ namespace
         // paint so changing a color cannot move the popup to a stale position.
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
+        g_annotationPopupAnchorOffset = POINT{};
+        g_annotationPopupAnchorOffsetValid = false;
 
         for (auto& annotation : tab.annotations) annotation.persisted = true;
         tab.dirty = false;
@@ -27768,6 +27816,8 @@ namespace
                     g_annotationHitRect = annotationHitRect;
                     g_annotationPopupAnchor = releasePoint;
                     g_annotationPopupAnchorValid = true;
+                    g_annotationPopupAnchorOffset = POINT{};
+                    g_annotationPopupAnchorOffsetValid = false;
                     g_annotationInlineFreeText = false;
                     g_annotationToolbarOpen = true;
                     g_annotationNoteOpen = false;
@@ -27824,6 +27874,8 @@ namespace
                                 g_annotationHitRect = hitRect;
                                 g_annotationPopupAnchor = g_selectionEnd;
                                 g_annotationPopupAnchorValid = true;
+                                g_annotationPopupAnchorOffset = POINT{};
+                                g_annotationPopupAnchorOffsetValid = false;
                                 g_annotationInlineFreeText = false;
                                 g_annotationToolbarOpen = true;
                                 g_annotationNoteOpen = false;

@@ -2,6 +2,10 @@
 
 本项目的公开版本变更记录从 0.8.6 开始维护。
 
+## [1.9.6] - 2026-10-04
+- Repaint the reader when floating selection or annotation controls are open so retained scrolling cannot leave stale toolbar pixels behind.
+- Keep annotation popup placement relative to its mark while scrolling.
+
 ## [1.9.5] - 2026-10-04
 - Keep selection and annotation toolbars attached to visible document content.
 - Prevent selection quick actions from reopening the annotation color toolbar.
