@@ -20060,21 +20060,21 @@ namespace
         RECT selectionBounds{};
         if (!SelectionToolbarBounds(tab, selectionBounds)) return;
 
-        int button = S(27);
-        int gap = S(3);
-        int padding = S(7);
+        int button = S(31);
+        int gap = S(4);
+        int padding = S(8);
         int width = padding * 2 + button * 5 + gap * 4;
-        int height = button + S(7);
+        int height = button + S(8);
         int left = (selectionBounds.left + selectionBounds.right - width) / 2;
-        left = std::clamp<int>(left, g_stage.left + S(6),
-            std::max<int>(g_stage.left + S(6), g_stage.right - width - S(6)));
-        int top = selectionBounds.top - height - S(7);
-        if (top < g_stage.top + S(6)) top = selectionBounds.bottom + S(7);
+        left = std::clamp<int>(left, g_stage.left + S(7),
+            std::max<int>(g_stage.left + S(7), g_stage.right - width - S(7)));
+        int top = selectionBounds.top - height - S(8);
+        if (top < g_stage.top + S(6)) top = selectionBounds.bottom + S(8);
         top = std::clamp<int>(top, g_stage.top + S(6),
             std::max<int>(g_stage.top + S(6), g_stage.bottom - height - S(6)));
         g_selectionToolbarRect = RECT{ left, top, left + width, top + height };
 
-        float radius = static_cast<float>(S(6));
+        float radius = static_cast<float>(S(7));
         BlurRoundedBackdrop(dc, g_selectionToolbarRect, radius);
         DrawRoundedShadow(dc, g_selectionToolbarRect, radius, S(1), S(2), S(3), IsDarkTheme() ? 32 : 24);
         GlassRoundedSurface(dc, g_selectionToolbarRect, IsDarkTheme() ? 210 : 230, radius, false);
