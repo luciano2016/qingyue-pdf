@@ -3527,62 +3527,30 @@ namespace
         char const* m_data{};
     };
 
-    void DrawSelectionSvgIconFitted(Gdiplus::Graphics& graphics, RECT rect,
-        char const* pathData, COLORREF color, bool fitWidthOnly, float inkSpread = 0.0f)
+    void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect,
+        char const* pathData, COLORREF color)
     {
         if (!pathData || IsRectEmpty(&rect)) return;
         Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
         SvgPathReader reader(pathData);
         if (!reader.Read(path)) return;
-        // The supplied SVGs use the same 1024px viewBox but different path
-        // bounds. Normalize the visible geometry so its optical footprint is
-        // consistent instead of aligning only the invisible viewBox.
-        Gdiplus::RectF bounds{};
-        if (path.GetBounds(&bounds) != Gdiplus::Ok || bounds.Width <= 0.0f || bounds.Height <= 0.0f)
-            return;
+
+        // Keep the source SVG geometry intact. The five supplied files are
+        // designed for the same 1024x1024 viewBox; fitting their visible
+        // bounds independently changes their intended proportions and makes
+        // the set look inconsistent.
         float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
         float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
-        float scale = fitWidthOnly
-            ? width / bounds.Width
-            : std::max(1.0f, std::min(width, height) - static_cast<float>(S(17))) /
-                std::max(bounds.Width, bounds.Height);
+        float iconSize = std::max(1.0f, std::min(width, height) - static_cast<float>(S(17)));
+        float scale = iconSize / 1024.0f;
         float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
         float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
-        float translateX = centerX - (bounds.X + bounds.Width * 0.5f) * scale;
-        float translateY = centerY - (bounds.Y + bounds.Height * 0.5f) * scale;
+        float translateX = centerX - 512.0f * scale;
+        float translateY = centerY - 512.0f * scale;
         Gdiplus::Matrix transform(scale, 0.0f, 0.0f, scale, translateX, translateY);
         path.Transform(&transform);
         Gdiplus::SolidBrush brush(GdiColor(color));
-        if (inkSpread <= 0.0f)
-        {
-            graphics.FillPath(&brush, &path);
-            return;
-        }
-
-        // Very thin outline glyphs lose apparent density at their anti-aliased
-        // edge even when they use the same opaque brush as filled glyphs. A
-        // sub-pixel expansion restores the same visual gray without changing
-        // the icon's nominal footprint or making the heavier glyphs thicker.
-        float diagonal = inkSpread * 0.70710678f;
-        float offsets[][2] = {
-            { 0.0f, 0.0f },
-            {-inkSpread, 0.0f }, { inkSpread, 0.0f },
-            { 0.0f, -inkSpread }, { 0.0f, inkSpread },
-            {-diagonal, -diagonal }, { diagonal, -diagonal },
-            {-diagonal, diagonal }, { diagonal, diagonal }
-        };
-        for (auto const& offset : offsets)
-        {
-            Gdiplus::GraphicsState state = graphics.Save();
-            graphics.TranslateTransform(offset[0], offset[1], Gdiplus::MatrixOrderAppend);
-            graphics.FillPath(&brush, &path);
-            graphics.Restore(state);
-        }
-    }
-
-    void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect, char const* pathData, COLORREF color)
-    {
-        DrawSelectionSvgIconFitted(graphics, rect, pathData, color, false);
+        graphics.FillPath(&brush, &path);
     }
 
     int SelectionToolbarActionAt(POINT pt)
