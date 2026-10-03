@@ -2387,6 +2387,47 @@ namespace
 
     constexpr int AnnotationPaletteDisplayOrder[] = { 3, 0, 1, 2, 4, 5 };
 
+    struct SessionAnnotationColor
+    {
+        int paletteIndex{};
+        bool hasCustomColor{};
+        COLORREF customColor{};
+    };
+
+    // These values intentionally live only for the current process. The PDF
+    // keeps each annotation's actual color, while new marks remember the last
+    // color used for their own annotation type until the application closes.
+    SessionAnnotationColor g_sessionAnnotationColors[12] = {
+        { 0, false, 0 }, { 3, false, 0 }, { 3, false, 0 }, { 3, false, 0 },
+        { 3, false, 0 }, { 3, false, 0 }, { 3, false, 0 }, { 3, false, 0 },
+        { 3, false, 0 }, { 3, false, 0 }, { 3, false, 0 }, { 3, false, 0 }
+    };
+
+    SessionAnnotationColor& SessionColorFor(AnnotationKind kind)
+    {
+        size_t index = static_cast<size_t>(kind);
+        if (index >= std::size(g_sessionAnnotationColors)) index = 0;
+        return g_sessionAnnotationColors[index];
+    }
+
+    void ApplySessionAnnotationColor(PdfAnnotation& annotation, AnnotationKind kind)
+    {
+        SessionAnnotationColor const& choice = SessionColorFor(kind);
+        annotation.colorIndex = std::clamp(choice.paletteIndex, 0,
+            static_cast<int>(std::size(AnnotationPalette)) - 1);
+        annotation.hasCustomColor = choice.hasCustomColor;
+        annotation.customColor = choice.customColor;
+    }
+
+    void RememberSessionAnnotationColor(PdfAnnotation const& annotation)
+    {
+        SessionAnnotationColor& choice = SessionColorFor(annotation.kind);
+        choice.paletteIndex = std::clamp(annotation.colorIndex, 0,
+            static_cast<int>(std::size(AnnotationPalette)) - 1);
+        choice.hasCustomColor = annotation.hasCustomColor;
+        choice.customColor = annotation.customColor;
+    }
+
     COLORREF AnnotationColor(PdfAnnotation const& annotation)
     {
         if (annotation.hasCustomColor) return annotation.customColor;
@@ -3486,7 +3527,8 @@ namespace
         char const* m_data{};
     };
 
-    void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect, char const* pathData, COLORREF color)
+    void DrawSelectionSvgIconFitted(Gdiplus::Graphics& graphics, RECT rect,
+        char const* pathData, COLORREF color, bool fitWidthOnly)
     {
         if (!pathData || IsRectEmpty(&rect)) return;
         Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
@@ -3498,8 +3540,12 @@ namespace
         Gdiplus::RectF bounds{};
         if (path.GetBounds(&bounds) != Gdiplus::Ok || bounds.Width <= 0.0f || bounds.Height <= 0.0f)
             return;
-        float size = static_cast<float>(std::max<LONG>(1, std::min(rect.right - rect.left, rect.bottom - rect.top) - S(17)));
-        float scale = size / std::max(bounds.Width, bounds.Height);
+        float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
+        float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
+        float scale = fitWidthOnly
+            ? width / bounds.Width
+            : std::max(1.0f, std::min(width, height) - static_cast<float>(S(17))) /
+                std::max(bounds.Width, bounds.Height);
         float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
         float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
         float translateX = centerX - (bounds.X + bounds.Width * 0.5f) * scale;
@@ -3508,6 +3554,28 @@ namespace
         path.Transform(&transform);
         Gdiplus::SolidBrush brush(GdiColor(color));
         graphics.FillPath(&brush, &path);
+    }
+
+    void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect, char const* pathData, COLORREF color)
+    {
+        DrawSelectionSvgIconFitted(graphics, rect, pathData, color, false);
+    }
+
+    int SelectionToolbarActionAt(POINT pt)
+    {
+        if (!g_selectionToolbarOpen) return -1;
+        for (size_t i = 0; i < g_selectionToolbarActionRects.size(); ++i)
+            if (Hit(g_selectionToolbarActionRects[i], pt.x, pt.y))
+                return static_cast<int>(i);
+        return -1;
+    }
+
+    wchar_t const* SelectionToolbarActionName(int index)
+    {
+        static wchar_t const* names[] = {
+            L"复制", L"高亮", L"下划线", L"波浪线", L"删除线"
+        };
+        return index >= 0 && index < static_cast<int>(std::size(names)) ? names[index] : L"";
     }
 
     void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line)
@@ -19888,6 +19956,7 @@ namespace
         g_annotationColorDialogAnchor = {};
         annotation.customColor = choose.rgbResult;
         annotation.hasCustomColor = true;
+        RememberSessionAnnotationColor(annotation);
         tab.dirty = true;
         SetTitle();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -19898,9 +19967,7 @@ namespace
     {
         if (!g_selectionToolbarOpen) return false;
         if (Hit(g_selectionToolbarRect, pt.x, pt.y)) return true;
-        for (RECT const& rect : g_selectionToolbarActionRects)
-            if (Hit(rect, pt.x, pt.y)) return true;
-        return false;
+        return SelectionToolbarActionAt(pt) >= 0;
     }
 
     bool SelectionToolbarBounds(PdfTab const& tab, RECT& bounds)
@@ -19985,7 +20052,22 @@ namespace
             bool hovered = Hit(buttonRect, g_mousePos.x, g_mousePos.y);
             if (hovered)
                 RoundFillAA(dc, buttonRect, S(6), MixColor(T().panel2, T().accent, 0.12), T().line);
-            DrawSelectionSvgIcon(graphics, buttonRect, icons[i], iconColor);
+            if (i == 3)
+            {
+                // The supplied squiggly SVG has a U glyph and a separate
+                // wave whose viewBox is wider. Fit both subpaths to the same
+                // horizontal bounds so the wave sits directly under the U.
+                RECT upper{ buttonRect.left + S(8), buttonRect.top + S(2),
+                    buttonRect.right - S(8), buttonRect.top + S(24) };
+                RECT wave{ buttonRect.left + S(8), buttonRect.top + S(23),
+                    buttonRect.right - S(8), buttonRect.bottom - S(2) };
+                DrawSelectionSvgIconFitted(graphics, upper,
+                    SelectionToolbarSvg::SquigglyUpper, iconColor, true);
+                DrawSelectionSvgIconFitted(graphics, wave,
+                    SelectionToolbarSvg::SquigglyWave, iconColor, true);
+            }
+            else
+                DrawSelectionSvgIcon(graphics, buttonRect, icons[i], iconColor);
             x += button + gap;
         }
     }
@@ -22523,7 +22605,7 @@ namespace
             annotation.x1 = std::max(r.x0, r.x1);
             annotation.y1 = std::max(r.y0, r.y1);
             annotation.kind = kind;
-            annotation.colorIndex = kind == AnnotationKind::Highlight ? 0 : 3;
+            ApplySessionAnnotationColor(annotation, kind);
             annotation.createdAt = NowMs();
             annotation.author = L"10726";
             annotation.text = selected.text;
@@ -22575,7 +22657,7 @@ namespace
         PdfAnnotation annotation;
         annotation.page = page;
         annotation.kind = kind;
-        annotation.colorIndex = 3;
+        ApplySessionAnnotationColor(annotation, kind);
         annotation.createdAt = NowMs();
         annotation.author = L"10726";
         annotation.x0 = std::clamp((std::min(a.x, b.x) - pageRect.left) / pageW, 0.0, 1.0);
@@ -25900,6 +25982,12 @@ namespace
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
+                if (g_selectionToolbarOpen && Hit(g_selectionToolbarRect, pt.x, pt.y))
+                {
+                    SetCursor(LoadCursorW(nullptr,
+                        SelectionToolbarActionAt(pt) >= 0 ? IDC_HAND : IDC_ARROW));
+                    return TRUE;
+                }
                 if (PdfTab* tab = Active())
                 {
                     int page = -1;
@@ -26236,7 +26324,20 @@ namespace
                     {
                         if (!Hit(g_selectionToolbarActionRects[i], x, y)) continue;
                         if (i == 0)
+                        {
                             CopyCurrentSelectionToClipboard(hwnd);
+                            g_selectionToolbarOpen = false;
+                            g_selectionToolbarRect = {};
+                            g_selectionToolbarActionRects.clear();
+                            g_hasHoverTip = false;
+                            g_hoverTip.clear();
+                            g_hoverTipRect = {};
+                            g_hoverTipPaintRect = {};
+                            g_hoverTipAnchor = POINT{};
+                            g_hoverTipAnchorValid = false;
+                            g_hoverTipIsPdfLink = false;
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                        }
                         else if (i == 1)
                             AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
                         else if (i == 2)
@@ -26276,6 +26377,7 @@ namespace
                         {
                             annotation->colorIndex = AnnotationPaletteDisplayOrder[i];
                             annotation->hasCustomColor = false;
+                            RememberSessionAnnotationColor(*annotation);
                             tab->dirty = true;
                             SetTitle();
                             InvalidateRect(hwnd, nullptr, FALSE);
@@ -27404,6 +27506,16 @@ namespace
                     g_hoverTip = b.tip;
                     g_hoverTipRect = b.rect;
                     break;
+                }
+            }
+            if (!favoriteOverlayHit)
+            {
+                int selectionAction = SelectionToolbarActionAt(newMousePos);
+                if (selectionAction >= 0)
+                {
+                    g_hasHoverTip = true;
+                    g_hoverTip = SelectionToolbarActionName(selectionAction);
+                    g_hoverTipRect = g_selectionToolbarActionRects[static_cast<size_t>(selectionAction)];
                 }
             }
             if (hadTip != g_hasHoverTip || oldTip != g_hoverTip ||
