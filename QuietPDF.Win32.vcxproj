@@ -87,6 +87,7 @@
 
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClInclude Include="src\selection_toolbar_icons.h" />
   </ItemGroup>
 
   <ItemGroup>

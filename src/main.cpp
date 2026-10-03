@@ -43,6 +43,7 @@
 
 #include "resource.h"
 #include "..\version.h"
+#include "selection_toolbar_icons.h"
 
 namespace
 {
@@ -3526,112 +3527,79 @@ namespace
         char const* m_data{};
     };
 
-    void DrawSelectionToolbarIcon(Gdiplus::Graphics& graphics, RECT rect, int index, COLORREF color)
+    void DrawSelectionSvgPath(Gdiplus::Graphics& graphics, RECT rect,
+        char const* pathData, COLORREF color, float viewBoxWidth = 1024.0f,
+        float viewBoxHeight = 1024.0f)
     {
-        if (IsRectEmpty(&rect) || index < 0 || index > 4) return;
+        if (!pathData || IsRectEmpty(&rect)) return;
+        Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
+        SvgPathReader reader(pathData);
+        if (!reader.Read(path)) return;
+        float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
+        float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
+        float iconSize = std::max(1.0f, std::min(width, height) - static_cast<float>(S(16)));
+        float scale = iconSize / std::max(viewBoxWidth, viewBoxHeight);
+        float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
+        float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
+        Gdiplus::Matrix transform(
+            scale, 0.0f, 0.0f, scale,
+            centerX - viewBoxWidth * 0.5f * scale,
+            centerY - viewBoxHeight * 0.5f * scale);
+        path.Transform(&transform);
+        Gdiplus::SolidBrush brush(GdiColor(color));
+        graphics.FillPath(&brush, &path);
+    }
 
-        // All five marks use one 24x24 coordinate system and one rounded pen.
-        // This keeps their optical size, line weight, caps and joins stable
-        // while preserving the recognizable silhouettes from the reference.
-        float iconSize = static_cast<float>(S(24));
-        float unit = iconSize / 24.0f;
-        float originX = (static_cast<float>(rect.left) + static_cast<float>(rect.right) - iconSize) * 0.5f;
-        float originY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom) - iconSize) * 0.5f;
+    void DrawSelectionWave(Gdiplus::Graphics& graphics, RECT rect, COLORREF color)
+    {
+        float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
+        float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
+        float iconSize = std::max(1.0f, std::min(width, height) - static_cast<float>(S(16)));
+        float scale = iconSize / 1024.0f;
+        float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
+        float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
         auto point = [&](float x, float y)
         {
-            return Gdiplus::PointF(originX + x * unit, originY + y * unit);
+            return Gdiplus::PointF(
+                centerX + (x - 512.0f) * scale,
+                centerY + (y - 512.0f) * scale);
         };
-        auto roundRect = [&](float x, float y, float width, float height, float radius)
-        {
-            Gdiplus::RectF bounds(originX + x * unit, originY + y * unit,
-                width * unit, height * unit);
-            Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.0f, S(1.25f)));
-            pen.SetLineJoin(Gdiplus::LineJoinRound);
-            DrawGdiRoundRect(graphics, pen, bounds, radius * unit);
-        };
-
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.0f, S(1.25f)));
+        Gdiplus::GraphicsPath wave;
+        wave.StartFigure();
+        wave.AddBezier(point(244.0f, 900.0f), point(290.0f, 862.0f),
+            point(336.0f, 862.0f), point(382.0f, 900.0f));
+        wave.AddBezier(point(382.0f, 900.0f), point(428.0f, 938.0f),
+            point(474.0f, 938.0f), point(520.0f, 900.0f));
+        wave.AddBezier(point(520.0f, 900.0f), point(566.0f, 862.0f),
+            point(612.0f, 862.0f), point(658.0f, 900.0f));
+        wave.AddBezier(point(658.0f, 900.0f), point(704.0f, 938.0f),
+            point(750.0f, 938.0f), point(796.0f, 900.0f));
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.0f, 69.818182f * scale));
         pen.SetStartCap(Gdiplus::LineCapRound);
         pen.SetEndCap(Gdiplus::LineCapRound);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
+        graphics.DrawPath(&pen, &wave);
+    }
+
+    void DrawSelectionToolbarIcon(Gdiplus::Graphics& graphics, RECT rect, int index, COLORREF color)
+    {
+        if (IsRectEmpty(&rect) || index < 0 || index > 4) return;
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
         graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
-
         if (index == 0)
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Copy, color);
+        else if (index == 1)
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color);
+        else if (index == 2)
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Underline, color);
+        else if (index == 3)
         {
-            roundRect(3.5f, 3.0f, 12.5f, 12.5f, 1.6f);
-            roundRect(8.0f, 7.5f, 12.5f, 12.5f, 1.6f);
-            return;
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::UnderlineU, color);
+            DrawSelectionWave(graphics, rect, color);
         }
-
-        if (index == 1)
-        {
-            Gdiplus::GraphicsPath pencil;
-            pencil.StartFigure();
-            pencil.AddLine(point(4.0f, 19.0f), point(5.0f, 14.0f));
-            pencil.AddLine(point(17.0f, 2.0f), point(22.0f, 7.0f));
-            pencil.AddLine(point(10.0f, 19.0f), point(4.0f, 19.0f));
-            pencil.CloseFigure();
-            graphics.DrawPath(&pen, &pencil);
-            graphics.DrawLine(&pen, point(5.0f, 14.0f), point(10.0f, 19.0f));
-            graphics.DrawLine(&pen, point(16.5f, 2.5f), point(21.5f, 7.5f));
-            return;
-        }
-
-        auto addU = [&](Gdiplus::GraphicsPath& path, float bottom)
-        {
-            path.StartFigure();
-            path.AddLine(point(4.0f, 3.0f), point(4.0f, bottom - 4.0f));
-            path.AddBezier(point(4.0f, bottom - 4.0f), point(4.0f, bottom),
-                point(8.0f, bottom), point(12.0f, bottom));
-            path.AddBezier(point(12.0f, bottom), point(16.0f, bottom),
-                point(20.0f, bottom), point(20.0f, bottom - 4.0f));
-            path.AddLine(point(20.0f, bottom - 4.0f), point(20.0f, 3.0f));
-        };
-
-        if (index == 2)
-        {
-            Gdiplus::GraphicsPath underline;
-            addU(underline, 17.0f);
-            graphics.DrawPath(&pen, &underline);
-            graphics.DrawLine(&pen, point(3.0f, 21.0f), point(21.0f, 21.0f));
-            return;
-        }
-
-        if (index == 3)
-        {
-            Gdiplus::GraphicsPath squiggly;
-            addU(squiggly, 14.0f);
-            graphics.DrawPath(&pen, &squiggly);
-            Gdiplus::GraphicsPath wave;
-            wave.StartFigure();
-            wave.AddBezier(point(4.0f, 16.5f), point(6.0f, 15.2f),
-                point(8.0f, 15.2f), point(10.0f, 16.5f));
-            wave.AddBezier(point(10.0f, 16.5f), point(12.0f, 17.8f),
-                point(14.0f, 17.8f), point(16.0f, 16.5f));
-            wave.AddBezier(point(16.0f, 16.5f), point(18.0f, 15.2f),
-                point(20.0f, 15.2f), point(22.0f, 16.5f));
-            graphics.DrawPath(&pen, &wave);
-            return;
-        }
-
-        Gdiplus::GraphicsPath strikeout;
-        strikeout.StartFigure();
-        strikeout.AddBezier(point(19.0f, 7.0f), point(19.0f, 4.5f),
-            point(16.5f, 3.0f), point(12.5f, 3.0f));
-        strikeout.AddBezier(point(8.0f, 3.0f), point(5.0f, 5.0f),
-            point(5.0f, 8.0f), point(5.0f, 10.0f));
-        strikeout.AddBezier(point(5.0f, 12.0f), point(7.5f, 13.0f),
-            point(12.0f, 14.0f), point(15.0f, 15.0f));
-        strikeout.AddBezier(point(18.0f, 16.0f), point(19.0f, 17.0f),
-            point(19.0f, 18.5f), point(19.0f, 19.0f));
-        strikeout.AddBezier(point(19.0f, 20.5f), point(16.5f, 21.0f),
-            point(12.0f, 21.0f), point(8.0f, 21.0f));
-        strikeout.AddBezier(point(6.0f, 21.0f), point(4.5f, 19.5f),
-            point(4.0f, 17.0f), point(4.0f, 16.0f));
-        graphics.DrawPath(&pen, &strikeout);
-        graphics.DrawLine(&pen, point(3.0f, 12.0f), point(21.0f, 12.0f));
+        else
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Strikeout, color);
     }
 
     int SelectionToolbarActionAt(POINT pt)
@@ -20107,7 +20075,7 @@ namespace
         int gap = S(4);
         int x = left + S(8);
         int y = top + (height - button) / 2;
-        COLORREF iconColor = IsDarkTheme() ? T().text : RGB(112, 112, 112);
+        COLORREF iconColor = IsDarkTheme() ? T().text : RGB(138, 138, 138);
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
