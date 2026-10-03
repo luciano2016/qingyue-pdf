@@ -22204,6 +22204,7 @@ namespace
             { L"Ctrl + F", L"打开搜索" },
             { L"Ctrl + H", L"为选中文本添加高亮" },
             { L"Ctrl + U", L"为选中文本添加下划线" },
+            { L"Ctrl + G", L"为选中文本添加波浪线" },
             { L"Ctrl + K", L"为选中文本添加删除线" }
         };
         ShortcutGroup groups[] = {
@@ -22474,7 +22475,7 @@ namespace
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, withShortcuts ? L"\u9ad8\u4eae\tCtrl + H" : L"\u9ad8\u4eae");
             AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
-            AppendThemedMenuItem(menu, 2506, withShortcuts ? L"\u6ce2\u6d6a\u7ebf" : L"\u6ce2\u6d6a\u7ebf");
+            AppendThemedMenuItem(menu, 2506, withShortcuts ? L"\u6ce2\u6d6a\u7ebf\tCtrl + G" : L"\u6ce2\u6d6a\u7ebf");
             AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u7ebf");
             AppendThemedMenuSeparator(menu);
             PopulateThemedAnnotationMenuItems();
@@ -28492,6 +28493,11 @@ namespace
                     if (wParam == 'U')
                     {
                         AddAnnotationFromSelection(hwnd, AnnotationKind::Underline);
+                        return 0;
+                    }
+                    if (wParam == 'G')
+                    {
+                        AddAnnotationFromSelection(hwnd, AnnotationKind::Squiggly);
                         return 0;
                     }
                     if (wParam == 'K')
