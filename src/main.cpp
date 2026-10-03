@@ -20058,7 +20058,13 @@ namespace
             return;
 
         RECT selectionBounds{};
-        if (!SelectionToolbarBounds(tab, selectionBounds)) return;
+        if (!SelectionToolbarBounds(tab, selectionBounds))
+        {
+            // Keep the selection itself intact, but do not leave its floating
+            // actions visible after the selected text has scrolled away.
+            g_selectionToolbarOpen = false;
+            return;
+        }
 
         int button = S(31);
         int gap = S(4);
@@ -20176,12 +20182,27 @@ namespace
         if (!PageRectForPage(tab, annotation->page, pageRect)) return;
         RECT mark = DenormalizeAnnotationRect(*annotation, pageRect);
         g_annotationHitRect = mark;
+        RECT visibleMark{};
+        if (!IntersectRect(&visibleMark, &mark, &g_stage))
+        {
+            // The annotation popup follows the mark. Once the mark is fully
+            // outside the reader viewport, hide the popup instead of clamping
+            // it to an unrelated edge of the window.
+            g_annotationToolbarOpen = false;
+            g_annotationNoteOpen = false;
+            g_annotationNoteFocused = false;
+            g_annotationPopupAnchor = POINT{};
+            g_annotationPopupAnchorValid = false;
+            if (g_annotationNoteEdit) ShowWindow(g_annotationNoteEdit, SW_HIDE);
+            return;
+        }
 
         int width = S(312);
         int height = S(42);
-        int anchorX = g_annotationPopupAnchorValid ? g_annotationPopupAnchor.x : static_cast<int>(mark.left);
-        int anchorY = g_annotationPopupAnchorValid ? g_annotationPopupAnchor.y : static_cast<int>(mark.top);
-        int left = g_annotationPopupAnchorValid ? anchorX - width / 2 : static_cast<int>(mark.left);
+        bool usePopupAnchor = g_annotationPopupAnchorValid;
+        int anchorX = usePopupAnchor ? g_annotationPopupAnchor.x : static_cast<int>(mark.left);
+        int anchorY = usePopupAnchor ? g_annotationPopupAnchor.y : static_cast<int>(mark.top);
+        int left = usePopupAnchor ? anchorX - width / 2 : static_cast<int>(mark.left);
         left = std::clamp<int>(left, static_cast<int>(g_stage.left + S(10)),
             std::max<int>(static_cast<int>(g_stage.left + S(10)), static_cast<int>(g_stage.right - width - S(10))));
         int top = anchorY - height - S(10);
@@ -20210,6 +20231,11 @@ namespace
         top = std::clamp<int>(top, static_cast<int>(g_stage.top + S(8)),
             std::max<int>(static_cast<int>(g_stage.top + S(8)), static_cast<int>(g_stage.bottom - height - S(8))));
         g_annotationToolbarRect = RECT{ left, top, left + width, top + height };
+        // The click point is only for the first placement. Subsequent paints
+        // derive the position from the mark, so scrolling carries the popup
+        // with the annotation instead of leaving it at an old screen point.
+        g_annotationPopupAnchor = POINT{};
+        g_annotationPopupAnchorValid = false;
 
         BlurRoundedBackdrop(dc, g_annotationToolbarRect, S(11.0f));
         DrawRoundedShadow(dc, g_annotationToolbarRect, S(11.0f), S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
@@ -23223,6 +23249,12 @@ namespace
             g_scrollX = std::clamp(g_scrollX, 0, std::max<int>(0, g_contentWidth - std::max<int>(1, g_stage.right - g_stage.left)));
             UpdateVertScrollBar(hwnd);
         }
+
+        // The old anchor is a client-space point from before the PDF handles
+        // were reopened. Re-anchor to the annotation geometry on the next
+        // paint so changing a color cannot move the popup to a stale position.
+        g_annotationPopupAnchor = POINT{};
+        g_annotationPopupAnchorValid = false;
 
         for (auto& annotation : tab.annotations) annotation.persisted = true;
         tab.dirty = false;
@@ -26363,13 +26395,25 @@ namespace
                             InvalidateRect(hwnd, nullptr, FALSE);
                         }
                         else if (i == 1)
+                        {
                             AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
+                            ClearAnnotationFocus();
+                        }
                         else if (i == 2)
+                        {
                             AddAnnotationFromSelection(hwnd, AnnotationKind::Underline);
+                            ClearAnnotationFocus();
+                        }
                         else if (i == 3)
+                        {
                             AddAnnotationFromSelection(hwnd, AnnotationKind::Squiggly);
+                            ClearAnnotationFocus();
+                        }
                         else if (i == 4)
+                        {
                             AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout);
+                            ClearAnnotationFocus();
+                        }
                         return 0;
                     }
                     return 0;

@@ -2,6 +2,11 @@
 
 本项目的公开版本变更记录从 0.8.6 开始维护。
 
+## [1.9.5] - 2026-10-04
+- Keep selection and annotation toolbars attached to visible document content.
+- Prevent selection quick actions from reopening the annotation color toolbar.
+- Re-anchor annotation controls after saving and reopening the PDF.
+
 ## [1.9.4] - 2026-10-04
 
 - 为文字选区右键菜单增加“波浪线 · Ctrl + G”快捷键。
