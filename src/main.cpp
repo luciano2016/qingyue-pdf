@@ -43,7 +43,6 @@
 
 #include "resource.h"
 #include "..\version.h"
-#include "selection_toolbar_icons.h"
 
 namespace
 {
@@ -3527,35 +3526,112 @@ namespace
         char const* m_data{};
     };
 
-    void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect,
-        char const* pathData, COLORREF color, float fitX = 1.0f, float fitY = 1.0f)
+    void DrawSelectionToolbarIcon(Gdiplus::Graphics& graphics, RECT rect, int index, COLORREF color)
     {
-        if (!pathData || IsRectEmpty(&rect)) return;
-        Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
-        SvgPathReader reader(pathData);
-        if (!reader.Read(path)) return;
+        if (IsRectEmpty(&rect) || index < 0 || index > 4) return;
 
-        // Keep each supplied SVG path intact, but normalize its visible
-        // footprint. The source files use different amounts of viewBox
-        // whitespace, so a shared viewBox alone makes the U too narrow and
-        // the S too wide beside the other four icons.
-        Gdiplus::RectF bounds{};
-        if (path.GetBounds(&bounds) != Gdiplus::Ok || bounds.Width <= 0.0f || bounds.Height <= 0.0f)
+        // All five marks use one 24x24 coordinate system and one rounded pen.
+        // This keeps their optical size, line weight, caps and joins stable
+        // while preserving the recognizable silhouettes from the reference.
+        float iconSize = static_cast<float>(S(24));
+        float unit = iconSize / 24.0f;
+        float originX = (static_cast<float>(rect.left) + static_cast<float>(rect.right) - iconSize) * 0.5f;
+        float originY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom) - iconSize) * 0.5f;
+        auto point = [&](float x, float y)
+        {
+            return Gdiplus::PointF(originX + x * unit, originY + y * unit);
+        };
+        auto roundRect = [&](float x, float y, float width, float height, float radius)
+        {
+            Gdiplus::RectF bounds(originX + x * unit, originY + y * unit,
+                width * unit, height * unit);
+            Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.0f, S(1.25f)));
+            pen.SetLineJoin(Gdiplus::LineJoinRound);
+            DrawGdiRoundRect(graphics, pen, bounds, radius * unit);
+        };
+
+        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.0f, S(1.25f)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+
+        if (index == 0)
+        {
+            roundRect(3.5f, 3.0f, 12.5f, 12.5f, 1.6f);
+            roundRect(8.0f, 7.5f, 12.5f, 12.5f, 1.6f);
             return;
-        float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
-        float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
-        float iconSize = std::max(1.0f, std::min(width, height) - static_cast<float>(S(17)));
-        float scale = iconSize / std::max(bounds.Width, bounds.Height);
-        float scaleX = scale * fitX;
-        float scaleY = scale * fitY;
-        float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
-        float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
-        float translateX = centerX - (bounds.X + bounds.Width * 0.5f) * scaleX;
-        float translateY = centerY - (bounds.Y + bounds.Height * 0.5f) * scaleY;
-        Gdiplus::Matrix transform(scaleX, 0.0f, 0.0f, scaleY, translateX, translateY);
-        path.Transform(&transform);
-        Gdiplus::SolidBrush brush(GdiColor(color));
-        graphics.FillPath(&brush, &path);
+        }
+
+        if (index == 1)
+        {
+            Gdiplus::GraphicsPath pencil;
+            pencil.StartFigure();
+            pencil.AddLine(point(4.0f, 19.0f), point(5.0f, 14.0f));
+            pencil.AddLine(point(17.0f, 2.0f), point(22.0f, 7.0f));
+            pencil.AddLine(point(10.0f, 19.0f), point(4.0f, 19.0f));
+            pencil.CloseFigure();
+            graphics.DrawPath(&pen, &pencil);
+            graphics.DrawLine(&pen, point(5.0f, 14.0f), point(10.0f, 19.0f));
+            graphics.DrawLine(&pen, point(16.5f, 2.5f), point(21.5f, 7.5f));
+            return;
+        }
+
+        auto addU = [&](Gdiplus::GraphicsPath& path, float bottom)
+        {
+            path.StartFigure();
+            path.AddLine(point(4.0f, 3.0f), point(4.0f, bottom - 4.0f));
+            path.AddBezier(point(4.0f, bottom - 4.0f), point(4.0f, bottom),
+                point(8.0f, bottom), point(12.0f, bottom));
+            path.AddBezier(point(12.0f, bottom), point(16.0f, bottom),
+                point(20.0f, bottom), point(20.0f, bottom - 4.0f));
+            path.AddLine(point(20.0f, bottom - 4.0f), point(20.0f, 3.0f));
+        };
+
+        if (index == 2)
+        {
+            Gdiplus::GraphicsPath underline;
+            addU(underline, 17.0f);
+            graphics.DrawPath(&pen, &underline);
+            graphics.DrawLine(&pen, point(3.0f, 21.0f), point(21.0f, 21.0f));
+            return;
+        }
+
+        if (index == 3)
+        {
+            Gdiplus::GraphicsPath squiggly;
+            addU(squiggly, 14.0f);
+            graphics.DrawPath(&pen, &squiggly);
+            Gdiplus::GraphicsPath wave;
+            wave.StartFigure();
+            wave.AddBezier(point(4.0f, 16.5f), point(6.0f, 15.2f),
+                point(8.0f, 15.2f), point(10.0f, 16.5f));
+            wave.AddBezier(point(10.0f, 16.5f), point(12.0f, 17.8f),
+                point(14.0f, 17.8f), point(16.0f, 16.5f));
+            wave.AddBezier(point(16.0f, 16.5f), point(18.0f, 15.2f),
+                point(20.0f, 15.2f), point(22.0f, 16.5f));
+            graphics.DrawPath(&pen, &wave);
+            return;
+        }
+
+        Gdiplus::GraphicsPath strikeout;
+        strikeout.StartFigure();
+        strikeout.AddBezier(point(19.0f, 7.0f), point(19.0f, 4.5f),
+            point(16.5f, 3.0f), point(12.5f, 3.0f));
+        strikeout.AddBezier(point(8.0f, 3.0f), point(5.0f, 5.0f),
+            point(5.0f, 8.0f), point(5.0f, 10.0f));
+        strikeout.AddBezier(point(5.0f, 12.0f), point(7.5f, 13.0f),
+            point(12.0f, 14.0f), point(15.0f, 15.0f));
+        strikeout.AddBezier(point(18.0f, 16.0f), point(19.0f, 17.0f),
+            point(19.0f, 18.5f), point(19.0f, 19.0f));
+        strikeout.AddBezier(point(19.0f, 20.5f), point(16.5f, 21.0f),
+            point(12.0f, 21.0f), point(8.0f, 21.0f));
+        strikeout.AddBezier(point(6.0f, 21.0f), point(4.5f, 19.5f),
+            point(4.0f, 17.0f), point(4.0f, 16.0f));
+        graphics.DrawPath(&pen, &strikeout);
+        graphics.DrawLine(&pen, point(3.0f, 12.0f), point(21.0f, 12.0f));
     }
 
     int SelectionToolbarActionAt(POINT pt)
@@ -20032,18 +20108,6 @@ namespace
         int x = left + S(8);
         int y = top + (height - button) / 2;
         COLORREF iconColor = IsDarkTheme() ? T().text : RGB(112, 112, 112);
-        char const* icons[] = {
-            SelectionToolbarSvg::Copy,
-            SelectionToolbarSvg::Highlight,
-            SelectionToolbarSvg::Underline,
-            SelectionToolbarSvg::Squiggly,
-            SelectionToolbarSvg::Strikeout
-        };
-        // The values are fixed optical corrections, not runtime guesses. They
-        // compensate for the different whitespace/aspect ratios in the source
-        // SVG viewBoxes while leaving every path itself unchanged.
-        float fitX[] = { 1.10f, 0.98f, 1.22f, 0.92f, 0.98f };
-        float fitY[] = { 1.06f, 0.96f, 1.12f, 0.94f, 0.96f };
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
@@ -20054,7 +20118,7 @@ namespace
             bool hovered = Hit(buttonRect, g_mousePos.x, g_mousePos.y);
             if (hovered)
                 RoundFillAA(dc, buttonRect, S(6), MixColor(T().panel2, T().accent, 0.12), T().line);
-            DrawSelectionSvgIcon(graphics, buttonRect, icons[i], iconColor, fitX[i], fitY[i]);
+            DrawSelectionToolbarIcon(graphics, buttonRect, i, iconColor);
             x += button + gap;
         }
     }
