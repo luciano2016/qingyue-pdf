@@ -43,7 +43,6 @@
 
 #include "resource.h"
 #include "..\version.h"
-#include "selection_toolbar_icons.h"
 
 namespace
 {
@@ -3600,6 +3599,120 @@ namespace
             L"复制", L"高亮", L"下划线", L"波浪线", L"删除线"
         };
         return index >= 0 && index < static_cast<int>(std::size(names)) ? names[index] : L"";
+    }
+
+    void DrawSelectionToolbarIcon(Gdiplus::Graphics& graphics, RECT rect, int index, COLORREF color)
+    {
+        if (IsRectEmpty(&rect) || index < 0 || index > 4) return;
+
+        // All five marks share one 24x24 coordinate system and one pen. This
+        // removes the visual differences caused by fitting unrelated SVG
+        // viewBoxes and makes the icon density deterministic at every DPI.
+        float iconSize = S(24.0f);
+        float unit = iconSize / 24.0f;
+        float originX = (static_cast<float>(rect.left) + static_cast<float>(rect.right) - iconSize) * 0.5f;
+        float originY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom) - iconSize) * 0.5f;
+        auto point = [&](float x, float y)
+        {
+            return Gdiplus::PointF(originX + x * unit, originY + y * unit);
+        };
+
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        Gdiplus::Pen pen(GdiColor(color), S(1.8f));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+
+        auto drawRoundedRect = [&](float left, float top, float width, float height, float radius)
+        {
+            DrawGdiRoundRect(graphics, pen,
+                Gdiplus::RectF(originX + left * unit, originY + top * unit,
+                    width * unit, height * unit), radius * unit);
+        };
+        auto drawLine = [&](Gdiplus::PointF a, Gdiplus::PointF b)
+        {
+            graphics.DrawLine(&pen, a, b);
+        };
+
+        if (index == 0)
+        {
+            drawRoundedRect(3.0f, 3.0f, 13.0f, 13.0f, 1.8f);
+            drawRoundedRect(8.0f, 8.0f, 13.0f, 13.0f, 1.8f);
+            return;
+        }
+
+        if (index == 1)
+        {
+            Gdiplus::GraphicsPath pencil;
+            pencil.StartFigure();
+            pencil.AddLine(point(4.0f, 19.0f), point(5.0f, 14.0f));
+            pencil.AddLine(point(17.0f, 2.0f), point(22.0f, 7.0f));
+            pencil.AddLine(point(10.0f, 19.0f), point(4.0f, 19.0f));
+            pencil.CloseFigure();
+            graphics.DrawPath(&pen, &pencil);
+            drawLine(point(5.0f, 14.0f), point(10.0f, 19.0f));
+            drawLine(point(16.5f, 2.5f), point(21.5f, 7.5f));
+            return;
+        }
+
+        auto addU = [&](Gdiplus::GraphicsPath& path, float bottom)
+        {
+            path.StartFigure();
+            path.AddLine(point(4.0f, 3.0f), point(4.0f, bottom - 4.0f));
+            path.AddBezier(point(4.0f, bottom - 4.0f), point(4.0f, bottom),
+                point(8.0f, bottom), point(12.0f, bottom));
+            path.AddBezier(point(12.0f, bottom), point(16.0f, bottom),
+                point(20.0f, bottom), point(20.0f, bottom - 4.0f));
+            path.AddLine(point(20.0f, bottom - 4.0f), point(20.0f, 3.0f));
+        };
+
+        if (index == 2)
+        {
+            Gdiplus::GraphicsPath underline;
+            addU(underline, 17.0f);
+            graphics.DrawPath(&pen, &underline);
+            drawLine(point(3.0f, 21.0f), point(21.0f, 21.0f));
+            return;
+        }
+
+        if (index == 3)
+        {
+            Gdiplus::GraphicsPath squiggly;
+            addU(squiggly, 14.5f);
+            graphics.DrawPath(&pen, &squiggly);
+
+            // The wave is deliberately close to the U, with the same left
+            // and right bounds. Its small gap remains visible at 100% DPI.
+            Gdiplus::GraphicsPath wave;
+            wave.StartFigure();
+            wave.AddBezier(point(4.0f, 17.1f), point(6.0f, 15.8f),
+                point(8.0f, 15.8f), point(10.0f, 17.1f));
+            wave.AddBezier(point(10.0f, 17.1f), point(12.0f, 18.4f),
+                point(14.0f, 18.4f), point(16.0f, 17.1f));
+            wave.AddBezier(point(16.0f, 17.1f), point(18.0f, 15.8f),
+                point(20.0f, 15.8f), point(22.0f, 17.1f));
+            graphics.DrawPath(&pen, &wave);
+            return;
+        }
+
+        Gdiplus::GraphicsPath strikeout;
+        strikeout.StartFigure();
+        strikeout.AddBezier(point(19.0f, 7.0f), point(19.0f, 4.5f),
+            point(16.5f, 3.0f), point(12.5f, 3.0f));
+        strikeout.AddBezier(point(8.0f, 3.0f), point(5.0f, 5.0f),
+            point(5.0f, 8.0f), point(5.0f, 10.0f));
+        strikeout.AddBezier(point(5.0f, 12.0f), point(7.5f, 13.0f),
+            point(12.0f, 14.0f), point(15.0f, 15.0f));
+        strikeout.AddBezier(point(18.0f, 16.0f), point(19.0f, 17.0f),
+            point(19.0f, 18.5f), point(19.0f, 19.0f));
+        strikeout.AddBezier(point(19.0f, 20.5f), point(16.5f, 21.0f),
+            point(12.0f, 21.0f), point(8.0f, 21.0f));
+        strikeout.AddBezier(point(6.0f, 21.0f), point(4.5f, 19.5f),
+            point(4.0f, 17.0f), point(4.0f, 16.0f));
+        graphics.DrawPath(&pen, &strikeout);
+        drawLine(point(3.0f, 12.0f), point(21.0f, 12.0f));
     }
 
     void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line)
@@ -20059,13 +20172,6 @@ namespace
         int x = left + S(8);
         int y = top + (height - button) / 2;
         COLORREF iconColor = IsDarkTheme() ? T().text : RGB(56, 61, 68);
-        char const* icons[] = {
-            SelectionToolbarSvg::Copy,
-            SelectionToolbarSvg::Highlight,
-            SelectionToolbarSvg::Underline,
-            SelectionToolbarSvg::Squiggly,
-            SelectionToolbarSvg::Strikeout
-        };
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
@@ -20076,25 +20182,7 @@ namespace
             bool hovered = Hit(buttonRect, g_mousePos.x, g_mousePos.y);
             if (hovered)
                 RoundFillAA(dc, buttonRect, S(6), MixColor(T().panel2, T().accent, 0.12), T().line);
-            if (i == 3)
-            {
-                // The supplied squiggly SVG has a U glyph and a separate
-                // wave whose viewBox is wider. Fit both subpaths to the same
-                // horizontal bounds so the wave sits directly under the U.
-                RECT upper{ buttonRect.left + S(10), buttonRect.top + S(3),
-                    buttonRect.right - S(10), buttonRect.top + S(23) };
-                RECT wave{ buttonRect.left + S(10), buttonRect.top + S(23),
-                    buttonRect.right - S(10), buttonRect.bottom - S(3) };
-                DrawSelectionSvgIconFitted(graphics, upper,
-                    SelectionToolbarSvg::SquigglyUpper, iconColor, true);
-                DrawSelectionSvgIconFitted(graphics, wave,
-                    SelectionToolbarSvg::SquigglyWave, iconColor, true);
-            }
-            else if (i == 0)
-                DrawSelectionSvgIconFitted(graphics, buttonRect, icons[i], iconColor,
-                    false, S(0.25f));
-            else
-                DrawSelectionSvgIcon(graphics, buttonRect, icons[i], iconColor);
+            DrawSelectionToolbarIcon(graphics, buttonRect, i, iconColor);
             x += button + gap;
         }
     }
