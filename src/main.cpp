@@ -3529,7 +3529,7 @@ namespace
 
     void DrawSelectionSvgPath(Gdiplus::Graphics& graphics, RECT rect,
         char const* pathData, COLORREF color, float viewBoxWidth = 1024.0f,
-        float viewBoxHeight = 1024.0f)
+        float viewBoxHeight = 1024.0f, float scaleMultiplier = 1.0f)
     {
         if (!pathData || IsRectEmpty(&rect)) return;
         Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
@@ -3538,7 +3538,7 @@ namespace
         float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
         float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
         float iconSize = std::max(1.0f, std::min(width, height) - static_cast<float>(S(16)));
-        float scale = iconSize / std::max(viewBoxWidth, viewBoxHeight);
+        float scale = iconSize / std::max(viewBoxWidth, viewBoxHeight) * scaleMultiplier;
         float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
         float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
         Gdiplus::Matrix transform(
@@ -3590,7 +3590,7 @@ namespace
         if (index == 0)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Copy, color);
         else if (index == 1)
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color, 1024.0f, 1024.0f, 0.90f);
         else if (index == 2)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Underline, color);
         else if (index == 3)
@@ -6197,15 +6197,20 @@ namespace
             : (g_hoverTipRect.left + g_hoverTipRect.right) / 2;
         int x = anchorX - w / 2;
         x = std::clamp<int>(x, S(8), std::max<int>(S(8), static_cast<int>(client.right) - w - S(8)));
+        RECT selectionTipIntersection{};
+        bool selectionToolbarTip = g_selectionToolbarOpen &&
+            IntersectRect(&selectionTipIntersection, &g_hoverTipRect, &g_selectionToolbarRect);
         int y = g_hoverTipIsPdfLink && g_hoverTipAnchorValid
             ? g_hoverTipAnchor.y + S(14)
-            : (g_hoverTipIsPdfLink ? g_hoverTipRect.bottom + S(6) : g_hoverTipRect.top - h - S(9));
+            : (g_hoverTipIsPdfLink ? g_hoverTipRect.bottom + S(6)
+                : (selectionToolbarTip ? g_selectionToolbarRect.top - h - S(1)
+                    : g_hoverTipRect.top - h - S(9)));
         if (g_hoverTipIsPdfLink && y + h > client.bottom - S(8))
             y = g_hoverTipAnchorValid
                 ? g_hoverTipAnchor.y - h - S(14)
                 : g_hoverTipRect.top - h - S(6);
         else if (!g_hoverTipIsPdfLink && y < S(8))
-            y = g_hoverTipRect.bottom + S(9);
+            y = selectionToolbarTip ? g_selectionToolbarRect.bottom + S(1) : g_hoverTipRect.bottom + S(9);
         y = std::clamp<int>(y, S(8), static_cast<int>(client.bottom) - h - S(8));
         RECT box{ x, y, x + w, y + h };
         // Keep the actual painted bounds separate from the button/link anchor.
