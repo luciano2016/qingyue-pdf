@@ -3492,13 +3492,21 @@ namespace
         Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
         SvgPathReader reader(pathData);
         if (!reader.Read(path)) return;
+        // The supplied SVGs use the same 1024px viewBox but different path
+        // bounds. Normalize the visible geometry so its optical footprint is
+        // consistent instead of aligning only the invisible viewBox.
+        Gdiplus::RectF bounds{};
+        if (path.GetBounds(&bounds) != Gdiplus::Ok || bounds.Width <= 0.0f || bounds.Height <= 0.0f)
+            return;
         float size = static_cast<float>(std::max<LONG>(1, std::min(rect.right - rect.left, rect.bottom - rect.top) - S(9)));
-        float left = static_cast<float>(rect.left) + (static_cast<float>(rect.right - rect.left) - size) * 0.5f;
-        float top = static_cast<float>(rect.top) + (static_cast<float>(rect.bottom - rect.top) - size) * 0.5f;
-        float scale = size / 1024.0f;
-        Gdiplus::Matrix transform(scale, 0.0f, 0.0f, scale, left, top);
+        float scale = size / std::max(bounds.Width, bounds.Height);
+        float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
+        float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
+        float translateX = centerX - (bounds.X + bounds.Width * 0.5f) * scale;
+        float translateY = centerY - (bounds.Y + bounds.Height * 0.5f) * scale;
+        Gdiplus::Matrix transform(scale, 0.0f, 0.0f, scale, translateX, translateY);
         path.Transform(&transform);
-        Gdiplus::SolidBrush brush(GdiColor(color, 238));
+        Gdiplus::SolidBrush brush(GdiColor(color));
         graphics.FillPath(&brush, &path);
     }
 
