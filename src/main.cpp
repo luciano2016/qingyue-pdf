@@ -3528,7 +3528,7 @@ namespace
     };
 
     void DrawSelectionSvgIconFitted(Gdiplus::Graphics& graphics, RECT rect,
-        char const* pathData, COLORREF color, bool fitWidthOnly)
+        char const* pathData, COLORREF color, bool fitWidthOnly, float inkSpread = 0.0f)
     {
         if (!pathData || IsRectEmpty(&rect)) return;
         Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
@@ -3553,7 +3553,31 @@ namespace
         Gdiplus::Matrix transform(scale, 0.0f, 0.0f, scale, translateX, translateY);
         path.Transform(&transform);
         Gdiplus::SolidBrush brush(GdiColor(color));
-        graphics.FillPath(&brush, &path);
+        if (inkSpread <= 0.0f)
+        {
+            graphics.FillPath(&brush, &path);
+            return;
+        }
+
+        // Very thin outline glyphs lose apparent density at their anti-aliased
+        // edge even when they use the same opaque brush as filled glyphs. A
+        // sub-pixel expansion restores the same visual gray without changing
+        // the icon's nominal footprint or making the heavier glyphs thicker.
+        float diagonal = inkSpread * 0.70710678f;
+        float offsets[][2] = {
+            { 0.0f, 0.0f },
+            {-inkSpread, 0.0f }, { inkSpread, 0.0f },
+            { 0.0f, -inkSpread }, { 0.0f, inkSpread },
+            {-diagonal, -diagonal }, { diagonal, -diagonal },
+            {-diagonal, diagonal }, { diagonal, diagonal }
+        };
+        for (auto const& offset : offsets)
+        {
+            Gdiplus::GraphicsState state = graphics.Save();
+            graphics.TranslateTransform(offset[0], offset[1], Gdiplus::MatrixOrderAppend);
+            graphics.FillPath(&brush, &path);
+            graphics.Restore(state);
+        }
     }
 
     void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect, char const* pathData, COLORREF color)
@@ -20057,15 +20081,18 @@ namespace
                 // The supplied squiggly SVG has a U glyph and a separate
                 // wave whose viewBox is wider. Fit both subpaths to the same
                 // horizontal bounds so the wave sits directly under the U.
-                RECT upper{ buttonRect.left + S(8), buttonRect.top + S(2),
-                    buttonRect.right - S(8), buttonRect.top + S(24) };
-                RECT wave{ buttonRect.left + S(8), buttonRect.top + S(23),
-                    buttonRect.right - S(8), buttonRect.bottom - S(2) };
+                RECT upper{ buttonRect.left + S(10), buttonRect.top + S(3),
+                    buttonRect.right - S(10), buttonRect.top + S(23) };
+                RECT wave{ buttonRect.left + S(10), buttonRect.top + S(23),
+                    buttonRect.right - S(10), buttonRect.bottom - S(3) };
                 DrawSelectionSvgIconFitted(graphics, upper,
                     SelectionToolbarSvg::SquigglyUpper, iconColor, true);
                 DrawSelectionSvgIconFitted(graphics, wave,
                     SelectionToolbarSvg::SquigglyWave, iconColor, true);
             }
+            else if (i == 0)
+                DrawSelectionSvgIconFitted(graphics, buttonRect, icons[i], iconColor,
+                    false, S(0.25f));
             else
                 DrawSelectionSvgIcon(graphics, buttonRect, icons[i], iconColor);
             x += button + gap;
