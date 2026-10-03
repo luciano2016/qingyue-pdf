@@ -20060,25 +20060,26 @@ namespace
         RECT selectionBounds{};
         if (!SelectionToolbarBounds(tab, selectionBounds)) return;
 
-        int width = S(202);
-        int height = S(42);
+        int button = S(27);
+        int gap = S(3);
+        int padding = S(7);
+        int width = padding * 2 + button * 5 + gap * 4;
+        int height = button + S(7);
         int left = (selectionBounds.left + selectionBounds.right - width) / 2;
-        left = std::clamp<int>(left, g_stage.left + S(8),
-            std::max<int>(g_stage.left + S(8), g_stage.right - width - S(8)));
-        int top = selectionBounds.top - height - S(9);
-        if (top < g_stage.top + S(7)) top = selectionBounds.bottom + S(9);
-        top = std::clamp<int>(top, g_stage.top + S(7),
-            std::max<int>(g_stage.top + S(7), g_stage.bottom - height - S(7)));
+        left = std::clamp<int>(left, g_stage.left + S(6),
+            std::max<int>(g_stage.left + S(6), g_stage.right - width - S(6)));
+        int top = selectionBounds.top - height - S(7);
+        if (top < g_stage.top + S(6)) top = selectionBounds.bottom + S(7);
+        top = std::clamp<int>(top, g_stage.top + S(6),
+            std::max<int>(g_stage.top + S(6), g_stage.bottom - height - S(6)));
         g_selectionToolbarRect = RECT{ left, top, left + width, top + height };
 
-        float radius = static_cast<float>(S(8));
+        float radius = static_cast<float>(S(6));
         BlurRoundedBackdrop(dc, g_selectionToolbarRect, radius);
         DrawRoundedShadow(dc, g_selectionToolbarRect, radius, S(1), S(2), S(3), IsDarkTheme() ? 32 : 24);
         GlassRoundedSurface(dc, g_selectionToolbarRect, IsDarkTheme() ? 210 : 230, radius, false);
 
-        int button = S(34);
-        int gap = S(4);
-        int x = left + S(8);
+        int x = left + padding;
         int y = top + (height - button) / 2;
         COLORREF iconColor = IsDarkTheme() ? T().text : RGB(138, 138, 138);
         Gdiplus::Graphics graphics(dc);
@@ -20090,7 +20091,7 @@ namespace
             g_selectionToolbarActionRects.push_back(buttonRect);
             bool hovered = Hit(buttonRect, g_mousePos.x, g_mousePos.y);
             if (hovered)
-                RoundFillAA(dc, buttonRect, S(6), MixColor(T().panel2, T().accent, 0.12), T().line);
+                RoundFillAA(dc, buttonRect, S(5), MixColor(T().panel2, T().accent, 0.12), T().line);
             DrawSelectionToolbarIcon(graphics, buttonRect, i, iconColor);
             x += button + gap;
         }
