@@ -3498,7 +3498,7 @@ namespace
         Gdiplus::RectF bounds{};
         if (path.GetBounds(&bounds) != Gdiplus::Ok || bounds.Width <= 0.0f || bounds.Height <= 0.0f)
             return;
-        float size = static_cast<float>(std::max<LONG>(1, std::min(rect.right - rect.left, rect.bottom - rect.top) - S(13)));
+        float size = static_cast<float>(std::max<LONG>(1, std::min(rect.right - rect.left, rect.bottom - rect.top) - S(17)));
         float scale = size / std::max(bounds.Width, bounds.Height);
         float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
         float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
@@ -3507,25 +3507,7 @@ namespace
         Gdiplus::Matrix transform(scale, 0.0f, 0.0f, scale, translateX, translateY);
         path.Transform(&transform);
         Gdiplus::SolidBrush brush(GdiColor(color));
-        // Apply the same small sub-pixel ink spread to every supplied path.
-        // This keeps naturally thin SVGs from looking lighter than the filled
-        // glyphs while preserving their original geometry and proportions.
-        float spread = S(0.35f);
-        float diagonal = spread * 0.70710678f;
-        float offsets[][2] = {
-            { 0.0f, 0.0f },
-            {-spread, 0.0f }, { spread, 0.0f },
-            { 0.0f, -spread }, { 0.0f, spread },
-            {-diagonal, -diagonal }, { diagonal, -diagonal },
-            {-diagonal, diagonal }, { diagonal, diagonal }
-        };
-        for (auto const& offset : offsets)
-        {
-            Gdiplus::GraphicsState state = graphics.Save();
-            graphics.TranslateTransform(offset[0], offset[1], Gdiplus::MatrixOrderAppend);
-            graphics.FillPath(&brush, &path);
-            graphics.Restore(state);
-        }
+        graphics.FillPath(&brush, &path);
     }
 
     void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line)
