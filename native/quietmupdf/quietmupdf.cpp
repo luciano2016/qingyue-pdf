@@ -321,6 +321,7 @@ static bool quiet_page_has_supported_markup(fz_context* ctx, pdf_document* doc, 
         pdf_obj* subtype = pdf_dict_get(ctx, annot, PDF_NAME(Subtype));
         if (pdf_name_eq(ctx, subtype, PDF_NAME(Highlight)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(Underline)) ||
+            pdf_name_eq(ctx, subtype, PDF_NAME(Squiggly)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(StrikeOut)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(Ink)) ||
             pdf_name_eq(ctx, subtype, PDF_NAME(Text)) ||
@@ -639,6 +640,7 @@ static bool quiet_is_supported_markup(enum pdf_annot_type type)
 {
     return type == PDF_ANNOT_HIGHLIGHT ||
         type == PDF_ANNOT_UNDERLINE ||
+        type == PDF_ANNOT_SQUIGGLY ||
         type == PDF_ANNOT_STRIKE_OUT ||
         type == PDF_ANNOT_TEXT ||
         type == PDF_ANNOT_FREE_TEXT ||
@@ -815,6 +817,7 @@ extern "C" int quiet_pdf_save_annotations(
 
             enum pdf_annot_type type = PDF_ANNOT_HIGHLIGHT;
             if (input.kind == 1) type = PDF_ANNOT_UNDERLINE;
+            else if (input.kind == 11) type = PDF_ANNOT_SQUIGGLY;
             else if (input.kind == 2) type = PDF_ANNOT_STRIKE_OUT;
             else if (input.kind == 3) type = PDF_ANNOT_INK;
             else if (input.kind == 4) type = PDF_ANNOT_TEXT;
@@ -878,6 +881,7 @@ extern "C" int quiet_pdf_save_annotations(
                     float color[3] = { input.color_r, input.color_g, input.color_b };
                     pdf_set_annot_color(ctx, annot, 3, color);
                     if (type == PDF_ANNOT_HIGHLIGHT || type == PDF_ANNOT_UNDERLINE ||
+                        type == PDF_ANNOT_SQUIGGLY ||
                         type == PDF_ANNOT_STRIKE_OUT)
                     {
                         fz_quad quad = fz_make_quad(left, top, right, top, left, bottom, right, bottom);
@@ -1020,6 +1024,7 @@ extern "C" int quiet_pdf_load_annotations(
                         int kind = -1;
                         if (type == PDF_ANNOT_HIGHLIGHT) kind = 0;
                         else if (type == PDF_ANNOT_UNDERLINE) kind = 1;
+                        else if (type == PDF_ANNOT_SQUIGGLY) kind = 11;
                         else if (type == PDF_ANNOT_STRIKE_OUT) kind = 2;
                         else if (type == PDF_ANNOT_INK) kind = 3;
                         else if (type == PDF_ANNOT_TEXT) kind = 4;
@@ -1093,6 +1098,7 @@ extern "C" int quiet_pdf_load_annotations(
                         }
                         else if (type == PDF_ANNOT_HIGHLIGHT ||
                             type == PDF_ANNOT_UNDERLINE ||
+                            type == PDF_ANNOT_SQUIGGLY ||
                             type == PDF_ANNOT_STRIKE_OUT)
                         {
                             int quad_count = pdf_annot_quad_point_count(ctx, annot);

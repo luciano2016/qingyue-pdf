@@ -18,9 +18,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <cstdint>
 #include <deque>
 #include <ctime>
@@ -41,6 +43,7 @@
 
 #include "resource.h"
 #include "..\version.h"
+#include "selection_toolbar_icons.h"
 
 namespace
 {
@@ -273,7 +276,8 @@ namespace
         Caret = 7,
         Line = 8,
         Square = 9,
-        Circle = 10
+        Circle = 10,
+        Squiggly = 11
     };
 
     struct AnnotationSegment
@@ -1957,6 +1961,9 @@ namespace
     RECT g_annotationNoteInputRect{};
     RECT g_annotationCustomColorRect{};
     std::vector<RECT> g_annotationColorRects;
+    bool g_selectionToolbarOpen{};
+    RECT g_selectionToolbarRect{};
+    std::vector<RECT> g_selectionToolbarActionRects;
     int g_pressedAnnotationPage{ -1 };
     COLORREF g_annotationCustomColors[16]{};
     RECT g_annotationColorDialogAnchor{};
@@ -2430,6 +2437,7 @@ namespace
     std::wstring AnnotationKindName(AnnotationKind kind)
     {
         if (kind == AnnotationKind::Underline) return L"\u4e0b\u5212\u7ebf";
+        if (kind == AnnotationKind::Squiggly) return L"\u6ce2\u6d6a\u7ebf";
         if (kind == AnnotationKind::Strikeout) return L"\u5220\u9664\u7ebf";
         if (kind == AnnotationKind::Ink) return L"Ink\u6807\u6ce8";
         if (kind == AnnotationKind::Text) return L"\u6587\u672c\u4fbf\u7b7e";
@@ -3178,6 +3186,320 @@ namespace
         path.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
         path.CloseFigure();
         g.FillPath(&brush, &path);
+    }
+
+    struct SvgPathToken
+    {
+        bool command{};
+        char valueCommand{};
+        double value{};
+    };
+
+    class SvgPathReader
+    {
+    public:
+        explicit SvgPathReader(char const* data) : m_data(data ? data : "") {}
+
+        bool Read(Gdiplus::GraphicsPath& path)
+        {
+            std::vector<SvgPathToken> tokens;
+            char const* cursor = m_data;
+            while (*cursor)
+            {
+                while (*cursor && (std::isspace(static_cast<unsigned char>(*cursor)) || *cursor == ',')) ++cursor;
+                if (!*cursor) break;
+                if (std::isalpha(static_cast<unsigned char>(*cursor)))
+                {
+                    tokens.push_back(SvgPathToken{ true, *cursor++, 0.0 });
+                    continue;
+                }
+                char* end = nullptr;
+                double number = std::strtod(cursor, &end);
+                if (!end || end == cursor) return false;
+                tokens.push_back(SvgPathToken{ false, 0, number });
+                cursor = end;
+            }
+
+            size_t index = 0;
+            char command = 0;
+            Gdiplus::PointF current{};
+            Gdiplus::PointF figureStart{};
+            Gdiplus::PointF lastCubicControl{};
+            Gdiplus::PointF lastQuadControl{};
+            char previousCommand = 0;
+            bool hasCurrent = false;
+            bool hasCubicControl = false;
+            bool hasQuadControl = false;
+
+            while (index < tokens.size())
+            {
+                if (tokens[index].command)
+                {
+                    command = tokens[index++].valueCommand;
+                    if (command == 'Z' || command == 'z')
+                    {
+                        if (hasCurrent)
+                        {
+                            path.CloseFigure();
+                            current = figureStart;
+                        }
+                        previousCommand = command;
+                        hasCubicControl = hasQuadControl = false;
+                        continue;
+                    }
+                }
+                if (!command) return false;
+                int argumentCount = ArgumentCount(command);
+                if (argumentCount <= 0 || index + static_cast<size_t>(argumentCount) > tokens.size()) return false;
+                for (int i = 0; i < argumentCount; ++i)
+                    if (tokens[index + static_cast<size_t>(i)].command) return false;
+
+                bool relative = command >= 'a' && command <= 'z';
+                char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(command)));
+                auto number = [&](int offset) { return tokens[index + static_cast<size_t>(offset)].value; };
+                auto point = [&](double x, double y)
+                {
+                    return Gdiplus::PointF(
+                        static_cast<float>(relative ? current.X + x : x),
+                        static_cast<float>(relative ? current.Y + y : y));
+                };
+                switch (upper)
+                {
+                case 'M':
+                {
+                    Gdiplus::PointF next = point(number(0), number(1));
+                    if (hasCurrent) path.CloseFigure();
+                    path.StartFigure();
+                    current = next;
+                    figureStart = next;
+                    hasCurrent = true;
+                    previousCommand = command;
+                    hasCubicControl = hasQuadControl = false;
+                    command = relative ? 'l' : 'L';
+                    break;
+                }
+                case 'L':
+                    if (!hasCurrent) return false;
+                    path.AddLine(current, point(number(0), number(1)));
+                    current = point(number(0), number(1));
+                    previousCommand = command;
+                    hasCubicControl = hasQuadControl = false;
+                    break;
+                case 'H':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF start = current;
+                        current = Gdiplus::PointF(static_cast<float>(relative ? current.X + number(0) : number(0)), current.Y);
+                        path.AddLine(start, current);
+                    }
+                    previousCommand = command;
+                    hasCubicControl = hasQuadControl = false;
+                    break;
+                case 'V':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF start = current;
+                        current = Gdiplus::PointF(current.X, static_cast<float>(relative ? current.Y + number(0) : number(0)));
+                        path.AddLine(start, current);
+                    }
+                    previousCommand = command;
+                    hasCubicControl = hasQuadControl = false;
+                    break;
+                case 'C':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF c1 = point(number(0), number(1));
+                        Gdiplus::PointF c2 = point(number(2), number(3));
+                        Gdiplus::PointF next = point(number(4), number(5));
+                        path.AddBezier(current, c1, c2, next);
+                        current = next;
+                        lastCubicControl = c2;
+                        hasCubicControl = true;
+                        hasQuadControl = false;
+                    }
+                    previousCommand = command;
+                    break;
+                case 'S':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF c1 = (hasCubicControl && (previousCommand == 'C' || previousCommand == 'c' || previousCommand == 'S' || previousCommand == 's'))
+                            ? Gdiplus::PointF(2.0f * current.X - lastCubicControl.X, 2.0f * current.Y - lastCubicControl.Y)
+                            : current;
+                        Gdiplus::PointF c2 = point(number(0), number(1));
+                        Gdiplus::PointF next = point(number(2), number(3));
+                        path.AddBezier(current, c1, c2, next);
+                        current = next;
+                        lastCubicControl = c2;
+                        hasCubicControl = true;
+                        hasQuadControl = false;
+                    }
+                    previousCommand = command;
+                    break;
+                case 'Q':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF q = point(number(0), number(1));
+                        Gdiplus::PointF next = point(number(2), number(3));
+                        Gdiplus::PointF c1{
+                            current.X + (q.X - current.X) * (2.0f / 3.0f),
+                            current.Y + (q.Y - current.Y) * (2.0f / 3.0f) };
+                        Gdiplus::PointF c2{
+                            next.X + (q.X - next.X) * (2.0f / 3.0f),
+                            next.Y + (q.Y - next.Y) * (2.0f / 3.0f) };
+                        path.AddBezier(current, c1, c2, next);
+                        current = next;
+                        lastQuadControl = q;
+                        hasQuadControl = true;
+                        hasCubicControl = false;
+                    }
+                    previousCommand = command;
+                    break;
+                case 'T':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF q = (hasQuadControl && (previousCommand == 'Q' || previousCommand == 'q' || previousCommand == 'T' || previousCommand == 't'))
+                            ? Gdiplus::PointF(2.0f * current.X - lastQuadControl.X, 2.0f * current.Y - lastQuadControl.Y)
+                            : current;
+                        Gdiplus::PointF next = point(number(0), number(1));
+                        Gdiplus::PointF c1{
+                            current.X + (q.X - current.X) * (2.0f / 3.0f),
+                            current.Y + (q.Y - current.Y) * (2.0f / 3.0f) };
+                        Gdiplus::PointF c2{
+                            next.X + (q.X - next.X) * (2.0f / 3.0f),
+                            next.Y + (q.Y - next.Y) * (2.0f / 3.0f) };
+                        path.AddBezier(current, c1, c2, next);
+                        current = next;
+                        lastQuadControl = q;
+                        hasQuadControl = true;
+                        hasCubicControl = false;
+                    }
+                    previousCommand = command;
+                    break;
+                case 'A':
+                    if (!hasCurrent) return false;
+                    {
+                        Gdiplus::PointF next = point(number(5), number(6));
+                        AddArc(path, current, next, std::abs(number(0)), std::abs(number(1)), number(2), number(3) != 0.0, number(4) != 0.0);
+                        current = next;
+                        hasCubicControl = hasQuadControl = false;
+                    }
+                    previousCommand = command;
+                    break;
+                default:
+                    return false;
+                }
+                index += static_cast<size_t>(argumentCount);
+            }
+            return hasCurrent;
+        }
+
+    private:
+        static int ArgumentCount(char command)
+        {
+            switch (static_cast<char>(std::toupper(static_cast<unsigned char>(command))))
+            {
+            case 'M': case 'L': case 'T': return 2;
+            case 'H': case 'V': return 1;
+            case 'C': return 6;
+            case 'S': case 'Q': return 4;
+            case 'A': return 7;
+            default: return 0;
+            }
+        }
+
+        static double VectorAngle(double ux, double uy, double vx, double vy)
+        {
+            double cross = ux * vy - uy * vx;
+            double dot = ux * vx + uy * vy;
+            return std::atan2(cross, dot);
+        }
+
+        static void AddArc(Gdiplus::GraphicsPath& path, Gdiplus::PointF start, Gdiplus::PointF end,
+            double rx, double ry, double rotation, bool largeArc, bool sweep)
+        {
+            if (rx < 0.001 || ry < 0.001 || (std::abs(start.X - end.X) < 0.001 && std::abs(start.Y - end.Y) < 0.001))
+            {
+                path.AddLine(start, end);
+                return;
+            }
+            double phi = rotation * 3.14159265358979323846 / 180.0;
+            double cosPhi = std::cos(phi);
+            double sinPhi = std::sin(phi);
+            double dx = (start.X - end.X) * 0.5;
+            double dy = (start.Y - end.Y) * 0.5;
+            double xPrime = cosPhi * dx + sinPhi * dy;
+            double yPrime = -sinPhi * dx + cosPhi * dy;
+            double rx2 = rx * rx;
+            double ry2 = ry * ry;
+            double xPrime2 = xPrime * xPrime;
+            double yPrime2 = yPrime * yPrime;
+            double correction = xPrime2 / rx2 + yPrime2 / ry2;
+            if (correction > 1.0)
+            {
+                double scale = std::sqrt(correction);
+                rx *= scale;
+                ry *= scale;
+                rx2 = rx * rx;
+                ry2 = ry * ry;
+            }
+            double denominator = rx2 * yPrime2 + ry2 * xPrime2;
+            double numerator = std::max(0.0, rx2 * ry2 - denominator);
+            double factor = denominator > 0.0 ? std::sqrt(numerator / denominator) : 0.0;
+            if (largeArc == sweep) factor = -factor;
+            double cxPrime = factor * rx * yPrime / ry;
+            double cyPrime = factor * -ry * xPrime / rx;
+            double cx = cosPhi * cxPrime - sinPhi * cyPrime + (start.X + end.X) * 0.5;
+            double cy = sinPhi * cxPrime + cosPhi * cyPrime + (start.Y + end.Y) * 0.5;
+            double ux = (xPrime - cxPrime) / rx;
+            double uy = (yPrime - cyPrime) / ry;
+            double vx = (-xPrime - cxPrime) / rx;
+            double vy = (-yPrime - cyPrime) / ry;
+            double startAngle = VectorAngle(1.0, 0.0, ux, uy);
+            double sweepAngle = VectorAngle(ux, uy, vx, vy);
+            if (!sweep && sweepAngle > 0.0) sweepAngle -= 2.0 * 3.14159265358979323846;
+            if (sweep && sweepAngle < 0.0) sweepAngle += 2.0 * 3.14159265358979323846;
+            int pieces = std::max(1, static_cast<int>(std::ceil(std::abs(sweepAngle) / (3.14159265358979323846 * 0.5))));
+            double step = sweepAngle / pieces;
+            Gdiplus::PointF previous = start;
+            for (int i = 0; i < pieces; ++i)
+            {
+                double a0 = startAngle + step * i;
+                double a1 = a0 + step;
+                double alpha = 4.0 / 3.0 * std::tan((a1 - a0) * 0.25);
+                double cos0 = std::cos(a0), sin0 = std::sin(a0);
+                double cos1 = std::cos(a1), sin1 = std::sin(a1);
+                auto map = [&](double x, double y)
+                {
+                    return Gdiplus::PointF(
+                        static_cast<float>(cx + cosPhi * rx * x - sinPhi * ry * y),
+                        static_cast<float>(cy + sinPhi * rx * x + cosPhi * ry * y));
+                };
+                Gdiplus::PointF c1 = map(cos0 - alpha * sin0, sin0 + alpha * cos0);
+                Gdiplus::PointF c2 = map(cos1 + alpha * sin1, sin1 - alpha * cos1);
+                Gdiplus::PointF next = map(cos1, sin1);
+                if (i == 0) previous = start;
+                path.AddBezier(previous, c1, c2, next);
+                previous = next;
+            }
+        }
+
+        char const* m_data{};
+    };
+
+    void DrawSelectionSvgIcon(Gdiplus::Graphics& graphics, RECT rect, char const* pathData, COLORREF color)
+    {
+        if (!pathData || IsRectEmpty(&rect)) return;
+        Gdiplus::GraphicsPath path(Gdiplus::FillModeWinding);
+        SvgPathReader reader(pathData);
+        if (!reader.Read(path)) return;
+        float size = static_cast<float>(std::max<LONG>(1, std::min(rect.right - rect.left, rect.bottom - rect.top) - S(9)));
+        float left = static_cast<float>(rect.left) + (static_cast<float>(rect.right - rect.left) - size) * 0.5f;
+        float top = static_cast<float>(rect.top) + (static_cast<float>(rect.bottom - rect.top) - size) * 0.5f;
+        float scale = size / 1024.0f;
+        Gdiplus::Matrix transform(scale, 0.0f, 0.0f, scale, left, top);
+        path.Transform(&transform);
+        Gdiplus::SolidBrush brush(GdiColor(color, 238));
+        graphics.FillPath(&brush, &path);
     }
 
     void RoundFillAA(HDC dc, RECT r, int radius, COLORREF fill, COLORREF line)
@@ -10593,6 +10915,12 @@ namespace
                             ? bottom + std::max(1.0f, lineWidth * 0.65f)
                             : bottom - std::max(1.0f, markHeight * 0.18f);
                     }
+                    else if (annotation.kind == AnnotationKind::Squiggly)
+                    {
+                        lineY = cjkOnlyText
+                            ? bottom + std::max(1.0f, lineWidth * 0.55f)
+                            : bottom - std::max(1.0f, markHeight * 0.10f);
+                    }
                     float halfWidth = lineWidth * 0.5f;
                     lineY = std::clamp(lineY,
                         static_cast<float>(pageRect.top) + halfWidth,
@@ -10604,9 +10932,35 @@ namespace
                     Gdiplus::Pen markPen(GdiColor(annotationColor), lineWidth);
                     markPen.SetStartCap(Gdiplus::LineCapFlat);
                     markPen.SetEndCap(Gdiplus::LineCapFlat);
-                    markGraphics.DrawLine(&markPen,
-                        static_cast<float>(visibleMark.left), lineY,
-                        static_cast<float>(visibleMark.right), lineY);
+                    if (annotation.kind == AnnotationKind::Squiggly)
+                    {
+                        Gdiplus::GraphicsPath wavePath;
+                        float amplitude = std::max(1.0f, lineWidth * 1.35f);
+                        float wavelength = std::max(5.0f, markHeight * 1.15f);
+                        float startX = static_cast<float>(visibleMark.left);
+                        float endX = static_cast<float>(visibleMark.right);
+                        int steps = std::max(2, static_cast<int>(std::ceil((endX - startX) / 2.0f)));
+                        wavePath.StartFigure();
+                        for (int step = 0; step <= steps; ++step)
+                        {
+                            float x = startX + (endX - startX) * static_cast<float>(step) / static_cast<float>(steps);
+                            float y = lineY + amplitude * static_cast<float>(std::sin((x - startX) * 6.28318530718 / wavelength));
+                            if (step == 0)
+                                wavePath.AddLine(x, y, x, y);
+                            else
+                                wavePath.AddLine(static_cast<float>(visibleMark.left) +
+                                    (endX - startX) * static_cast<float>(step - 1) / static_cast<float>(steps),
+                                    lineY + amplitude * static_cast<float>(std::sin((static_cast<float>(step - 1) / static_cast<float>(steps)) * (endX - startX) * 6.28318530718 / wavelength)),
+                                    x, y);
+                        }
+                        markGraphics.DrawPath(&markPen, &wavePath);
+                    }
+                    else
+                    {
+                        markGraphics.DrawLine(&markPen,
+                            static_cast<float>(visibleMark.left), lineY,
+                            static_cast<float>(visibleMark.right), lineY);
+                    }
                 }
             };
             if (!annotation.segments.empty())
@@ -11405,6 +11759,9 @@ namespace
 
     void ClearTextSelection()
     {
+        g_selectionToolbarOpen = false;
+        g_selectionToolbarRect = {};
+        g_selectionToolbarActionRects.clear();
         g_selectingContent = false;
         g_hasContentSelection = false;
         g_selectionIsImage = false;
@@ -12510,6 +12867,7 @@ namespace
         g_selectionText = FromUtf8(text.c_str());
         g_selectionSegments.clear();
         g_selectionSegments.push_back(TextSelectionSegment{ page, g_selectionQuads, g_selectionText });
+        g_selectionToolbarOpen = !g_selectionText.empty();
         InvalidateRect(hwnd, &g_stage, FALSE);
         return true;
     }
@@ -19528,6 +19886,102 @@ namespace
         return true;
     }
 
+    bool SelectionToolbarClickableAt(POINT pt)
+    {
+        if (!g_selectionToolbarOpen) return false;
+        if (Hit(g_selectionToolbarRect, pt.x, pt.y)) return true;
+        for (RECT const& rect : g_selectionToolbarActionRects)
+            if (Hit(rect, pt.x, pt.y)) return true;
+        return false;
+    }
+
+    bool SelectionToolbarBounds(PdfTab const& tab, RECT& bounds)
+    {
+        bounds = {};
+        bool haveBounds = false;
+        for (TextSelectionSegment const& segment : g_selectionSegments)
+        {
+            RECT pageRect{};
+            if (!PageRectForPage(tab, segment.page, pageRect)) continue;
+            RECT visiblePage{};
+            if (!IntersectRect(&visiblePage, &pageRect, &g_stage)) continue;
+            for (fz_quad const& quad : segment.quads)
+            {
+                RECT quadRect = QuadToRect(quad, pageRect);
+                RECT visibleQuad{};
+                if (!IntersectRect(&visibleQuad, &quadRect, &visiblePage)) continue;
+                if (!haveBounds)
+                {
+                    bounds = visibleQuad;
+                    haveBounds = true;
+                }
+                else
+                    UnionRect(&bounds, &bounds, &visibleQuad);
+            }
+        }
+        if (!haveBounds)
+        {
+            RECT fallback = CurrentSelectionRect();
+            if (!IsRectEmpty(&fallback) && IntersectRect(&bounds, &fallback, &g_stage))
+                haveBounds = true;
+        }
+        return haveBounds && !IsRectEmpty(&bounds);
+    }
+
+    void PaintSelectionToolbar(HDC dc, PdfTab& tab)
+    {
+        g_selectionToolbarRect = {};
+        g_selectionToolbarActionRects.clear();
+        if (!g_selectionToolbarOpen || !g_hasContentSelection || g_selectionIsImage ||
+            g_selectionQuads.empty() || g_selectionText.empty() || g_annotationToolbarOpen)
+            return;
+
+        RECT selectionBounds{};
+        if (!SelectionToolbarBounds(tab, selectionBounds)) return;
+
+        int width = S(202);
+        int height = S(42);
+        int left = (selectionBounds.left + selectionBounds.right - width) / 2;
+        left = std::clamp<int>(left, g_stage.left + S(8),
+            std::max<int>(g_stage.left + S(8), g_stage.right - width - S(8)));
+        int top = selectionBounds.top - height - S(9);
+        if (top < g_stage.top + S(7)) top = selectionBounds.bottom + S(9);
+        top = std::clamp<int>(top, g_stage.top + S(7),
+            std::max<int>(g_stage.top + S(7), g_stage.bottom - height - S(7)));
+        g_selectionToolbarRect = RECT{ left, top, left + width, top + height };
+
+        float radius = static_cast<float>(S(8));
+        BlurRoundedBackdrop(dc, g_selectionToolbarRect, radius);
+        DrawRoundedShadow(dc, g_selectionToolbarRect, radius, S(1), S(2), S(3), IsDarkTheme() ? 32 : 24);
+        GlassRoundedSurface(dc, g_selectionToolbarRect, IsDarkTheme() ? 210 : 230, radius, false);
+
+        int button = S(34);
+        int gap = S(4);
+        int x = left + S(8);
+        int y = top + (height - button) / 2;
+        COLORREF iconColor = IsDarkTheme() ? T().text : RGB(56, 61, 68);
+        char const* icons[] = {
+            SelectionToolbarSvg::Copy,
+            SelectionToolbarSvg::Highlight,
+            SelectionToolbarSvg::Underline,
+            SelectionToolbarSvg::Squiggly,
+            SelectionToolbarSvg::Strikeout
+        };
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        for (int i = 0; i < 5; ++i)
+        {
+            RECT buttonRect{ x, y, x + button, y + button };
+            g_selectionToolbarActionRects.push_back(buttonRect);
+            bool hovered = Hit(buttonRect, g_mousePos.x, g_mousePos.y);
+            if (hovered)
+                RoundFillAA(dc, buttonRect, S(6), MixColor(T().panel2, T().accent, 0.12), T().line);
+            DrawSelectionSvgIcon(graphics, buttonRect, icons[i], iconColor);
+            x += button + gap;
+        }
+    }
+
     bool AnnotationPageToggleAt(POINT pt, RECT* result = nullptr)
     {
         if (g_sideMode != 3) return false;
@@ -20161,8 +20615,12 @@ namespace
             Intersects(paintClip, g_favoriteListRect))
             PaintFavoriteList(dc);
         if (paintedPages) ClampScroll(g_hwnd);
-        if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) || Intersects(paintClip, g_annotationNotePanelRect))
-        PaintAnnotationToolbar(dc, *tab, client);
+        if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) ||
+            Intersects(paintClip, g_annotationNotePanelRect) || Intersects(paintClip, g_selectionToolbarRect))
+        {
+            PaintAnnotationToolbar(dc, *tab, client);
+            PaintSelectionToolbar(dc, *tab);
+        }
         return canFlush;
     }
 
@@ -21901,6 +22359,7 @@ namespace
             AppendThemedMenuSeparator(menu);
             AppendThemedMenuItem(menu, 2502, withShortcuts ? L"\u9ad8\u4eae\tCtrl + H" : L"\u9ad8\u4eae");
             AppendThemedMenuItem(menu, 2503, withShortcuts ? L"\u4e0b\u5212\u7ebf\tCtrl + U" : L"\u4e0b\u5212\u7ebf");
+            AppendThemedMenuItem(menu, 2506, withShortcuts ? L"\u6ce2\u6d6a\u7ebf" : L"\u6ce2\u6d6a\u7ebf");
             AppendThemedMenuItem(menu, 2504, withShortcuts ? L"\u5220\u9664\u7ebf\tCtrl + K" : L"\u5220\u7ebf");
             AppendThemedMenuSeparator(menu);
             PopulateThemedAnnotationMenuItems();
@@ -22288,6 +22747,7 @@ namespace
             annotation.y1 = std::clamp<double>(item.y1, 0.0, 1.0);
             annotation.kind = item.kind == 1 ? AnnotationKind::Underline :
                 (item.kind == 2 ? AnnotationKind::Strikeout :
+                    (item.kind == 11 ? AnnotationKind::Squiggly :
                     (item.kind == 3 ? AnnotationKind::Ink :
                         (item.kind == 4 ? AnnotationKind::Text :
                             (item.kind == 5 ? AnnotationKind::FreeText :
@@ -22295,7 +22755,7 @@ namespace
                                     (item.kind == 7 ? AnnotationKind::Caret :
                                         (item.kind == 8 ? AnnotationKind::Line :
                                             (item.kind == 9 ? AnnotationKind::Square :
-                                                (item.kind == 10 ? AnnotationKind::Circle : AnnotationKind::Highlight)))))))));
+                                                (item.kind == 10 ? AnnotationKind::Circle : AnnotationKind::Highlight))))))))));
             annotation.colorIndex = AnnotationColorIndexFromRgb(item.colorR, item.colorG, item.colorB);
             int exactColorIndex = annotation.colorIndex;
             annotation.hasCustomColor = !ExactAnnotationPaletteColor(item.colorR, item.colorG, item.colorB, exactColorIndex);
@@ -22312,7 +22772,7 @@ namespace
             if (annotation.author.empty()) annotation.author = L"10726";
             annotation.note = FromUtf8(item.contents);
             annotation.text = annotation.note;
-            if (annotation.kind == AnnotationKind::Underline)
+            if (annotation.kind == AnnotationKind::Underline || annotation.kind == AnnotationKind::Squiggly)
             {
                 std::wstring selectedText = ExtractAnnotationTextForRect(
                     tab, annotation.page, annotation.x0, annotation.y0,
@@ -23435,6 +23895,7 @@ namespace
         if (id == 2601) { PrintActiveDocument(hwnd); return; }
         if (id == 2502) { AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight); return; }
         if (id == 2503) { AddAnnotationFromSelection(hwnd, AnnotationKind::Underline); return; }
+        if (id == 2506) { AddAnnotationFromSelection(hwnd, AnnotationKind::Squiggly); return; }
         if (id == 2504) { AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout); return; }
         if (id == 2531) { CreateAnnotationAtCursor(hwnd, AnnotationKind::FreeText); return; }
         if (id == 2532) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Stamp); return; }
@@ -25761,6 +26222,25 @@ namespace
             }
             if (PdfTab* tab = Active())
             {
+                if (g_selectionToolbarOpen && SelectionToolbarClickableAt(POINT{ x, y }))
+                {
+                    for (size_t i = 0; i < g_selectionToolbarActionRects.size(); ++i)
+                    {
+                        if (!Hit(g_selectionToolbarActionRects[i], x, y)) continue;
+                        if (i == 0)
+                            CopyCurrentSelectionToClipboard(hwnd);
+                        else if (i == 1)
+                            AddAnnotationFromSelection(hwnd, AnnotationKind::Highlight);
+                        else if (i == 2)
+                            AddAnnotationFromSelection(hwnd, AnnotationKind::Underline);
+                        else if (i == 3)
+                            AddAnnotationFromSelection(hwnd, AnnotationKind::Squiggly);
+                        else if (i == 4)
+                            AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout);
+                        return 0;
+                    }
+                    return 0;
+                }
                 PdfAnnotation* annotation = nullptr;
                 if (ActiveAnnotation(*tab, annotation))
                 {
@@ -26504,6 +26984,8 @@ namespace
             }
             bool oldAnnotationToolHover = AnnotationToolbarClickableAt(oldMousePos);
             bool newAnnotationToolHover = AnnotationToolbarClickableAt(newMousePos);
+            bool oldSelectionToolHover = SelectionToolbarClickableAt(oldMousePos);
+            bool newSelectionToolHover = SelectionToolbarClickableAt(newMousePos);
             RECT oldToggleRect{};
             RECT newToggleRect{};
             bool oldAnnotationToggleHover = AnnotationPageToggleAt(oldMousePos, &oldToggleRect);
@@ -26517,6 +26999,12 @@ namespace
             {
                 InvalidateRect(hwnd, &g_annotationToolbarRect, FALSE);
                 if (g_annotationNoteOpen) InvalidateRect(hwnd, &g_annotationNotePanelRect, FALSE);
+            }
+            if (oldSelectionToolHover != newSelectionToolHover ||
+                (g_selectionToolbarOpen && Hit(g_selectionToolbarRect, oldMousePos.x, oldMousePos.y)) ||
+                (g_selectionToolbarOpen && Hit(g_selectionToolbarRect, newMousePos.x, newMousePos.y)))
+            {
+                InvalidateRect(hwnd, &g_selectionToolbarRect, FALSE);
             }
             if (oldAnnotationToggleHover != newAnnotationToggleHover ||
                 (oldAnnotationToggleHover && newAnnotationToggleHover && !EqualRect(&oldToggleRect, &newToggleRect)))
@@ -27130,6 +27618,7 @@ namespace
                 // image must never create a false yellow selection.
                 g_selectionIsImage = false;
                 g_hasContentSelection = !g_selectionQuads.empty();
+                g_selectionToolbarOpen = g_hasContentSelection && !g_selectionText.empty();
                 if (!g_hasContentSelection)
                 {
                     g_selectionQuads.clear();
