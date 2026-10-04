@@ -20135,6 +20135,13 @@ namespace
         return SelectionToolbarActionAt(pt) >= 0;
     }
 
+    RECT SelectionToolbarPaintBounds(RECT rect)
+    {
+        if (!IsRectEmpty(&rect))
+            InflateRect(&rect, S(7), S(7));
+        return rect;
+    }
+
     bool SelectionToolbarBounds(PdfTab const& tab, RECT& bounds)
     {
         bounds = {};
@@ -20205,7 +20212,10 @@ namespace
 
         float radius = static_cast<float>(S(7));
         BlurRoundedBackdrop(dc, g_selectionToolbarRect, radius);
-        DrawRoundedShadow(dc, g_selectionToolbarRect, radius, S(1), S(2), S(3), IsDarkTheme() ? 32 : 24);
+        // Keep the selection panel's shadow profile aligned with the
+        // annotation color panel. Its outer footprint is protected below so
+        // the retained page frame cannot erase the anti-aliased edge.
+        DrawRoundedShadow(dc, g_selectionToolbarRect, radius, S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
         GlassRoundedSurface(dc, g_selectionToolbarRect, IsDarkTheme() ? 210 : 230, radius, false);
 
         int x = left + padding;
@@ -20946,8 +20956,9 @@ namespace
             Intersects(paintClip, g_favoriteListRect))
             PaintFavoriteList(dc);
         if (paintedPages) ClampScroll(g_hwnd);
+        RECT selectionToolbarPaint = SelectionToolbarPaintBounds(g_selectionToolbarRect);
         if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) ||
-            Intersects(paintClip, g_annotationNotePanelRect) || Intersects(paintClip, g_selectionToolbarRect))
+            Intersects(paintClip, g_annotationNotePanelRect) || Intersects(paintClip, selectionToolbarPaint))
         {
             PaintAnnotationToolbar(dc, *tab, client, false);
             PaintSelectionToolbar(dc, *tab, false);
@@ -25260,9 +25271,10 @@ namespace
         // Floating annotation/selection surfaces are foreground chrome. Paint
         // them only after the page frame has been committed or restored so a
         // later zoom/scroll transform can never carry their old pixels along.
+        RECT selectionToolbarPaint = SelectionToolbarPaintBounds(g_selectionToolbarRect);
         if (!scrollBarOnly &&
             (Intersects(dirty, g_stage) || Intersects(dirty, g_annotationToolbarRect) ||
-                Intersects(dirty, g_annotationNotePanelRect) || Intersects(dirty, g_selectionToolbarRect)))
+                Intersects(dirty, g_annotationNotePanelRect) || Intersects(dirty, selectionToolbarPaint)))
         {
             if (PdfTab* activeTab = Active())
             {
@@ -25353,7 +25365,7 @@ namespace
                     // normal paint copy and they flash away after zoom.
                     RECT toggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
                     RECT exit = ImmersiveExitPanelPaintRectForClient(client);
-                    RECT selectionToolbar = g_selectionToolbarRect;
+                    RECT selectionToolbar = SelectionToolbarPaintBounds(g_selectionToolbarRect);
                     RECT annotationToolbar = g_annotationToolbarRect;
                     RECT annotationNote = g_annotationNotePanelRect;
                     if (!IsRectEmpty(&toggle))
@@ -26187,7 +26199,14 @@ namespace
                 HDC editDc = reinterpret_cast<HDC>(wParam);
                 if (g_annotationInlineFreeText)
                 {
-                    SetTextColor(editDc, T().text);
+                    COLORREF textColor = T().text;
+                    if (PdfTab* tab = Active())
+                    {
+                        PdfAnnotation* annotation = nullptr;
+                        if (ActiveAnnotation(*tab, annotation) && annotation->kind == AnnotationKind::FreeText)
+                            textColor = AnnotationColor(*annotation);
+                    }
+                    SetTextColor(editDc, textColor);
                     SetBkMode(editDc, TRANSPARENT);
                     return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
                 }
