@@ -289,6 +289,15 @@ namespace
         int strokeStart{};
     };
 
+    constexpr int kFreeTextDefaultFontSizePt = 14;
+
+    enum class FreeTextFontKind
+    {
+        Sans = 0,
+        Serif = 1,
+        Mono = 2
+    };
+
     struct PdfAnnotation
     {
         int page{};
@@ -306,6 +315,8 @@ namespace
         std::wstring text;
         std::wstring note;
         std::wstring author{ L"10726" };
+        FreeTextFontKind freeTextFont{ FreeTextFontKind::Sans };
+        int freeTextFontSizePt{ kFreeTextDefaultFontSizePt };
     };
 
     struct TextSelectionSegment
@@ -339,6 +350,8 @@ namespace
         const char* contents{};
         const QuietPdfInkPoint* inkPoints{};
         int inkPointCount{};
+        int fontKind{};
+        float fontSizePt{ 14.0f };
     };
 
     struct QuietPdfAnnotationInfo
@@ -357,6 +370,8 @@ namespace
         char author[128]{};
         char contents[512]{};
         int strokeStart{};
+        int fontKind{};
+        float fontSizePt{};
     };
 
     struct QuietPdfLinkInfo
@@ -1933,6 +1948,9 @@ namespace
     bool g_annotationSaveInProgress{};
     HWND g_annotationNoteEdit{};
     HFONT g_annotationNoteEditFont{};
+    HFONT g_annotationFreeTextEditFont{};
+    FreeTextFontKind g_annotationFreeTextEditFontKind{ FreeTextFontKind::Sans };
+    int g_annotationFreeTextEditFontSizePt{};
     HBRUSH g_annotationNoteEditBrush{};
     COLORREF g_annotationNoteEditBrushColor{ CLR_INVALID };
     WNDPROC g_annotationNoteEditProc{};
@@ -2638,6 +2656,22 @@ namespace
         lf.lfWeight = weight;
         lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
         wcscpy_s(lf.lfFaceName, L"Segoe UI Variable Text");
+        return CreateFontIndirectW(&lf);
+    }
+
+    HFONT FreeTextFont(PdfAnnotation const& annotation, int weight = FW_NORMAL)
+    {
+        LOGFONTW lf{};
+        lf.lfHeight = -MulDiv(std::clamp(annotation.freeTextFontSizePt, 8, 48),
+            static_cast<int>(g_dpi), 72);
+        lf.lfWeight = weight;
+        lf.lfQuality = CLEARTYPE_NATURAL_QUALITY;
+        const wchar_t* face = L"Segoe UI Variable Text";
+        if (annotation.freeTextFont == FreeTextFontKind::Serif)
+            face = L"Georgia";
+        else if (annotation.freeTextFont == FreeTextFontKind::Mono)
+            face = L"Consolas";
+        wcscpy_s(lf.lfFaceName, face);
         return CreateFontIndirectW(&lf);
     }
 
@@ -10982,16 +11016,23 @@ namespace
                     }
                     else if (annotation.kind == AnnotationKind::Stamp)
                     {
-                        shapeGraphics.DrawRectangle(&shapePen,
+                        Gdiplus::Pen stampPen(GdiColor(annotationColor),
+                            std::max<Gdiplus::REAL>(S(2.0f), 1.8f));
+                        stampPen.SetLineJoin(Gdiplus::LineJoinRound);
+                        shapeGraphics.DrawRectangle(&stampPen,
                             static_cast<float>(mark.left), static_cast<float>(mark.top),
                             static_cast<float>(std::max<LONG>(1, mark.right - mark.left)),
                             static_cast<float>(std::max<LONG>(1, mark.bottom - mark.top)));
                         RECT stampText = mark;
-                        InflateRect(&stampText, -S(3), -S(2));
+                        InflateRect(&stampText, -S(6), -S(3));
+                        HFONT stampFont = Font(13, FW_BOLD);
+                        HGDIOBJ oldStampFont = SelectObject(dc, stampFont);
                         SetBkMode(dc, TRANSPARENT);
                         SetTextColor(dc, annotationColor);
                         DrawTextW(dc, annotation.note.empty() ? L"DRAFT" : annotation.note.c_str(), -1,
                             &stampText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                        SelectObject(dc, oldStampFont);
+                        DeleteObject(stampFont);
                     }
                     else if (annotation.kind == AnnotationKind::Text)
                     {
@@ -11006,12 +11047,16 @@ namespace
                     }
                     else if (annotation.kind == AnnotationKind::FreeText)
                     {
+                        HFONT freeTextFont = FreeTextFont(annotation);
+                        HGDIOBJ oldFreeTextFont = SelectObject(dc, freeTextFont);
                         SetBkMode(dc, TRANSPARENT);
                         SetTextColor(dc, annotationColor);
                         RECT textRect = mark;
-                        InflateRect(&textRect, -S(3), -S(2));
+                        InflateRect(&textRect, -S(4), -S(3));
                         DrawTextW(dc, annotation.note.c_str(), -1, &textRect,
                             DT_LEFT | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+                        SelectObject(dc, oldFreeTextFont);
+                        DeleteObject(freeTextFont);
                     }
                     return;
                 }
@@ -14324,6 +14369,8 @@ namespace
     RECT MainReaderPixelClip();
     void PaintMainScrollBar(HDC dc, RECT client, RECT paintClip);
     void PaintSidebarPanelToggle(HDC dc, RECT client);
+    void PaintSelectionToolbar(HDC dc, PdfTab& tab, bool paintSurface);
+    void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client, bool paintSurface);
     void PaintSidebarPanelToggleAtomic(HDC dc, RECT client);
     void PaintStatus(HDC dc, RECT client);
     void PaintImmersiveExitAtomic(HDC dc, RECT client);
@@ -15355,6 +15402,11 @@ namespace
         BitBlt(g_paintBufferDc, g_stage.left, g_stage.top,
             g_stage.right - g_stage.left, g_stage.bottom - g_stage.top,
             g_stageFrameDc, g_stage.left, g_stage.top, SRCCOPY);
+        // Recompose floating surfaces from the target geometry. They are not
+        // part of g_stageFrameDc, so a zoom transform cannot stretch an old
+        // popup or leave a snapshot at its pre-zoom position.
+        PaintAnnotationToolbar(g_paintBufferDc, *Active(), client, true);
+        PaintSelectionToolbar(g_paintBufferDc, *Active(), true);
         PaintMainScrollBar(g_paintBufferDc, client, g_stage);
 
         RECT toggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
@@ -19851,7 +19903,6 @@ namespace
 
     void EnsureAnnotationNoteEdit(HWND hwnd)
     {
-        bool fontCreated = false;
         if (!g_annotationNoteEdit)
         {
             g_annotationNoteEdit = CreateWindowExW(
@@ -19875,12 +19926,19 @@ namespace
             SendMessageW(g_annotationNoteEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"点击输入注释..."));
         }
         if (!g_annotationNoteEditFont)
-        {
             g_annotationNoteEditFont = SystemUiFont(10);
-            fontCreated = true;
+        if (!g_annotationFreeTextEditFont)
+        {
+            PdfAnnotation defaultAnnotation;
+            defaultAnnotation.freeTextFontSizePt = kFreeTextDefaultFontSizePt;
+            g_annotationFreeTextEditFont = FreeTextFont(defaultAnnotation);
+            g_annotationFreeTextEditFontKind = defaultAnnotation.freeTextFont;
+            g_annotationFreeTextEditFontSizePt = defaultAnnotation.freeTextFontSizePt;
         }
-        if (fontCreated)
-            SendMessageW(g_annotationNoteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_annotationNoteEditFont), FALSE);
+        HFONT targetFont = g_annotationInlineFreeText
+            ? g_annotationFreeTextEditFont : g_annotationNoteEditFont;
+        if (reinterpret_cast<HFONT>(SendMessageW(g_annotationNoteEdit, WM_GETFONT, 0, 0)) != targetFont)
+            SendMessageW(g_annotationNoteEdit, WM_SETFONT, reinterpret_cast<WPARAM>(targetFont), TRUE);
         UpdateAnnotationNoteEditScrollbar();
     }
 
@@ -19946,6 +20004,19 @@ namespace
     {
         EnsureAnnotationNoteEdit(hwnd);
         if (!g_annotationNoteEdit) return;
+
+        if (!g_annotationFreeTextEditFont ||
+            g_annotationFreeTextEditFontKind != annotation.freeTextFont ||
+            g_annotationFreeTextEditFontSizePt != annotation.freeTextFontSizePt)
+        {
+            if (g_annotationFreeTextEditFont) DeleteObject(g_annotationFreeTextEditFont);
+            g_annotationFreeTextEditFont = nullptr;
+            g_annotationFreeTextEditFont = FreeTextFont(annotation);
+            g_annotationFreeTextEditFontKind = annotation.freeTextFont;
+            g_annotationFreeTextEditFontSizePt = annotation.freeTextFontSizePt;
+            SendMessageW(g_annotationNoteEdit, WM_SETFONT,
+                reinterpret_cast<WPARAM>(g_annotationFreeTextEditFont), TRUE);
+        }
 
         if (g_annotationNoteEditAnnotation != g_activeAnnotation)
         {
@@ -20072,7 +20143,7 @@ namespace
         return haveBounds && !IsRectEmpty(&bounds);
     }
 
-    void PaintSelectionToolbar(HDC dc, PdfTab& tab)
+    void PaintSelectionToolbar(HDC dc, PdfTab& tab, bool paintSurface = true)
     {
         g_selectionToolbarRect = {};
         g_selectionToolbarActionRects.clear();
@@ -20102,6 +20173,12 @@ namespace
         top = std::clamp<int>(top, g_stage.top + S(6),
             std::max<int>(g_stage.top + S(6), g_stage.bottom - height - S(6)));
         g_selectionToolbarRect = RECT{ left, top, left + width, top + height };
+
+        // Layout and hit-test geometry must be refreshed during the reader
+        // pass, but the floating surface itself must stay out of the retained
+        // page frame. It is painted after that frame has been committed.
+        if (!paintSurface)
+            return;
 
         float radius = static_cast<float>(S(7));
         BlurRoundedBackdrop(dc, g_selectionToolbarRect, radius);
@@ -20153,6 +20230,7 @@ namespace
         if (!g_annotationToolbarOpen) return false;
         if (Hit(g_annotationCopyRect, pt.x, pt.y) ||
             Hit(g_annotationNoteRect, pt.x, pt.y) ||
+            Hit(g_annotationFormatRect, pt.x, pt.y) ||
             Hit(g_annotationDeleteRect, pt.x, pt.y) ||
             Hit(g_annotationNoteCloseRect, pt.x, pt.y) ||
             Hit(g_annotationCustomColorRect, pt.x, pt.y))
@@ -20162,7 +20240,7 @@ namespace
         return false;
     }
 
-    void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client)
+    void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client, bool paintSurface = true)
     {
         g_annotationToolbarRect = {};
         g_annotationCopyRect = {};
@@ -20279,6 +20357,50 @@ namespace
         g_annotationPopupAnchor = POINT{};
         g_annotationPopupAnchorValid = false;
 
+        // The toolbar geometry above is part of the reader layout pass. Do
+        // not let its pixels enter g_stageFrameDc: zoom and scroll transform
+        // that buffer as a page-only surface. The foreground pass below
+        // redraws this same geometry after the page frame is stable.
+        if (!paintSurface)
+        {
+            int x = g_annotationToolbarRect.left + S(9);
+            int y = g_annotationToolbarRect.top + S(7);
+            int h = S(28);
+            g_annotationCopyRect = RECT{ x, y, x + S(40), y + h };
+            x += S(45);
+            g_annotationNoteRect = RECT{ x, y, x + S(40), y + h };
+            g_annotationFormatRect = annotation->kind == AnnotationKind::FreeText
+                ? g_annotationNoteRect : RECT{};
+            x += S(45);
+            g_annotationDeleteRect = RECT{ x, y, x + S(40), y + h };
+            x += S(50);
+            for (int displayIndex = 0; displayIndex < static_cast<int>(std::size(AnnotationPaletteDisplayOrder)); ++displayIndex)
+            {
+                RECT swatch{ x, y + S(6), x + S(16), y + S(22) };
+                g_annotationColorRects.push_back(swatch);
+                x += S(22);
+            }
+            g_annotationCustomColorRect = RECT{ x, y + S(6), x + S(16), y + S(22) };
+            if (g_annotationNoteOpen)
+            {
+                int panelW = S(260);
+                int panelH = S(214);
+                int panelLeft = std::min<int>(static_cast<int>(g_annotationToolbarRect.right) - panelW,
+                    static_cast<int>(client.right) - panelW - S(14));
+                panelLeft = std::max<int>(static_cast<int>(g_stage.left) + S(14), panelLeft);
+                int panelTop = std::min<int>(static_cast<int>(g_annotationToolbarRect.bottom) + S(8),
+                    static_cast<int>(client.bottom) - panelH - S(46));
+                panelTop = std::max<int>(static_cast<int>(g_stage.top) + S(14), panelTop);
+                g_annotationNotePanelRect = RECT{ panelLeft, panelTop, panelLeft + panelW, panelTop + panelH };
+                g_annotationNoteInputRect = RECT{ panelLeft + S(14), panelTop + S(64),
+                    panelLeft + panelW - S(14), panelTop + panelH - S(14) };
+                SyncAnnotationNoteEdit(g_hwnd, *annotation);
+            }
+            else if (g_annotationNoteEdit)
+                ShowWindow(g_annotationNoteEdit, SW_HIDE);
+            return;
+        }
+
         BlurRoundedBackdrop(dc, g_annotationToolbarRect, S(11.0f));
         DrawRoundedShadow(dc, g_annotationToolbarRect, S(11.0f), S(1), S(2), S(4), IsDarkTheme() ? 36 : 28);
         GlassRoundedSurface(dc, g_annotationToolbarRect, IsDarkTheme() ? 208 : 226, S(11.0f), false);
@@ -20299,7 +20421,10 @@ namespace
         drawTool(g_annotationCopyRect, L"\u590d\u5236");
         x += S(45);
         g_annotationNoteRect = RECT{ x, y, x + S(40), y + h };
-        drawTool(g_annotationNoteRect, L"\u4fbf\u7b7e", g_annotationNoteOpen);
+        bool freeTextAnnotation = annotation->kind == AnnotationKind::FreeText;
+        g_annotationFormatRect = freeTextAnnotation ? g_annotationNoteRect : RECT{};
+        drawTool(g_annotationNoteRect, freeTextAnnotation ? L"\u5b57\u4f53" : L"\u4fbf\u7b7e",
+            !freeTextAnnotation && g_annotationNoteOpen);
         x += S(45);
         g_annotationDeleteRect = RECT{ x, y, x + S(40), y + h };
         drawTool(g_annotationDeleteRect, L"\u5220\u9664");
@@ -20801,8 +20926,8 @@ namespace
         if (Intersects(paintClip, g_stage) || Intersects(paintClip, g_annotationToolbarRect) ||
             Intersects(paintClip, g_annotationNotePanelRect) || Intersects(paintClip, g_selectionToolbarRect))
         {
-            PaintAnnotationToolbar(dc, *tab, client);
-            PaintSelectionToolbar(dc, *tab);
+            PaintAnnotationToolbar(dc, *tab, client, false);
+            PaintSelectionToolbar(dc, *tab, false);
         }
         return canFlush;
     }
@@ -22185,6 +22310,27 @@ namespace
         ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
     }
 
+    void ShowFreeTextFormatMenu(HWND hwnd)
+    {
+        PdfTab* tab = Active();
+        PdfAnnotation* annotation = nullptr;
+        if (!tab || !ActiveAnnotation(*tab, annotation) ||
+            annotation->kind != AnnotationKind::FreeText)
+            return;
+        HMENU menu = CreatePopupMenu();
+        AppendThemedMenuItem(menu, 2540, L"\u65e0\u895e\u7ebf\u5b57\u4f53", annotation->freeTextFont == FreeTextFontKind::Sans);
+        AppendThemedMenuItem(menu, 2541, L"\u886c\u7ebf\u5b57\u4f53", annotation->freeTextFont == FreeTextFontKind::Serif);
+        AppendThemedMenuItem(menu, 2542, L"\u7b49\u5bbd\u5b57\u4f53", annotation->freeTextFont == FreeTextFontKind::Mono);
+        AppendThemedMenuSeparator(menu);
+        AppendThemedMenuItem(menu, 2543, L"\u5b57\u53f7 12", annotation->freeTextFontSizePt == 12);
+        AppendThemedMenuItem(menu, 2544, L"\u5b57\u53f7 14", annotation->freeTextFontSizePt == 14);
+        AppendThemedMenuItem(menu, 2545, L"\u5b57\u53f7 18", annotation->freeTextFontSizePt == 18);
+        AppendThemedMenuItem(menu, 2546, L"\u5b57\u53f7 22", annotation->freeTextFontSizePt == 22);
+        POINT pt{ g_annotationFormatRect.left, g_annotationFormatRect.bottom + S(4) };
+        ClientToScreen(hwnd, &pt);
+        ShowThemedPopupMenu(hwnd, menu, pt.x, pt.y);
+    }
+
     void ShowKeyboardShortcutsDialog(HWND hwnd)
     {
         g_keyboardShortcutsOpen = true;
@@ -22826,7 +22972,7 @@ namespace
         else if (kind == AnnotationKind::Stamp)
         {
             FinishCreatedAnnotation(hwnd, kind, g_annotationCreatePage, r,
-                POINT{ p.x - S(42), p.y - S(14) }, POINT{ p.x + S(42), p.y + S(14) });
+                POINT{ p.x - S(66), p.y - S(21) }, POINT{ p.x + S(66), p.y + S(21) });
         }
         else if (kind == AnnotationKind::Caret)
         {
@@ -22835,8 +22981,8 @@ namespace
         }
         else if (kind == AnnotationKind::FreeText)
         {
-            int width = S(220);
-            int height = S(42);
+            int width = S(260);
+            int height = S(58);
             POINT a{ p.x, p.y };
             POINT b{ p.x + width, p.y + height };
             if (b.x > r.right)
@@ -22960,6 +23106,13 @@ namespace
             if (annotation.author.empty()) annotation.author = L"10726";
             annotation.note = FromUtf8(item.contents);
             annotation.text = annotation.note;
+            if (annotation.kind == AnnotationKind::FreeText)
+            {
+                annotation.freeTextFont = item.fontKind == 1 ? FreeTextFontKind::Serif
+                    : (item.fontKind == 2 ? FreeTextFontKind::Mono : FreeTextFontKind::Sans);
+                if (item.fontSizePt >= 8.0f && item.fontSizePt <= 48.0f)
+                    annotation.freeTextFontSizePt = static_cast<int>(item.fontSizePt + 0.5f);
+            }
             if (annotation.kind == AnnotationKind::Underline || annotation.kind == AnnotationKind::Squiggly)
             {
                 std::wstring selectedText = ExtractAnnotationTextForRect(
@@ -23173,6 +23326,10 @@ namespace
                 out.createdAtMs = item.createdAt > 0 ? item.createdAt : NowMs();
                 out.author = authors.back().empty() ? "10726" : authors.back().c_str();
                 out.contents = notes.back().empty() ? nullptr : notes.back().c_str();
+                out.fontKind = item.freeTextFont == FreeTextFontKind::Serif ? 1
+                    : (item.freeTextFont == FreeTextFontKind::Mono ? 2 : 0);
+                out.fontSizePt = static_cast<float>(std::clamp(item.freeTextFontSizePt,
+                    8, 48));
                 if (inkPoints && !inkPoints->empty())
                 {
                     out.inkPoints = inkPoints->data();
@@ -24100,6 +24257,25 @@ namespace
         if (id == 2535) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Square); return; }
         if (id == 2536) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Circle); return; }
         if (id == 2537) { CreateAnnotationAtCursor(hwnd, AnnotationKind::Ink); return; }
+        if (id >= 2540 && id <= 2546)
+        {
+            PdfTab* activeTab = Active();
+            PdfAnnotation* annotation = nullptr;
+            if (activeTab && ActiveAnnotation(*activeTab, annotation) &&
+                annotation->kind == AnnotationKind::FreeText)
+            {
+                if (id <= 2542)
+                    annotation->freeTextFont = id == 2540 ? FreeTextFontKind::Sans
+                        : (id == 2541 ? FreeTextFontKind::Serif : FreeTextFontKind::Mono);
+                else
+                    annotation->freeTextFontSizePt = id == 2543 ? 12
+                        : (id == 2544 ? 14 : (id == 2545 ? 18 : 22));
+                activeTab->dirty = true;
+                SetTitle();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return;
+        }
         if (id == 2505)
         {
             size_t annotationCount = tab ? tab->annotations.size() : 0;
@@ -24740,6 +24916,8 @@ namespace
             // complete frame stable until the target spread is ready.
             Fill(dc, reader, T().stage);
             presented = RestoreStableStageFrame(dc, reader);
+            PaintAnnotationToolbar(dc, *tab, client, true);
+            PaintSelectionToolbar(dc, *tab, true);
             PaintSidebarPanelToggle(dc, client);
             if (g_immersive) PaintStatus(dc, client);
             RestoreDC(dc, state);
@@ -24787,6 +24965,8 @@ namespace
             paintExposed(RECT{ covered.right, reader.top, reader.right, covered.bottom });
         if (covered.left > reader.left)
             paintExposed(RECT{ reader.left, covered.top, covered.left, covered.bottom });
+        PaintAnnotationToolbar(dc, *tab, client, true);
+        PaintSelectionToolbar(dc, *tab, true);
         PaintSidebarPanelToggle(dc, client);
         if (g_immersive) PaintStatus(dc, client);
         RestoreDC(dc, state);
@@ -25053,6 +25233,19 @@ namespace
         {
             if (IntersectRect(&stableStageRect, &dirty, &g_stage))
                 restoredStableStage = RestoreStageFrame(mem, stableStageRect);
+        }
+        // Floating annotation/selection surfaces are foreground chrome. Paint
+        // them only after the page frame has been committed or restored so a
+        // later zoom/scroll transform can never carry their old pixels along.
+        if (!scrollBarOnly &&
+            (Intersects(dirty, g_stage) || Intersects(dirty, g_annotationToolbarRect) ||
+                Intersects(dirty, g_annotationNotePanelRect) || Intersects(dirty, g_selectionToolbarRect)))
+        {
+            if (PdfTab* activeTab = Active())
+            {
+                PaintAnnotationToolbar(mem, *activeTab, client, true);
+                PaintSelectionToolbar(mem, *activeTab, true);
+            }
         }
         if (!scrollBarOnly)
             PaintMainScrollBar(mem, client, dirty);
@@ -25867,6 +26060,12 @@ namespace
                 DeleteObject(g_annotationNoteEditFont);
                 g_annotationNoteEditFont = nullptr;
             }
+            if (g_annotationFreeTextEditFont)
+            {
+                DeleteObject(g_annotationFreeTextEditFont);
+                g_annotationFreeTextEditFont = nullptr;
+                g_annotationFreeTextEditFontSizePt = 0;
+            }
             RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_ALLCHILDREN);
             InvalidateSidebarChrome(hwnd);
             return 0;
@@ -26476,6 +26675,11 @@ namespace
                     }
                     if (Hit(g_annotationNoteRect, x, y))
                     {
+                        if (annotation->kind == AnnotationKind::FreeText)
+                        {
+                            ShowFreeTextFormatMenu(hwnd);
+                            return 0;
+                        }
                         g_annotationNoteOpen = true;
                         g_annotationNoteFocused = true;
                         g_annotationNoteEditAnnotation = -1;
@@ -28964,6 +29168,7 @@ namespace
             ReleasePaintBuffer();
             if (g_glassBackdrop) DeleteObject(g_glassBackdrop);
             if (g_annotationNoteEditFont) DeleteObject(g_annotationNoteEditFont);
+            if (g_annotationFreeTextEditFont) DeleteObject(g_annotationFreeTextEditFont);
             if (g_annotationNoteEditBrush) DeleteObject(g_annotationNoteEditBrush);
             ReleaseUiaProvider();
             ReleaseUiaRootProvider();

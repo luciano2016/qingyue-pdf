@@ -187,7 +187,7 @@ extern "C" fz_document* quiet_open_document_shared_w(fz_context* ctx, const wcha
     }
     return document;
 }
-struct quiet_pdf_annotation
+    struct quiet_pdf_annotation
 {
     int page;
     int kind;
@@ -202,8 +202,10 @@ struct quiet_pdf_annotation
     int64_t created_at_ms;
     const char* author;
     const char* contents;
-    struct quiet_pdf_ink_point const* ink_points;
-    int ink_point_count;
+        struct quiet_pdf_ink_point const* ink_points;
+        int ink_point_count;
+        int font_kind;
+        float font_size_pt;
 };
 
 struct quiet_pdf_ink_point
@@ -227,8 +229,10 @@ struct quiet_pdf_annotation_info
     float opacity;
     int64_t created_at_ms;
     char author[128];
-    char contents[512];
-    int stroke_start;
+        char contents[512];
+        int stroke_start;
+        int font_kind;
+        float font_size_pt;
 };
 
 static char quiet_last_error[512] = "";
@@ -926,7 +930,13 @@ extern "C" int quiet_pdf_save_annotations(
                         if (type == PDF_ANNOT_FREE_TEXT)
                         {
                             pdf_set_annot_border_width(ctx, annot, 0.0f);
-                            pdf_set_annot_default_appearance(ctx, annot, "Helv", 12, 3, color);
+                            const char* font = input.font_kind == 1 ? "TiRo"
+                                : (input.font_kind == 2 ? "Cour" : "Helv");
+                            float fontSize = input.font_size_pt >= 8.0f && input.font_size_pt <= 48.0f
+                                ? input.font_size_pt : 14.0f;
+                            // Keep the saved PDF appearance aligned with the
+                            // inline editor and the native page renderer.
+                            pdf_set_annot_default_appearance(ctx, annot, font, fontSize, 3, color);
                         }
                         else if (type == PDF_ANNOT_TEXT)
                         {
@@ -1064,6 +1074,23 @@ extern "C" int quiet_pdf_load_annotations(
                             item.created_at_ms = date > 0 ? date * 1000 : 0;
                             quiet_copy_text(item.author, sizeof(item.author), author);
                             quiet_copy_text(item.contents, sizeof(item.contents), contents);
+                            item.font_kind = 0;
+                            item.font_size_pt = 0.0f;
+                            if (type == PDF_ANNOT_FREE_TEXT)
+                            {
+                                const char* font = nullptr;
+                                float size = 0.0f;
+                                int components = 0;
+                                float appearanceColor[4] = {};
+                                pdf_annot_default_appearance(ctx, annot, &font, &size,
+                                    &components, appearanceColor);
+                                if (font && (std::strstr(font, "Times") || std::strstr(font, "TiRo")))
+                                    item.font_kind = 1;
+                                else if (font && (std::strstr(font, "Courier") || std::strstr(font, "Cour")))
+                                    item.font_kind = 2;
+                                if (size >= 8.0f && size <= 48.0f)
+                                    item.font_size_pt = size;
+                            }
                             item.stroke_start = stroke_start;
                             ++count;
                         };

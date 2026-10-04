@@ -2,6 +2,11 @@
 
 本项目的公开版本变更记录从 0.8.6 开始维护。
 
+## [1.9.7] - 2026-10-04
+- 将选区快捷面板和标注面板从页面保留帧中分离，避免缩放、滚动时闪动、回弹和残影。
+- 自由文字默认字号调整为 14，并支持无衬线、衬线、等宽字体以及 12/14/18/22 号字号选择；保存到 PDF 的外观与编辑态保持一致。
+- 放大默认图章尺寸并优化红色边框与 `DRAFT` 字样的显示效果。
+
 ## [1.9.6] - 2026-10-04
 - Repaint the reader when floating selection or annotation controls are open so retained scrolling cannot leave stale toolbar pixels behind.
 - Keep annotation popup placement relative to its mark while scrolling.
