@@ -3814,7 +3814,7 @@ namespace
         if (IsRectEmpty(&r)) return;
 
         float radius = S(10.0f);
-        DrawRoundedShadow(dc, r, radius, S(1), S(3), S(5), IsDarkTheme() ? 40 : 28);
+        DrawRoundedShadow(dc, r, radius, S(0), S(1), S(2), IsDarkTheme() ? 24 : 16);
 
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -3853,11 +3853,6 @@ namespace
                 Gdiplus::PointF(static_cast<float>(x), static_cast<float>(r.bottom - S(9))));
         }
 
-        COLORREF bottomLine = highlighted ? T().accent : T().line;
-        Gdiplus::Pen bottom(GdiColor(bottomLine, IsDarkTheme() ? 76 : 92), S(1.0f));
-        g.DrawLine(&bottom,
-            Gdiplus::PointF(static_cast<float>(r.left + S(14)), static_cast<float>(r.bottom - S(2))),
-            Gdiplus::PointF(static_cast<float>(r.right - S(14)), static_cast<float>(r.bottom - S(2))));
     }
 
     void BlurRoundedBackdrop(HDC dc, RECT r, float radius)
@@ -5191,6 +5186,35 @@ namespace
                         g.DrawRectangle(&pen, x + w * (0.22f + xx * 0.32f), y + h * (0.22f + yy * 0.32f), w * 0.18f, h * 0.18f);
             }
         }
+    }
+
+    void PaintHomeFavoriteSurface(HDC dc, RECT r, bool hovered, bool active, bool pressed)
+    {
+        float radius = S(7.0f);
+        DrawRoundedShadow(dc, r, radius, S(0), S(1), S(2), IsDarkTheme() ? 22 : 14);
+
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+        COLORREF base = active
+            ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.30 : 0.78)
+            : MixColor(T().panel, T().paper, IsDarkTheme() ? 0.18 : 0.42);
+        if (hovered)
+            base = MixColor(base, T().accent, IsDarkTheme() ? 0.075 : 0.035);
+        if (pressed)
+            base = MixColor(base, T().accent, IsDarkTheme() ? 0.14 : 0.075);
+
+        Gdiplus::SolidBrush fill(GdiColor(base, IsDarkTheme() ? 214 : 228));
+        FillGdiRoundRect(g, fill, Rf(r), radius);
+
+        COLORREF edge = active ? T().accent : MixColor(T().line, T().paper, 0.18);
+        Gdiplus::Pen border(GdiColor(edge, IsDarkTheme() ? 112 : 128), S(1.0f));
+        DrawGdiRoundRect(g, border, Rf(r), radius);
+
+        RECT sheen{ r.left + S(5), r.top + S(2), r.right - S(5), r.top + S(3) };
+        Gdiplus::SolidBrush top(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 22 : 58));
+        FillGdiRoundRect(g, top, Rf(sheen), S(1.0f));
     }
 
     void AddButton(int id, RECT r, std::wstring text, std::wstring tip = L"")
@@ -17119,7 +17143,10 @@ namespace
             fill = pressed ? RGB(255, 224, 224) : (hover ? RGB(255, 238, 238) : T().panel2);
             line = fill;
         }
-        if (pressed || active || (hover && hoverBackground)) RoundFill(dc, hot, S(7), fill, line);
+        if (action == HomeAction::Favorite)
+            PaintHomeFavoriteSurface(dc, hot, hover, active, pressed);
+        else if (pressed || active || (hover && hoverBackground))
+            RoundFill(dc, hot, S(7), fill, line);
         RECT icon{ hot.left + S(iconInset), hot.top + S(iconInset), hot.right - S(iconInset), hot.bottom - S(iconInset) };
         COLORREF color = action == HomeAction::Remove
             ? (hover || pressed ? RGB(238, 73, 78) : RGB(225, 92, 92))
