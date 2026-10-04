@@ -5089,9 +5089,26 @@ namespace
         }
         path.AddLines(points, 10);
         path.CloseFigure();
-        Gdiplus::Pen pen(GdiColor(color), std::max<Gdiplus::REAL>(1.25f, S(1.1f)));
+        Gdiplus::REAL strokeWidth = std::max<Gdiplus::REAL>(1.25f, S(1.1f));
+        Gdiplus::Pen pen(GdiColor(color), strokeWidth);
         pen.SetLineJoin(Gdiplus::LineJoinRound);
         Gdiplus::SolidBrush brush(GdiColor(color));
+
+        // Give the star its own small extrusion. There is deliberately no
+        // surrounding button surface: the depth comes from the star shape.
+        Gdiplus::PointF shadowPoints[10]{};
+        for (int i = 0; i < 10; ++i)
+            shadowPoints[i] = Gdiplus::PointF(points[i].X + S(0.8f), points[i].Y + S(1.1f));
+        Gdiplus::GraphicsPath shadowPath;
+        shadowPath.AddLines(shadowPoints, 10);
+        shadowPath.CloseFigure();
+        COLORREF shadowColor = MixColor(color, RGB(0, 0, 0), filled ? 0.48 : 0.34);
+        Gdiplus::Pen shadowPen(GdiColor(shadowColor, filled ? 148 : 82), strokeWidth);
+        shadowPen.SetLineJoin(Gdiplus::LineJoinRound);
+        Gdiplus::SolidBrush shadowBrush(GdiColor(shadowColor, filled ? 126 : 0));
+        if (filled) g.FillPath(&shadowBrush, &shadowPath);
+        g.DrawPath(&shadowPen, &shadowPath);
+
         if (filled) g.FillPath(&brush, &path);
         g.DrawPath(&pen, &path);
     }
@@ -5186,41 +5203,6 @@ namespace
                         g.DrawRectangle(&pen, x + w * (0.22f + xx * 0.32f), y + h * (0.22f + yy * 0.32f), w * 0.18f, h * 0.18f);
             }
         }
-    }
-
-    void PaintHomeFavoriteSurface(HDC dc, RECT r, bool hovered, bool active, bool pressed)
-    {
-        float radius = S(7.0f);
-        DrawRoundedShadow(dc, r, radius, S(0), S(2), S(3), IsDarkTheme() ? 34 : 28);
-
-        Gdiplus::Graphics g(dc);
-        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-
-        COLORREF base = active
-            ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.30 : 0.78)
-            : MixColor(T().paper, T().line, IsDarkTheme() ? 0.16 : 0.22);
-        if (hovered)
-            base = MixColor(base, T().accent, IsDarkTheme() ? 0.075 : 0.035);
-        if (pressed)
-            base = MixColor(base, T().accent, IsDarkTheme() ? 0.14 : 0.075);
-
-        Gdiplus::SolidBrush fill(GdiColor(base, IsDarkTheme() ? 232 : 244));
-        FillGdiRoundRect(g, fill, Rf(r), radius);
-
-        COLORREF edge = active ? T().accent : MixColor(T().line, T().paper, 0.08);
-        Gdiplus::Pen border(GdiColor(edge, IsDarkTheme() ? 132 : 158), S(1.0f));
-        DrawGdiRoundRect(g, border, Rf(r), radius);
-
-        RECT sheen{ r.left + S(5), r.top + S(2), r.right - S(5), r.top + S(4) };
-        Gdiplus::SolidBrush top(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 30 : 82));
-        FillGdiRoundRect(g, top, Rf(sheen), S(1.0f));
-
-        RECT lower{ r.left + S(4), r.bottom - S(4), r.right - S(4), r.bottom - S(2) };
-        Gdiplus::SolidBrush lowerEdge(GdiColor(
-            IsDarkTheme() ? T().line : MixColor(T().line, T().paper, 0.10),
-            IsDarkTheme() ? 52 : 64));
-        FillGdiRoundRect(g, lowerEdge, Rf(lower), S(1.0f));
     }
 
     void AddButton(int id, RECT r, std::wstring text, std::wstring tip = L"")
@@ -17149,9 +17131,7 @@ namespace
             fill = pressed ? RGB(255, 224, 224) : (hover ? RGB(255, 238, 238) : T().panel2);
             line = fill;
         }
-        if (action == HomeAction::Favorite)
-            PaintHomeFavoriteSurface(dc, hot, hover, active, pressed);
-        else if (pressed || active || (hover && hoverBackground))
+        if (pressed || active || (hover && hoverBackground))
             RoundFill(dc, hot, S(7), fill, line);
         RECT icon{ hot.left + S(iconInset), hot.top + S(iconInset), hot.right - S(iconInset), hot.bottom - S(iconInset) };
         COLORREF color = action == HomeAction::Remove
