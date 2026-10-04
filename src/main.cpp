@@ -14371,6 +14371,7 @@ namespace
     void PaintSidebarPanelToggle(HDC dc, RECT client);
     void PaintSelectionToolbar(HDC dc, PdfTab& tab, bool paintSurface);
     void PaintAnnotationToolbar(HDC dc, PdfTab& tab, RECT client, bool paintSurface);
+    void RefreshFloatingToolbarGeometry(HWND hwnd, PdfTab& tab);
     void PaintSidebarPanelToggleAtomic(HDC dc, RECT client);
     void PaintStatus(HDC dc, RECT client);
     void PaintImmersiveExitAtomic(HDC dc, RECT client);
@@ -14408,6 +14409,20 @@ namespace
         // page/book zoom falls back to waiting for a fresh full-page render.
         // Single-page mode remains on the 2.5.9 path.
         return g_viewMode != 0;
+    }
+
+    void RefreshFloatingToolbarGeometry(HWND hwnd, PdfTab& tab)
+    {
+        RECT client{};
+        if (hwnd)
+            GetClientRect(hwnd, &client);
+
+        // These calls intentionally use the layout-only path. Keeping the
+        // floating controls out of the retained page frame means their screen
+        // rectangles follow the document immediately after a viewport move,
+        // while their pixels are still submitted by the foreground pass.
+        PaintAnnotationToolbar(nullptr, tab, client, false);
+        PaintSelectionToolbar(nullptr, tab, false);
     }
 
     void FinishZoomPresentationForScroll(HWND hwnd, PdfTab& tab)
@@ -14880,6 +14895,8 @@ namespace
             g_annotationPopupAnchorValid = false;
         }
         g_scrollY = std::clamp(newScrollY, 0, maxScroll);
+        if (tab && (g_selectionToolbarOpen || g_annotationToolbarOpen || g_annotationNoteOpen))
+            RefreshFloatingToolbarGeometry(hwnd, *tab);
         if (tab && g_continuousRead)
         {
             tab->currentPage = PageFromScroll(*tab, g_scrollY);
@@ -15076,6 +15093,8 @@ namespace
             UpdateVertScrollBar(hwnd);
             return;
         }
+        if (tab && (g_selectionToolbarOpen || g_annotationToolbarOpen || g_annotationNoteOpen))
+            RefreshFloatingToolbarGeometry(hwnd, *tab);
         MarkStageScrolling(hwnd);
         bool facingContinuous = UseFacingContinuousPresentation();
         if (facingContinuous && tab && tab->zoomPresentationPending)
@@ -15594,6 +15613,7 @@ namespace
         tab.zoomPresentationScrollX = g_scrollX;
         tab.zoomPresentationScrollY = g_scrollY;
         tab.zoomPresentationAnchorValid = true;
+        RefreshFloatingToolbarGeometry(hwnd, tab);
 
         if (g_viewMode != 0 && UseTiledPageRendering(tab))
         {
@@ -18985,6 +19005,11 @@ namespace
         PaintMainScrollBar(g_paintBufferDc, client, g_stage);
         if (toggleInReader)
             PaintSidebarPanelToggle(g_paintBufferDc, client);
+        // Floating controls are foreground chrome. Include them in the same
+        // off-screen zoom transaction so the old page frame cannot erase or
+        // flash them while the target page generation is pending.
+        PaintAnnotationToolbar(g_paintBufferDc, tab, client, true);
+        PaintSelectionToolbar(g_paintBufferDc, tab, true);
         if (g_immersive)
             PaintStatus(g_paintBufferDc, client);
         if (g_tabListOpen)
@@ -20134,12 +20159,10 @@ namespace
                     UnionRect(&bounds, &bounds, &visibleQuad);
             }
         }
-        if (!haveBounds)
-        {
-            RECT fallback = CurrentSelectionRect();
-            if (!IsRectEmpty(&fallback) && IntersectRect(&bounds, &fallback, &g_stage))
-                haveBounds = true;
-        }
+        // Do not fall back to the drag endpoints here. They are screen-space
+        // coordinates from selection creation and become stale after a
+        // scroll. The native text quads are the only source that can prove
+        // the selection is still visible in the current viewport.
         return haveBounds && !IsRectEmpty(&bounds);
     }
 
@@ -25330,10 +25353,22 @@ namespace
                     // normal paint copy and they flash away after zoom.
                     RECT toggle = Active() ? SidebarPanelTogglePaintRectForClient(client) : RECT{};
                     RECT exit = ImmersiveExitPanelPaintRectForClient(client);
+                    RECT selectionToolbar = g_selectionToolbarRect;
+                    RECT annotationToolbar = g_annotationToolbarRect;
+                    RECT annotationNote = g_annotationNotePanelRect;
                     if (!IsRectEmpty(&toggle))
                         ExcludeClipRect(dc, toggle.left, toggle.top, toggle.right, toggle.bottom);
                     if (!IsRectEmpty(&exit))
                         ExcludeClipRect(dc, exit.left, exit.top, exit.right, exit.bottom);
+                    if (!IsRectEmpty(&selectionToolbar))
+                        ExcludeClipRect(dc, selectionToolbar.left, selectionToolbar.top,
+                            selectionToolbar.right, selectionToolbar.bottom);
+                    if (!IsRectEmpty(&annotationToolbar))
+                        ExcludeClipRect(dc, annotationToolbar.left, annotationToolbar.top,
+                            annotationToolbar.right, annotationToolbar.bottom);
+                    if (!IsRectEmpty(&annotationNote))
+                        ExcludeClipRect(dc, annotationNote.left, annotationNote.top,
+                            annotationNote.right, annotationNote.bottom);
                     // The retained reader frame is submitted after the
                     // tooltip has already been composited into the paint
                     // buffer. Keep the current tooltip out of this final

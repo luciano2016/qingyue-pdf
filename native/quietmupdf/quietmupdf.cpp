@@ -883,7 +883,14 @@ extern "C" int quiet_pdf_save_annotations(
                         pdf_set_annot_contents(ctx, annot, input.contents);
 
                     float color[3] = { input.color_r, input.color_g, input.color_b };
-                    pdf_set_annot_color(ctx, annot, 3, color);
+                    // For FreeText, /C is the fill/background color in PDF.
+                    // The application color is the text color and belongs in
+                    // /DA only; writing it to both fields creates an opaque
+                    // colored rectangle that hides the text in other readers.
+                    if (type == PDF_ANNOT_FREE_TEXT)
+                        pdf_dict_del(ctx, pdf_annot_obj(ctx, annot), PDF_NAME(C));
+                    else
+                        pdf_set_annot_color(ctx, annot, 3, color);
                     if (type == PDF_ANNOT_HIGHLIGHT || type == PDF_ANNOT_UNDERLINE ||
                         type == PDF_ANNOT_SQUIGGLY ||
                         type == PDF_ANNOT_STRIKE_OUT)
@@ -1050,6 +1057,26 @@ extern "C" int quiet_pdf_load_annotations(
                         float color[4] = { 1.0f, 0.82f, 0.0f, 1.0f };
                         int n = 0;
                         pdf_annot_color(ctx, annot, &n, color);
+                        if (type == PDF_ANNOT_FREE_TEXT)
+                        {
+                            const char* appearanceFont = nullptr;
+                            float appearanceSize = 0.0f;
+                            int appearanceComponents = 0;
+                            float appearanceColor[4] = {};
+                            pdf_annot_default_appearance(ctx, annot, &appearanceFont,
+                                &appearanceSize, &appearanceComponents, appearanceColor);
+                            if (appearanceComponents >= 3)
+                            {
+                                n = appearanceComponents;
+                                for (int component = 0; component < appearanceComponents && component < 4; ++component)
+                                    color[component] = appearanceColor[component];
+                            }
+                            else if (appearanceComponents == 1)
+                            {
+                                n = 3;
+                                color[0] = color[1] = color[2] = appearanceColor[0];
+                            }
+                        }
                         int64_t date = pdf_annot_creation_date(ctx, annot);
                         if (date <= 0) date = pdf_annot_modification_date(ctx, annot);
                         const char* author = pdf_annot_author(ctx, annot);
