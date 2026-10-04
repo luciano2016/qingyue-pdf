@@ -5191,7 +5191,7 @@ namespace
     void PaintHomeFavoriteSurface(HDC dc, RECT r, bool hovered, bool active, bool pressed)
     {
         float radius = S(7.0f);
-        DrawRoundedShadow(dc, r, radius, S(0), S(1), S(2), IsDarkTheme() ? 22 : 14);
+        DrawRoundedShadow(dc, r, radius, S(0), S(2), S(3), IsDarkTheme() ? 34 : 28);
 
         Gdiplus::Graphics g(dc);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -5199,22 +5199,28 @@ namespace
 
         COLORREF base = active
             ? MixColor(T().accent, T().paper, IsDarkTheme() ? 0.30 : 0.78)
-            : MixColor(T().panel, T().paper, IsDarkTheme() ? 0.18 : 0.42);
+            : MixColor(T().paper, T().line, IsDarkTheme() ? 0.16 : 0.22);
         if (hovered)
             base = MixColor(base, T().accent, IsDarkTheme() ? 0.075 : 0.035);
         if (pressed)
             base = MixColor(base, T().accent, IsDarkTheme() ? 0.14 : 0.075);
 
-        Gdiplus::SolidBrush fill(GdiColor(base, IsDarkTheme() ? 214 : 228));
+        Gdiplus::SolidBrush fill(GdiColor(base, IsDarkTheme() ? 232 : 244));
         FillGdiRoundRect(g, fill, Rf(r), radius);
 
-        COLORREF edge = active ? T().accent : MixColor(T().line, T().paper, 0.18);
-        Gdiplus::Pen border(GdiColor(edge, IsDarkTheme() ? 112 : 128), S(1.0f));
+        COLORREF edge = active ? T().accent : MixColor(T().line, T().paper, 0.08);
+        Gdiplus::Pen border(GdiColor(edge, IsDarkTheme() ? 132 : 158), S(1.0f));
         DrawGdiRoundRect(g, border, Rf(r), radius);
 
-        RECT sheen{ r.left + S(5), r.top + S(2), r.right - S(5), r.top + S(3) };
-        Gdiplus::SolidBrush top(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 22 : 58));
+        RECT sheen{ r.left + S(5), r.top + S(2), r.right - S(5), r.top + S(4) };
+        Gdiplus::SolidBrush top(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 30 : 82));
         FillGdiRoundRect(g, top, Rf(sheen), S(1.0f));
+
+        RECT lower{ r.left + S(4), r.bottom - S(4), r.right - S(4), r.bottom - S(2) };
+        Gdiplus::SolidBrush lowerEdge(GdiColor(
+            IsDarkTheme() ? T().line : MixColor(T().line, T().paper, 0.10),
+            IsDarkTheme() ? 52 : 64));
+        FillGdiRoundRect(g, lowerEdge, Rf(lower), S(1.0f));
     }
 
     void AddButton(int id, RECT r, std::wstring text, std::wstring tip = L"")
