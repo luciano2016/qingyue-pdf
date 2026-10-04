@@ -3809,6 +3809,57 @@ namespace
         DrawGdiRoundRect(g, border, Rf(r), radius);
     }
 
+    void PaintHomeActionDock(HDC dc, RECT r, bool highlighted)
+    {
+        if (IsRectEmpty(&r)) return;
+
+        float radius = S(10.0f);
+        DrawRoundedShadow(dc, r, radius, S(1), S(3), S(5), IsDarkTheme() ? 40 : 28);
+
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+        COLORREF base = IsDarkTheme()
+            ? MixColor(T().panel2, T().stage, 0.20)
+            : MixColor(T().panel, T().paper, 0.36);
+        if (highlighted)
+            base = MixColor(base, T().accent, IsDarkTheme() ? 0.045 : 0.025);
+
+        Gdiplus::SolidBrush fill(GdiColor(base, IsDarkTheme() ? 224 : 236));
+        FillGdiRoundRect(g, fill, Rf(r), radius);
+
+        RECT inner{ r.left + S(1), r.top + S(1), r.right - S(1), r.bottom - S(1) };
+        COLORREF innerLine = IsDarkTheme()
+            ? MixColor(T().muted, T().line, 0.34)
+            : MixColor(T().line, RGB(255, 255, 255), 0.42);
+        Gdiplus::Pen innerBorder(GdiColor(innerLine, IsDarkTheme() ? 92 : 122), S(1.0f));
+        DrawGdiRoundRect(g, innerBorder, Rf(inner), std::max(1.0f, radius - S(1.0f)));
+
+        RECT topSheen{ r.left + S(12), r.top + S(2), r.right - S(12), r.top + S(3) };
+        Gdiplus::SolidBrush sheen(GdiColor(RGB(255, 255, 255), IsDarkTheme() ? 24 : 70));
+        FillGdiRoundRect(g, sheen, Rf(topSheen), S(1.5f));
+
+        // Keep the three actions visually grouped without turning the dock
+        // into three separate cards.
+        Gdiplus::Pen divider(GdiColor(
+            IsDarkTheme() ? T().line : MixColor(T().line, T().paper, 0.16),
+            IsDarkTheme() ? 64 : 82), S(1.0f));
+        for (int i = 1; i < 3; ++i)
+        {
+            int x = r.left + S(34 * i);
+            g.DrawLine(&divider,
+                Gdiplus::PointF(static_cast<float>(x), static_cast<float>(r.top + S(9))),
+                Gdiplus::PointF(static_cast<float>(x), static_cast<float>(r.bottom - S(9))));
+        }
+
+        COLORREF bottomLine = highlighted ? T().accent : T().line;
+        Gdiplus::Pen bottom(GdiColor(bottomLine, IsDarkTheme() ? 76 : 92), S(1.0f));
+        g.DrawLine(&bottom,
+            Gdiplus::PointF(static_cast<float>(r.left + S(14)), static_cast<float>(r.bottom - S(2))),
+            Gdiplus::PointF(static_cast<float>(r.right - S(14)), static_cast<float>(r.bottom - S(2))));
+    }
+
     void BlurRoundedBackdrop(HDC dc, RECT r, float radius)
     {
         int width = r.right - r.left;
@@ -17289,7 +17340,7 @@ namespace
                 if (drawTile && g_homeScrollLightPaint)
                     RoundFill(dc, dock, S(11), MixColor(T().panel, T().paper, 0.36), MixColor(T().line, T().paper, 0.18));
                 else
-                    GlassRoundedSurface(dc, dock, IsDarkTheme() ? 196 : 208, S(11.0f));
+                    PaintHomeActionDock(dc, dock, hovered);
             }
             HomeAction actions[] = { HomeAction::Pin, HomeAction::Folder, HomeAction::Remove };
             const wchar_t* tips[] = { item.pinned ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u7f6e\u9876", L"\u6253\u5f00\u6587\u4ef6\u5939", L"\u5220\u9664\u8bb0\u5f55" };
