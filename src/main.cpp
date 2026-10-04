@@ -20284,7 +20284,9 @@ namespace
 
         int x = left + padding;
         int y = top + (height - button) / 2;
-        COLORREF iconColor = IsDarkTheme() ? T().text : RGB(138, 138, 138);
+        COLORREF iconColor = IsDarkTheme()
+            ? MixColor(T().text, T().panel, 0.12)
+            : RGB(112, 112, 112);
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
