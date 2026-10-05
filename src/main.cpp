@@ -3619,7 +3619,7 @@ namespace
 
     void DrawSelectionToolbarIcon(Gdiplus::Graphics& graphics, RECT rect, int index, COLORREF color)
     {
-        if (IsRectEmpty(&rect) || index < 0 || index > 4) return;
+        if (IsRectEmpty(&rect) || index < 0 || index > 5) return;
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
         graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
@@ -3634,8 +3634,10 @@ namespace
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::UnderlineU, color);
             DrawSelectionWave(graphics, rect, color);
         }
-        else
+        else if (index == 4)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Strikeout, color);
+        else
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Search, color);
     }
 
     int SelectionToolbarActionAt(POINT pt)
@@ -3650,7 +3652,7 @@ namespace
     wchar_t const* SelectionToolbarActionName(int index)
     {
         static wchar_t const* names[] = {
-            L"复制", L"高亮", L"下划线", L"波浪线", L"删除线"
+            L"复制", L"高亮", L"下划线", L"波浪线", L"删除线", L"必应搜索"
         };
         return index >= 0 && index < static_cast<int>(std::size(names)) ? names[index] : L"";
     }
@@ -20255,9 +20257,9 @@ namespace
         }
 
         int button = S(31);
-        int gap = S(4);
+        int gap = S(2);
         int padding = S(8);
-        int width = padding * 2 + button * 5 + gap * 4;
+        int width = padding * 2 + button * 6 + gap * 5;
         int height = button + S(8);
         int left = (selectionBounds.left + selectionBounds.right - width) / 2;
         left = std::clamp<int>(left, g_stage.left + S(7),
@@ -20285,12 +20287,12 @@ namespace
         int x = left + padding;
         int y = top + (height - button) / 2;
         COLORREF iconColor = IsDarkTheme()
-            ? MixColor(T().text, T().panel, 0.12)
-            : RGB(112, 112, 112);
+            ? MixColor(T().text, T().panel, 0.28)
+            : RGB(88, 88, 88);
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < 6; ++i)
         {
             RECT buttonRect{ x, y, x + button, y + button };
             g_selectionToolbarActionRects.push_back(buttonRect);
@@ -26780,6 +26782,16 @@ namespace
                         {
                             AddAnnotationFromSelection(hwnd, AnnotationKind::Strikeout);
                             ClearAnnotationFocus();
+                        }
+                        else if (i == 5)
+                        {
+                            SearchSelection(hwnd, 0);
+                            ClearTextSelection();
+                            g_hasHoverTip = false;
+                            g_hoverTip.clear();
+                            g_hoverTipRect = {};
+                            g_hoverTipPaintRect = {};
+                            InvalidateRect(hwnd, nullptr, FALSE);
                         }
                         return 0;
                     }
