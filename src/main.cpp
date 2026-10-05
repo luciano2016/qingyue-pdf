@@ -3620,11 +3620,15 @@ namespace
     void DrawSelectionToolbarIcon(Gdiplus::Graphics& graphics, RECT rect, int index, COLORREF color)
     {
         if (IsRectEmpty(&rect) || index < 0 || index > 5) return;
+        // The toolbar is a small physical-pixel surface even at high DPI.
+        // Keep vector coverage enabled and align it to half-pixels so curved
+        // SVG edges do not soften when the monitor compositor presents it.
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
         if (index == 0)
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Copy, color);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Copy,
+                MixColor(color, T().panel2, IsDarkTheme() ? 0.08 : 0.10));
         else if (index == 1)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color, 1024.0f, 1024.0f, 0.90f);
         else if (index == 2)
