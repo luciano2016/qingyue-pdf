@@ -3628,7 +3628,7 @@ namespace
         graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
         if (index == 0)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Copy,
-                MixColor(color, T().panel2, IsDarkTheme() ? 0.08 : 0.10));
+                MixColor(color, T().panel2, IsDarkTheme() ? 0.14 : 0.16));
         else if (index == 1)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color, 1024.0f, 1024.0f, 0.90f);
         else if (index == 2)
@@ -20291,8 +20291,8 @@ namespace
         int x = left + padding;
         int y = top + (height - button) / 2;
         COLORREF iconColor = IsDarkTheme()
-            ? MixColor(T().text, T().panel, 0.28)
-            : RGB(88, 88, 88);
+            ? MixColor(T().text, T().panel, 0.38)
+            : RGB(70, 70, 70);
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
