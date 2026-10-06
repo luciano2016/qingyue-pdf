@@ -1910,6 +1910,10 @@ namespace
     RECT g_selectionPageRect{};
     fz_point g_selectionStartNorm{};
     fz_rect g_selectionNorm{};
+    // Shift+Up/Down keeps the visual caret's preferred horizontal position,
+    // matching native text editors instead of jumping to line boundaries.
+    bool g_selectionPreferredXValid{};
+    float g_selectionPreferredX{};
     std::vector<fz_quad> g_selectionQuads;
     std::vector<TextSelectionSegment> g_selectionSegments;
     std::wstring g_selectionText;
@@ -11786,6 +11790,7 @@ namespace
         fz_rect current = (*boxes)[static_cast<size_t>(nearest)];
         if (key == VK_LEFT || key == VK_RIGHT)
         {
+            g_selectionPreferredXValid = false;
             int candidate = -1;
             if (key == VK_RIGHT)
             {
@@ -11847,37 +11852,161 @@ namespace
             return false;
         }
 
-        int candidate = -1;
-        float bestDistance = 2.0f;
         bool upward = key == VK_UP;
-        for (int i = 0; i < static_cast<int>(boxes->size()); ++i)
+        if (!g_selectionPreferredXValid)
         {
-            fz_rect const& box = (*boxes)[static_cast<size_t>(i)];
-            float lineDistance = upward ? current.y0 - box.y1 : box.y0 - current.y1;
-            if (lineDistance <= kEpsilon || lineDistance >= bestDistance) continue;
-            float horizontalDistance = endpoint.x < box.x0 ? box.x0 - endpoint.x :
-                (endpoint.x > box.x1 ? endpoint.x - box.x1 : 0.0f);
-            bestDistance = lineDistance;
-            candidate = i;
-            // Prefer the character nearest the current horizontal caret on
-            // the selected line when several boxes share the same baseline.
-            if (horizontalDistance < 0.001f) break;
+            g_selectionPreferredX = endpoint.x;
+            g_selectionPreferredXValid = true;
         }
-        if (candidate >= 0)
-            return setEndpoint(g_selectionEndPage, (*boxes)[static_cast<size_t>(candidate)],
-                !upward, upward);
 
-        int adjacentPage = g_selectionEndPage + (upward ? -1 : 1);
-        if (adjacentPage >= 0 && adjacentPage < tab->pageCount)
+        struct VisualLine
         {
-            if (auto adjacent = boxesFor(adjacentPage); adjacent && !adjacent->empty())
+            std::vector<int> indices;
+            float y0{};
+            float y1{};
+            float cy{};
+            float size{};
+        };
+
+        auto buildLines = [](std::vector<fz_rect> const& source)
+        {
+            std::vector<int> order;
+            order.reserve(source.size());
+            for (int i = 0; i < static_cast<int>(source.size()); ++i)
             {
-                return upward
-                    ? setEndpoint(adjacentPage, adjacent->back(), false, false)
-                    : setEndpoint(adjacentPage, adjacent->front(), true, true);
+                fz_rect const& box = source[static_cast<size_t>(i)];
+                if (box.x1 > box.x0 && box.y1 > box.y0)
+                    order.push_back(i);
+            }
+            std::sort(order.begin(), order.end(), [&](int a, int b)
+            {
+                fz_rect const& left = source[static_cast<size_t>(a)];
+                fz_rect const& right = source[static_cast<size_t>(b)];
+                float leftCy = (left.y0 + left.y1) * 0.5f;
+                float rightCy = (right.y0 + right.y1) * 0.5f;
+                float tolerance = std::max({ left.y1 - left.y0, right.y1 - right.y0, 0.001f }) * 0.45f;
+                if (std::abs(leftCy - rightCy) > tolerance)
+                    return leftCy < rightCy;
+                if (left.x0 != right.x0)
+                    return left.x0 < right.x0;
+                return left.x1 < right.x1;
+            });
+
+            std::vector<VisualLine> lines;
+            for (int index : order)
+            {
+                fz_rect const& box = source[static_cast<size_t>(index)];
+                float cy = (box.y0 + box.y1) * 0.5f;
+                float size = std::max(0.001f, box.y1 - box.y0);
+                int best = -1;
+                float bestDistance = std::numeric_limits<float>::max();
+                for (int lineIndex = static_cast<int>(lines.size()) - 1; lineIndex >= 0; --lineIndex)
+                {
+                    VisualLine const& line = lines[static_cast<size_t>(lineIndex)];
+                    if (cy > line.cy + std::max(0.006f, line.size * 2.0f))
+                        break;
+                    float tolerance = std::max({ 0.002f, line.size, size }) * 0.45f;
+                    float distance = std::abs(cy - line.cy);
+                    if (distance <= tolerance && distance < bestDistance)
+                    {
+                        best = lineIndex;
+                        bestDistance = distance;
+                    }
+                }
+                if (best < 0)
+                {
+                    VisualLine line;
+                    line.y0 = box.y0;
+                    line.y1 = box.y1;
+                    line.cy = cy;
+                    line.size = size;
+                    line.indices.push_back(index);
+                    lines.push_back(std::move(line));
+                }
+                else
+                {
+                    VisualLine& line = lines[static_cast<size_t>(best)];
+                    line.indices.push_back(index);
+                    line.y0 = std::min(line.y0, box.y0);
+                    line.y1 = std::max(line.y1, box.y1);
+                    line.cy = (line.y0 + line.y1) * 0.5f;
+                    line.size = std::max(line.size, size);
+                }
+            }
+
+            for (VisualLine& line : lines)
+            {
+                std::sort(line.indices.begin(), line.indices.end(), [&](int a, int b)
+                {
+                    fz_rect const& left = source[static_cast<size_t>(a)];
+                    fz_rect const& right = source[static_cast<size_t>(b)];
+                    if (left.x0 != right.x0)
+                        return left.x0 < right.x0;
+                    return left.x1 < right.x1;
+                });
+            }
+            std::sort(lines.begin(), lines.end(), [](VisualLine const& a, VisualLine const& b)
+            {
+                return a.cy < b.cy;
+            });
+            return lines;
+        };
+
+        auto setCaretOnLine = [&](int page, std::vector<fz_rect> const& pageBoxes,
+            VisualLine const& line)
+        {
+            if (line.indices.empty()) return false;
+            int bestIndex = line.indices.front();
+            float bestDistance = std::numeric_limits<float>::max();
+            float caretX = endpoint.x;
+            for (int index : line.indices)
+            {
+                fz_rect const& box = pageBoxes[static_cast<size_t>(index)];
+                float midpoint = (box.x0 + box.x1) * 0.5f;
+                float candidateX = g_selectionPreferredX <= midpoint ? box.x0 : box.x1;
+                float distance = std::abs(candidateX - g_selectionPreferredX);
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    bestIndex = index;
+                    caretX = candidateX;
+                }
+            }
+            fz_rect const& chosen = pageBoxes[static_cast<size_t>(bestIndex)];
+            if (bestDistance == std::numeric_limits<float>::max())
+                caretX = g_selectionPreferredX <= (chosen.x0 + chosen.x1) * 0.5f ? chosen.x0 : chosen.x1;
+            return SetSelectionEndpointFromNormalized(*tab, page, fz_point{ caretX, line.cy });
+        };
+
+        std::vector<VisualLine> lines = buildLines(*boxes);
+        if (lines.empty()) return false;
+        int currentLine = 0;
+        float currentDistance = std::numeric_limits<float>::max();
+        for (int i = 0; i < static_cast<int>(lines.size()); ++i)
+        {
+            float distance = std::abs(endpoint.y - lines[static_cast<size_t>(i)].cy);
+            if (distance < currentDistance)
+            {
+                currentDistance = distance;
+                currentLine = i;
             }
         }
-        return false;
+
+        int targetLine = currentLine + (upward ? -1 : 1);
+        if (targetLine >= 0 && targetLine < static_cast<int>(lines.size()))
+            return setCaretOnLine(g_selectionEndPage, *boxes, lines[static_cast<size_t>(targetLine)]);
+
+        int adjacentPage = g_selectionEndPage + (upward ? -1 : 1);
+        if (adjacentPage < 0 || adjacentPage >= tab->pageCount)
+            return false;
+        std::vector<fz_rect> const* adjacentBoxes = boxesFor(adjacentPage);
+        if (!adjacentBoxes || adjacentBoxes->empty()) return false;
+        std::vector<VisualLine> adjacentLines = buildLines(*adjacentBoxes);
+        if (adjacentLines.empty()) return false;
+        return setCaretOnLine(
+            adjacentPage,
+            *adjacentBoxes,
+            adjacentLines[static_cast<size_t>(upward ? adjacentLines.size() - 1 : 0)]);
     }
 
     bool SelectAllDocumentText(PdfTab& tab)
@@ -12177,6 +12306,8 @@ namespace
         g_selectionPageRect = {};
         g_selectionStartNorm = {};
         g_selectionNorm = {};
+        g_selectionPreferredXValid = false;
+        g_selectionPreferredX = 0.0f;
         g_selectionQuads.clear();
         g_selectionSegments.clear();
         g_selectionText.clear();
@@ -13272,6 +13403,8 @@ namespace
         g_selectionEnd = POINT{ unionRect.right, unionRect.bottom };
         g_selectionStartNorm = fz_point{ norm.x0, norm.y0 };
         g_selectionNorm = norm;
+        g_selectionPreferredXValid = false;
+        g_selectionPreferredX = 0.0f;
         g_selectionQuads = std::move(quads);
         g_selectionText = FromUtf8(text.c_str());
         g_selectionSegments.clear();
@@ -27407,6 +27540,8 @@ namespace
                     g_selectionEnd = POINT{ x, y };
                     g_selectionPageRect = pageRect;
                     g_selectionStartNorm = NormalizeSelectionPoint(pageRect, POINT{ x, y });
+                    g_selectionPreferredXValid = false;
+                    g_selectionPreferredX = 0.0f;
                     g_selectionSegments.clear();
                     ResetDragSelectionLatch();
                     SetCapture(hwnd);
