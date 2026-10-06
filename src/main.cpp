@@ -1623,6 +1623,9 @@ namespace
     LONG_PTR g_preImmersiveExStyle{};
     int g_active{ -1 };
     bool g_pageNavigationPending{};
+    // Keep the last complete reader frame visible while a saved PDF is
+    // reopened and its visible page cache is rebuilt.
+    bool g_annotationReloadPending{};
     // Facing-page scrolling has its own presentation transaction. It is
     // intentionally separate from bookmark navigation and zoom transitions:
     // scrolling may commit a complete low-resolution coverage frame before
@@ -11711,6 +11714,172 @@ namespace
         return !g_selectionQuads.empty();
     }
 
+    bool SetSelectionEndpointFromNormalized(PdfTab& tab, int page, fz_point point)
+    {
+        RECT pageRect{};
+        if (page < 0 || page >= tab.pageCount || !PageRectForPage(tab, page, pageRect))
+            return false;
+
+        point.x = std::clamp(point.x, 0.0f, 1.0f);
+        point.y = std::clamp(point.y, 0.0f, 1.0f);
+        g_selectionEndPage = page;
+        g_selectionEnd = POINT{
+            pageRect.left + static_cast<int>(std::lround(point.x * std::max<LONG>(1, pageRect.right - pageRect.left))),
+            pageRect.top + static_cast<int>(std::lround(point.y * std::max<LONG>(1, pageRect.bottom - pageRect.top))) };
+        return RefreshTextSelection(tab);
+    }
+
+    bool ExtendTextSelectionByArrow(WPARAM key)
+    {
+        if (!g_hasContentSelection || g_selectionIsImage || g_selectionQuads.empty() ||
+            (key != VK_LEFT && key != VK_RIGHT && key != VK_UP && key != VK_DOWN))
+            return false;
+
+        PdfTab* tab = Active();
+        if (!tab || g_selectionEndPage < 0 || g_selectionEndPage >= tab->pageCount)
+            return false;
+
+        RECT pageRect{};
+        if (!PageRectForPage(*tab, g_selectionEndPage, pageRect)) return false;
+        fz_point endpoint = NormalizeSelectionPoint(pageRect, g_selectionEnd);
+        auto boxesFor = [&](int page) -> std::vector<fz_rect> const*
+        {
+            return page >= 0 && page < tab->pageCount ? TextBoxesForPage(*tab, page) : nullptr;
+        };
+        auto distanceToBox = [&](fz_rect const& box)
+        {
+            float dx = endpoint.x < box.x0 ? box.x0 - endpoint.x :
+                (endpoint.x > box.x1 ? endpoint.x - box.x1 : 0.0f);
+            float dy = endpoint.y < box.y0 ? box.y0 - endpoint.y :
+                (endpoint.y > box.y1 ? endpoint.y - box.y1 : 0.0f);
+            return dx + dy;
+        };
+
+        std::vector<fz_rect> const* boxes = boxesFor(g_selectionEndPage);
+        if (!boxes || boxes->empty()) return false;
+        int nearest = 0;
+        float nearestDistance = distanceToBox((*boxes)[0]);
+        for (int i = 1; i < static_cast<int>(boxes->size()); ++i)
+        {
+            float distance = distanceToBox((*boxes)[static_cast<size_t>(i)]);
+            if (distance < nearestDistance)
+            {
+                nearest = i;
+                nearestDistance = distance;
+            }
+        }
+
+        constexpr float kEpsilon = 0.0005f;
+        auto setEndpoint = [&](int page, fz_rect box, bool useRight, bool useBottom)
+        {
+            fz_point next{
+                useRight ? box.x1 : box.x0,
+                useBottom ? box.y1 : box.y0 };
+            return SetSelectionEndpointFromNormalized(*tab, page, next);
+        };
+        auto sameLine = [&](fz_rect const& box, fz_rect const& current)
+        {
+            float overlap = std::min(box.y1, current.y1) - std::max(box.y0, current.y0);
+            return overlap >= std::min(box.y1 - box.y0, current.y1 - current.y0) * 0.35f;
+        };
+
+        fz_rect current = (*boxes)[static_cast<size_t>(nearest)];
+        if (key == VK_LEFT || key == VK_RIGHT)
+        {
+            int candidate = -1;
+            if (key == VK_RIGHT)
+            {
+                float bestX = 2.0f;
+                for (int i = 0; i < static_cast<int>(boxes->size()); ++i)
+                {
+                    fz_rect const& box = (*boxes)[static_cast<size_t>(i)];
+                    if (!sameLine(box, current) || box.x0 <= endpoint.x + kEpsilon) continue;
+                    if (box.x0 < bestX) { bestX = box.x0; candidate = i; }
+                }
+                if (candidate >= 0)
+                    return setEndpoint(g_selectionEndPage, (*boxes)[static_cast<size_t>(candidate)], true, true);
+
+                // At the end of a line, continue at the first character of
+                // the next line before crossing to the next page.
+                float bestY = 2.0f;
+                for (int i = 0; i < static_cast<int>(boxes->size()); ++i)
+                {
+                    fz_rect const& box = (*boxes)[static_cast<size_t>(i)];
+                    if (box.y0 <= current.y1 + kEpsilon || box.y0 >= bestY) continue;
+                    bestY = box.y0; candidate = i;
+                }
+                if (candidate >= 0)
+                    return setEndpoint(g_selectionEndPage, (*boxes)[static_cast<size_t>(candidate)], true, true);
+            }
+            else
+            {
+                float bestX = -1.0f;
+                for (int i = 0; i < static_cast<int>(boxes->size()); ++i)
+                {
+                    fz_rect const& box = (*boxes)[static_cast<size_t>(i)];
+                    if (!sameLine(box, current) || box.x1 >= endpoint.x - kEpsilon) continue;
+                    if (box.x1 > bestX) { bestX = box.x1; candidate = i; }
+                }
+                if (candidate >= 0)
+                    return setEndpoint(g_selectionEndPage, (*boxes)[static_cast<size_t>(candidate)], false, false);
+
+                float bestY = -1.0f;
+                for (int i = 0; i < static_cast<int>(boxes->size()); ++i)
+                {
+                    fz_rect const& box = (*boxes)[static_cast<size_t>(i)];
+                    if (box.y1 >= current.y0 - kEpsilon || box.y1 <= bestY) continue;
+                    bestY = box.y1; candidate = i;
+                }
+                if (candidate >= 0)
+                    return setEndpoint(g_selectionEndPage, (*boxes)[static_cast<size_t>(candidate)], false, false);
+            }
+
+            int adjacentPage = g_selectionEndPage + (key == VK_RIGHT ? 1 : -1);
+            if (adjacentPage >= 0 && adjacentPage < tab->pageCount)
+            {
+                if (auto adjacent = boxesFor(adjacentPage); adjacent && !adjacent->empty())
+                {
+                    return key == VK_RIGHT
+                        ? setEndpoint(adjacentPage, adjacent->front(), true, true)
+                        : setEndpoint(adjacentPage, adjacent->back(), false, false);
+                }
+            }
+            return false;
+        }
+
+        int candidate = -1;
+        float bestDistance = 2.0f;
+        bool upward = key == VK_UP;
+        for (int i = 0; i < static_cast<int>(boxes->size()); ++i)
+        {
+            fz_rect const& box = (*boxes)[static_cast<size_t>(i)];
+            float lineDistance = upward ? current.y0 - box.y1 : box.y0 - current.y1;
+            if (lineDistance <= kEpsilon || lineDistance >= bestDistance) continue;
+            float horizontalDistance = endpoint.x < box.x0 ? box.x0 - endpoint.x :
+                (endpoint.x > box.x1 ? endpoint.x - box.x1 : 0.0f);
+            bestDistance = lineDistance;
+            candidate = i;
+            // Prefer the character nearest the current horizontal caret on
+            // the selected line when several boxes share the same baseline.
+            if (horizontalDistance < 0.001f) break;
+        }
+        if (candidate >= 0)
+            return setEndpoint(g_selectionEndPage, (*boxes)[static_cast<size_t>(candidate)],
+                !upward, upward);
+
+        int adjacentPage = g_selectionEndPage + (upward ? -1 : 1);
+        if (adjacentPage >= 0 && adjacentPage < tab->pageCount)
+        {
+            if (auto adjacent = boxesFor(adjacentPage); adjacent && !adjacent->empty())
+            {
+                return upward
+                    ? setEndpoint(adjacentPage, adjacent->back(), false, false)
+                    : setEndpoint(adjacentPage, adjacent->front(), true, true);
+            }
+        }
+        return false;
+    }
+
     bool SelectAllDocumentText(PdfTab& tab)
     {
         if (!g_pdf.selectTextWithMargins || tab.pageCount <= 0 || !tab.doc)
@@ -13922,6 +14091,7 @@ namespace
         // the previous document's committed frame must not suppress its
         // first normal paint.
         g_pageNavigationPending = false;
+        g_annotationReloadPending = false;
         g_facingScrollPending = false;
         g_allowIncompletePageNavigationFrame = false;
         g_stageFrameValid = false;
@@ -16587,6 +16757,7 @@ namespace
         // A pending page-navigation commit belongs to the previous Tab. Do
         // not make the new Tab wait for that old viewport to become complete.
         g_pageNavigationPending = false;
+        g_annotationReloadPending = false;
         g_facingScrollPending = false;
         g_stageIdleRefreshPending = false;
         g_stageLightPaintUntil = 0;
@@ -19510,7 +19681,10 @@ namespace
         bool preserveFacingFrame = UseFacingContinuousPresentation() &&
             (g_pageNavigationPending || g_facingScrollPending) &&
             g_stageFrameValid && !zoomPresentationPending && !facingCoverageReady;
-        if (preserveFacingFrame)
+        bool preserveAnnotationFrame = g_annotationReloadPending && g_stageFrameValid &&
+            !zoomPresentationPending;
+        bool preserveCommittedFrame = preserveFacingFrame || preserveAnnotationFrame;
+        if (preserveCommittedFrame)
         {
             // RestoreStageFrame may have no source pixels for the newly
             // exposed edge of a shifted viewport. Initialize that edge with
@@ -19570,7 +19744,7 @@ namespace
                          {
                              QueuePageRender(g_hwnd, tab, i, 0);
                          }
-                          if (!zoomPresentationPending && !preserveFacingFrame)
+                          if (!zoomPresentationPending && !preserveCommittedFrame)
                                Fill(dc, drawRect, PdfPageBackgroundColor());
                           PageImage* fallback = FindZoomFallbackPage(tab, i);
                           PageImage* facingPreview = UseFacingContinuousPresentation()
@@ -19614,7 +19788,7 @@ namespace
                     }
                       else
                       {
-                           if (!zoomPresentationPending && !preserveFacingFrame)
+                           if (!zoomPresentationPending && !preserveCommittedFrame)
                                Fill(dc, drawRect, PdfPageBackgroundColor());
                            bool fallbackPainted = false;
                            bool facingCoveragePainted = false;
@@ -19887,7 +20061,20 @@ namespace
                 return false;
             }
             g_pageNavigationPending = false;
+            g_annotationReloadPending = false;
             return true;
+        }
+        if (g_annotationReloadPending)
+        {
+            // Only release the old frame after a complete visible viewport
+            // has been painted from the reopened PDF. Until then the saved
+            // annotation remains visible on the old committed surface.
+            if (missingVisiblePage || !RectContains(paintClip, g_stage))
+            {
+                InvalidateRect(g_hwnd, &g_stage, FALSE);
+                return false;
+            }
+            g_annotationReloadPending = false;
         }
         return true;
     }
@@ -23576,15 +23763,12 @@ namespace
         GetClientRect(hwnd, &client);
         RECT chrome{ 0, 0, client.right, g_stage.top };
         InvalidateRect(hwnd, &chrome, FALSE);
-        // Reopen loads a fresh annotation list and invalidates the page
-        // render generation. Present the reader frame as one unit so newly
-        // saved Line and Ink annotations cannot be hidden by the old page
-        // bitmap that was committed before the PDF rewrite.
-        g_stageFrameValid = false;
-        g_stageFrameOffsetX = 0;
-        g_stageFrameOffsetY = 0;
-        InvalidateRect(hwnd, &g_stage, FALSE);
-        SchedulePagePrefetch(hwnd);
+        // Reopen invalidates the page cache, but the visible pixels themselves
+        // are unchanged. Retain the last complete reader frame as an atomic
+        // underlay while the reopened PDF renders, especially in immersive
+        // mode where the reader reaches the window's top and bottom edges.
+        g_annotationReloadPending = true;
+        RequestPageNavigationRepaint(hwnd, tab, true);
         if (SidebarVisible()) InvalidateRect(hwnd, &g_sidebar, FALSE);
     }
 
@@ -29088,6 +29272,18 @@ namespace
                         SetTimer(hwnd, 15, 500, nullptr);
                     g_homeSearchCaretVisible = true;
                     InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+            if ((GetKeyState(VK_SHIFT) & 0x8000) &&
+                (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN) &&
+                Active() && !g_pageInputFocused && !g_searchInputFocused &&
+                !g_outlineSearchFocused && !g_homeSearchFocused && !g_annotationNoteFocused)
+            {
+                if (ExtendTextSelectionByArrow(wParam))
+                {
+                    NotifyUiaSelectionChanged();
+                    InvalidateRect(hwnd, &g_stage, FALSE);
                     return 0;
                 }
             }
