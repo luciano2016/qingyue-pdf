@@ -3598,7 +3598,7 @@ namespace
         float width = static_cast<float>(std::max<LONG>(1, rect.right - rect.left));
         float height = static_cast<float>(std::max<LONG>(1, rect.bottom - rect.top));
         float iconSize = std::max(1.0f, std::min(width, height) - static_cast<float>(S(16)));
-        float scale = iconSize / 1024.0f;
+        float scale = iconSize / 1024.0f * 1.20f;
         float centerX = (static_cast<float>(rect.left) + static_cast<float>(rect.right)) * 0.5f;
         float centerY = (static_cast<float>(rect.top) + static_cast<float>(rect.bottom)) * 0.5f;
         auto point = [&](float x, float y)
@@ -3635,20 +3635,21 @@ namespace
         graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
         if (index == 0)
             DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Copy,
-                MixColor(color, T().panel2, IsDarkTheme() ? 0.14 : 0.16));
+                MixColor(color, T().panel2, IsDarkTheme() ? 0.12 : 0.14),
+                1024.0f, 1024.0f, 1.20f);
         else if (index == 1)
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color, 1024.0f, 1024.0f, 0.90f);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Highlight, color, 1024.0f, 1024.0f, 1.08f);
         else if (index == 2)
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Underline, color);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Underline, color, 1024.0f, 1024.0f, 1.20f);
         else if (index == 3)
         {
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::UnderlineU, color);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::UnderlineU, color, 1024.0f, 1024.0f, 1.20f);
             DrawSelectionWave(graphics, rect, color);
         }
         else if (index == 4)
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Strikeout, color);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Strikeout, color, 1024.0f, 1024.0f, 1.20f);
         else
-            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Search, color);
+            DrawSelectionSvgPath(graphics, rect, SelectionToolbarSvg::Search, color, 1024.0f, 1024.0f, 1.20f);
     }
 
     int SelectionToolbarActionAt(POINT pt)
@@ -20611,8 +20612,8 @@ namespace
         int x = left + padding;
         int y = top + (height - button) / 2;
         COLORREF iconColor = IsDarkTheme()
-            ? MixColor(T().text, T().panel, 0.38)
-            : RGB(70, 70, 70);
+            ? MixColor(T().text, T().panel, 0.28)
+            : RGB(52, 52, 52);
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
